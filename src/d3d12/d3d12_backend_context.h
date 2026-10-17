@@ -978,6 +978,8 @@ namespace dxup::d3d12 {
 
     void transitionResource(D3D12BackendBuffer* buffer, D3D12_RESOURCE_STATES newState);
     void transitionResource(D3D12BackendImage* image, D3D12_RESOURCE_STATES newState);
+    // Maps a lazily committed render target's tiles and clears it to zero.
+    void commitLazyImage(D3D12BackendImage* image);
     void transitionResource(D3D12BackendImage* image, const ImageSubresource& subresource, D3D12_RESOURCE_STATES newState);
     void transitionResource(D3D12BackendImage* image, const D3D12BackendImageView* view, D3D12_RESOURCE_STATES newState);
     void transitionSubresource(D3D12BackendImage* image, uint32_t subresource, D3D12_RESOURCE_STATES newState);
@@ -1112,6 +1114,7 @@ namespace dxup::d3d12 {
     std::unordered_map<uint32_t, ComPtr<ID3D12PipelineState>> m_mipGenPsoCache;
     // Reused for every mip: render target views are read when bound.
     D3D12_CPU_DESCRIPTOR_HANDLE m_mipGenRtv = {};
+    D3D12_CPU_DESCRIPTOR_HANDLE m_lazyClearRtv = {};
     void initMipGenResources();
 
     // Forced multisampling passes: a fullscreen triangle reads one image and

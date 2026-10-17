@@ -2193,7 +2193,7 @@ namespace dxup::d3d12 {
     return resource;
   }
 
-  void D3D12BackendDevice::commitLazyImage(D3D12BackendImage* image) {
+  bool D3D12BackendDevice::commitLazyImage(D3D12BackendImage* image) {
     // {3b0d6e52-8a41-4c7f-9f2e-6d1a5c8b7e03}
     static constexpr GUID kLazyHeapGuid = { 0x3b0d6e52, 0x8a41, 0x4c7f, { 0x9f, 0x2e, 0x6d, 0x1a, 0x5c, 0x8b, 0x7e, 0x03 } };
     // One at a time: a second context writing the same target waits here
@@ -2201,7 +2201,7 @@ namespace dxup::d3d12 {
     std::lock_guard<std::mutex> lock(m_lazyCommitMutex);
     const uint32_t tiles = image->m_lazyTiles.load(std::memory_order_acquire);
     if (!tiles)
-      return;
+      return false;
     D3D12_HEAP_DESC heapDesc = {};
     heapDesc.SizeInBytes = uint64_t(tiles) * D3D12_TILED_RESOURCE_TILE_SIZE_IN_BYTES;
     heapDesc.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
@@ -2211,7 +2211,7 @@ namespace dxup::d3d12 {
     HRESULT hr = m_device->CreateHeap(&heapDesc, IID_PPV_ARGS(&heap));
     if (FAILED(hr)) {
       logMessage(LogLevel::Error, "commitLazyImage: CreateHeap of %u tiles failed (hr=0x%08x)", tiles, static_cast<unsigned>(hr));
-      return;
+      return false;
     }
     // In queue order before the command list that writes it.
     D3D12_TILED_RESOURCE_COORDINATE start = {};
@@ -2225,6 +2225,7 @@ namespace dxup::d3d12 {
     image->getResource()->SetPrivateDataInterface(kLazyHeapGuid, heap.Get());
     memstats::track(heap.Get(), memstats::TargetTexture);
     image->m_lazyTiles.store(0, std::memory_order_release);
+    return true;
   }
 
   void D3D12BackendDevice::createCommandQueue() {

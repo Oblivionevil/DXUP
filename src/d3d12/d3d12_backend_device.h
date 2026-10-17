@@ -1173,9 +1173,10 @@ namespace dxup::d3d12 {
     uint32_t getVendorId() const { return m_vendorId; }
   public:
     // Gives a lazily committed render target its memory before the first
-    // command that writes it: a heap of its own (zeroed, as new resources
-    // are) mapped onto all its tiles.
-    void commitLazyImage(D3D12BackendImage* image);
+    // command that writes it: a heap of its own mapped onto all its tiles.
+    // True when this call mapped them; the caller then initializes the
+    // target (D3D12BackendContext::commitLazyImage).
+    bool commitLazyImage(D3D12BackendImage* image);
   private:
     // Whether render targets are committed on their first write
     // (d3d12.lazyTargets; NVIDIA by default, where reserved targets render

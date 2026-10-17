@@ -8747,13 +8747,61 @@ namespace dxup::d3d12 {
     return true;
   }
 
+  namespace {
+    // A typed format of a typeless one for a view that clears to zero
+    // (zero has the same bits in every type of a format family).
+    DXGI_FORMAT zeroClearFormat(DXGI_FORMAT format) {
+      switch (format) {
+        case DXGI_FORMAT_R32G32B32A32_TYPELESS: return DXGI_FORMAT_R32G32B32A32_UINT;
+        case DXGI_FORMAT_R32G32B32_TYPELESS:    return DXGI_FORMAT_R32G32B32_UINT;
+        case DXGI_FORMAT_R16G16B16A16_TYPELESS: return DXGI_FORMAT_R16G16B16A16_UINT;
+        case DXGI_FORMAT_R32G32_TYPELESS:       return DXGI_FORMAT_R32G32_UINT;
+        case DXGI_FORMAT_R10G10B10A2_TYPELESS:  return DXGI_FORMAT_R10G10B10A2_UINT;
+        case DXGI_FORMAT_R8G8B8A8_TYPELESS:     return DXGI_FORMAT_R8G8B8A8_UINT;
+        case DXGI_FORMAT_R16G16_TYPELESS:       return DXGI_FORMAT_R16G16_UINT;
+        case DXGI_FORMAT_R32_TYPELESS:          return DXGI_FORMAT_R32_UINT;
+        case DXGI_FORMAT_R8G8_TYPELESS:         return DXGI_FORMAT_R8G8_UINT;
+        case DXGI_FORMAT_R16_TYPELESS:          return DXGI_FORMAT_R16_UINT;
+        case DXGI_FORMAT_R8_TYPELESS:           return DXGI_FORMAT_R8_UINT;
+        case DXGI_FORMAT_B8G8R8A8_TYPELESS:     return DXGI_FORMAT_B8G8R8A8_UNORM;
+        case DXGI_FORMAT_B8G8R8X8_TYPELESS:     return DXGI_FORMAT_B8G8R8X8_UNORM;
+        default:                                return format;
+      }
+    }
+  }
+
+  void D3D12BackendContext::commitLazyImage(D3D12BackendImage* image) {
+    if (!m_device->commitLazyImage(image))
+      return;
+    // Newly mapped tiles hold undefined contents and, on GPUs that compress
+    // render targets, undefined compression data: D3D12 wants a reserved
+    // render target cleared, discarded or copied over before anything else
+    // uses it. Zero matches the zeroed memory of a new D3D11 resource.
+    if (m_copyOnly)
+      return;
+    transitionResource(image, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    flushBarriers();
+    ID3D12Resource* resource = image->getResource();
+    const D3D12_RESOURCE_DESC desc = resource->GetDesc();
+    const DXGI_FORMAT format = zeroClearFormat(desc.Format);
+    if (!m_lazyClearRtv.ptr)
+      m_lazyClearRtv = m_device->getDescriptorHeapManager().allocateRtv();
+    D3D12_RENDER_TARGET_VIEW_DESC rtvDesc = {};
+    rtvDesc.Format = format;
+    rtvDesc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+    // The descriptor is read when the clear is recorded: one serves all.
+    m_device->getDevice()->CreateRenderTargetView(resource, &rtvDesc, m_lazyClearRtv);
+    const float zero[4] = {};
+    m_cmdList->ClearRenderTargetView(m_lazyClearRtv, zero, 0, nullptr);
+  }
+
   void D3D12BackendContext::transitionResource(D3D12BackendImage* image, D3D12_RESOURCE_STATES newState) {
     if (image->isStaging()) {
       transitionResource(image->getStagingBuffer(), newState);
       return;
     }
     if (image->isLazyUncommitted() && (newState & kImageWriteStates))
-      m_device->commitLazyImage(image);
+      commitLazyImage(image);
     if (memstats::enabled() && (newState & kImageWriteStates))
       memstats::noteWritten(image->getResource());
     noteSharedUse(image);
@@ -8802,7 +8850,7 @@ namespace dxup::d3d12 {
       return;
     }
     if (image->isLazyUncommitted() && (newState & kImageWriteStates))
-      m_device->commitLazyImage(image);
+      commitLazyImage(image);
     if (memstats::enabled() && (newState & kImageWriteStates))
       memstats::noteWritten(image->getResource());
     noteSharedUse(image);
@@ -8850,7 +8898,7 @@ namespace dxup::d3d12 {
       return;
     }
     if (image->isLazyUncommitted() && (newState & kImageWriteStates))
-      m_device->commitLazyImage(image);
+      commitLazyImage(image);
     if (memstats::enabled() && (newState & kImageWriteStates))
       memstats::noteWritten(image->getResource());
     const auto& imageDesc = image->getDesc();
@@ -8888,7 +8936,7 @@ namespace dxup::d3d12 {
       return;
     }
     if (image->isLazyUncommitted() && (newState & kImageWriteStates))
-      m_device->commitLazyImage(image);
+      commitLazyImage(image);
     if (memstats::enabled() && (newState & kImageWriteStates))
       memstats::noteWritten(image->getResource());
     noteSharedUse(image);
