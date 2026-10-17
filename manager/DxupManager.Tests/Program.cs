@@ -241,6 +241,17 @@ namespace Dxup.Tests
                     Check(deployer.Remove(game7, new[] { game7 }, out error)
                         && File.ReadAllText(Path.Combine(dx7Dir, "ddraw.dll")) == "foreign",
                         "removing restores the game's own ddraw.dll " + error);
+
+                    // An engine DLL next to the executable imports ddraw.dll
+                    // (Risen's Engine.dll imports d3d9.dll).
+                    File.Copy(dx7Test, Path.Combine(game32Dir, "engine.dll"));
+                    Check(GameDeployer.DllsFor(game32).Contains("ddraw.dll"), "a game whose engine DLL imports ddraw.dll gets it");
+                    File.Delete(Path.Combine(game32Dir, "engine.dll"));
+
+                    // DXUP's legacy DLL already in the folder is kept up to date.
+                    File.Copy(ddraw32, Path.Combine(game32Dir, "ddraw.dll"));
+                    Check(GameDeployer.DllsFor(game32).Contains("ddraw.dll"), "DXUP's ddraw.dll in the folder stays up to date");
+                    File.Delete(Path.Combine(game32Dir, "ddraw.dll"));
                 }
             }
             else

@@ -33,6 +33,9 @@ namespace Dxup.Shared
             bool any = false, all = true, current = true;
             foreach (string dll in DllsFor(game))
             {
+                string source = Path.Combine(SourceDir(game), dll);
+                if (!File.Exists(source))
+                    continue;
                 string target = Path.Combine(game.Dir, dll);
                 if (!DxupInstall.IsDxupFile(target))
                 {
@@ -40,7 +43,7 @@ namespace Dxup.Shared
                     continue;
                 }
                 any = true;
-                if (DxupInstall.Hash(target) != DxupInstall.Hash(Path.Combine(SourceDir(game), dll)))
+                if (DxupInstall.Hash(target) != DxupInstall.Hash(source))
                     current = false;
             }
             if (!game.Enabled)
@@ -51,32 +54,53 @@ namespace Dxup.Shared
         }
 
         // The DLLs a game gets: DXUP's Direct3D 11 and DXGI, and those of the
-        // older APIs its executable imports or loads by name.
+        // older APIs the game uses: its executable or an engine DLL next to it
+        // imports them (Risen's Engine.dll imports d3d9.dll), or the
+        // executable loads them by name. Not every DLL that merely names one:
+        // Bink video looks for ddraw.dll in Direct3D 9 games and should keep
+        // getting Windows' DirectDraw. DXUP's DLLs already in the folder (an
+        // older setup or a copy by hand) are kept up to date.
         public static List<string> DllsFor(GameEntry game)
         {
             var dlls = new List<string>(DxupInstall.Dlls);
-            string exe = string.IsNullOrEmpty(game.Exe) ? null : Path.Combine(game.Dir, game.Exe);
-            if (exe == null || !File.Exists(exe))
-                return dlls;
-            var pe = PeFile.Read(exe);
-            string text = null;
             foreach (string dll in DxupInstall.LegacyDlls)
             {
-                bool uses = pe != null && pe.ImportsDll(dll);
-                if (!uses)
-                {
-                    // LoadLibrary("d3d9.dll"): the name is in the file.
-                    if (text == null)
-                    {
-                        try { text = Encoding.ASCII.GetString(File.ReadAllBytes(exe)).ToLowerInvariant(); }
-                        catch (Exception) { text = ""; }
-                    }
-                    uses = text.Contains(dll);
-                }
-                if (uses)
+                if (DxupInstall.IsDxupFile(Path.Combine(game.Dir, dll)) || Uses(game, dll))
                     dlls.Add(dll);
             }
             return dlls;
+        }
+
+        // Whether the game's executable imports or names the DLL, or a DLL in
+        // its folder imports it.
+        static bool Uses(GameEntry game, string dll)
+        {
+            string exe = string.IsNullOrEmpty(game.Exe) ? null : Path.Combine(game.Dir, game.Exe);
+            if (exe != null && File.Exists(exe))
+            {
+                if (PeFile.Read(exe)?.ImportsDll(dll) == true)
+                    return true;
+                // LoadLibrary("d3d9.dll"): the name is in the file.
+                try
+                {
+                    if (Encoding.ASCII.GetString(File.ReadAllBytes(exe)).ToLowerInvariant().Contains(dll))
+                        return true;
+                }
+                catch (Exception) { }
+            }
+            try
+            {
+                foreach (string module in Directory.GetFiles(game.Dir, "*.dll"))
+                {
+                    string name = Path.GetFileName(module);
+                    if (DxupInstall.Dlls.Concat(DxupInstall.LegacyDlls).Any(own => string.Equals(own, name, StringComparison.OrdinalIgnoreCase)))
+                        continue;
+                    if (PeFile.Read(module)?.ImportsDll(dll) == true)
+                        return true;
+                }
+            }
+            catch (Exception) { }
+            return false;
         }
 
         // The DLLs for the game's executable: 32-bit games load 32-bit DLLs.

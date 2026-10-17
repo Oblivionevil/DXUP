@@ -3,8 +3,9 @@ DXUP - Direct3D 7 to 11 on Direct3D 12
 DXUP Manager (Start menu) sets up games:
   - "Add game" / drag an EXE onto the window / "Autofind" (installed Steam and
     Battle.net games) add a game and copy DXUP's DLLs (d3d11.dll and
-    dxgi.dll, for older games also d3d9.dll, d3d8.dll or ddraw.dll) next to
-    its executable. DLLs of other programs found there are kept as
+    dxgi.dll, and d3d9.dll, d3d8.dll or ddraw.dll when the executable or a
+    DLL next to it uses them; 32- or 64-bit by the executable) next to its
+    executable. DLLs of other programs found there are kept as
     *.dxup-backup and come back when DXUP is removed from the game.
   - The settings of each game (anisotropic filtering, LOD bias, MSAA, forced
     MSAA, supersampling, VSync, pre-rendered frames, render scale,
