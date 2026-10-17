@@ -291,12 +291,45 @@ namespace Dxup.Manager
             if (!layer)
                 DiagLayerBox.IsEnabled = DiagGpuBox.IsEnabled = false;
             DiagInactive.Visibility = active ? Visibility.Collapsed : Visibility.Visible;
+            bool recording = active && DiagnosticMarkers.AnyOn(entry.Dir);
+            RecordButton.IsEnabled = active;
+            RecordButton.Content = Loc.T(recording ? "DiagRecordStop" : "DiagRecord");
             RenderDocButton.Content = Loc.T(m_renderDoc.Value != null ? "DiagRenderDoc" : "DiagRenderDocGet");
             PixButton.Content = Loc.T(m_pix.Value != null ? "DiagPix" : "DiagPixGet");
             // PIX takes 64-bit programs only.
             bool is32Bit = PeFile.Read(entry.ExePath)?.Is32Bit == true;
             PixButton.IsEnabled = !is32Bit;
             PixButton.ToolTip = is32Bit ? Loc.T("DiagPix32") : null;
+        }
+
+        // One click for a bug report: the diagnostics that cost little enough
+        // to play with (the debug layer only when Windows has it), from a
+        // fresh start; pressed again, or after the package, they go off.
+        static readonly string[] RecordMarkers =
+            { DiagnosticMarkers.Log, DiagnosticMarkers.DebugLayer, DiagnosticMarkers.Exceptions, DiagnosticMarkers.FrameDump };
+
+        void OnRecord(object sender, RoutedEventArgs e)
+        {
+            if (Selected == null)
+                return;
+            string dir = Selected.Entry.Dir;
+            try
+            {
+                bool recording = DiagnosticMarkers.AnyOn(dir);
+                DiagnosticMarkers.ClearAll(dir);
+                DiagnosticMarkers.DeleteFrames(dir);
+                if (!recording)
+                {
+                    foreach (string marker in RecordMarkers)
+                    {
+                        if (marker != DiagnosticMarkers.DebugLayer || DiagnosticMarkers.DebugLayerInstalled)
+                            DiagnosticMarkers.Set(dir, marker, true);
+                    }
+                }
+                ShowDetails();
+                StatusText.Text = Loc.T(recording ? "StatusRecordStopped" : "StatusRecording");
+            }
+            catch (Exception ex) { Error(ex.Message); }
         }
 
         // For the buttons' labels; pressing one looks again.
@@ -353,6 +386,14 @@ namespace Dxup.Manager
                 Error(Loc.F("ErrPackage", error));
                 return;
             }
+            // Packed: the diagnostics go off and the saved frames go.
+            try
+            {
+                DiagnosticMarkers.ClearAll(entry.Dir);
+                DiagnosticMarkers.DeleteFrames(entry.Dir);
+            }
+            catch (Exception) { }
+            ShowDetails();
             StatusText.Text = Loc.F("StatusPackage", zip);
             Process.Start("explorer.exe", "/select,\"" + zip + "\"");
         }

@@ -92,7 +92,12 @@ Trotzdem hinzufügen?</sys:String>
   <sys:String x:Key="ColSource">Quelle</sys:String>
   <sys:String x:Key="ColExe">Programm, neben das DXUP kommt</sys:String>
   <sys:String x:Key="SectionDiagnostics">Diagnose</sys:String>
-  <sys:String x:Key="DiagIntro">Für Fehlerberichte: Schalte an, was du brauchst, starte das Spiel, stell den Fehler nach, beende das Spiel und erstelle dann ein Diagnosepaket. Danach wieder ausschalten – alle Schalter machen das Spiel langsamer.</sys:String>
+  <sys:String x:Key="DiagIntro">Für Fehlerberichte: „Fehler aufzeichnen“ drücken, das Spiel starten, den Fehler nachstellen und das Spiel beenden. Dann „Diagnosepaket erstellen“: Das ZIP landet auf dem Desktop, die Aufzeichnung geht wieder aus.</sys:String>
+  <sys:String x:Key="DiagRecord">Fehler aufzeichnen</sys:String>
+  <sys:String x:Key="DiagRecordStop">Aufzeichnung beenden</sys:String>
+  <sys:String x:Key="DiagSingle">Oder einzeln einschalten (Log, Debug-Layer, Absturzprotokoll und Bilder nimmt „Fehler aufzeichnen“):</sys:String>
+  <sys:String x:Key="StatusRecording">Aufzeichnung läuft: Spiel starten, Fehler nachstellen, Spiel beenden, dann „Diagnosepaket erstellen“.</sys:String>
+  <sys:String x:Key="StatusRecordStopped">Aufzeichnung beendet.</sys:String>
   <sys:String x:Key="DiagLog">Ausführliches Log (logdxup.log)</sys:String>
   <sys:String x:Key="DiagLayer">D3D12-Debug-Layer: meldet fehlerhafte Direct3D-12-Aufrufe von DXUP im Log</sys:String>
   <sys:String x:Key="DiagGpu">GPU-Validierung: prüft auch auf der GPU (sehr langsam)</sys:String>
@@ -112,7 +117,7 @@ Trotzdem hinzufügen?</sys:String>
   <sys:String x:Key="WarnDiagnostics">Diagnose ist an: Das Spiel läuft langsamer und schreibt Logs. Schalte sie unter „Diagnose“ wieder aus, wenn du fertig bist.</sys:String>
   <sys:String x:Key="ErrPackage">Das Diagnosepaket konnte nicht erstellt werden:
 {0}</sys:String>
-  <sys:String x:Key="StatusPackage">Diagnosepaket erstellt: {0} – zum Verschicken an deinen Fehlerbericht hängen.</sys:String>
+  <sys:String x:Key="StatusPackage">Diagnosepaket erstellt: {0} – zum Verschicken an deinen Fehlerbericht hängen. Die Aufzeichnung ist wieder aus.</sys:String>
   <sys:String x:Key="StatusRenderDoc">RenderDoc ist offen, das Spiel ist eingetragen: „Launch“ startet es.</sys:String>
   <sys:String x:Key="PixHowTo">PIX startet. Der Pfad des Spiels ist in der Zwischenablage:
 {0}

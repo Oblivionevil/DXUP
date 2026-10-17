@@ -81,15 +81,15 @@ zip and in [`src/util/util_config.h`](src/util/util_config.h).
 
 ## Bug reports
 
-DXUP Manager has a **Diagnostics** section for each game. Turn on the
-detailed log (and for rendering errors the D3D12 debug layer and saved
-frames), start the game, reproduce the problem, quit the game, then click
-**Create diagnostic package**: one click puts a zip on your desktop. It holds
-DXUP's logs, the game's settings, Windows, CPU, GPU and driver versions, the
-game's crash reports and, with saved frames on, a few images of the game.
-User and computer names and the user folder are replaced, so the zip can be
-shared. Attach it to an issue together with a description. Turn the
-diagnostics off again afterwards, they slow the game down.
+DXUP Manager has a **Diagnostics** section for each game. Click **Record a
+problem**, start the game, reproduce the problem and quit the game, then
+click **Create diagnostic package**: a zip goes to your desktop and the
+recording goes off again. The zip holds DXUP's log (with the D3D12 debug
+layer's messages when Windows' Graphics Tools are installed), the game's
+settings, Windows, CPU, GPU and driver versions, the game's crash reports
+and the last few frames as images. User and computer names and the user
+folder are replaced, so the zip can be shared. Attach it to an issue
+together with a description.
 
 Developers can start a game in RenderDoc or PIX from the same section to
 capture what DXUP sends to Direct3D 12.
