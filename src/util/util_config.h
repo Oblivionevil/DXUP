@@ -146,11 +146,17 @@ namespace dxup {
     // Render targets get their memory when first written, as Direct3D 11
     // drivers do (d3d12.lazyTargets): -1 NVIDIA only, 0 off, 1 on.
     int32_t  lazyTargets      = -1;
-    // Direct3D 9 shaders multiply as Direct3D 9 drivers do: 0 times anything,
-    // infinity and NaN too, is 0 (d3d9.floatEmulation, on by default; IEEE
-    // gives NaN, which draws objects black where a game has infinities or
-    // NaN in its data, as Mirror's Edge has in some constants).
-    bool     d3d9FloatEmulation = true;
+    // Where Direct3D 9 drivers differ, DXUP does as the driver of the GPU it
+    // runs on would (Mirror's Edge has infinities and NaN in its data):
+    // 0 times infinity or NaN (d3d9.floatEmulation): -1 auto, as NVIDIA's
+    // driver 0 in mul, mad and the dot products, as Intel's 0 in the dot
+    // products only (NaN in mul and mad); 0 IEEE (NaN) everywhere; 1 0
+    // everywhere.
+    int32_t  d3d9FloatEmulation = -1;
+    // A vertex with NaN depth (d3d9.nanDepth): -1 auto, as NVIDIA's driver
+    // its primitive is not drawn, as Intel's it is drawn at depth 0; 0 not
+    // drawn; 1 drawn at depth 0.
+    int32_t  d3d9NanDepth = -1;
     // Flip model applications draw into the real swap chain buffers, no
     // proxy copied at Present (dxgi.directBackBuffer).
     bool     directBackBuffer = true;

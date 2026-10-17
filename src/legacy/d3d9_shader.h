@@ -66,9 +66,14 @@ namespace dxup::legacy {
     uint16_t shadowSamplers = 0;
     // Vertex shaders: user clip planes enabled (clip space, cbuffer b3).
     uint8_t clipPlanes = 0;
-    // mul, mad, dp2add, dp3, dp4 and the matrix products give 0 where a
-    // factor is 0, also times infinity or NaN, as Direct3D 9 drivers do.
+    // 0 times infinity or NaN gives 0 (as Direct3D 9 drivers do) in mul and
+    // mad (floatEmulation), and in dp2add, dp3, dp4 and the matrix products
+    // (dotEmulation); IEEE gives NaN.
     bool floatEmulation = false;
+    bool dotEmulation = false;
+    // Vertex shaders: a NaN depth becomes 0 (drawn at depth 0, as Intel's
+    // driver does; Direct3D 11 and NVIDIA's Direct3D 9 drop the primitive).
+    bool nanDepthZero = false;
   };
 
   constexpr uint32_t kVaryingSlots9 = 30;

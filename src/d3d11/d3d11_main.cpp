@@ -730,6 +730,19 @@ void WINAPI DXUPNoteBackBufferSize(IUnknown* pDevice, UINT Width, UINT Height) {
   static_cast<D3D11Device*>(dxupDevice.Get())->NoteBackBufferSize(Width, Height);
 }
 
+// The PCI vendor of the GPU DXUP renders on, also when games are shown
+// another (dxgi.spoofVendor): DXUP's Direct3D 7-9 layers do as that
+// maker's driver where Direct3D 9 drivers differ. 0 for a device that is
+// not DXUP's.
+UINT WINAPI DXUPGetVendorId(IUnknown* pDevice) {
+  ComPtr<ID3D11Device5> dxupDevice;
+  if (!pDevice
+   || FAILED(pDevice->QueryInterface(kDxupD3D11DeviceIid, reinterpret_cast<void**>(dxupDevice.GetAddressOf()))))
+    return 0;
+  auto* backend = static_cast<D3D11Device*>(dxupDevice.Get())->GetBackend();
+  return backend ? static_cast<d3d12::D3D12BackendDevice*>(backend)->getVendorId() : 0;
+}
+
 } // extern "C"
 
 #endif // _WIN32

@@ -421,7 +421,14 @@ namespace dxup {
     overrides.pixelOutputMasks = config.getBool("d3d12.pixelOutputMasks", true);
     overrides.adapter = config.getString("dxgi.adapter", "");
     overrides.directBackBuffer = config.getBool("dxgi.directBackBuffer", true);
-    overrides.d3d9FloatEmulation = config.getBool("d3d9.floatEmulation", true);
+    {
+      const std::string emulation = config.getString("d3d9.floatEmulation", "auto");
+      overrides.d3d9FloatEmulation = emulation == "true" || emulation == "on" || emulation == "1" ? 1
+        : emulation == "false" || emulation == "off" || emulation == "0" ? 0 : -1;
+      const std::string nanDepth = config.getString("d3d9.nanDepth", "auto");
+      overrides.d3d9NanDepth = nanDepth == "zero" || nanDepth == "true" || nanDepth == "1" ? 1
+        : nanDepth == "discard" || nanDepth == "false" || nanDepth == "0" ? 0 : -1;
+    }
     readGpuSpoof(config, overrides);
     {
       const std::string lazy = config.getString("d3d12.lazyTargets", "auto");

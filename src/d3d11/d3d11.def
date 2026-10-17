@@ -4,3 +4,4 @@ EXPORTS
   D3D11CreateDeviceAndSwapChain
   D3D11On12CreateDevice
   DXUPNoteBackBufferSize
+  DXUPGetVendorId

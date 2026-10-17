@@ -489,10 +489,11 @@ namespace dxup::legacy {
       bool emit(const Instruction& ins) {
         const auto& s = ins.src;
         auto src = [&](size_t i) { return i < s.size() ? source(s[i]) : std::string("float4(0, 0, 0, 0)"); };
-        // Products as Direct3D 9 forms them (TranslateOptions9::floatEmulation).
-        const bool legacy = options.floatEmulation;
+        // Products as Direct3D 9 forms them (TranslateOptions9::floatEmulation
+        // and dotEmulation).
+        const bool legacy = options.dotEmulation;
         auto mul = [&](const std::string& a, const std::string& b) {
-          return legacy ? "dxup_mul(" + a + ", " + b + ")" : a + " * " + b;
+          return options.floatEmulation ? "dxup_mul(" + a + ", " + b + ")" : a + " * " + b;
         };
         auto dot4 = [&](const std::string& a, const std::string& b) {
           return legacy ? "dxup_dot4(" + a + ", " + b + ")" : "dot(" + a + ", " + b + ")";
@@ -902,7 +903,7 @@ namespace dxup::legacy {
     s += "float dxup_log(float x) { return x == 0.0f ? -3.402823466e38f : log2(abs(x)); }\n";
     s += "float dxup_pow(float x, float y) { return y == 0.0f ? 1.0f : exp2(y * dxup_log(x)); }\n";
     s += "float4 dxup_nrm(float4 x) { float l = dot(x.xyz, x.xyz); return l > 0.0f ? x * rsqrt(l) : 0.0f.xxxx; }\n";
-    if (options.floatEmulation) {
+    if (options.floatEmulation || options.dotEmulation) {
       // 0 times anything is 0 (Direct3D 9), not NaN for infinity or NaN.
       s += "float4 dxup_mul(float4 a, float4 b) { return a == 0.0f || b == 0.0f ? 0.0f.xxxx : a * b; }\n";
       s += "float dxup_dot4(float4 a, float4 b) { float4 m = dxup_mul(a, b); return (m.x + m.y) + (m.z + m.w); }\n";
@@ -1011,7 +1012,8 @@ namespace dxup::legacy {
       // Direct3D 9 draws a vertex whose depth is NaN at depth 0 (Intel's
       // driver), Direct3D 11 discards its primitive: Mirror's Edge has NaN
       // in its view-projection's z column in some frames.
-      storeOutputs += "  if ((asuint(output.position.z) & 0x7fffffffu) > 0x7f800000u) output.position.z = 0.0f;\n";
+      if (options.nanDepthZero)
+        storeOutputs += "  if ((asuint(output.position.z) & 0x7fffffffu) > 0x7f800000u) output.position.z = 0.0f;\n";
       count = (std::min)((std::max)(count, options.minVaryings), kVaryingSlots9);
       outputStruct += "  float4 position : SV_Position;\n";
       for (uint32_t i = 0; i < count; i++) {

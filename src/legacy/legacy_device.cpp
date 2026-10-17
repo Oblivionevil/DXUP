@@ -1053,6 +1053,19 @@ namespace dxup::legacy {
     constexpr uint64_t kTranslatorVersion = 5;
   }
 
+  // The PCI vendor of the GPU DXUP renders on (DXUPGetVendorId), 0 unknown.
+  std::atomic<uint32_t> g_vendorId{0};
+
+  // Where Direct3D 9 drivers differ: as the driver of that GPU's maker, or
+  // as dxup.conf says (UserOverrides::d3d9FloatEmulation, d3d9NanDepth).
+  void driverBehavior(TranslateOptions9& options) {
+    const UserOverrides& overrides = UserOverrides::get();
+    const bool intel = g_vendorId.load(std::memory_order_relaxed) == 0x8086;
+    options.floatEmulation = overrides.d3d9FloatEmulation == 1 || (overrides.d3d9FloatEmulation < 0 && !intel);
+    options.dotEmulation = overrides.d3d9FloatEmulation != 0;
+    options.nanDepthZero = overrides.d3d9NanDepth == 1 || (overrides.d3d9NanDepth < 0 && intel);
+  }
+
   namespace {
     // Workers compiling shader variants while a game loads.
     class CompilePool {
@@ -1119,7 +1132,7 @@ namespace dxup::legacy {
     shader->m_hash = hash;
     std::string hlsl;
     TranslateOptions9 options;
-    options.floatEmulation = UserOverrides::get().d3d9FloatEmulation;
+    driverBehavior(options);
     if (!translateShader9(shader->m_tokens.data(), shader->m_tokens.size(), options, hlsl, shader->m_info, error))
       return nullptr;
     // The likely variant now, on a worker: compiling at the first draw
@@ -1148,7 +1161,7 @@ namespace dxup::legacy {
   const Shader::Variant* Shader::variant(const TranslateOptions9& in) {
     // A vertex shader writes its own varyings at least: the same variant.
     TranslateOptions9 options = in;
-    options.floatEmulation = UserOverrides::get().d3d9FloatEmulation;
+    driverBehavior(options);
     if (vertex())
       options.minVaryings = (std::max)(options.minVaryings, m_info.varyingCount);
     else
@@ -1174,7 +1187,8 @@ namespace dxup::legacy {
     key = fnv64Multiply(key ^ options.sintInputs);
     key = fnv64Multiply(key ^ options.shadowSamplers);
     key = fnv64Multiply(key ^ (uint32_t(options.clipPlanes) << 16));
-    key = fnv64Multiply(key ^ (options.floatEmulation ? 0x1000000u : 0u));
+    key = fnv64Multiply(key ^ ((options.floatEmulation ? 0x1000000u : 0u) | (options.dotEmulation ? 0x2000000u : 0u)
+      | (options.nanDepthZero ? 0x4000000u : 0u)));
     if (options.boundSamplerTypes)
       for (int i = 0; i < 16; i++)
         key = fnv64Multiply(key ^ (options.boundSamplerTypes[i] + 0x100u * uint32_t(i)));
@@ -1309,6 +1323,10 @@ namespace dxup::legacy {
     }
     m_noteBackBufferSize = reinterpret_cast<decltype(m_noteBackBufferSize)>(
       GetProcAddress(m_d3d11Module, "DXUPNoteBackBufferSize"));
+    // The GPU's maker, before the first shader is translated.
+    using GetVendorId = UINT (WINAPI*)(IUnknown*);
+    if (auto getVendorId = reinterpret_cast<GetVendorId>(GetProcAddress(m_d3d11Module, "DXUPGetVendorId")))
+      g_vendorId.store(getVendorId(m_device.get()), std::memory_order_relaxed);
     // Constant buffers bound with offsets (Direct3D 11.1).
     if (FAILED(m_context->QueryInterface(__uuidof(ID3D11DeviceContext1), reinterpret_cast<void**>(m_context1.put())))) {
       error = "no ID3D11DeviceContext1";
@@ -2580,7 +2598,7 @@ namespace dxup::legacy {
       std::string hlsl, error;
       ShaderInfo9 info;
       TranslateOptions9 options;
-      options.floatEmulation = UserOverrides::get().d3d9FloatEmulation;
+      driverBehavior(options);
       if (!translateShader9(shader->tokens().data(), shader->tokens().size(), options, hlsl, info, error))
         hlsl = "(not translated: " + error + ")";
       logMessage(LogLevel::Warn, "glitch: %s shader %016llX reads NaN or infinite constants:%s; its HLSL:\n%s",
