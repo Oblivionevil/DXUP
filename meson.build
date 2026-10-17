@@ -1,5 +1,5 @@
 project('dxup', ['c', 'cpp'],
-  version : '1.0.0',
+  version : '1.1.0',
   default_options : [
     'cpp_std=c++17',
     'warning_level=2',
