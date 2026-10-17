@@ -124,6 +124,10 @@ namespace Dxup.Manager
         {
             var text = new StringBuilder();
             text.AppendLine("DXUP " + dxupVersion);
+            // The manager's build: version and commit (betas share a version).
+            text.AppendLine("Manager build: " + (typeof(Diagnostics).Assembly
+                .GetCustomAttributes(typeof(System.Reflection.AssemblyInformationalVersionAttribute), false)
+                .OfType<System.Reflection.AssemblyInformationalVersionAttribute>().FirstOrDefault()?.InformationalVersion ?? "?"));
             Wmi(text, "SELECT Caption, Version, BuildNumber, OSArchitecture FROM Win32_OperatingSystem", "Windows",
                 "Caption", "Version", "BuildNumber", "OSArchitecture");
             Wmi(text, "SELECT Name, NumberOfCores, NumberOfLogicalProcessors FROM Win32_Processor", "CPU",
