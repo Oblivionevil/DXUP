@@ -25,6 +25,7 @@ namespace Dxup.Shared
         public bool SpatialUpscale;      // scale a back buffer smaller than the window up at Present
         public int? RenderScale;         // percent of the asked back buffer size (33-99), null = all
         public string Adapter;           // part of the GPU's name in lower case, "warp"; null = the game's choice
+        public string SpoofVendor;       // nvidia, amd, intel: the GPU the game sees; null = the real one
 
         public GameSettings Clone() => (GameSettings)MemberwiseClone();
 
@@ -59,6 +60,10 @@ namespace Dxup.Shared
                     string adapter = value.Trim().ToLowerInvariant();
                     Adapter = adapter.Length > 0 ? adapter : null;
                     return true;
+                case "dxgi.spoofvendor":
+                    string vendor = value.Trim().ToLowerInvariant();
+                    SpoofVendor = vendor == "nvidia" || vendor == "amd" || vendor == "intel" ? vendor : null;
+                    return true;
                 case "dxgi.renderscale":
                     float? scale = ParseFloat(value);
                     RenderScale = scale.HasValue && scale.Value < 1.0f ? (int?)Math.Max(33, (int)Math.Round(scale.Value * 100.0f)) : null;
@@ -87,6 +92,7 @@ namespace Dxup.Shared
             if (RenderScale.HasValue && RenderScale.Value < 100)
                 yield return Entry("dxgi.renderScale", (RenderScale.Value / 100.0f).ToString("0.##", CultureInfo.InvariantCulture));
             if (!string.IsNullOrEmpty(Adapter)) yield return Entry("dxgi.adapter", Adapter);
+            if (!string.IsNullOrEmpty(SpoofVendor)) yield return Entry("dxgi.spoofVendor", SpoofVendor);
         }
 
         static KeyValuePair<string, string> Entry(string key, string value) => new KeyValuePair<string, string>(key, value);

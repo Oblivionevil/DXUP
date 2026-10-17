@@ -56,6 +56,7 @@ namespace Dxup.Tests
             game.Settings.SpatialUpscale = true;
             game.Settings.RenderScale = 75;
             game.Settings.Adapter = "intel(r) uhd graphics 770";
+            game.Settings.SpoofVendor = "amd";
             game.Extra.Add(new KeyValuePair<string, string>("d3d11.future", "x"));
             string text = GamesConfig.Format(new[] { game, new GameEntry { Name = "Bar", Dir = @"C:\Bar", Exe = "bar.exe" } });
             var parsed = GamesConfig.Parse(text);
@@ -68,14 +69,15 @@ namespace Dxup.Tests
                && back.Settings.AsyncShaders && !back.Settings.ShaderPrecompile && back.Settings.Upscaler == "xess"
                && back.Settings.UpscalerAuto && back.Settings.UpscalerInject && back.Settings.SpatialUpscale
                && back.Settings.RenderScale == 75 && back.Settings.Adapter == "intel(r) uhd graphics 770"
-               && !back.Settings.SyncInterval.HasValue && !back.Settings.MsaaScopeAll,
+               && back.Settings.SpoofVendor == "amd" && !back.Settings.SyncInterval.HasValue && !back.Settings.MsaaScopeAll,
                 "games.cfg keeps the settings");
             Check(back.Extra.Count == 1 && back.Extra[0].Key == "d3d11.future", "games.cfg keeps unknown settings");
             Check(!parsed[1].Enabled && parsed[1].Settings.Entries().Count() == 0 && parsed[1].Settings.ShaderPrecompile,
                 "a game without settings writes none and precompiles");
             Check(text.Contains("d3d11.sgssaa = alpha") && text.Contains("dxgi.maxFrameLatency = 1") && text.Contains("d3d11.asyncShaders = true")
                && text.Contains("d3d11.upscaler = xess") && text.Contains("d3d11.upscalerAuto = true")
-               && text.Contains("dxgi.upscale = spatial") && text.Contains("dxgi.renderScale = 0.75"),
+               && text.Contains("dxgi.upscale = spatial") && text.Contains("dxgi.renderScale = 0.75")
+               && text.Contains("dxgi.spoofVendor = amd"),
                 "settings use DXUP's keys");
 
             string path = Path.Combine(Path.GetTempPath(), "dxup_test_games.cfg");

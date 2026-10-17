@@ -1484,12 +1484,13 @@ int main(int argc, char** argv) {
   bool dumpImages = false, memory = false;
   const char* filter = nullptr;
   int benchFrames = 0, benchDraws = 0;
-  bool childForcedMsaa = false;
+  bool childForcedMsaa = false, identifier = false;
   for (int i = 1; i < argc; i++) {
     if (std::strcmp(argv[i], "--dump") == 0) dumpImages = true;
     else if (std::strcmp(argv[i], "--trace") == 0) g_trace = true;
     else if (std::strcmp(argv[i], "--memory") == 0) memory = true;
     else if (std::strcmp(argv[i], "--forced-msaa-child") == 0) childForcedMsaa = true;
+    else if (std::strcmp(argv[i], "--identifier") == 0) identifier = true;
     else if (std::strcmp(argv[i], "--bench") == 0 && i + 2 < argc) { benchFrames = std::atoi(argv[i + 1]); benchDraws = std::atoi(argv[i + 2]); i += 2; }
     else filter = argv[i];
   }
@@ -1515,6 +1516,21 @@ int main(int argc, char** argv) {
     const int partial = forcedMsaaEdgePixels(dxup);
     std::printf("%d\n", partial);
     return partial < 0 ? 255 : (std::min)(partial, 254);
+  }
+
+  // The first adapter as each runtime describes it (dxgi.spoofVendor).
+  if (identifier) {
+    for (Runtime* r : { &windows, &dxup }) {
+      IDirect3D9* d3d = r->create(D3D_SDK_VERSION);
+      D3DADAPTER_IDENTIFIER9 id = {};
+      if (d3d && SUCCEEDED(d3d->GetAdapterIdentifier(0, 0, &id)))
+        std::printf("%-8s %04lx:%04lx %s (%s %u.%u.%u.%u)\n", r->name, id.VendorId, id.DeviceId, id.Description, id.Driver,
+          unsigned(HIWORD(id.DriverVersion.HighPart)), unsigned(LOWORD(id.DriverVersion.HighPart)),
+          unsigned(HIWORD(id.DriverVersion.LowPart)), unsigned(LOWORD(id.DriverVersion.LowPart)));
+      if (d3d)
+        d3d->Release();
+    }
+    return 0;
   }
 
   if (benchFrames) {

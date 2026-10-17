@@ -3,6 +3,7 @@
 #include "d3d9_objects.h"
 
 #include "../legacy/legacy_formats.h"
+#include "../util/util_gpu_spoof.h"
 #include "../util/util_types.h"
 
 #include <dxgi1_2.h>
@@ -198,26 +199,31 @@ namespace dxup::d3d9 {
     if (adapter >= m_adapters.size() || !identifier)
       return D3DERR_INVALIDCALL;
     const Adapter& a = m_adapters[adapter];
+    // The spoofed GPU (dxgi.spoofVendor) when DXGI did not show it already.
+    DXGI_ADAPTER_DESC1 desc = a.desc;
+    spoofAdapterDesc(desc);
+    LARGE_INTEGER driverVersion = a.driverVersion;
+    spoofDriverVersion(a.desc.VendorId, driverVersion.QuadPart);
     *identifier = {};
     const char* driver = "d3d9.dll";
-    switch (a.desc.VendorId) {
+    switch (desc.VendorId) {
       case 0x10de: driver = "nvd3dum.dll"; break;
       case 0x1002: driver = "aticfx32.dll"; break;
       case 0x8086: driver = "igdumd32.dll"; break;
       default: break;
     }
     strcpy_s(identifier->Driver, driver);
-    WideCharToMultiByte(CP_ACP, 0, a.desc.Description, -1, identifier->Description, sizeof(identifier->Description), nullptr, nullptr);
+    WideCharToMultiByte(CP_ACP, 0, desc.Description, -1, identifier->Description, sizeof(identifier->Description), nullptr, nullptr);
     WideCharToMultiByte(CP_ACP, 0, a.deviceName.c_str(), -1, identifier->DeviceName, sizeof(identifier->DeviceName), nullptr, nullptr);
-    identifier->DriverVersion = a.driverVersion;
-    identifier->VendorId = a.desc.VendorId;
-    identifier->DeviceId = a.desc.DeviceId;
-    identifier->SubSysId = a.desc.SubSysId;
-    identifier->Revision = a.desc.Revision;
+    identifier->DriverVersion = driverVersion;
+    identifier->VendorId = desc.VendorId;
+    identifier->DeviceId = desc.DeviceId;
+    identifier->SubSysId = desc.SubSysId;
+    identifier->Revision = desc.Revision;
     // A stable identifier per adapter.
-    identifier->DeviceIdentifier = { 0xd7b71e3e, WORD(a.desc.VendorId), WORD(a.desc.DeviceId),
-      { BYTE(a.desc.AdapterLuid.LowPart), BYTE(a.desc.AdapterLuid.LowPart >> 8), BYTE(a.desc.AdapterLuid.LowPart >> 16),
-        BYTE(a.desc.AdapterLuid.LowPart >> 24), BYTE(a.desc.SubSysId), BYTE(a.desc.SubSysId >> 8), BYTE(a.desc.Revision),
+    identifier->DeviceIdentifier = { 0xd7b71e3e, WORD(desc.VendorId), WORD(desc.DeviceId),
+      { BYTE(desc.AdapterLuid.LowPart), BYTE(desc.AdapterLuid.LowPart >> 8), BYTE(desc.AdapterLuid.LowPart >> 16),
+        BYTE(desc.AdapterLuid.LowPart >> 24), BYTE(desc.SubSysId), BYTE(desc.SubSysId >> 8), BYTE(desc.Revision),
         BYTE(adapter) } };
     identifier->WHQLLevel = 1;
     return D3D_OK;

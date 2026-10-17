@@ -190,6 +190,8 @@
                   <RowDefinition Height="Auto" />
                   <RowDefinition Height="Auto" />
                   <RowDefinition Height="Auto" />
+                  <RowDefinition Height="Auto" />
+                  <RowDefinition Height="Auto" />
                 </Grid.RowDefinitions>
                 <TextBlock Text="{DynamicResource VSync}" Style="{StaticResource Caption}" />
                 <ComboBox x:Name="VSyncBox" Grid.Column="1" HorizontalAlignment="Left" DisplayMemberPath="Text" SelectionChanged="OnSettingChanged" />
@@ -204,6 +206,9 @@
                 <TextBlock Grid.Row="5" Text="{DynamicResource Adapter}" Style="{StaticResource Caption}" Margin="0,10,12,0" />
                 <ComboBox x:Name="AdapterBox" Grid.Row="5" Grid.Column="1" HorizontalAlignment="Left" Margin="0,10,0,0" DisplayMemberPath="Text" SelectionChanged="OnSettingChanged" />
                 <TextBlock Grid.Row="6" Grid.Column="1" Text="{DynamicResource AdapterHint}" Foreground="{DynamicResource Muted}" FontSize="11" Margin="0,4,0,0" TextWrapping="Wrap" />
+                <TextBlock Grid.Row="7" Text="{DynamicResource SpoofVendor}" Style="{StaticResource Caption}" Margin="0,10,12,0" />
+                <ComboBox x:Name="SpoofBox" Grid.Row="7" Grid.Column="1" HorizontalAlignment="Left" Margin="0,10,0,0" DisplayMemberPath="Text" SelectionChanged="OnSettingChanged" />
+                <TextBlock Grid.Row="8" Grid.Column="1" Text="{DynamicResource SpoofVendorHint}" Foreground="{DynamicResource Muted}" FontSize="11" Margin="0,4,0,0" TextWrapping="Wrap" />
               </Grid>
 
               <TextBlock Text="{DynamicResource SectionShaders}" Style="{StaticResource Section}" />

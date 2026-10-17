@@ -315,6 +315,72 @@ namespace dxup {
     return value ? lower(*value) : lower(fallback);
   }
 
+  std::string Config::getText(const char* key, const char* fallback) const {
+    const std::string* value = find(key);
+    return value ? *value : std::string(fallback);
+  }
+
+  // GPUs of each maker the application can be shown (dxgi.spoofVendor),
+  // with a driver version of that maker's numbering.
+  struct GpuPreset {
+    const char*    name;
+    uint32_t       vendorId;
+    uint32_t       deviceId;
+    const wchar_t* description;
+    uint16_t       driverVersion[4];
+
+    // As DXGI reports it (CheckInterfaceSupport).
+    int64_t packedDriverVersion() const {
+      return int64_t(driverVersion[0]) << 48 | int64_t(driverVersion[1]) << 32
+           | int64_t(driverVersion[2]) << 16 | int64_t(driverVersion[3]);
+    }
+  };
+
+  static const GpuPreset kGpuPresets[] = {
+    { "nvidia", 0x10DE, 0x2503, L"NVIDIA GeForce RTX 3060", { 32, 0, 15, 6094 } },
+    { "amd", 0x1002, 0x73DF, L"AMD Radeon RX 6700 XT", { 31, 0, 24033, 1003 } },
+    { "intel", 0x8086, 0x56A0, L"Intel(R) Arc(TM) A770 Graphics", { 32, 0, 101, 6083 } },
+  };
+
+  static void readGpuSpoof(const Config& config, UserOverrides& overrides) {
+    const std::string vendor = config.getString("dxgi.spoofVendor", "off");
+    for (const GpuPreset& preset : kGpuPresets) {
+      if (vendor != preset.name)
+        continue;
+      overrides.spoofVendorId = preset.vendorId;
+      overrides.spoofDeviceId = preset.deviceId;
+      overrides.spoofDescription = preset.description;
+      overrides.spoofDriverVersion = preset.packedDriverVersion();
+    }
+    // Ids in hex, with or without 0x.
+    auto hex = [&](const char* key) {
+      const std::string text = config.getString(key, "");
+      char* end = nullptr;
+      const unsigned long value = std::strtoul(text.c_str(), &end, 16);
+      return text.empty() || *end ? 0u : uint32_t(value & 0xFFFF);
+    };
+    if (const uint32_t vendorId = hex("dxgi.customVendorId")) {
+      overrides.spoofVendorId = vendorId;
+      // A maker's driver numbering for its vendor id: games read their
+      // version number out of it.
+      overrides.spoofDriverVersion = 0;
+      for (const GpuPreset& preset : kGpuPresets) {
+        if (preset.vendorId == vendorId)
+          overrides.spoofDriverVersion = preset.packedDriverVersion();
+      }
+    }
+    if (const uint32_t deviceId = hex("dxgi.customDeviceId"))
+      overrides.spoofDeviceId = deviceId;
+    const std::string description = config.getText("dxgi.customDeviceDesc", "");
+#ifdef _WIN32
+    if (!description.empty()) {
+      wchar_t wide[128] = {};
+      if (MultiByteToWideChar(CP_UTF8, 0, description.c_str(), -1, wide, 127))
+        overrides.spoofDescription = wide;
+    }
+#endif
+  }
+
   UserOverrides UserOverrides::fromConfig(const Config& config) {
     UserOverrides overrides;
     // 0 turns anisotropic filtering off, 1-16 force that many samples.
@@ -356,6 +422,7 @@ namespace dxup {
     overrides.adapter = config.getString("dxgi.adapter", "");
     overrides.directBackBuffer = config.getBool("dxgi.directBackBuffer", true);
     overrides.d3d9FloatEmulation = config.getBool("d3d9.floatEmulation", true);
+    readGpuSpoof(config, overrides);
     {
       const std::string lazy = config.getString("d3d12.lazyTargets", "auto");
       overrides.lazyTargets = lazy == "true" || lazy == "on" || lazy == "1" ? 1
@@ -377,6 +444,18 @@ namespace dxup {
         result.upscaler, result.upscalerSharpness, static_cast<unsigned long long>(result.upscalerShader),
         result.upscalerAuto ? 1 : 0, result.spatialUpscale ? 1 : 0, result.spatialSharpness, result.renderScale,
         result.relaxedUavBarriers ? 1 : 0);
+#ifdef _WIN32
+      if (result.spoofVendorId || result.spoofDeviceId || !result.spoofDescription.empty()) {
+        char description[128] = {};
+        WideCharToMultiByte(CP_UTF8, 0, result.spoofDescription.c_str(), -1, description, sizeof(description) - 1, nullptr, nullptr);
+        logMessage(LogLevel::Info, "dxup.conf: the application sees GPU %04x:%04x \"%s\", driver %llu.%llu.%llu.%llu (0: real)",
+          result.spoofVendorId, result.spoofDeviceId, description,
+          static_cast<unsigned long long>(result.spoofDriverVersion >> 48 & 0xFFFF),
+          static_cast<unsigned long long>(result.spoofDriverVersion >> 32 & 0xFFFF),
+          static_cast<unsigned long long>(result.spoofDriverVersion >> 16 & 0xFFFF),
+          static_cast<unsigned long long>(result.spoofDriverVersion & 0xFFFF));
+      }
+#endif
       return result;
     }();
     return overrides;

@@ -51,6 +51,9 @@
   <sys:String x:Key="SpatialUpscale">Scale a lower game resolution up to the window size (borderless window)</sys:String>
   <sys:String x:Key="Adapter">Graphics card</sys:String>
   <sys:String x:Key="AdapterHint">The GPU DXUP renders on, whichever the game picks. For PCs with integrated and dedicated graphics.</sys:String>
+  <sys:String x:Key="SpoofVendor">Report GPU as</sys:String>
+  <sys:String x:Key="SpoofVendorHint">The game sees a GPU of this maker (name, ids, driver version) while DXUP keeps rendering on the real one. For games that refuse a GPU or take other paths per maker.</sys:String>
+  <sys:String x:Key="OptRealGpu">Real GPU</sys:String>
   <sys:String x:Key="RenderScale">Render resolution</sys:String>
   <sys:String x:Key="RenderScaleHint">The game renders at this share of the resolution, DXUP scales up. Only for games that take their size from the swap chain.</sys:String>
   <sys:String x:Key="AppliesNextStart">Changes are saved right away and apply the next time the game starts.</sys:String>

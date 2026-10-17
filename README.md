@@ -58,6 +58,7 @@ dxgi.syncInterval = 0          # force VSync off (0) or on (1-4)
 dxgi.maxFrameLatency = 1       # pre-rendered frames (1-16)
 dxgi.renderScale = 0.75        # render at this share of the resolution, scaled up by DXUP
 dxgi.upscale = spatial         # scale a back buffer smaller than the window with DXUP's filter
+dxgi.spoofVendor = nvidia      # the game sees an NVIDIA, AMD or Intel GPU; DXUP renders on the real one
 ```
 
 The full list with explanations is in `dxup.conf.example` in the portable

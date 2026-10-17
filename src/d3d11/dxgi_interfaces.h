@@ -27,6 +27,7 @@
 #include "../d3d12/d3d12_backend_context.h"
 #include "../util/com_ptr.h"
 #include "../util/util_config.h"
+#include "../util/util_gpu_spoof.h"
 
 namespace dxup {
 
@@ -379,18 +380,25 @@ namespace dxup {
 
 
   // ============================================================
-  // DXGIAdapter : IDXGIAdapter1
+  // DXGIAdapter : IDXGIAdapter4
   //
   // Wraps a real IDXGIAdapter1 and returns our custom output
-  // objects.
+  // objects, and the spoofed GPU's description (dxgi.spoofVendor).
   // ============================================================
-  class DXGIAdapter : public IDXGIAdapter1 {
+  class DXGIAdapter : public IDXGIAdapter4 {
   public:
     DXGIAdapter(ComPtr<IDXGIAdapter1> realAdapter, DXGIFactory* factory)
     : m_refCount(1)
     , m_realAdapter(std::move(realAdapter))
     , m_factory(factory) {
       if (m_factory) m_factory->AddRef();
+      // With a spoofed GPU the later adapter interfaces are answered here
+      // too, so that their descriptions show it.
+      if (m_realAdapter && gpuSpoofed()) {
+        m_realAdapter.As(&m_realAdapter2);
+        m_realAdapter.As(&m_realAdapter3);
+        m_realAdapter.As(&m_realAdapter4);
+      }
     }
 
     ~DXGIAdapter() {
@@ -405,8 +413,11 @@ namespace dxup {
       if (riid == __uuidof(IUnknown)
        || riid == __uuidof(IDXGIObject)
        || riid == __uuidof(IDXGIAdapter)
-       || riid == __uuidof(IDXGIAdapter1)) {
-        *ppvObject = static_cast<IDXGIAdapter1*>(this);
+       || riid == __uuidof(IDXGIAdapter1)
+       || (riid == __uuidof(IDXGIAdapter2) && m_realAdapter2)
+       || (riid == __uuidof(IDXGIAdapter3) && m_realAdapter3)
+       || (riid == __uuidof(IDXGIAdapter4) && m_realAdapter4)) {
+        *ppvObject = static_cast<IDXGIAdapter4*>(this);
         AddRef();
         return S_OK;
       }
@@ -465,18 +476,76 @@ namespace dxup {
 
     HRESULT STDMETHODCALLTYPE GetDesc(DXGI_ADAPTER_DESC* pDesc) override {
       if (!pDesc) return E_POINTER;
-      return m_realAdapter->GetDesc(pDesc);
+      const HRESULT hr = m_realAdapter->GetDesc(pDesc);
+      if (SUCCEEDED(hr))
+        spoofAdapterDesc(*pDesc);
+      return hr;
     }
 
     HRESULT STDMETHODCALLTYPE CheckInterfaceSupport(REFGUID InterfaceName, LARGE_INTEGER* pUMDVersion) override {
-      return m_realAdapter->CheckInterfaceSupport(InterfaceName, pUMDVersion);
+      const HRESULT hr = m_realAdapter->CheckInterfaceSupport(InterfaceName, pUMDVersion);
+      DXGI_ADAPTER_DESC1 real = {};
+      if (SUCCEEDED(hr) && pUMDVersion && SUCCEEDED(m_realAdapter->GetDesc1(&real)))
+        spoofDriverVersion(real.VendorId, pUMDVersion->QuadPart);
+      return hr;
     }
 
     // ---- IDXGIAdapter1 ----
 
     HRESULT STDMETHODCALLTYPE GetDesc1(DXGI_ADAPTER_DESC1* pDesc) override {
       if (!pDesc) return E_POINTER;
-      return m_realAdapter->GetDesc1(pDesc);
+      const HRESULT hr = m_realAdapter->GetDesc1(pDesc);
+      if (SUCCEEDED(hr))
+        spoofAdapterDesc(*pDesc);
+      return hr;
+    }
+
+    // ---- IDXGIAdapter2-4 (with a spoofed GPU only) ----
+
+    HRESULT STDMETHODCALLTYPE GetDesc2(DXGI_ADAPTER_DESC2* pDesc) override {
+      if (!pDesc) return E_POINTER;
+      if (!m_realAdapter2) return E_NOINTERFACE;
+      const HRESULT hr = m_realAdapter2->GetDesc2(pDesc);
+      if (SUCCEEDED(hr))
+        spoofAdapterDesc(*pDesc);
+      return hr;
+    }
+
+    HRESULT STDMETHODCALLTYPE RegisterHardwareContentProtectionTeardownStatusEvent(HANDLE hEvent, DWORD* pdwCookie) override {
+      return m_realAdapter3 ? m_realAdapter3->RegisterHardwareContentProtectionTeardownStatusEvent(hEvent, pdwCookie) : E_NOINTERFACE;
+    }
+
+    void STDMETHODCALLTYPE UnregisterHardwareContentProtectionTeardownStatus(DWORD dwCookie) override {
+      if (m_realAdapter3)
+        m_realAdapter3->UnregisterHardwareContentProtectionTeardownStatus(dwCookie);
+    }
+
+    HRESULT STDMETHODCALLTYPE QueryVideoMemoryInfo(UINT NodeIndex, DXGI_MEMORY_SEGMENT_GROUP MemorySegmentGroup,
+                                                   DXGI_QUERY_VIDEO_MEMORY_INFO* pVideoMemoryInfo) override {
+      return m_realAdapter3 ? m_realAdapter3->QueryVideoMemoryInfo(NodeIndex, MemorySegmentGroup, pVideoMemoryInfo) : E_NOINTERFACE;
+    }
+
+    HRESULT STDMETHODCALLTYPE SetVideoMemoryReservation(UINT NodeIndex, DXGI_MEMORY_SEGMENT_GROUP MemorySegmentGroup,
+                                                        UINT64 Reservation) override {
+      return m_realAdapter3 ? m_realAdapter3->SetVideoMemoryReservation(NodeIndex, MemorySegmentGroup, Reservation) : E_NOINTERFACE;
+    }
+
+    HRESULT STDMETHODCALLTYPE RegisterVideoMemoryBudgetChangeNotificationEvent(HANDLE hEvent, DWORD* pdwCookie) override {
+      return m_realAdapter3 ? m_realAdapter3->RegisterVideoMemoryBudgetChangeNotificationEvent(hEvent, pdwCookie) : E_NOINTERFACE;
+    }
+
+    void STDMETHODCALLTYPE UnregisterVideoMemoryBudgetChangeNotification(DWORD dwCookie) override {
+      if (m_realAdapter3)
+        m_realAdapter3->UnregisterVideoMemoryBudgetChangeNotification(dwCookie);
+    }
+
+    HRESULT STDMETHODCALLTYPE GetDesc3(DXGI_ADAPTER_DESC3* pDesc) override {
+      if (!pDesc) return E_POINTER;
+      if (!m_realAdapter4) return E_NOINTERFACE;
+      const HRESULT hr = m_realAdapter4->GetDesc3(pDesc);
+      if (SUCCEEDED(hr))
+        spoofAdapterDesc(*pDesc);
+      return hr;
     }
 
     // ---- Accessors ----
@@ -487,6 +556,10 @@ namespace dxup {
   private:
     std::atomic<ULONG>    m_refCount;
     ComPtr<IDXGIAdapter1> m_realAdapter;
+    // Set with a spoofed GPU only.
+    ComPtr<IDXGIAdapter2> m_realAdapter2;
+    ComPtr<IDXGIAdapter3> m_realAdapter3;
+    ComPtr<IDXGIAdapter4> m_realAdapter4;
     DXGIFactory*          m_factory;
   };
 

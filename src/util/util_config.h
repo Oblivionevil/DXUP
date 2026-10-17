@@ -56,6 +56,13 @@ namespace dxup {
   //                                  the back buffer that DXUP copies at
   //                                  Present (default: into the real buffer)
   //   dxgi.maxFrameLatency = 1       force the number of pre-rendered frames (1-16)
+  //   dxgi.spoofVendor = nvidia      the application sees a GPU of this maker
+  //                                  (nvidia, amd, intel): its name, ids and
+  //                                  a driver version of that maker; DXUP
+  //                                  still renders on the real one
+  //   dxgi.customVendorId = 10de     the ids (hex) and name the application
+  //   dxgi.customDeviceId = 2503     sees, over those of spoofVendor
+  //   dxgi.customDeviceDesc = ...
   class Config {
   public:
     static const Config& get();
@@ -70,6 +77,8 @@ namespace dxup {
     bool    getBool(const char* key, bool fallback) const;
     // The value in lower case.
     std::string getString(const char* key, const char* fallback) const;
+    // The value as written.
+    std::string getText(const char* key, const char* fallback) const;
 
   private:
     const std::string* find(const char* key) const;
@@ -150,6 +159,16 @@ namespace dxup {
     // Microsoft's software renderer (dxgi.adapter). Empty: the
     // application's choice, else the first GPU.
     std::string adapter;
+    // The GPU the application sees (dxgi.spoofVendor, dxgi.customVendorId,
+    // dxgi.customDeviceId, dxgi.customDeviceDesc); 0 and empty keep the
+    // real one's. Games choose paths, settings and workarounds by the maker,
+    // and some refuse to start on one.
+    uint32_t    spoofVendorId = 0;
+    uint32_t    spoofDeviceId = 0;
+    std::wstring spoofDescription;
+    // The user mode driver version DXGI reports (CheckInterfaceSupport):
+    // games read the maker's version number out of it. 0 keeps the real one.
+    int64_t     spoofDriverVersion = 0;
 
     static UserOverrides fromConfig(const Config& config);
     static const UserOverrides& get();

@@ -456,6 +456,7 @@ void main(uint2 id : SV_DispatchThreadID) {
         {"user_overrides", &Dx11TestApp::testUserOverrides},
         {"forced_msaa_samples", &Dx11TestApp::testForcedMsaaSamples},
         {"games_config", &Dx11TestApp::testGamesConfig},
+        {"gpu_spoof", &Dx11TestApp::testGpuSpoof},
         {"forced_sgssaa", &Dx11TestApp::testForcedSgssaa},
         {"forced_msaa_targets", &Dx11TestApp::testForcedMsaaTargets},
         {"forced_msaa_scope", &Dx11TestApp::testForcedMsaaScope},
@@ -7859,6 +7860,13 @@ float4 main(float4 position : SV_Position, float4 t0 : TEXCOORD0, float4 t : TEX
       DeleteFileA(configPath.c_str());
       RemoveDirectoryA(installDir.c_str());
       return passed;
+    }
+
+    // dxup.conf shows the application an AMD GPU with a device id of its
+    // own: the factory's adapters (every description and the driver
+    // version) and the device's adapter (see runGpuSpoofChild).
+    bool testGpuSpoof(std::string& error) {
+      return runChildWithConfig("dxgi.spoofVendor = AMD\ndxgi.customDeviceId = 0x1234\n", "--gpu-spoof-child", error);
     }
 
     // dxup.conf raises a 2x target to 8 samples: an edge resolves to more
@@ -18847,6 +18855,69 @@ namespace {
     return _stricmp(exeDir.c_str(), dllDir.c_str()) == 0;
   }
 
+  // Runs with dxup.conf spoofing an AMD GPU of device id 0x1234 (see
+  // testGpuSpoof); returns 0 when every description shows it on DXUP (and
+  // natively whatever the GPU is).
+  int runGpuSpoofChild() {
+    ComPtr<IDXGIFactory1> factory;
+    if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(factory.GetAddressOf()))))
+      return 2;
+    ComPtr<ID3D11Device> device;
+    D3D_FEATURE_LEVEL level = D3D_FEATURE_LEVEL_11_0;
+    if (FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, &level, 1, D3D11_SDK_VERSION,
+          device.GetAddressOf(), nullptr, nullptr)))
+      return 3;
+    if (!runsOnDxup())
+      return 0;
+    auto spoofed = [](UINT vendor, UINT deviceId, const wchar_t* description) {
+      return vendor == 0x1002 && deviceId == 0x1234 && wcscmp(description, L"AMD Radeon RX 6700 XT") == 0;
+    };
+    ComPtr<IDXGIAdapter1> adapter;
+    for (UINT i = 0; SUCCEEDED(factory->EnumAdapters1(i, adapter.ReleaseAndGetAddressOf())); i++) {
+      DXGI_ADAPTER_DESC1 desc1 = {};
+      if (FAILED(adapter->GetDesc1(&desc1)))
+        return 4;
+      // Microsoft's software adapter keeps its own.
+      if (desc1.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) {
+        if (desc1.VendorId != 0x1414)
+          return 5;
+        continue;
+      }
+      DXGI_ADAPTER_DESC desc = {};
+      if (FAILED(adapter->GetDesc(&desc)) || !spoofed(desc.VendorId, desc.DeviceId, desc.Description)
+       || !spoofed(desc1.VendorId, desc1.DeviceId, desc1.Description))
+        return 6;
+      // The later interfaces too, when the GPU has them.
+      ComPtr<IDXGIAdapter2> adapter2;
+      DXGI_ADAPTER_DESC2 desc2 = {};
+      if (SUCCEEDED(adapter.As(&adapter2))
+       && (FAILED(adapter2->GetDesc2(&desc2)) || !spoofed(desc2.VendorId, desc2.DeviceId, desc2.Description)))
+        return 7;
+      ComPtr<IDXGIAdapter4> adapter4;
+      DXGI_ADAPTER_DESC3 desc3 = {};
+      if (SUCCEEDED(adapter.As(&adapter4))
+       && (FAILED(adapter4->GetDesc3(&desc3)) || !spoofed(desc3.VendorId, desc3.DeviceId, desc3.Description)))
+        return 8;
+      ComPtr<IDXGIAdapter3> adapter3;
+      DXGI_QUERY_VIDEO_MEMORY_INFO memory = {};
+      if (SUCCEEDED(adapter.As(&adapter3))
+       && FAILED(adapter3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &memory)))
+        return 9;
+      // AMD's driver numbering: 31.0.24033.1003.
+      LARGE_INTEGER version = {};
+      if (FAILED(adapter->CheckInterfaceSupport(__uuidof(IDXGIDevice), &version))
+       || version.QuadPart != (int64_t(31) << 48 | int64_t(24033) << 16 | 1003))
+        return 10;
+    }
+    ComPtr<IDXGIDevice> dxgiDevice;
+    ComPtr<IDXGIAdapter> deviceAdapter;
+    DXGI_ADAPTER_DESC desc = {};
+    if (FAILED(device.As(&dxgiDevice)) || FAILED(dxgiDevice->GetAdapter(deviceAdapter.GetAddressOf()))
+     || FAILED(deviceAdapter->GetDesc(&desc)) || !spoofed(desc.VendorId, desc.DeviceId, desc.Description))
+      return 11;
+    return 0;
+  }
+
   // Draws into a multisampled target with dxup.conf in place and checks
   // the resolve. "edge": a 2x target with a slanted edge; "sgssaa", "alpha":
   // 4x targets with patterns finer than a pixel; "uav": a 4x target drawn by
@@ -21768,6 +21839,8 @@ int main(int argc, char** argv) {
     return runGlitchChild();
   if (argc > 1 && std::strcmp(argv[1], "--msaa-nan-child") == 0)
     return runMsaaNanChild();
+  if (argc > 1 && std::strcmp(argv[1], "--gpu-spoof-child") == 0)
+    return runGpuSpoofChild();
   if (argc > 1 && std::strcmp(argv[1], "--relaxed-uav-child") == 0)
     return runRelaxedUavChild();
   if (argc > 1 && std::strcmp(argv[1], "--native-fallback-child") == 0)

@@ -51,6 +51,9 @@
   <sys:String x:Key="SpatialUpscale">Kleinere Spielauflösung selbst auf die Fenstergröße hochskalieren (randloses Fenster)</sys:String>
   <sys:String x:Key="Adapter">Grafikkarte</sys:String>
   <sys:String x:Key="AdapterHint">Die GPU, auf der DXUP rendert, egal welche das Spiel wählt. Für Rechner mit integrierter und eigener Grafikkarte.</sys:String>
+  <sys:String x:Key="SpoofVendor">GPU melden als</sys:String>
+  <sys:String x:Key="SpoofVendorHint">Das Spiel sieht eine GPU dieses Herstellers (Name, IDs, Treiberversion), DXUP rendert weiter auf der echten. Für Spiele, die eine GPU ablehnen oder je nach Hersteller andere Wege gehen.</sys:String>
+  <sys:String x:Key="OptRealGpu">Echte GPU</sys:String>
   <sys:String x:Key="RenderScale">Renderauflösung</sys:String>
   <sys:String x:Key="RenderScaleHint">Das Spiel rendert mit diesem Anteil der Auflösung, DXUP skaliert hoch. Nur für Spiele, die ihre Größe aus der Swap Chain nehmen.</sys:String>
   <sys:String x:Key="AppliesNextStart">Änderungen werden sofort gespeichert und gelten beim nächsten Start des Spiels.</sys:String>

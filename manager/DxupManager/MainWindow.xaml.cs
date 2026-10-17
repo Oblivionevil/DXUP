@@ -95,6 +95,9 @@ namespace Dxup.Manager
                 new Option(Loc.T("OptOff"), null), new Option("90 %", 90), new Option("75 %", 75), new Option("67 %", 67),
                 new Option("50 %", 50) };
             AdapterBox.ItemsSource = AdapterOptions(null);
+            SpoofBox.ItemsSource = new[] {
+                new Option(Loc.T("OptRealGpu"), null), new Option("NVIDIA", "nvidia"), new Option("AMD", "amd"),
+                new Option("Intel", "intel") };
         }
 
         // The graphics cards Windows knows (WMI takes a moment: they come in
@@ -242,6 +245,7 @@ namespace Dxup.Manager
             if (!string.IsNullOrEmpty(settings.Adapter) && !((List<Option>)AdapterBox.ItemsSource).Exists(o => Equals(o.Value, settings.Adapter)))
                 AdapterBox.ItemsSource = AdapterOptions(settings.Adapter);
             Select(AdapterBox, settings.Adapter);
+            Select(SpoofBox, settings.SpoofVendor);
             Select(VSyncBox, settings.SyncInterval.HasValue ? (object)(settings.SyncInterval.Value == 0 ? 0 : 1) : null);
             Select(FramesBox, settings.MaxFrameLatency);
             AsyncBox.IsChecked = settings.AsyncShaders;
@@ -482,6 +486,7 @@ namespace Dxup.Manager
             settings.SpatialUpscale = SpatialBox.IsChecked == true;
             settings.RenderScale = IntValue(RenderScaleBox);
             settings.Adapter = Value<string>(AdapterBox);
+            settings.SpoofVendor = Value<string>(SpoofBox);
             settings.SyncInterval = IntValue(VSyncBox);
             settings.MaxFrameLatency = IntValue(FramesBox);
             settings.AsyncShaders = AsyncBox.IsChecked == true;

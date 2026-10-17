@@ -1,6 +1,7 @@
 #include "ddraw_objects.h"
 
 #include "../legacy/legacy_formats.h"
+#include "../util/util_gpu_spoof.h"
 #include "../util/util_types.h"
 
 #include <dxgi.h>
@@ -2239,6 +2240,7 @@ namespace dxup::ddraw {
         IDXGIAdapter* adapter = nullptr;
         DXGI_ADAPTER_DESC desc = {};
         if (SUCCEEDED(dxgiDevice->GetAdapter(&adapter)) && SUCCEEDED(adapter->GetDesc(&desc))) {
+          spoofAdapterDesc(desc);
           identifier->dwVendorId = desc.VendorId;
           identifier->dwDeviceId = desc.DeviceId;
           identifier->dwSubSysId = desc.SubSysId;
