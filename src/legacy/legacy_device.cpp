@@ -1050,7 +1050,7 @@ namespace dxup::legacy {
     };
 
     // Changes whenever the translator's output changes.
-    constexpr uint64_t kTranslatorVersion = 4;
+    constexpr uint64_t kTranslatorVersion = 5;
   }
 
   namespace {
@@ -2579,7 +2579,9 @@ namespace dxup::legacy {
       }
       std::string hlsl, error;
       ShaderInfo9 info;
-      if (!translateShader9(shader->tokens().data(), shader->tokens().size(), TranslateOptions9(), hlsl, info, error))
+      TranslateOptions9 options;
+      options.floatEmulation = UserOverrides::get().d3d9FloatEmulation;
+      if (!translateShader9(shader->tokens().data(), shader->tokens().size(), options, hlsl, info, error))
         hlsl = "(not translated: " + error + ")";
       logMessage(LogLevel::Warn, "glitch: %s shader %016llX reads NaN or infinite constants:%s; its HLSL:\n%s",
         pixel ? "pixel" : "vertex", static_cast<unsigned long long>(shader->hash()), registers.c_str(), hlsl.c_str());

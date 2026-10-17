@@ -839,6 +839,63 @@ PO main(float4 c : COLOR0) { PO o; o.c0 = c; o.c1 = c.gbra * 0.8; return o; }
     return true;
   }
 
+  // A view-projection matrix whose z column is NaN (Mirror's Edge in some
+  // frames), so every vertex gets a NaN depth. From the left: depth test
+  // LESSEQUAL, depth test ALWAYS, depth test off, and finite depth.
+  bool sceneNanDepth(IDirect3DDevice9* d) {
+    d->Clear(0, nullptr, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, 0xff203040u, 1.0f, 0);
+    d->SetRenderState(D3DRS_LIGHTING, FALSE);
+    d->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+    const auto vsCode = assemble("vs_3_0\ndcl_position v0\ndcl_position o0\ndcl_color o1\n"
+                                 "mul r0, c1, v0.y\nmad r0, c0, v0.x, r0\nmad r0, c2, v0.z, r0\nmad o0, c3, v0.w, r0\nmov o1, c4\n");
+    const auto psCode = assemble("ps_3_0\ndcl_color v0\nmov oC0, v0\n");
+    IDirect3DVertexShader9* vs = nullptr;
+    IDirect3DPixelShader9* ps = nullptr;
+    if (vsCode.empty() || psCode.empty() || FAILED(d->CreateVertexShader(vsCode.data(), &vs))
+     || FAILED(d->CreatePixelShader(psCode.data(), &ps)))
+      return false;
+    d->SetVertexShader(vs);
+    d->SetPixelShader(ps);
+    d->SetFVF(D3DFVF_XYZ);
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    const float nanMatrix[16] = { 1, 0, nan, 0, 0, 1, nan, 0, 0, 0, nan, 0, 0, 0, nan, 1 };
+    const float finiteMatrix[16] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 };
+    struct Case { const float* matrix; BOOL depth; D3DCMPFUNC func; float color[4]; };
+    const Case cases[4] = {
+      { nanMatrix, TRUE, D3DCMP_LESSEQUAL, { 1.0f, 0.2f, 0.2f, 1.0f } },
+      { nanMatrix, TRUE, D3DCMP_ALWAYS, { 0.2f, 1.0f, 0.2f, 1.0f } },
+      { nanMatrix, FALSE, D3DCMP_LESSEQUAL, { 1.0f, 1.0f, 0.2f, 1.0f } },
+      { finiteMatrix, TRUE, D3DCMP_LESSEQUAL, { 0.2f, 0.4f, 1.0f, 1.0f } },
+    };
+    for (int i = 0; i < 4; i++) {
+      d->SetVertexShaderConstantF(0, cases[i].matrix, 4);
+      d->SetVertexShaderConstantF(4, cases[i].color, 1);
+      d->SetRenderState(D3DRS_ZENABLE, cases[i].depth);
+      d->SetRenderState(D3DRS_ZFUNC, cases[i].func);
+      // No vertex at x = 0: 0 times NaN is 0 for some drivers.
+      const float x0 = -0.95f + 0.5f * float(i), x1 = x0 + 0.4f;
+      const float quad[12] = { x0, 0.8f, 0.5f, x1, 0.8f, 0.5f, x0, -0.8f, 0.5f, x1, -0.8f, 0.5f };
+      d->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, quad, 3 * sizeof(float));
+    }
+    // NaN depth is written as 0: a white strip at depth 0.25 (test LESS)
+    // stays hidden behind the first two quads, and shows over the last two.
+    d->SetVertexShaderConstantF(0, finiteMatrix, 4);
+    const float white[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+    d->SetVertexShaderConstantF(4, white, 1);
+    d->SetRenderState(D3DRS_ZENABLE, TRUE);
+    d->SetRenderState(D3DRS_ZFUNC, D3DCMP_LESS);
+    const float strip[12] = { -0.95f, 0.3f, 0.25f, 0.95f, 0.3f, 0.25f, -0.95f, 0.0f, 0.25f, 0.95f, 0.0f, 0.25f };
+    d->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, strip, 3 * sizeof(float));
+    d->SetRenderState(D3DRS_ZENABLE, TRUE);
+    d->SetRenderState(D3DRS_ZFUNC, D3DCMP_LESSEQUAL);
+    d->SetRenderState(D3DRS_CULLMODE, D3DCULL_CCW);
+    d->SetVertexShader(nullptr);
+    d->SetPixelShader(nullptr);
+    ps->Release();
+    vs->Release();
+    return true;
+  }
+
   bool scenePointSprites(IDirect3DDevice9* d) {
     d->Clear(0, nullptr, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, 0xff000000u, 1.0f, 0);
     IDirect3DTexture9* texture = checkerTexture(d, 8);
@@ -1142,6 +1199,7 @@ float4 main(float2 t : TEXCOORD0) : COLOR {
     { "cube_volume_shader", sceneCubeVolumeShader },
     { "point_sprites", scenePointSprites },
     { "float_specials", sceneFloatSpecials },
+    { "nan_depth", sceneNanDepth },
     { "clip_planes", sceneClipPlanes },
     { "depth_textures", sceneDepthTextures },
     { "srgb_targets", sceneSrgbAndTargets, 3 },

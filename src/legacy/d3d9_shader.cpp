@@ -1008,6 +1008,10 @@ namespace dxup::legacy {
         for (uint8_t i = 0; i < 8; i++)
           if (w.texCoordOutputs & (1u << i)) info.outputs.push_back({ i, UsageTexCoord, i, 0xf });
       }
+      // Direct3D 9 draws a vertex whose depth is NaN at depth 0 (Intel's
+      // driver), Direct3D 11 discards its primitive: Mirror's Edge has NaN
+      // in its view-projection's z column in some frames.
+      storeOutputs += "  if ((asuint(output.position.z) & 0x7fffffffu) > 0x7f800000u) output.position.z = 0.0f;\n";
       count = (std::min)((std::max)(count, options.minVaryings), kVaryingSlots9);
       outputStruct += "  float4 position : SV_Position;\n";
       for (uint32_t i = 0; i < count; i++) {
