@@ -489,6 +489,20 @@ namespace dxup::legacy {
       bool emit(const Instruction& ins) {
         const auto& s = ins.src;
         auto src = [&](size_t i) { return i < s.size() ? source(s[i]) : std::string("float4(0, 0, 0, 0)"); };
+        // Products as Direct3D 9 forms them (TranslateOptions9::floatEmulation).
+        const bool legacy = options.floatEmulation;
+        auto mul = [&](const std::string& a, const std::string& b) {
+          return legacy ? "dxup_mul(" + a + ", " + b + ")" : a + " * " + b;
+        };
+        auto dot4 = [&](const std::string& a, const std::string& b) {
+          return legacy ? "dxup_dot4(" + a + ", " + b + ")" : "dot(" + a + ", " + b + ")";
+        };
+        auto dot3 = [&](const std::string& a, const std::string& b) {
+          return legacy ? "dxup_dot4(float4((" + a + ").xyz, 0.0f), " + b + ")" : "dot((" + a + ").xyz, (" + b + ").xyz)";
+        };
+        auto dot2 = [&](const std::string& a, const std::string& b) {
+          return legacy ? "dxup_dot4(float4((" + a + ").xy, 0.0f, 0.0f), " + b + ")" : "dot((" + a + ").xy, (" + b + ").xy)";
+        };
         auto one = [&](size_t i) { return i < s.size() ? scalar(s[i]) : std::string("0.0f"); };
         const uint32_t reg = ins.dst.empty() ? 0 : ins.dst[0].index;
         switch (ins.opcode) {
@@ -497,8 +511,8 @@ namespace dxup::legacy {
           case OpMov: case OpMova: write(ins, src(0)); return true;
           case OpAdd:  write(ins, src(0) + " + " + src(1)); return true;
           case OpSub:  write(ins, src(0) + " - " + src(1)); return true;
-          case OpMul:  write(ins, src(0) + " * " + src(1)); return true;
-          case OpMad:  write(ins, src(0) + " * " + src(1) + " + " + src(2)); return true;
+          case OpMul:  write(ins, mul(src(0), src(1))); return true;
+          case OpMad:  write(ins, mul(src(0), src(1)) + " + " + src(2)); return true;
           case OpMin:  write(ins, "min(" + src(0) + ", " + src(1) + ")"); return true;
           case OpMax:  write(ins, "max(" + src(0) + ", " + src(1) + ")"); return true;
           case OpSlt:  write(ins, "float4(" + src(0) + " < " + src(1) + ")"); return true;
@@ -524,9 +538,9 @@ namespace dxup::legacy {
           case OpExp: write(ins, "exp2(" + one(0) + ").xxxx"); return true;
           case OpLog: write(ins, "dxup_log(" + one(0) + ").xxxx"); return true;
           case OpPow:  write(ins, "dxup_pow(" + one(0) + ", " + one(1) + ").xxxx"); return true;
-          case OpDp3:  write(ins, "dot((" + src(0) + ").xyz, (" + src(1) + ").xyz).xxxx"); return true;
-          case OpDp4:  write(ins, "dot(" + src(0) + ", " + src(1) + ").xxxx"); return true;
-          case OpDp2Add: write(ins, "(dot((" + src(0) + ").xy, (" + src(1) + ").xy) + " + one(2) + ").xxxx"); return true;
+          case OpDp3:  write(ins, dot3(src(0), src(1)) + ".xxxx"); return true;
+          case OpDp4:  write(ins, dot4(src(0), src(1)) + ".xxxx"); return true;
+          case OpDp2Add: write(ins, "(" + dot2(src(0), src(1)) + " + " + one(2) + ").xxxx"); return true;
           case OpFrc:  write(ins, "frac(" + src(0) + ")"); return true;
           case OpAbs:  write(ins, "abs(" + src(0) + ")"); return true;
           case OpSgn:  write(ins, "sign(" + src(0) + ")"); return true;
@@ -556,8 +570,7 @@ namespace dxup::legacy {
             std::string parts[4] = { "0.0f", "0.0f", "0.0f", "0.0f" };
             const std::string v = src(0);
             for (uint32_t i = 0; i < rows && s.size() > 1; i++)
-              parts[i] = four ? "dot(" + v + ", " + source(offset(s[1], i)) + ")"
-                              : "dot((" + v + ").xyz, (" + source(offset(s[1], i)) + ").xyz)";
+              parts[i] = four ? dot4(v, source(offset(s[1], i))) : dot3(v, source(offset(s[1], i)));
             write(ins, "float4(" + parts[0] + ", " + parts[1] + ", " + parts[2] + ", " + parts[3] + ")");
             return true;
           }
@@ -889,6 +902,11 @@ namespace dxup::legacy {
     s += "float dxup_log(float x) { return x == 0.0f ? -3.402823466e38f : log2(abs(x)); }\n";
     s += "float dxup_pow(float x, float y) { return y == 0.0f ? 1.0f : exp2(y * dxup_log(x)); }\n";
     s += "float4 dxup_nrm(float4 x) { float l = dot(x.xyz, x.xyz); return l > 0.0f ? x * rsqrt(l) : 0.0f.xxxx; }\n";
+    if (options.floatEmulation) {
+      // 0 times anything is 0 (Direct3D 9), not NaN for infinity or NaN.
+      s += "float4 dxup_mul(float4 a, float4 b) { return a == 0.0f || b == 0.0f ? 0.0f.xxxx : a * b; }\n";
+      s += "float dxup_dot4(float4 a, float4 b) { float4 m = dxup_mul(a, b); return (m.x + m.y) + (m.z + m.w); }\n";
+    }
     // Per-component selects: faster to compile than four scalar ones.
     s += "float4 dxup_cmp(float4 a, float4 b, float4 c) { return a >= 0.0f ? b : c; }\n";
     s += "float4 dxup_cnd(float4 a, float4 b, float4 c) { return a > 0.5f ? b : c; }\n";

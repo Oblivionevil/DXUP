@@ -66,6 +66,9 @@ namespace dxup::legacy {
     uint16_t shadowSamplers = 0;
     // Vertex shaders: user clip planes enabled (clip space, cbuffer b3).
     uint8_t clipPlanes = 0;
+    // mul, mad, dp2add, dp3, dp4 and the matrix products give 0 where a
+    // factor is 0, also times infinity or NaN, as Direct3D 9 drivers do.
+    bool floatEmulation = false;
   };
 
   constexpr uint32_t kVaryingSlots9 = 30;

@@ -137,6 +137,11 @@ namespace dxup {
     // Render targets get their memory when first written, as Direct3D 11
     // drivers do (d3d12.lazyTargets): -1 NVIDIA only, 0 off, 1 on.
     int32_t  lazyTargets      = -1;
+    // Direct3D 9 shaders multiply as Direct3D 9 drivers do: 0 times anything,
+    // infinity and NaN too, is 0 (d3d9.floatEmulation, on by default; IEEE
+    // gives NaN, which draws objects black where a game has infinities or
+    // NaN in its data, as Mirror's Edge has in some constants).
+    bool     d3d9FloatEmulation = true;
     // Flip model applications draw into the real swap chain buffers, no
     // proxy copied at Present (dxgi.directBackBuffer).
     bool     directBackBuffer = true;

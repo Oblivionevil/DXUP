@@ -13,6 +13,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <functional>
 #include <string>
 #include <vector>
@@ -802,6 +803,42 @@ PO main(float4 c : COLOR0) { PO o; o.c0 = c; o.c1 = c.gbra * 0.8; return o; }
     return true;
   }
 
+  // 0 times infinity or NaN in mul, mad and dp3 of a pixel shader: 0 with
+  // Direct3D 9 drivers (IEEE would give NaN, written as black).
+  bool sceneFloatSpecials(IDirect3DDevice9* d) {
+    d->Clear(0, nullptr, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, 0xff336699u, 1.0f, 0);
+    d->SetRenderState(D3DRS_LIGHTING, FALSE);
+    d->SetRenderState(D3DRS_ZENABLE, FALSE);
+    const char* sources[3] = {
+      "ps_2_0\nmov r1, c1\nmov r2, c2\nmul r0, c0, r1\nadd r0, r0, r2\nmov oC0, r0\n",
+      "ps_2_0\nmov r1, c1\nmov r2, c2\nmad r0, c0, r1, r2\nmov oC0, r0\n",
+      "ps_2_0\nmov r1, c1\nmov r2, c2\ndp3 r0, c0, r1\nadd r0, r0, r2\nmov oC0, r0\n",
+    };
+    const float inf = std::numeric_limits<float>::infinity(), nan = std::numeric_limits<float>::quiet_NaN();
+    const float zero[4] = { 0.0f, 0.0f, 0.0f, 0.0f }, specials[4] = { inf, nan, -inf, 1.0f }, half[4] = { 0.5f, 0.5f, 0.5f, 1.0f };
+    d->SetPixelShaderConstantF(0, zero, 1);
+    d->SetPixelShaderConstantF(1, specials, 1);
+    d->SetPixelShaderConstantF(2, half, 1);
+    d->SetFVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE);
+    for (int i = 0; i < 3; i++) {
+      const auto code = assemble(sources[i]);
+      IDirect3DPixelShader9* ps = nullptr;
+      if (code.empty() || FAILED(d->CreatePixelShader(code.data(), &ps)))
+        return false;
+      d->SetPixelShader(ps);
+      const float x0 = float(i * kWidth / 3) - 0.5f, x1 = float((i + 1) * kWidth / 3) - 0.5f;
+      const TLVertex quad[4] = {
+        { x0, -0.5f, 0.5f, 1.0f, 0xffffffffu }, { x1, -0.5f, 0.5f, 1.0f, 0xffffffffu },
+        { x0, float(kHeight) - 0.5f, 0.5f, 1.0f, 0xffffffffu }, { x1, float(kHeight) - 0.5f, 0.5f, 1.0f, 0xffffffffu },
+      };
+      d->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, quad, sizeof(TLVertex));
+      ps->Release();
+    }
+    d->SetPixelShader(nullptr);
+    d->SetRenderState(D3DRS_ZENABLE, TRUE);
+    return true;
+  }
+
   bool scenePointSprites(IDirect3DDevice9* d) {
     d->Clear(0, nullptr, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, 0xff000000u, 1.0f, 0);
     IDirect3DTexture9* texture = checkerTexture(d, 8);
@@ -1104,6 +1141,7 @@ float4 main(float2 t : TEXCOORD0) : COLOR {
     { "ffp_extras", sceneFixedFunctionExtras, 3 },
     { "cube_volume_shader", sceneCubeVolumeShader },
     { "point_sprites", scenePointSprites },
+    { "float_specials", sceneFloatSpecials },
     { "clip_planes", sceneClipPlanes },
     { "depth_textures", sceneDepthTextures },
     { "srgb_targets", sceneSrgbAndTargets, 3 },

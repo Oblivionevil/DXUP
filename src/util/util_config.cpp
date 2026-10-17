@@ -355,6 +355,7 @@ namespace dxup {
     overrides.pixelOutputMasks = config.getBool("d3d12.pixelOutputMasks", true);
     overrides.adapter = config.getString("dxgi.adapter", "");
     overrides.directBackBuffer = config.getBool("dxgi.directBackBuffer", true);
+    overrides.d3d9FloatEmulation = config.getBool("d3d9.floatEmulation", true);
     {
       const std::string lazy = config.getString("d3d12.lazyTargets", "auto");
       overrides.lazyTargets = lazy == "true" || lazy == "on" || lazy == "1" ? 1
