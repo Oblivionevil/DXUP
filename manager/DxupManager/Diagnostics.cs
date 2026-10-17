@@ -51,8 +51,9 @@ namespace Dxup.Manager
                         "DXUP diagnostic package\r\n" +
                         "Created " + DateTime.Now.ToString("yyyy-MM-dd HH:mm", CultureInfo.InvariantCulture) + " by DXUP Manager " + dxupVersion + ".\r\n" +
                         "system.txt: Windows, CPU, GPUs and drivers, the game's DLLs. settings.txt: DXUP's settings for the game.\r\n" +
-                        "logs\\: DXUP's logs from the game folder. frames\\: frame dumps. crashes.txt: Windows error reports of the game.\r\n" +
-                        "User and computer names in paths are replaced by <user> and <pc>.\r\n");
+                        "logs\\: DXUP's logs from the game folder. frames\\: images of the game (only with saved frames on).\r\n" +
+                        "crashes.txt: Windows error reports of the game.\r\n" +
+                        "The user folder, user and computer names are replaced by %USERPROFILE%, <user> and <pc>.\r\n");
                     AddText(zip, "system.txt", SystemInfo(game, dxupVersion));
                     AddText(zip, "settings.txt", games + LocalConfig(game));
                     if (Directory.Exists(game.Dir))
@@ -122,9 +123,9 @@ namespace Dxup.Manager
                 "Caption", "Version", "BuildNumber", "OSArchitecture");
             Wmi(text, "SELECT Name, NumberOfCores, NumberOfLogicalProcessors FROM Win32_Processor", "CPU",
                 "Name", "NumberOfCores", "NumberOfLogicalProcessors");
-            Wmi(text, "SELECT TotalPhysicalMemory FROM Win32_ComputerSystem", "RAM", "TotalPhysicalMemory");
-            Wmi(text, "SELECT Name, DriverVersion, DriverDate, AdapterRAM FROM Win32_VideoController", "GPU",
-                "Name", "DriverVersion", "DriverDate", "AdapterRAM");
+            Wmi(text, "SELECT TotalPhysicalMemory FROM Win32_ComputerSystem", "RAM (GB)", "TotalPhysicalMemory");
+            Wmi(text, "SELECT Name, DriverVersion, DriverDate FROM Win32_VideoController", "GPU",
+                "Name", "DriverVersion", "DriverDate");
             text.AppendLine("D3D12 debug layer installed: " + (DiagnosticMarkers.DebugLayerInstalled ? "yes" : "no"));
             text.AppendLine();
             text.AppendLine("Game: " + game.Name + (string.IsNullOrEmpty(game.AppId) ? "" : " (" + game.AppId + ")"));
@@ -153,10 +154,21 @@ namespace Dxup.Manager
                 using (var searcher = new System.Management.ManagementObjectSearcher(query))
                 {
                     foreach (var item in searcher.Get())
-                        text.AppendLine(label + ": " + string.Join(", ", properties.Select(p => Convert.ToString(item[p], CultureInfo.InvariantCulture))));
+                        text.AppendLine(label + ": " + string.Join(", ", properties.Select(p => WmiValue(p, item[p]))));
                 }
             }
             catch (Exception) { text.AppendLine(label + ": ?"); }
+        }
+
+        static string WmiValue(string property, object value)
+        {
+            string text = Convert.ToString(value, CultureInfo.InvariantCulture) ?? "";
+            if (property == "TotalPhysicalMemory" && ulong.TryParse(text, out ulong bytes))
+                return (bytes / (1024.0 * 1024 * 1024)).ToString("0.0", CultureInfo.InvariantCulture);
+            // CIM dates: yyyyMMddHHmmss.ffffff+zzz
+            if (property == "DriverDate" && text.Length >= 8)
+                return text.Substring(0, 4) + "-" + text.Substring(4, 2) + "-" + text.Substring(6, 2);
+            return text;
         }
 
         // Application errors and Windows error reports of the game's program

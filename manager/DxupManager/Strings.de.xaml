@@ -101,7 +101,7 @@ Trotzdem hinzufügen?</sys:String>
   <sys:String x:Key="DiagFrames">Bilder speichern: einige Frames als Bild und die Aufrufe eines Frames im Log (für Grafikfehler)</sys:String>
   <sys:String x:Key="DiagLayerMissing">Der D3D12-Debug-Layer ist nicht installiert: Windows-Einstellungen › System › Optionale Features › „Grafiktools“ hinzufügen.</sys:String>
   <sys:String x:Key="DiagInactive">Die Schalter wirken nur, wenn DXUP für das Spiel aktiv ist.</sys:String>
-  <sys:String x:Key="DiagPackage">Diagnosepaket erstellen …</sys:String>
+  <sys:String x:Key="DiagPackage">Diagnosepaket erstellen (ZIP auf dem Desktop)</sys:String>
   <sys:String x:Key="DiagOpenFolder">Spielordner öffnen (Logs)</sys:String>
   <sys:String x:Key="DiagRenderDoc">In RenderDoc starten</sys:String>
   <sys:String x:Key="DiagRenderDocGet">RenderDoc herunterladen</sys:String>
@@ -109,10 +109,9 @@ Trotzdem hinzufügen?</sys:String>
   <sys:String x:Key="DiagPixGet">PIX herunterladen</sys:String>
   <sys:String x:Key="DiagGpuDebuggers">RenderDoc und PIX zeichnen einzelne Frames so auf, wie DXUP sie an Direct3D 12 schickt – für Entwickler. Das Diagnosepaket enthält Logs, Einstellungen, Systeminfo (Windows, CPU, Grafikkarte, Treiber) und Fehlerberichte des Spiels; Benutzer- und Computername werden ersetzt.</sys:String>
   <sys:String x:Key="WarnDiagnostics">Diagnose ist an: Das Spiel läuft langsamer und schreibt Logs. Schalte sie unter „Diagnose“ wieder aus, wenn du fertig bist.</sys:String>
-  <sys:String x:Key="ZipFilter">ZIP-Archiv (*.zip)|*.zip</sys:String>
   <sys:String x:Key="ErrPackage">Das Diagnosepaket konnte nicht erstellt werden:
 {0}</sys:String>
-  <sys:String x:Key="StatusPackage">Diagnosepaket „{0}“ erstellt.</sys:String>
+  <sys:String x:Key="StatusPackage">Diagnosepaket erstellt: {0} – zum Verschicken an deinen Fehlerbericht hängen.</sys:String>
   <sys:String x:Key="StatusRenderDoc">RenderDoc ist offen, das Spiel ist eingetragen: „Launch“ startet es.</sys:String>
   <sys:String x:Key="PixHowTo">PIX startet. Der Pfad des Spiels ist in der Zwischenablage:
 {0}

@@ -250,6 +250,10 @@ namespace Dxup.Manager
             {
                 foreach (var each in DiagBoxes)
                     DiagnosticMarkers.Set(Selected.Entry.Dir, (string)each.Tag, each.IsChecked == true);
+                // Saved frames are large: a new run starts without old ones, and
+                // turning them off removes them.
+                if (box == DiagFramesBox)
+                    DiagnosticMarkers.DeleteFrames(Selected.Entry.Dir);
                 StatusText.Text = Loc.T("StatusSaved");
             }
             catch (Exception ex)
@@ -263,27 +267,24 @@ namespace Dxup.Manager
         {
             if (Selected == null)
                 return;
+            // One click: the zip goes to the desktop, Explorer shows it.
             var entry = Selected.Entry;
-            string safeName = new string(entry.Name.Select(c => Path.GetInvalidFileNameChars().Contains(c) || c == ' ' ? '_' : c).ToArray());
-            var dialog = new SaveFileDialog
-            {
-                FileName = "DXUP-Diagnose-" + safeName + "-" + DateTime.Now.ToString("yyyyMMdd-HHmm", CultureInfo.InvariantCulture) + ".zip",
-                InitialDirectory = Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory),
-                Filter = Loc.T("ZipFilter"),
-            };
-            if (dialog.ShowDialog(this) != true)
-                return;
+            string safeName = new string(entry.Name.Select(c => c < 128 && (char.IsLetterOrDigit(c) || c == '-') ? c : '_').ToArray());
+            string folder = Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory);
+            if (string.IsNullOrEmpty(folder) || !Directory.Exists(folder))
+                folder = Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments);
+            string zip = Path.Combine(folder, "DXUP-Diagnose-" + safeName + "-" + DateTime.Now.ToString("yyyyMMdd-HHmmss", CultureInfo.InvariantCulture) + ".zip");
             Mouse.OverrideCursor = Cursors.Wait;
             string error;
-            try { error = Diagnostics.CreatePackage(entry, GamesConfig.Format(new[] { entry }), m_install.DllVersion, dialog.FileName); }
+            try { error = Diagnostics.CreatePackage(entry, GamesConfig.Format(new[] { entry }), m_install.DllVersion, zip); }
             finally { Mouse.OverrideCursor = null; }
             if (error != null)
             {
                 Error(Loc.F("ErrPackage", error));
                 return;
             }
-            StatusText.Text = Loc.F("StatusPackage", Path.GetFileName(dialog.FileName));
-            Process.Start("explorer.exe", "/select,\"" + dialog.FileName + "\"");
+            StatusText.Text = Loc.F("StatusPackage", zip);
+            Process.Start("explorer.exe", "/select,\"" + zip + "\"");
         }
 
         void OnRenderDoc(object sender, RoutedEventArgs e)

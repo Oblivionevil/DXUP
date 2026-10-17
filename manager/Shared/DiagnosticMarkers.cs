@@ -38,6 +38,19 @@ namespace Dxup.Shared
             }
         }
 
+        // The frames DXUP saved (dxup_frame_<n>.bmp, about 33 MB each at 4K).
+        public static void DeleteFrames(string dir)
+        {
+            try
+            {
+                foreach (string frame in Directory.GetFiles(dir, "dxup_frame_*.bmp"))
+                {
+                    try { File.Delete(frame); } catch (Exception) { }
+                }
+            }
+            catch (Exception) { }
+        }
+
         // The debug layer is an optional Windows feature ("Graphics Tools").
         public static bool DebugLayerInstalled =>
             File.Exists(Path.Combine(Environment.SystemDirectory, "d3d12SDKLayers.dll"));

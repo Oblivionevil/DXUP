@@ -101,7 +101,7 @@ Add it anyway?</sys:String>
   <sys:String x:Key="DiagFrames">Save frames: a few frames as images and one frame's calls in the log (for rendering errors)</sys:String>
   <sys:String x:Key="DiagLayerMissing">The D3D12 debug layer is not installed: Windows Settings › System › Optional features › add "Graphics Tools".</sys:String>
   <sys:String x:Key="DiagInactive">The switches work only while DXUP is active for the game.</sys:String>
-  <sys:String x:Key="DiagPackage">Create diagnostic package …</sys:String>
+  <sys:String x:Key="DiagPackage">Create diagnostic package (zip on the desktop)</sys:String>
   <sys:String x:Key="DiagOpenFolder">Open game folder (logs)</sys:String>
   <sys:String x:Key="DiagRenderDoc">Start in RenderDoc</sys:String>
   <sys:String x:Key="DiagRenderDocGet">Download RenderDoc</sys:String>
@@ -109,10 +109,9 @@ Add it anyway?</sys:String>
   <sys:String x:Key="DiagPixGet">Download PIX</sys:String>
   <sys:String x:Key="DiagGpuDebuggers">RenderDoc and PIX capture single frames as DXUP sends them to Direct3D 12, for developers. The diagnostic package holds the logs, settings, system information (Windows, CPU, GPU, driver) and the game's error reports; user and computer names are replaced.</sys:String>
   <sys:String x:Key="WarnDiagnostics">Diagnostics are on: the game runs slower and writes logs. Turn them off under "Diagnostics" when you are done.</sys:String>
-  <sys:String x:Key="ZipFilter">ZIP archive (*.zip)|*.zip</sys:String>
   <sys:String x:Key="ErrPackage">The diagnostic package could not be created:
 {0}</sys:String>
-  <sys:String x:Key="StatusPackage">Diagnostic package "{0}" created.</sys:String>
+  <sys:String x:Key="StatusPackage">Diagnostic package created: {0}. Attach it to your bug report.</sys:String>
   <sys:String x:Key="StatusRenderDoc">RenderDoc is open with the game filled in: "Launch" starts it.</sys:String>
   <sys:String x:Key="PixHowTo">PIX is starting. The game's path is on the clipboard:
 {0}
