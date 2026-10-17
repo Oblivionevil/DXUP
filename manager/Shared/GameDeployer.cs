@@ -31,9 +31,10 @@ namespace Dxup.Shared
         public GameState State(GameEntry game)
         {
             bool any = false, all = true, current = true;
+            string sourceDir = SourceDir(game);
             foreach (string dll in DllsFor(game))
             {
-                string source = Path.Combine(SourceDir(game), dll);
+                string source = Path.Combine(sourceDir, dll);
                 if (!File.Exists(source))
                     continue;
                 string target = Path.Combine(game.Dir, dll);
@@ -63,44 +64,140 @@ namespace Dxup.Shared
         public static List<string> DllsFor(GameEntry game)
         {
             var dlls = new List<string>(DxupInstall.Dlls);
+            HashSet<string> used = null;
             foreach (string dll in DxupInstall.LegacyDlls)
             {
-                if (DxupInstall.IsDxupFile(Path.Combine(game.Dir, dll)) || Uses(game, dll))
+                if (DxupInstall.IsDxupFile(Path.Combine(game.Dir, dll)) || (used ?? (used = UsedLegacyDlls(game))).Contains(dll))
                     dlls.Add(dll);
             }
             return dlls;
         }
 
-        // Whether the game's executable imports or names the DLL, or a DLL in
-        // its folder imports it.
-        static bool Uses(GameEntry game, string dll)
+        // The older APIs' DLLs the executable imports or names, or a DLL in
+        // its folder imports. Worked out once while the executable and the
+        // folder's DLLs stay the same: reading a 100 MB executable takes a
+        // while, and the list asks again at every refresh.
+        static HashSet<string> UsedLegacyDlls(GameEntry game)
         {
-            string exe = string.IsNullOrEmpty(game.Exe) ? null : Path.Combine(game.Dir, game.Exe);
-            if (exe != null && File.Exists(exe))
+            string signature = FolderSignature(game);
+            lock (s_usage)
             {
-                if (PeFile.Read(exe)?.ImportsDll(dll) == true)
-                    return true;
-                // LoadLibrary("d3d9.dll"): the name is in the file.
-                try
+                if (s_usage.TryGetValue(game.ExePath, out var cached) && cached.signature == signature)
+                    return cached.dlls;
+            }
+            var used = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            string exe = game.ExePath;
+            if (!string.IsNullOrEmpty(game.Exe) && File.Exists(exe))
+            {
+                var pe = PeFile.Read(exe);
+                foreach (string dll in DxupInstall.LegacyDlls)
                 {
-                    if (Encoding.ASCII.GetString(File.ReadAllBytes(exe)).ToLowerInvariant().Contains(dll))
-                        return true;
+                    if (pe?.ImportsDll(dll) == true)
+                        used.Add(dll);
                 }
-                catch (Exception) { }
+                // LoadLibrary("d3d9.dll"): the name is in the file.
+                used.UnionWith(NamesIn(exe, DxupInstall.LegacyDlls.Where(dll => !used.Contains(dll)).ToList()));
             }
             try
             {
                 foreach (string module in Directory.GetFiles(game.Dir, "*.dll"))
                 {
-                    string name = Path.GetFileName(module);
-                    if (DxupInstall.Dlls.Concat(DxupInstall.LegacyDlls).Any(own => string.Equals(own, name, StringComparison.OrdinalIgnoreCase)))
+                    if (IsOwnDll(Path.GetFileName(module)))
                         continue;
-                    if (PeFile.Read(module)?.ImportsDll(dll) == true)
-                        return true;
+                    var pe = PeFile.Read(module);
+                    foreach (string dll in DxupInstall.LegacyDlls)
+                    {
+                        if (pe?.ImportsDll(dll) == true)
+                            used.Add(dll);
+                    }
                 }
             }
             catch (Exception) { }
-            return false;
+            lock (s_usage)
+                s_usage[game.ExePath] = (signature, used);
+            return used;
+        }
+
+        static readonly Dictionary<string, (string signature, HashSet<string> dlls)> s_usage =
+            new Dictionary<string, (string, HashSet<string>)>(StringComparer.OrdinalIgnoreCase);
+
+        static bool IsOwnDll(string name) =>
+            DxupInstall.Dlls.Concat(DxupInstall.LegacyDlls).Any(own => string.Equals(own, name, StringComparison.OrdinalIgnoreCase));
+
+        // Sizes and times of the executable and the folder's DLLs (without
+        // DXUP's, which come and go with DXUP).
+        static string FolderSignature(GameEntry game)
+        {
+            var text = new StringBuilder();
+            try
+            {
+                var exe = new FileInfo(game.ExePath);
+                if (exe.Exists)
+                    text.Append(exe.Length).Append('/').Append(exe.LastWriteTimeUtc.Ticks);
+                foreach (var dll in new DirectoryInfo(game.Dir).EnumerateFiles("*.dll"))
+                {
+                    if (!IsOwnDll(dll.Name))
+                        text.Append('|').Append(dll.Name).Append('/').Append(dll.Length).Append('/').Append(dll.LastWriteTimeUtc.Ticks);
+                }
+            }
+            catch (Exception) { }
+            return text.ToString();
+        }
+
+        // Which of the names (lower case ASCII) occur in the file, in any
+        // case: one pass over the file in large blocks, without decoding it.
+        static IEnumerable<string> NamesIn(string path, IList<string> names)
+        {
+            var found = new List<string>();
+            if (names.Count == 0)
+                return found;
+            var patterns = names.Select(name => Encoding.ASCII.GetBytes(name.ToLowerInvariant())).ToArray();
+            var done = new bool[patterns.Length];
+            int longest = patterns.Max(pattern => pattern.Length);
+            try
+            {
+                using (var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete,
+                    1 << 16, FileOptions.SequentialScan))
+                {
+                    var buffer = new byte[(4 << 20) + longest];
+                    int kept = 0;
+                    long remaining = stream.Length;
+                    while (remaining > 0 && found.Count < patterns.Length)
+                    {
+                        int read = stream.Read(buffer, kept, buffer.Length - kept);
+                        if (read <= 0)
+                            break;
+                        remaining -= read;
+                        int end = kept + read;
+                        // A name across the block's end is found in the next block.
+                        int scanEnd = remaining > 0 ? Math.Max(0, end - longest + 1) : end;
+                        for (int i = 0; i < scanEnd; i++)
+                        {
+                            // Bit 0x20 folds ASCII letters to lower case; the names'
+                            // digits and dots already have it.
+                            int first = buffer[i] | 0x20;
+                            for (int p = 0; p < patterns.Length; p++)
+                            {
+                                var pattern = patterns[p];
+                                if (done[p] || first != pattern[0] || i + pattern.Length > end)
+                                    continue;
+                                int j = 1;
+                                while (j < pattern.Length && (buffer[i + j] | 0x20) == pattern[j])
+                                    j++;
+                                if (j == pattern.Length)
+                                {
+                                    done[p] = true;
+                                    found.Add(names[p]);
+                                }
+                            }
+                        }
+                        kept = end - scanEnd;
+                        Buffer.BlockCopy(buffer, scanEnd, buffer, 0, kept);
+                    }
+                }
+            }
+            catch (Exception) { }
+            return found;
         }
 
         // The DLLs for the game's executable: 32-bit games load 32-bit DLLs.

@@ -2,8 +2,11 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.ComponentModel;
 using System.Threading.Tasks;
 using System.Windows;
+using System.Windows.Controls;
+using System.Windows.Data;
 using Dxup.Shared;
 
 namespace Dxup.Manager
@@ -37,7 +40,22 @@ namespace Dxup.Manager
 
         async Task Load()
         {
-            var games = await Task.Run(() => GameFinder.All());
+            // Finding the games and looking into their folders off the UI thread.
+            string already = Loc.T("FindAlready"), ownCopyText = Loc.T("FindOwnCopy");
+            var rows = await Task.Run(() => Rows(GameFinder.All(), already, ownCopyText));
+            GameList.ItemsSource = rows;
+            m_view = CollectionViewSource.GetDefaultView(rows);
+            InfoText.Text = Loc.T("FindNone");
+            InfoText.Visibility = rows.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
+            AddButton.IsEnabled = rows.Count != 0;
+            SearchBox.IsEnabled = rows.Count != 0;
+            SearchBox.Focus();
+        }
+
+        ICollectionView m_view;
+
+        List<Row> Rows(IEnumerable<FoundGame> games, string already, string ownCopyText)
+        {
             var rows = new List<Row>();
             foreach (var game in games)
             {
@@ -52,15 +70,30 @@ namespace Dxup.Manager
                     Game = game,
                     Available = !known,
                     Selected = ownCopy != null,
-                    Note = known ? Loc.T("FindAlready") : ownCopy != null ? Loc.T("FindOwnCopy") : game.Dir,
+                    Note = known ? already : ownCopy != null ? ownCopyText : game.Dir,
                     Executables = options,
                     Executable = ownCopy ?? options.FirstOrDefault(),
                 });
             }
-            GameList.ItemsSource = rows;
-            InfoText.Text = Loc.T("FindNone");
-            InfoText.Visibility = rows.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
-            AddButton.IsEnabled = rows.Count != 0;
+            return rows;
+        }
+
+        // Words in the name, the store or the folder.
+        void OnSearchChanged(object sender, TextChangedEventArgs e)
+        {
+            SearchHint.Visibility = SearchBox.Text.Length == 0 ? Visibility.Visible : Visibility.Collapsed;
+            if (m_view == null)
+                return;
+            var words = SearchBox.Text.Split((char[])null, StringSplitOptions.RemoveEmptyEntries);
+            m_view.Filter = words.Length == 0 ? null : (Predicate<object>)(item =>
+            {
+                var row = (Row)item;
+                return words.All(word => row.Name.IndexOf(word, StringComparison.CurrentCultureIgnoreCase) >= 0
+                    || row.Store.IndexOf(word, StringComparison.CurrentCultureIgnoreCase) >= 0
+                    || row.Game.Dir.IndexOf(word, StringComparison.CurrentCultureIgnoreCase) >= 0);
+            });
+            InfoText.Text = Loc.T("NoMatch");
+            InfoText.Visibility = m_view.IsEmpty ? Visibility.Visible : Visibility.Collapsed;
         }
 
         static string RelativePath(string dir, string path) =>

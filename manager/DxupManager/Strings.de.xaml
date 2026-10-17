@@ -118,6 +118,9 @@ Trotzdem hinzufügen?</sys:String>
 {0}
 
 In PIX: „Select Target Process“ › „Launch Win32“ › bei „Path to executable“ einfügen (Strg+V) › „Launch“. Im Spiel nimmt „Print“ (Druck) einen Frame auf.</sys:String>
+  <sys:String x:Key="StateChecking">wird geprüft …</sys:String>
+  <sys:String x:Key="Search">Suchen …</sys:String>
+  <sys:String x:Key="NoMatch">Kein Spiel passt zur Suche.</sys:String>
   <sys:String x:Key="Yes">Ja</sys:String>
   <sys:String x:Key="No">Nein</sys:String>
 </ResourceDictionary>

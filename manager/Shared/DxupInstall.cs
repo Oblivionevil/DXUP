@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Security.Cryptography;
@@ -73,19 +74,43 @@ namespace Dxup.Shared
         {
             try
             {
-                if (!File.Exists(path))
-                    return false;
-                if (FileVersionInfo.GetVersionInfo(path).ProductName == "DXUP")
-                    return true;
                 var info = new FileInfo(path);
-                if (info.Length > 64L << 20)
+                if (!info.Exists)
                     return false;
-                return Contains(File.ReadAllBytes(path), s_logMarker);
+                return Cached(s_isDxup, info, () =>
+                {
+                    if (FileVersionInfo.GetVersionInfo(path).ProductName == "DXUP")
+                        return true;
+                    if (info.Length > 64L << 20)
+                        return false;
+                    return Contains(File.ReadAllBytes(path), s_logMarker);
+                });
             }
             catch (Exception)
             {
                 return false;
             }
+        }
+
+        // Answers about files, kept while a file's size and time stay the
+        // same: the game list asks for every game's DLLs at each refresh.
+        static readonly Dictionary<string, (long length, long time, bool value)> s_isDxup =
+            new Dictionary<string, (long, long, bool)>(StringComparer.OrdinalIgnoreCase);
+        static readonly Dictionary<string, (long length, long time, string value)> s_hashes =
+            new Dictionary<string, (long, long, string)>(StringComparer.OrdinalIgnoreCase);
+
+        static T Cached<T>(Dictionary<string, (long length, long time, T value)> cache, FileInfo info, Func<T> compute)
+        {
+            long time = info.LastWriteTimeUtc.Ticks;
+            lock (cache)
+            {
+                if (cache.TryGetValue(info.FullName, out var entry) && entry.length == info.Length && entry.time == time)
+                    return entry.value;
+            }
+            T value = compute();
+            lock (cache)
+                cache[info.FullName] = (info.Length, time, value);
+            return value;
         }
 
         static readonly byte[] s_logMarker = System.Text.Encoding.ASCII.GetBytes("dxup_info_log.txt");
@@ -121,9 +146,15 @@ namespace Dxup.Shared
         {
             try
             {
-                using (var sha = SHA256.Create())
-                using (var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
-                    return BitConverter.ToString(sha.ComputeHash(stream));
+                var info = new FileInfo(path);
+                if (!info.Exists)
+                    return "";
+                return Cached(s_hashes, info, () =>
+                {
+                    using (var sha = SHA256.Create())
+                    using (var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+                        return BitConverter.ToString(sha.ComputeHash(stream));
+                });
             }
             catch (Exception)
             {

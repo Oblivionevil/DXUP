@@ -1,6 +1,7 @@
 using System;
 using System.ComponentModel;
 using System.IO;
+using System.Linq;
 using System.Windows;
 using System.Windows.Interop;
 using System.Windows.Media;
@@ -15,6 +16,8 @@ namespace Dxup.Manager
         public GameEntry Entry { get; }
         public ImageSource Icon { get; }
         public GameState State { get; private set; }
+        // False until the first check of the game's folder is done.
+        public bool Known { get; private set; }
 
         public GameItem(GameEntry entry)
         {
@@ -29,6 +32,8 @@ namespace Dxup.Manager
         {
             get
             {
+                if (!Known)
+                    return Loc.T("StateChecking");
                 switch (State)
                 {
                     case GameState.Active: return Loc.T("StateActive");
@@ -43,6 +48,8 @@ namespace Dxup.Manager
         {
             get
             {
+                if (!Known)
+                    return (Brush)Application.Current.FindResource("Neutral");
                 switch (State)
                 {
                     case GameState.Active: return (Brush)Application.Current.FindResource("Good");
@@ -53,13 +60,26 @@ namespace Dxup.Manager
             }
         }
 
-        public void Refresh(GameDeployer deployer)
+        public void SetState(GameState state)
         {
-            State = deployer.State(Entry);
+            State = state;
+            Known = true;
+            Notify();
+        }
+
+        // After a rename or a theme change.
+        public void Notify()
+        {
             Changed(nameof(Name));
             Changed(nameof(StateText));
             Changed(nameof(StateBrush));
         }
+
+        // Matches a search: words in the name or the folder.
+        public bool Matches(string search) =>
+            search.Split((char[])null, StringSplitOptions.RemoveEmptyEntries).All(word =>
+                Entry.Name.IndexOf(word, StringComparison.CurrentCultureIgnoreCase) >= 0
+                || Entry.Dir.IndexOf(word, StringComparison.CurrentCultureIgnoreCase) >= 0);
 
         static ImageSource LoadIcon(string path)
         {

@@ -51,10 +51,18 @@
       <Border Grid.Column="0" Background="{DynamicResource Panel}" BorderBrush="{DynamicResource Line}" BorderThickness="1" CornerRadius="6">
         <Grid>
           <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
             <RowDefinition Height="*" />
             <RowDefinition Height="Auto" />
           </Grid.RowDefinitions>
-          <ListBox x:Name="GameList" SelectionChanged="OnSelectionChanged"
+          <Border BorderBrush="{DynamicResource Line}" BorderThickness="0,0,0,1" Padding="10,8">
+            <Grid>
+              <TextBox x:Name="SearchBox" TextChanged="OnSearchChanged" AutomationProperties.Name="{DynamicResource Search}" />
+              <TextBlock x:Name="SearchHint" Text="{DynamicResource Search}" Foreground="{DynamicResource Muted}" Margin="7,0,0,0"
+                         VerticalAlignment="Center" IsHitTestVisible="False" />
+            </Grid>
+          </Border>
+          <ListBox x:Name="GameList" Grid.Row="1" SelectionChanged="OnSelectionChanged"
                    ScrollViewer.HorizontalScrollBarVisibility="Disabled" HorizontalContentAlignment="Stretch">
             <ListBox.ItemTemplate>
               <DataTemplate>
@@ -76,9 +84,9 @@
               </DataTemplate>
             </ListBox.ItemTemplate>
           </ListBox>
-          <TextBlock x:Name="EmptyText" Text="{DynamicResource NoGames}" TextWrapping="Wrap" Margin="24" Foreground="{DynamicResource Muted}"
+          <TextBlock x:Name="EmptyText" Grid.Row="1" Text="{DynamicResource NoGames}" TextWrapping="Wrap" Margin="24" Foreground="{DynamicResource Muted}"
                      VerticalAlignment="Center" TextAlignment="Center" />
-          <Border Grid.Row="1" BorderBrush="{DynamicResource Line}" BorderThickness="0,1,0,0" Padding="10">
+          <Border Grid.Row="2" BorderBrush="{DynamicResource Line}" BorderThickness="0,1,0,0" Padding="10">
             <Button x:Name="RemoveButton" Content="{DynamicResource RemoveGame}" Click="OnRemove" HorizontalAlignment="Left" IsEnabled="False" />
           </Border>
         </Grid>

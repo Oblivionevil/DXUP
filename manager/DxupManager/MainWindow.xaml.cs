@@ -1,13 +1,16 @@
 using System;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
+using System.ComponentModel;
 using System.Diagnostics;
 using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Text;
+using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Data;
 using System.Windows.Input;
 using System.Windows.Interop;
 using System.Windows.Media;
@@ -27,7 +30,7 @@ namespace Dxup.Manager
         {
             InitializeComponent();
             Theme.Attach(this);
-            Theme.Changed += () => { foreach (var item in m_games) item.Refresh(m_deployer); ShowDetails(); };
+            Theme.Changed += () => { foreach (var item in m_games) item.Notify(); ShowDetails(); };
             // The manager lives in the installation, next to bin\ and games.cfg.
             m_install = new DxupInstall(AppDomain.CurrentDomain.BaseDirectory);
             m_deployer = new GameDeployer(m_install);
@@ -42,22 +45,31 @@ namespace Dxup.Manager
                 foreach (UIElement element in new UIElement[] { UpscalerCaption, UpscalerBox, UpscalerHintText, UpscalerAutoBox, UpscalerInjectBox })
                     element.Visibility = Visibility.Collapsed;
             GameList.ItemsSource = m_games;
-            foreach (var entry in GamesConfig.Load(m_install.GamesConfigPath))
-            {
-                if (entry.Enabled)
-                    GameDeployer.CleanOldFiles(entry.Dir);
+            m_view = CollectionViewSource.GetDefaultView(m_games);
+            var entries = GamesConfig.Load(m_install.GamesConfigPath);
+            foreach (var entry in entries)
                 m_games.Add(new GameItem(entry));
-            }
+            // The window shows at once; the folders are checked in the
+            // background (a game's state reads its executable and DLLs).
             RefreshAll();
             if (m_games.Count != 0)
                 GameList.SelectedIndex = 0;
             SourceInitialized += (s, e) => AcceptDroppedFiles();
-            Loaded += (s, e) =>
+            Loaded += async (s, e) =>
             {
                 foreach (string arg in args.Where(a => a.EndsWith(".exe", StringComparison.OrdinalIgnoreCase) && File.Exists(a)))
                     AddGame(arg, null, null);
+                await Task.Run(() =>
+                {
+                    foreach (var entry in entries.Where(entry => entry.Enabled))
+                        GameDeployer.CleanOldFiles(entry.Dir);
+                });
             };
+            Loaded += async (s, e) => await LoadAdapters();
         }
+
+        readonly ICollectionView m_view;
+        int m_refresh;   // the newest refresh; an older one that ends later is dropped
 
         // ---- Settings lists ----
 
@@ -85,26 +97,49 @@ namespace Dxup.Manager
             AdapterBox.ItemsSource = AdapterOptions(null);
         }
 
-        // The graphics cards Windows knows, by name; DXUP takes the first
-        // whose name contains the value.
-        static List<Option> AdapterOptions(string current)
+        // The graphics cards Windows knows (WMI takes a moment: they come in
+        // after the window shows).
+        List<string> m_gpus = new List<string>();
+
+        async Task LoadAdapters()
         {
-            var options = new List<Option> { new Option(Loc.T("OptGame"), null) };
-            try
+            m_gpus = await Task.Run(() =>
             {
-                using (var searcher = new System.Management.ManagementObjectSearcher("SELECT Name FROM Win32_VideoController"))
+                var names = new List<string>();
+                try
                 {
-                    foreach (var gpu in searcher.Get())
+                    using (var searcher = new System.Management.ManagementObjectSearcher("SELECT Name FROM Win32_VideoController"))
                     {
-                        string name = (gpu["Name"] as string)?.Trim();
-                        if (!string.IsNullOrEmpty(name) && !options.Exists(o => Equals(o.Value, name.ToLowerInvariant())))
-                            options.Add(new Option(name, name.ToLowerInvariant()));
+                        foreach (var gpu in searcher.Get())
+                        {
+                            string name = (gpu["Name"] as string)?.Trim();
+                            if (!string.IsNullOrEmpty(name))
+                                names.Add(name);
+                        }
                     }
                 }
-            }
-            catch (Exception)
+                catch (Exception)
+                {
+                    // Without WMI only the game's choice and the one set.
+                }
+                return names;
+            });
+            bool loading = m_loading;
+            m_loading = true;
+            string current = Selected?.Entry.Settings.Adapter;
+            AdapterBox.ItemsSource = AdapterOptions(current);
+            Select(AdapterBox, current);
+            m_loading = loading;
+        }
+
+        // By name; DXUP takes the first graphics card whose name contains the value.
+        List<Option> AdapterOptions(string current)
+        {
+            var options = new List<Option> { new Option(Loc.T("OptGame"), null) };
+            foreach (string name in m_gpus)
             {
-                // Without WMI only the game's choice and the one set.
+                if (!options.Exists(o => Equals(o.Value, name.ToLowerInvariant())))
+                    options.Add(new Option(name, name.ToLowerInvariant()));
             }
             if (!string.IsNullOrEmpty(current) && !options.Exists(o => Equals(o.Value, current)))
                 options.Add(new Option(current, current));
@@ -131,15 +166,41 @@ namespace Dxup.Manager
 
         // ---- List and details ----
 
-        void RefreshAll()
+        // The games' states, checked in the background.
+        async void RefreshAll()
         {
-            foreach (var item in m_games)
-                item.Refresh(m_deployer);
-            EmptyText.Visibility = m_games.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
-            int outdated = m_games.Count(item => item.State == GameState.Outdated);
+            int refresh = ++m_refresh;
+            UpdateEmptyText();
+            var items = m_games.ToList();
+            var states = await Task.Run(() => items.Select(item => m_deployer.State(item.Entry)).ToList());
+            if (refresh != m_refresh)
+                return;
+            for (int i = 0; i < items.Count; i++)
+                items[i].SetState(states[i]);
+            int outdated = m_games.Count(item => item.Known && item.State == GameState.Outdated);
             OutdatedBanner.Visibility = outdated != 0 ? Visibility.Visible : Visibility.Collapsed;
             OutdatedText.Text = Loc.F("OutdatedBanner", outdated);
-            ShowDetails();
+            if (Selected != null && items.Contains(Selected))
+                ShowDetails();
+        }
+
+        void UpdateEmptyText()
+        {
+            bool none = m_games.Count == 0, hidden = !none && m_view.IsEmpty;
+            EmptyText.Text = Loc.T(hidden ? "NoMatch" : "NoGames");
+            EmptyText.Visibility = none || hidden ? Visibility.Visible : Visibility.Collapsed;
+        }
+
+        // ---- Search ----
+
+        void OnSearchChanged(object sender, TextChangedEventArgs e)
+        {
+            string search = SearchBox.Text.Trim();
+            SearchHint.Visibility = SearchBox.Text.Length == 0 ? Visibility.Visible : Visibility.Collapsed;
+            m_view.Filter = search.Length == 0 ? null : (Predicate<object>)(item => ((GameItem)item).Matches(search));
+            if (Selected == null && !m_view.IsEmpty)
+                GameList.SelectedIndex = 0;
+            UpdateEmptyText();
         }
 
         void OnSelectionChanged(object sender, SelectionChangedEventArgs e) => ShowDetails();
@@ -161,7 +222,8 @@ namespace Dxup.Manager
             StateBadge.Background = item.StateBrush;
             ToggleButton.Content = Loc.T(entry.Enabled ? "Deactivate" : "Activate");
             ToggleButton.Style = (Style)FindResource(entry.Enabled ? "Button" : "AccentButton");
-            FixButton.Visibility = item.State == GameState.Outdated || item.State == GameState.Missing ? Visibility.Visible : Visibility.Collapsed;
+            FixButton.Visibility = item.Known && (item.State == GameState.Outdated || item.State == GameState.Missing)
+                ? Visibility.Visible : Visibility.Collapsed;
             FixButton.Content = Loc.T(item.State == GameState.Outdated ? "Update" : "Repair");
 
             var settings = entry.Settings;
@@ -229,13 +291,17 @@ namespace Dxup.Manager
             if (!layer)
                 DiagLayerBox.IsEnabled = DiagGpuBox.IsEnabled = false;
             DiagInactive.Visibility = active ? Visibility.Collapsed : Visibility.Visible;
-            RenderDocButton.Content = Loc.T(Diagnostics.RenderDocPath() != null ? "DiagRenderDoc" : "DiagRenderDocGet");
-            PixButton.Content = Loc.T(Diagnostics.PixPath() != null ? "DiagPix" : "DiagPixGet");
+            RenderDocButton.Content = Loc.T(m_renderDoc.Value != null ? "DiagRenderDoc" : "DiagRenderDocGet");
+            PixButton.Content = Loc.T(m_pix.Value != null ? "DiagPix" : "DiagPixGet");
             // PIX takes 64-bit programs only.
             bool is32Bit = PeFile.Read(entry.ExePath)?.Is32Bit == true;
             PixButton.IsEnabled = !is32Bit;
             PixButton.ToolTip = is32Bit ? Loc.T("DiagPix32") : null;
         }
+
+        // For the buttons' labels; pressing one looks again.
+        readonly Lazy<string> m_renderDoc = new Lazy<string>(Diagnostics.RenderDocPath);
+        readonly Lazy<string> m_pix = new Lazy<string>(Diagnostics.PixPath);
 
         void OnDiagChanged(object sender, RoutedEventArgs e)
         {
@@ -406,7 +472,7 @@ namespace Dxup.Manager
             if (m_loading || Selected == null || NameBox.Text.Trim().Length == 0 || NameBox.Text == Selected.Entry.Name)
                 return;
             Selected.Entry.Name = NameBox.Text.Trim();
-            Selected.Refresh(m_deployer);
+            Selected.Notify();
             Save();
         }
 
