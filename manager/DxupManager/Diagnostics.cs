@@ -237,12 +237,19 @@ namespace Dxup.Manager
 
         // RenderDoc with the game filled in on its Launch Application page
         // (a capture settings file); child processes are hooked too, for games
-        // that a launcher starts again.
+        // that a launcher starts again. RenderDoc and PIX run without the
+        // manager's administrator rights, as the games they start must.
         public static void StartRenderDoc(string qrenderdoc, GameEntry game)
         {
             string settings = Path.Combine(Path.GetTempPath(), "dxup_renderdoc.cap");
+            // A Steam game started directly stops with "Application load
+            // error 5:0000065434" unless it knows its Steam app ID.
+            string environment = SteamAppId(game) is string appId
+                ? "[\n      {\n        \"separator\": \"Platform style\",\n        \"type\": \"Set\",\n" +
+                  "        \"value\": " + JsonString(appId) + ",\n        \"variable\": \"SteamAppId\"\n      }\n    ]"
+                : "[]";
             string json = "{\n  \"rdocCaptureSettings\": 1,\n  \"settings\": {\n" +
-                "    \"autoStart\": false,\n    \"commandLine\": \"\",\n    \"environment\": [],\n" +
+                "    \"autoStart\": false,\n    \"commandLine\": \"\",\n    \"environment\": " + environment + ",\n" +
                 "    \"executable\": " + JsonString(game.ExePath) + ",\n    \"inject\": false,\n    \"numQueuedFrames\": 0,\n" +
                 "    \"options\": {\n      \"allowFullscreen\": true,\n      \"allowVSync\": true,\n      \"apiValidation\": false,\n" +
                 "      \"captureAllCmdLists\": false,\n      \"captureCallstacks\": false,\n      \"captureCallstacksOnlyDraws\": false,\n" +
@@ -250,13 +257,19 @@ namespace Dxup.Manager
                 "      \"refAllResources\": false,\n      \"softMemoryLimit\": 0,\n      \"verifyBufferAccess\": false\n    },\n" +
                 "    \"queuedFrameCap\": 0,\n    \"workingDir\": " + JsonString(game.Dir) + "\n  }\n}\n";
             File.WriteAllText(settings, json, new UTF8Encoding(false));
-            Process.Start(new ProcessStartInfo(qrenderdoc, "\"" + settings + "\"") { UseShellExecute = false });
+            Unelevated.Start(qrenderdoc, "\"" + settings + "\"", Path.GetDirectoryName(qrenderdoc));
         }
 
-        public static void StartPix(string winpix)
+        public static void StartPix(string winpix, GameEntry game)
         {
-            Process.Start(new ProcessStartInfo(winpix) { UseShellExecute = false });
+            var environment = SteamAppId(game) is string appId
+                ? new Dictionary<string, string> { ["SteamAppId"] = appId } : null;
+            Unelevated.Start(winpix, "", Path.GetDirectoryName(winpix), environment);
         }
+
+        // The Steam app ID of a game the manager found in Steam, or null.
+        public static string SteamAppId(GameEntry game) =>
+            game.AppId.Length != 0 && game.AppId.All(char.IsDigit) ? game.AppId : null;
 
         static string JsonString(string value) =>
             "\"" + value.Replace("\\", "\\\\").Replace("\"", "\\\"") + "\"";

@@ -231,6 +231,10 @@ namespace Dxup.Manager
             DiagInactive.Visibility = active ? Visibility.Collapsed : Visibility.Visible;
             RenderDocButton.Content = Loc.T(Diagnostics.RenderDocPath() != null ? "DiagRenderDoc" : "DiagRenderDocGet");
             PixButton.Content = Loc.T(Diagnostics.PixPath() != null ? "DiagPix" : "DiagPixGet");
+            // PIX takes 64-bit programs only.
+            bool is32Bit = PeFile.Read(entry.ExePath)?.Is32Bit == true;
+            PixButton.IsEnabled = !is32Bit;
+            PixButton.ToolTip = is32Bit ? Loc.T("DiagPix32") : null;
         }
 
         void OnDiagChanged(object sender, RoutedEventArgs e)
@@ -294,7 +298,7 @@ namespace Dxup.Manager
             string path = Diagnostics.RenderDocPath();
             if (path == null)
             {
-                Process.Start(new ProcessStartInfo("https://renderdoc.org/") { UseShellExecute = true });
+                Unelevated.Start("https://renderdoc.org/");
                 return;
             }
             try
@@ -312,13 +316,13 @@ namespace Dxup.Manager
             string path = Diagnostics.PixPath();
             if (path == null)
             {
-                Process.Start(new ProcessStartInfo("https://devblogs.microsoft.com/pix/download/") { UseShellExecute = true });
+                Unelevated.Start("https://devblogs.microsoft.com/pix/download/");
                 return;
             }
             try
             {
                 Clipboard.SetText(Selected.Entry.ExePath);
-                Diagnostics.StartPix(path);
+                Diagnostics.StartPix(path, Selected.Entry);
                 Dialog.Show(this, Loc.F("PixHowTo", Selected.Entry.ExePath), Dialog.Kind.Info);
             }
             catch (Exception ex) { Error(ex.Message); }

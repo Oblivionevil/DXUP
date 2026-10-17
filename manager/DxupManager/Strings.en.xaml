@@ -98,7 +98,7 @@ Add it anyway?</sys:String>
   <sys:String x:Key="DiagGpu">GPU-based validation: checks on the GPU as well (very slow)</sys:String>
   <sys:String x:Key="DiagDred">Track GPU crashes (DRED: shows the last command after a device error)</sys:String>
   <sys:String x:Key="DiagExceptions">Crash log: every exception of the game with its call stack</sys:String>
-  <sys:String x:Key="DiagFrames">Save frames: a few frames as images and one frame's calls in the log (for rendering errors)</sys:String>
+  <sys:String x:Key="DiagFrames">Save frames: an image every 15 seconds (the last four stay) and one frame's calls in the log (for rendering errors)</sys:String>
   <sys:String x:Key="DiagLayerMissing">The D3D12 debug layer is not installed: Windows Settings › System › Optional features › add "Graphics Tools".</sys:String>
   <sys:String x:Key="DiagInactive">The switches work only while DXUP is active for the game.</sys:String>
   <sys:String x:Key="DiagPackage">Create diagnostic package (zip on the desktop)</sys:String>
@@ -107,6 +107,7 @@ Add it anyway?</sys:String>
   <sys:String x:Key="DiagRenderDocGet">Download RenderDoc</sys:String>
   <sys:String x:Key="DiagPix">Start in PIX</sys:String>
   <sys:String x:Key="DiagPixGet">Download PIX</sys:String>
+  <sys:String x:Key="DiagPix32">PIX captures 64-bit games only; use RenderDoc for 32-bit games.</sys:String>
   <sys:String x:Key="DiagGpuDebuggers">RenderDoc and PIX capture single frames as DXUP sends them to Direct3D 12, for developers. The diagnostic package holds the logs, settings, system information (Windows, CPU, GPU, driver) and the game's error reports; user and computer names are replaced.</sys:String>
   <sys:String x:Key="WarnDiagnostics">Diagnostics are on: the game runs slower and writes logs. Turn them off under "Diagnostics" when you are done.</sys:String>
   <sys:String x:Key="ErrPackage">The diagnostic package could not be created:

@@ -1388,6 +1388,8 @@ namespace dxup {
     std::vector<IBackendImage*>  m_backBufferBackendImages;
     ComPtr<IUnknown>             m_proxyRenderTarget;  // Game renders to this instead of swap chain buffers
     uint32_t                     m_dumpPresentCount = 0;
+    uint64_t                     m_lastPeriodicDump = 0;   // GetTickCount64
+    std::vector<uint32_t>        m_periodicDumps;           // the frames still on disk
     uint32_t                     m_traceGoPresents = 0;
     uint32_t                     m_traceGoFrames = 0;
     bool                         m_traceGoDone = false;
@@ -1599,8 +1601,24 @@ namespace dxup {
       }
       if (dxupFrameDumpEnabled() && !(flags & DXGI_PRESENT_TEST)) {
         const uint32_t frame = ++m_dumpPresentCount;
-        if (frame == 60 || frame == 300 || frame == 301 || (frame % 1800) == 0)
+        // Presents 60, 300 and 301 (whose draws are traced), then one every
+        // 15 seconds, so that a bug report has what was on screen when the
+        // problem showed; of those only the last four stay (33 MB each at 4K).
+        const uint64_t now = GetTickCount64();
+        if (frame == 60 || frame == 300 || frame == 301) {
           dumpApplicationBackBuffer(frame);
+          m_lastPeriodicDump = now;
+        } else if (frame > 301 && now - m_lastPeriodicDump >= 15000) {
+          dumpApplicationBackBuffer(frame);
+          m_lastPeriodicDump = now;
+          m_periodicDumps.push_back(frame);
+          if (m_periodicDumps.size() > 4) {
+            char old[64];
+            sprintf_s(old, "dxup_frame_%u.bmp", m_periodicDumps.front());
+            DeleteFileA(dxupSiblingPath(old).c_str());
+            m_periodicDumps.erase(m_periodicDumps.begin());
+          }
+        }
         // The draws of the frame after present 300.
         // The draws of the frame after present 300, and of the one after
         // the dump of present 9000.

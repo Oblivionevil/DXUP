@@ -250,7 +250,7 @@
                 <Button Content="{DynamicResource DiagPackage}" Click="OnDiagPackage" Margin="0,0,8,8" />
                 <Button Content="{DynamicResource DiagOpenFolder}" Click="OnOpenFolder" Margin="0,0,8,8" />
                 <Button x:Name="RenderDocButton" Click="OnRenderDoc" Margin="0,0,8,8" />
-                <Button x:Name="PixButton" Click="OnPix" Margin="0,0,8,8" />
+                <Button x:Name="PixButton" Click="OnPix" Margin="0,0,8,8" ToolTipService.ShowOnDisabled="True" />
               </WrapPanel>
               <TextBlock Text="{DynamicResource DiagGpuDebuggers}" Foreground="{DynamicResource Muted}" FontSize="11" TextWrapping="Wrap" />
 

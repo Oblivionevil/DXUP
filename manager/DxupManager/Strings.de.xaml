@@ -98,7 +98,7 @@ Trotzdem hinzufügen?</sys:String>
   <sys:String x:Key="DiagGpu">GPU-Validierung: prüft auch auf der GPU (sehr langsam)</sys:String>
   <sys:String x:Key="DiagDred">Absturz der Grafikkarte nachverfolgen (DRED: zeigt nach einem Gerätefehler den letzten Befehl)</sys:String>
   <sys:String x:Key="DiagExceptions">Absturzprotokoll: jede Ausnahme des Spiels mit Aufrufstapel</sys:String>
-  <sys:String x:Key="DiagFrames">Bilder speichern: einige Frames als Bild und die Aufrufe eines Frames im Log (für Grafikfehler)</sys:String>
+  <sys:String x:Key="DiagFrames">Bilder speichern: alle 15 Sekunden ein Bild (die letzten vier bleiben) und die Aufrufe eines Frames im Log (für Grafikfehler)</sys:String>
   <sys:String x:Key="DiagLayerMissing">Der D3D12-Debug-Layer ist nicht installiert: Windows-Einstellungen › System › Optionale Features › „Grafiktools“ hinzufügen.</sys:String>
   <sys:String x:Key="DiagInactive">Die Schalter wirken nur, wenn DXUP für das Spiel aktiv ist.</sys:String>
   <sys:String x:Key="DiagPackage">Diagnosepaket erstellen (ZIP auf dem Desktop)</sys:String>
@@ -107,6 +107,7 @@ Trotzdem hinzufügen?</sys:String>
   <sys:String x:Key="DiagRenderDocGet">RenderDoc herunterladen</sys:String>
   <sys:String x:Key="DiagPix">In PIX starten</sys:String>
   <sys:String x:Key="DiagPixGet">PIX herunterladen</sys:String>
+  <sys:String x:Key="DiagPix32">PIX nimmt nur 64-Bit-Spiele auf; für 32-Bit-Spiele RenderDoc verwenden.</sys:String>
   <sys:String x:Key="DiagGpuDebuggers">RenderDoc und PIX zeichnen einzelne Frames so auf, wie DXUP sie an Direct3D 12 schickt – für Entwickler. Das Diagnosepaket enthält Logs, Einstellungen, Systeminfo (Windows, CPU, Grafikkarte, Treiber) und Fehlerberichte des Spiels; Benutzer- und Computername werden ersetzt.</sys:String>
   <sys:String x:Key="WarnDiagnostics">Diagnose ist an: Das Spiel läuft langsamer und schreibt Logs. Schalte sie unter „Diagnose“ wieder aus, wenn du fertig bist.</sys:String>
   <sys:String x:Key="ErrPackage">Das Diagnosepaket konnte nicht erstellt werden:
