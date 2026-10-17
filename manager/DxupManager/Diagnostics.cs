@@ -68,6 +68,11 @@ namespace Dxup.Manager
                             .OrderByDescending(f => f.LastWriteTimeUtc).Take(4);
                         foreach (var frame in frames)
                             AddPng(zip, "frames/" + Path.GetFileNameWithoutExtension(frame.Name) + ".png", frame.FullName);
+                        // Frames DXUP saw flicker (and the frame before each), the log names them.
+                        var glitches = new DirectoryInfo(game.Dir).GetFiles("dxup_glitch_*.bmp")
+                            .OrderBy(f => f.LastWriteTimeUtc).Take(8);
+                        foreach (var frame in glitches)
+                            AddPng(zip, "glitches/" + Path.GetFileNameWithoutExtension(frame.Name) + ".png", frame.FullName);
                     }
                     AddText(zip, "crashes.txt", Crashes(game.Exe));
                 }

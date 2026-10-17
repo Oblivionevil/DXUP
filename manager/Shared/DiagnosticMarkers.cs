@@ -38,12 +38,13 @@ namespace Dxup.Shared
             }
         }
 
-        // The frames DXUP saved (dxup_frame_<n>.bmp, about 33 MB each at 4K).
+        // The frames DXUP saved (dxup_frame_<n>.bmp, about 33 MB each at 4K),
+        // and the frames it saw flicker (dxup_glitch_<n>.bmp).
         public static void DeleteFrames(string dir)
         {
             try
             {
-                foreach (string frame in Directory.GetFiles(dir, "dxup_frame_*.bmp"))
+                foreach (string frame in Directory.GetFiles(dir, "dxup_frame_*.bmp").Concat(Directory.GetFiles(dir, "dxup_glitch_*.bmp")))
                 {
                     try { File.Delete(frame); } catch (Exception) { }
                 }
