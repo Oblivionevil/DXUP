@@ -79,6 +79,20 @@ zip and in [`src/util/util_config.h`](src/util/util_config.h).
   tampering to anti-cheat software. Use DXUP with such games at your own
   risk.
 
+## Bug reports
+
+DXUP Manager has a **Diagnostics** section for each game. Turn on the
+detailed log (and for rendering errors the D3D12 debug layer and saved
+frames), start the game, reproduce the problem, quit the game, then click
+**Create diagnostic package**. The zip holds DXUP's logs, the game's
+settings, Windows, CPU, GPU and driver versions and the game's crash reports;
+user and computer names are replaced. Attach it to an issue together with a
+description and, if you can, a screenshot. Turn the diagnostics off again
+afterwards, they slow the game down.
+
+Developers can start a game in RenderDoc or PIX from the same section to
+capture what DXUP sends to Direct3D 12.
+
 ## Building
 
 DXUP builds with Meson, Ninja and the MSVC toolchain (Visual Studio with the

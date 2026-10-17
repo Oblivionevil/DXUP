@@ -1,7 +1,9 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.IO.Compression;
 using System.Linq;
+using Dxup.Manager;
 using Dxup.Shared;
 
 namespace Dxup.Tests
@@ -25,6 +27,7 @@ namespace Dxup.Tests
             BattleNet();
             PeHeaders();
             Deployer();
+            DiagnosticsChecks();
             Console.WriteLine(s_failed == 0 ? "All passed" : s_failed + " failed");
             return s_failed == 0 ? 0 : 1;
         }
@@ -196,7 +199,9 @@ namespace Dxup.Tests
             var other = new GameEntry { Name = "Other", Dir = gameDir, Exe = "other.exe", Enabled = true };
             Check(deployer.Remove(game, new[] { game, other }, out error) && deployer.State(other) == GameState.Active,
                 "a shared folder keeps DXUP while another game uses it");
+            DiagnosticMarkers.Set(gameDir, DiagnosticMarkers.Log, true);
             Check(deployer.Remove(game, new[] { game }, out error), "remove " + error);
+            Check(!DiagnosticMarkers.AnyOn(gameDir), "remove turns the diagnostics off");
             Check(File.ReadAllText(Path.Combine(gameDir, "d3d11.dll")) == "foreign" && !File.Exists(Path.Combine(gameDir, "dxgi.dll")),
                 "remove restores the foreign DLL");
 
@@ -243,6 +248,60 @@ namespace Dxup.Tests
                 Console.WriteLine("[SKIP] 32-bit deployer (no build_rel32)");
             }
             Directory.Delete(root, true);
+        }
+
+        static void DiagnosticsChecks()
+        {
+            // Names of the user and the computer never leave in a package.
+            string profile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+            string text = Diagnostics.Anonymize(profile + @"\Documents\a.txt; C:\Users\Someone Else\x.log; C:\Users\Public\y; d:/users/bob/z; "
+                + Environment.UserName + " on " + Environment.MachineName);
+            Check(text.Contains(@"%USERPROFILE%\Documents\a.txt") && text.Contains(@"C:\Users\<user>\x.log") && text.Contains(@"C:\Users\Public\y")
+               && text.Contains("d:/users/<user>/z") && text.IndexOf(Environment.UserName, StringComparison.OrdinalIgnoreCase) < 0
+               && text.IndexOf(Environment.MachineName, StringComparison.OrdinalIgnoreCase) < 0, "anonymized paths and names: " + text);
+
+            string dir = Path.Combine(Path.GetTempPath(), "dxup_diag_test");
+            if (Directory.Exists(dir))
+                Directory.Delete(dir, true);
+            Directory.CreateDirectory(dir);
+            DiagnosticMarkers.Set(dir, DiagnosticMarkers.DebugLayer, true);
+            DiagnosticMarkers.Set(dir, DiagnosticMarkers.FrameDump, true);
+            Check(DiagnosticMarkers.IsOn(dir, DiagnosticMarkers.DebugLayer) && File.Exists(Path.Combine(dir, "dxup_debug.txt"))
+               && DiagnosticMarkers.AnyOn(dir) && !DiagnosticMarkers.IsOn(dir, DiagnosticMarkers.Log), "diagnostic switches are files next to the DLLs");
+
+            // A package with the log (anonymized), a frame as PNG, settings and system information.
+            File.WriteAllText(Path.Combine(dir, "logdxup.log"), "[INFO] loaded from " + profile + @"\Games\x\d3d11.dll" + "\r\n");
+            using (var bitmap = new System.Drawing.Bitmap(8, 8))
+                bitmap.Save(Path.Combine(dir, "dxup_frame_60.bmp"), System.Drawing.Imaging.ImageFormat.Bmp);
+            var game = new GameEntry { Name = "Test Game", Dir = dir, Exe = "test.exe", Enabled = true };
+            game.Settings.MsaaSamples = 4;
+            string zipPath = Path.Combine(Path.GetTempPath(), "dxup_diag_test.zip");
+            string error = Diagnostics.CreatePackage(game, GamesConfig.Format(new[] { game }), "1.2.3", zipPath);
+            Check(error == null, "diagnostic package " + error);
+            if (error == null)
+            {
+                using (var zip = ZipFile.OpenRead(zipPath))
+                {
+                    var names = zip.Entries.Select(entry => entry.FullName).ToList();
+                    string Read(string name)
+                    {
+                        using (var reader = new StreamReader(zip.GetEntry(name).Open()))
+                            return reader.ReadToEnd();
+                    }
+                    Check(names.Contains("README.txt") && names.Contains("system.txt") && names.Contains("settings.txt") && names.Contains("crashes.txt")
+                       && names.Contains("logs/logdxup.log") && names.Contains("frames/dxup_frame_60.png"), "package contents: " + string.Join(", ", names));
+                    string log = names.Contains("logs/logdxup.log") ? Read("logs/logdxup.log") : "";
+                    Check(log.Contains(@"%USERPROFILE%\Games\x\d3d11.dll"), "the log in the package is anonymized: " + log.Trim());
+                    string system = Read("system.txt");
+                    Check(system.Contains("DXUP 1.2.3") && system.Contains("GPU: ") && system.Contains("Diagnostics on: dxup_debug.txt, dxup_frame_dump.txt"),
+                        "system.txt names DXUP, the GPU and the switches");
+                    Check(Read("settings.txt").Contains("d3d11.msaaSamples = 4"), "settings.txt holds the game's settings");
+                }
+                File.Delete(zipPath);
+            }
+            DiagnosticMarkers.ClearAll(dir);
+            Check(!DiagnosticMarkers.AnyOn(dir), "all switches off");
+            Directory.Delete(dir, true);
         }
     }
 }

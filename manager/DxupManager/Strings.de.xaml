@@ -91,6 +91,33 @@ Trotzdem hinzufügen?</sys:String>
   <sys:String x:Key="ColGame">Spiel</sys:String>
   <sys:String x:Key="ColSource">Quelle</sys:String>
   <sys:String x:Key="ColExe">Programm, neben das DXUP kommt</sys:String>
+  <sys:String x:Key="SectionDiagnostics">Diagnose</sys:String>
+  <sys:String x:Key="DiagIntro">Für Fehlerberichte: Schalte an, was du brauchst, starte das Spiel, stell den Fehler nach, beende das Spiel und erstelle dann ein Diagnosepaket. Danach wieder ausschalten – alle Schalter machen das Spiel langsamer.</sys:String>
+  <sys:String x:Key="DiagLog">Ausführliches Log (logdxup.log)</sys:String>
+  <sys:String x:Key="DiagLayer">D3D12-Debug-Layer: meldet fehlerhafte Direct3D-12-Aufrufe von DXUP im Log</sys:String>
+  <sys:String x:Key="DiagGpu">GPU-Validierung: prüft auch auf der GPU (sehr langsam)</sys:String>
+  <sys:String x:Key="DiagDred">Absturz der Grafikkarte nachverfolgen (DRED: zeigt nach einem Gerätefehler den letzten Befehl)</sys:String>
+  <sys:String x:Key="DiagExceptions">Absturzprotokoll: jede Ausnahme des Spiels mit Aufrufstapel</sys:String>
+  <sys:String x:Key="DiagFrames">Bilder speichern: einige Frames als Bild und die Aufrufe eines Frames im Log (für Grafikfehler)</sys:String>
+  <sys:String x:Key="DiagLayerMissing">Der D3D12-Debug-Layer ist nicht installiert: Windows-Einstellungen › System › Optionale Features › „Grafiktools“ hinzufügen.</sys:String>
+  <sys:String x:Key="DiagInactive">Die Schalter wirken nur, wenn DXUP für das Spiel aktiv ist.</sys:String>
+  <sys:String x:Key="DiagPackage">Diagnosepaket erstellen …</sys:String>
+  <sys:String x:Key="DiagOpenFolder">Spielordner öffnen (Logs)</sys:String>
+  <sys:String x:Key="DiagRenderDoc">In RenderDoc starten</sys:String>
+  <sys:String x:Key="DiagRenderDocGet">RenderDoc herunterladen</sys:String>
+  <sys:String x:Key="DiagPix">In PIX starten</sys:String>
+  <sys:String x:Key="DiagPixGet">PIX herunterladen</sys:String>
+  <sys:String x:Key="DiagGpuDebuggers">RenderDoc und PIX zeichnen einzelne Frames so auf, wie DXUP sie an Direct3D 12 schickt – für Entwickler. Das Diagnosepaket enthält Logs, Einstellungen, Systeminfo (Windows, CPU, Grafikkarte, Treiber) und Fehlerberichte des Spiels; Benutzer- und Computername werden ersetzt.</sys:String>
+  <sys:String x:Key="WarnDiagnostics">Diagnose ist an: Das Spiel läuft langsamer und schreibt Logs. Schalte sie unter „Diagnose“ wieder aus, wenn du fertig bist.</sys:String>
+  <sys:String x:Key="ZipFilter">ZIP-Archiv (*.zip)|*.zip</sys:String>
+  <sys:String x:Key="ErrPackage">Das Diagnosepaket konnte nicht erstellt werden:
+{0}</sys:String>
+  <sys:String x:Key="StatusPackage">Diagnosepaket „{0}“ erstellt.</sys:String>
+  <sys:String x:Key="StatusRenderDoc">RenderDoc ist offen, das Spiel ist eingetragen: „Launch“ startet es.</sys:String>
+  <sys:String x:Key="PixHowTo">PIX startet. Der Pfad des Spiels ist in der Zwischenablage:
+{0}
+
+In PIX: „Select Target Process“ › „Launch Win32“ › bei „Path to executable“ einfügen (Strg+V) › „Launch“. Im Spiel nimmt „Print“ (Druck) einen Frame auf.</sys:String>
   <sys:String x:Key="Yes">Ja</sys:String>
   <sys:String x:Key="No">Nein</sys:String>
 </ResourceDictionary>

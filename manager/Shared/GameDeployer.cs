@@ -152,10 +152,11 @@ namespace Dxup.Shared
                 }
                 // What DXUP left in the folder: its pipeline cache and logs.
                 try { Directory.Delete(Path.Combine(game.Dir, "dxup_pso_cache"), true); } catch (Exception) { }
-                foreach (string log in Directory.GetFiles(game.Dir, "logdxup*.log"))
+                foreach (string log in Directory.GetFiles(game.Dir, "logdxup*.log").Concat(Directory.GetFiles(game.Dir, "dxup_frame_*.bmp")))
                 {
                     try { File.Delete(log); } catch (Exception) { }
                 }
+                DiagnosticMarkers.ClearAll(game.Dir);
                 return true;
             }
             catch (Exception e)

@@ -184,6 +184,7 @@ namespace Dxup.Manager
             Select(FramesBox, settings.MaxFrameLatency);
             AsyncBox.IsChecked = settings.AsyncShaders;
             PrecompileBox.IsChecked = settings.ShaderPrecompile;
+            ShowDiagnostics(item);
             UpdateEnabledControls();
             ShowWarnings(item);
             m_loading = false;
@@ -206,6 +207,120 @@ namespace Dxup.Manager
                 AddWarning(Loc.T("WarnD3D12"));
             if (entry.Enabled && GameDeployer.IsRunning(entry))
                 AddWarning(Loc.T("WarnRunning"));
+            if (entry.Enabled && Directory.Exists(entry.Dir) && DiagnosticMarkers.AnyOn(entry.Dir))
+                AddWarning(Loc.T("WarnDiagnostics"));
+        }
+
+        // ---- Diagnostics ----
+
+        IEnumerable<CheckBox> DiagBoxes => DiagSwitches.Children.OfType<CheckBox>();
+
+        void ShowDiagnostics(GameItem item)
+        {
+            var entry = item.Entry;
+            bool active = entry.Enabled && Directory.Exists(entry.Dir);
+            foreach (var box in DiagBoxes)
+            {
+                box.IsChecked = active && DiagnosticMarkers.IsOn(entry.Dir, (string)box.Tag);
+                box.IsEnabled = active;
+            }
+            bool layer = DiagnosticMarkers.DebugLayerInstalled;
+            DiagLayerMissing.Visibility = layer ? Visibility.Collapsed : Visibility.Visible;
+            if (!layer)
+                DiagLayerBox.IsEnabled = DiagGpuBox.IsEnabled = false;
+            DiagInactive.Visibility = active ? Visibility.Collapsed : Visibility.Visible;
+            RenderDocButton.Content = Loc.T(Diagnostics.RenderDocPath() != null ? "DiagRenderDoc" : "DiagRenderDocGet");
+            PixButton.Content = Loc.T(Diagnostics.PixPath() != null ? "DiagPix" : "DiagPixGet");
+        }
+
+        void OnDiagChanged(object sender, RoutedEventArgs e)
+        {
+            if (m_loading || Selected == null)
+                return;
+            var box = (CheckBox)sender;
+            bool on = box.IsChecked == true;
+            // GPU-based validation runs on the debug layer.
+            m_loading = true;
+            if (box == DiagGpuBox && on)
+                DiagLayerBox.IsChecked = true;
+            if (box == DiagLayerBox && !on)
+                DiagGpuBox.IsChecked = false;
+            m_loading = false;
+            try
+            {
+                foreach (var each in DiagBoxes)
+                    DiagnosticMarkers.Set(Selected.Entry.Dir, (string)each.Tag, each.IsChecked == true);
+                StatusText.Text = Loc.T("StatusSaved");
+            }
+            catch (Exception ex)
+            {
+                Error(Loc.F("ErrSave", ex.Message));
+            }
+            ShowWarnings(Selected);
+        }
+
+        void OnDiagPackage(object sender, RoutedEventArgs e)
+        {
+            if (Selected == null)
+                return;
+            var entry = Selected.Entry;
+            string safeName = new string(entry.Name.Select(c => Path.GetInvalidFileNameChars().Contains(c) || c == ' ' ? '_' : c).ToArray());
+            var dialog = new SaveFileDialog
+            {
+                FileName = "DXUP-Diagnose-" + safeName + "-" + DateTime.Now.ToString("yyyyMMdd-HHmm", CultureInfo.InvariantCulture) + ".zip",
+                InitialDirectory = Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory),
+                Filter = Loc.T("ZipFilter"),
+            };
+            if (dialog.ShowDialog(this) != true)
+                return;
+            Mouse.OverrideCursor = Cursors.Wait;
+            string error;
+            try { error = Diagnostics.CreatePackage(entry, GamesConfig.Format(new[] { entry }), m_install.DllVersion, dialog.FileName); }
+            finally { Mouse.OverrideCursor = null; }
+            if (error != null)
+            {
+                Error(Loc.F("ErrPackage", error));
+                return;
+            }
+            StatusText.Text = Loc.F("StatusPackage", Path.GetFileName(dialog.FileName));
+            Process.Start("explorer.exe", "/select,\"" + dialog.FileName + "\"");
+        }
+
+        void OnRenderDoc(object sender, RoutedEventArgs e)
+        {
+            if (Selected == null)
+                return;
+            string path = Diagnostics.RenderDocPath();
+            if (path == null)
+            {
+                Process.Start(new ProcessStartInfo("https://renderdoc.org/") { UseShellExecute = true });
+                return;
+            }
+            try
+            {
+                Diagnostics.StartRenderDoc(path, Selected.Entry);
+                StatusText.Text = Loc.T("StatusRenderDoc");
+            }
+            catch (Exception ex) { Error(ex.Message); }
+        }
+
+        void OnPix(object sender, RoutedEventArgs e)
+        {
+            if (Selected == null)
+                return;
+            string path = Diagnostics.PixPath();
+            if (path == null)
+            {
+                Process.Start(new ProcessStartInfo("https://devblogs.microsoft.com/pix/download/") { UseShellExecute = true });
+                return;
+            }
+            try
+            {
+                Clipboard.SetText(Selected.Entry.ExePath);
+                Diagnostics.StartPix(path);
+                Dialog.Show(this, Loc.F("PixHowTo", Selected.Entry.ExePath), Dialog.Kind.Info);
+            }
+            catch (Exception ex) { Error(ex.Message); }
         }
 
         void AddWarning(string text)

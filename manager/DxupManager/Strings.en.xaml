@@ -91,6 +91,33 @@ Add it anyway?</sys:String>
   <sys:String x:Key="ColGame">Game</sys:String>
   <sys:String x:Key="ColSource">Source</sys:String>
   <sys:String x:Key="ColExe">Program DXUP goes next to</sys:String>
+  <sys:String x:Key="SectionDiagnostics">Diagnostics</sys:String>
+  <sys:String x:Key="DiagIntro">For bug reports: turn on what you need, start the game, reproduce the problem, quit the game, then create a diagnostic package. Turn them off again afterwards: every switch slows the game down.</sys:String>
+  <sys:String x:Key="DiagLog">Detailed log (logdxup.log)</sys:String>
+  <sys:String x:Key="DiagLayer">D3D12 debug layer: reports wrong Direct3D 12 calls of DXUP in the log</sys:String>
+  <sys:String x:Key="DiagGpu">GPU-based validation: checks on the GPU as well (very slow)</sys:String>
+  <sys:String x:Key="DiagDred">Track GPU crashes (DRED: shows the last command after a device error)</sys:String>
+  <sys:String x:Key="DiagExceptions">Crash log: every exception of the game with its call stack</sys:String>
+  <sys:String x:Key="DiagFrames">Save frames: a few frames as images and one frame's calls in the log (for rendering errors)</sys:String>
+  <sys:String x:Key="DiagLayerMissing">The D3D12 debug layer is not installed: Windows Settings › System › Optional features › add "Graphics Tools".</sys:String>
+  <sys:String x:Key="DiagInactive">The switches work only while DXUP is active for the game.</sys:String>
+  <sys:String x:Key="DiagPackage">Create diagnostic package …</sys:String>
+  <sys:String x:Key="DiagOpenFolder">Open game folder (logs)</sys:String>
+  <sys:String x:Key="DiagRenderDoc">Start in RenderDoc</sys:String>
+  <sys:String x:Key="DiagRenderDocGet">Download RenderDoc</sys:String>
+  <sys:String x:Key="DiagPix">Start in PIX</sys:String>
+  <sys:String x:Key="DiagPixGet">Download PIX</sys:String>
+  <sys:String x:Key="DiagGpuDebuggers">RenderDoc and PIX capture single frames as DXUP sends them to Direct3D 12, for developers. The diagnostic package holds the logs, settings, system information (Windows, CPU, GPU, driver) and the game's error reports; user and computer names are replaced.</sys:String>
+  <sys:String x:Key="WarnDiagnostics">Diagnostics are on: the game runs slower and writes logs. Turn them off under "Diagnostics" when you are done.</sys:String>
+  <sys:String x:Key="ZipFilter">ZIP archive (*.zip)|*.zip</sys:String>
+  <sys:String x:Key="ErrPackage">The diagnostic package could not be created:
+{0}</sys:String>
+  <sys:String x:Key="StatusPackage">Diagnostic package "{0}" created.</sys:String>
+  <sys:String x:Key="StatusRenderDoc">RenderDoc is open with the game filled in: "Launch" starts it.</sys:String>
+  <sys:String x:Key="PixHowTo">PIX is starting. The game's path is on the clipboard:
+{0}
+
+In PIX: "Select Target Process" › "Launch Win32" › paste it into "Path to executable" (Ctrl+V) › "Launch". In the game, "Print Screen" captures a frame.</sys:String>
   <sys:String x:Key="Yes">Yes</sys:String>
   <sys:String x:Key="No">No</sys:String>
 </ResourceDictionary>
