@@ -157,7 +157,7 @@ namespace dxup {
     , m_backendCtx (std::move(backendCtx))
     , m_isDeferred (isDeferred)
     , m_outputMergerRebinds(m_backendCtx && m_backendCtx->outputMergerStateCanNeedRebind())
-    , m_infoLogging(d3d11InfoLoggingEnabled()) {
+    , m_infoLogging(d3d11FinalPassTraceEnabled()) {
       m_state = ContextState{};
       // A deferred context is a device child and keeps the device alive.
       // The immediate context shares the device's reference count instead.
@@ -4831,7 +4831,7 @@ namespace dxup {
       static int preparePipelineOmLogCount = 0;
       if (d3d11InfoLoggingEnabled()
        && (preparePipelineOmLogCount < 64
-        || (m_state.om.depthStencilView && desc.dsvFormat == DXGI_FORMAT_UNKNOWN))) {
+        || (m_state.om.depthStencilView && desc.dsvFormat == DXGI_FORMAT_UNKNOWN && preparePipelineOmLogCount < 512))) {
         logMessage(LogLevel::Info,
           "preparePipeline-om: tid=%lu activeRT=%u dsv=%p viewFmt=%u resFmt=%u dsvFmt=%u sample=%u dsEnable=%u dsWrite=%u dsFunc=%u stencilEnable=%u stencilReadMask=%u stencilWriteMask=%u stencilRef=%u uav0=%p uav1=%p",
           static_cast<unsigned long>(currentThreadId()),
@@ -5077,7 +5077,7 @@ namespace dxup {
         ID3D11RenderTargetView* pRenderTargetView,
         IBackendImageView*      backendRtv,
         const FLOAT             color[4]) const {
-      if (!d3d11InfoLoggingEnabled())
+      if (!d3d11FinalPassTraceEnabled())
         return;
 
       if (!backendRtv || !color)
@@ -5125,7 +5125,7 @@ namespace dxup {
         UINT             srcRowPitch,
         UINT             srcDepthPitch,
         const void*      srcData) const {
-      if (!d3d11InfoLoggingEnabled())
+      if (!d3d11FinalPassTraceEnabled())
         return;
 
       if (!backendImage)
@@ -5178,7 +5178,7 @@ namespace dxup {
         IBackendImage*   srcImage,
         UINT             srcSubresource,
         const D3D11_BOX* srcBox) const {
-      if (!d3d11InfoLoggingEnabled())
+      if (!d3d11FinalPassTraceEnabled())
         return;
 
       const bool trackedDst = dstImage && isTrackedFinalPassImageDesc(dstImage->getDesc());
@@ -5543,7 +5543,7 @@ namespace dxup {
         UINT        startIndexLocation,
         INT         baseVertexLocation,
         UINT        startInstanceLocation) const {
-      if (!d3d11InfoLoggingEnabled())
+      if (!d3d11FinalPassTraceEnabled())
         return;
 
       if (indexCount != 6u || (instanceCount != 1u && instanceCount != 3u))
@@ -5831,7 +5831,7 @@ namespace dxup {
 
       static int rebindOmLogCount = 0;
       if (d3d11InfoLoggingEnabled()
-       && (rebindOmLogCount < 64 || (activeRenderTargetCount == 0 && m_state.om.depthStencilView))) {
+       && (rebindOmLogCount < 64 || (activeRenderTargetCount == 0 && m_state.om.depthStencilView && rebindOmLogCount < 512))) {
         logMessage(LogLevel::Info,
           "rebindOM: tid=%lu activeRT=%u dsv=%p backendDsv=%p rtv0=%p uav0=%p uav1=%p",
           static_cast<unsigned long>(currentThreadId()),

@@ -236,9 +236,9 @@ namespace dxup {
 
   inline uint64_t getTrackedBufferShadowSize(const D3D11_BUFFER_DESC& desc) {
     // Buffer shadows only feed the optional final-pass diagnostics below.
-    // Keeping them enabled in normal gameplay duplicates every mapped constant
-    // buffer on Unmap, which can dominate CPU time without affecting rendering.
-    if (!d3d11InfoLoggingEnabled())
+    // Keeping them enabled duplicates every mapped constant buffer on Unmap,
+    // reading it back from upload memory, which can dominate CPU time.
+    if (!d3d11FinalPassTraceEnabled())
       return 0u;
 
     if (desc.BindFlags & D3D11_BIND_CONSTANT_BUFFER)

@@ -2824,7 +2824,7 @@ namespace dxup::d3d12 {
       const D3D12_RESOURCE_STATES dsvState = d3d12Image->getPlaneCount() > 1 ? stencilState : depthState;
 
       static int bindRtDsvLogCount = 0;
-      if (logBindings && (bindRtDsvLogCount < 16 || count == 0)) {
+      if (logBindings && (bindRtDsvLogCount < 16 || (count == 0 && bindRtDsvLogCount < 512))) {
         D3D12_RESOURCE_DESC dsvResDesc = d3d12Image->getResource()->GetDesc();
         D3D12_RESOURCE_STATES currentDsvState = getImageViewCurrentState(d3d12Image, dsvViewDesc);
         logMessage(LogLevel::Info,
@@ -2870,7 +2870,9 @@ namespace dxup::d3d12 {
     }
 
     static int bindRtPhaseLogCount = 0;
-    if (logBindings && (bindRtPhaseLogCount < 32 || (!effectiveCount && hasDsv))) {
+    // Depth-only passes (shadow maps) bind every frame: their lines stop too.
+    const bool logDepthOnly = !effectiveCount && hasDsv && bindRtPhaseLogCount < 512;
+    if (logBindings && (bindRtPhaseLogCount < 32 || logDepthOnly)) {
       logMessage(LogLevel::Info,
         "bindRenderTargets-beforeFlush: tid=%lu effectiveCount=%u rtv0=%p hasDsv=%u dsvHandle=%p",
         static_cast<unsigned long>(GetCurrentThreadId()),
@@ -2882,7 +2884,7 @@ namespace dxup::d3d12 {
     }
 
     flushBarriers();
-    if (logBindings && (bindRtPhaseLogCount < 48 || (!effectiveCount && hasDsv))) {
+    if (logBindings && (bindRtPhaseLogCount < 32 || logDepthOnly)) {
       logMessage(LogLevel::Info,
         "bindRenderTargets-afterFlush: tid=%lu effectiveCount=%u hasDsv=%u dsvHandle=%p",
         static_cast<unsigned long>(GetCurrentThreadId()),
@@ -2914,7 +2916,7 @@ namespace dxup::d3d12 {
       if (hasDsv) m_trackedDSV = dsvHandle;
       m_trackedOmBindingValid = true;
 
-      if (logBindings && (bindRtPhaseLogCount < 64 || (!effectiveCount && hasDsv))) {
+      if (logBindings && (bindRtPhaseLogCount < 32 || logDepthOnly)) {
         logMessage(LogLevel::Info,
           "bindRenderTargets-afterOM: tid=%lu effectiveCount=%u hasDsv=%u dsvHandle=%p",
           static_cast<unsigned long>(GetCurrentThreadId()),
