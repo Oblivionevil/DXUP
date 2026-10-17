@@ -527,6 +527,7 @@ namespace dxup::legacy {
     uint32_t m_ffpFvf = 0;                  // what the fixed function sees
     uint32_t m_psTextureTypes = 0;          // 2 bits per sampler: the bound textures' types
     uint32_t m_shadowMask = 0;              // samplers with depth textures compared
+    uint32_t m_blueOneMask = 0;             // samplers with ATI2 textures: blue reads 1
 
     // What changed since the last draw: draws set only that on D3D11.
     enum Dirty : uint32_t {

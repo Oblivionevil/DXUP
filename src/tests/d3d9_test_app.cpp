@@ -803,6 +803,58 @@ PO main(float4 c : COLOR0) { PO o; o.c0 = c; o.c1 = c.gbra * 0.8; return o; }
     return true;
   }
 
+  // ATI1 and ATI2 (BC4, BC5) filled as games fill them: height rows of the
+  // width with the pitch the lock reports (the width, not a row of blocks:
+  // Trine 2 wrote past DXUP's buffer with that), sampled onto the halves.
+  bool sceneAtiLock(IDirect3DDevice9* d) {
+    d->Clear(0, nullptr, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, 0xff000000u, 1.0f, 0);
+    d->SetRenderState(D3DRS_LIGHTING, FALSE);
+    const D3DFORMAT formats[3] = { D3DFORMAT(MAKEFOURCC('A', 'T', 'I', '1')), D3DFORMAT(MAKEFOURCC('A', 'T', 'I', '2')),
+                                   D3DFORMAT(MAKEFOURCC('A', 'T', 'I', '2')) };
+    // The third third samples ATI2 in a pixel shader.
+    const auto psCode = assemble("ps_2_0\ndcl t0.xy\ndcl_2d s0\ntexld r0, t0, s0\nmov oC0, r0\n");
+    IDirect3DPixelShader9* ps = nullptr;
+    if (psCode.empty() || FAILED(d->CreatePixelShader(psCode.data(), &ps)))
+      return false;
+    for (int i = 0; i < 3; i++) {
+      IDirect3DTexture9* texture = nullptr;
+      if (FAILED(d->CreateTexture(32, 32, 1, 0, formats[i], D3DPOOL_MANAGED, &texture, nullptr)))
+        return false;
+      D3DLOCKED_RECT rect = {};
+      if (FAILED(texture->LockRect(0, &rect, nullptr, 0)) || rect.Pitch < 32) {
+        texture->Release();
+        return false;
+      }
+      // ATI1 holds half a byte per pixel: the first 16 rows are its blocks.
+      const UINT rows = i == 0 ? 16 : 32;
+      for (UINT y = 0; y < rows; y++)
+        for (UINT x = 0; x < 32; x++)
+          static_cast<BYTE*>(rect.pBits)[y * rect.Pitch + x] = BYTE((x * 37 + y * 11 + (x & 4) * 29) ^ (y * 5));
+      texture->UnlockRect(0);
+      d->SetTexture(0, texture);
+      d->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_POINT);
+      d->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
+      d->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
+      d->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
+      struct TLTex { float x, y, z, rhw; float u, v; };
+      const float x0 = float(i * kWidth / 3) - 0.5f, x1 = float((i + 1) * kWidth / 3) - 0.5f;
+      const TLTex quad[4] = {
+        { x0, -0.5f, 0.5f, 1.0f, 0.0f, 0.0f }, { x1, -0.5f, 0.5f, 1.0f, 1.0f, 0.0f },
+        { x0, float(kHeight) - 0.5f, 0.5f, 1.0f, 0.0f, 1.0f }, { x1, float(kHeight) - 0.5f, 0.5f, 1.0f, 1.0f, 1.0f },
+      };
+      d->SetFVF(D3DFVF_XYZRHW | D3DFVF_TEX1);
+      d->SetPixelShader(i == 2 ? ps : nullptr);
+      d->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, quad, sizeof(TLTex));
+      d->SetPixelShader(nullptr);
+      d->SetTexture(0, nullptr);
+      texture->Release();
+    }
+    ps->Release();
+    d->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_MODULATE);
+    d->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
+    return true;
+  }
+
   // 0 times infinity or NaN in mul, mad and dp3 of a pixel shader: 0 with
   // Direct3D 9 drivers (IEEE would give NaN, written as black).
   bool sceneFloatSpecials(IDirect3DDevice9* d) {
@@ -1199,6 +1251,7 @@ float4 main(float2 t : TEXCOORD0) : COLOR {
     { "cube_volume_shader", sceneCubeVolumeShader },
     { "point_sprites", scenePointSprites },
     { "float_specials", sceneFloatSpecials },
+    { "ati_lock", sceneAtiLock },
     { "nan_depth", sceneNanDepth },
     { "clip_planes", sceneClipPlanes },
     { "depth_textures", sceneDepthTextures },

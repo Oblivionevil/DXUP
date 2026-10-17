@@ -467,13 +467,18 @@ namespace dxup::legacy {
           return "(" + tex + ".SampleCmpLevelZero(" + smp + ", " + p + ".xy, saturate(" + p + ".z))).xxxx";
         }
         const std::string c = "(" + coord + ")" + (type == Sampler2D ? ".xy" : ".xyz");
+        std::string sample;
         if (std::strcmp(mode, "level") == 0 || vertex)
-          return tex + ".SampleLevel(" + smp + ", " + c + ", " + (extra.empty() ? "0.0f" : extra) + ")";
-        if (std::strcmp(mode, "bias") == 0)
-          return tex + ".SampleBias(" + smp + ", " + c + ", clamp(" + extra + ", -15.99f, 15.99f))";
-        if (std::strcmp(mode, "grad") == 0)
-          return tex + ".SampleGrad(" + smp + ", " + c + ", " + extra + ")";
-        return tex + ".Sample(" + smp + ", " + c + ")";
+          sample = tex + ".SampleLevel(" + smp + ", " + c + ", " + (extra.empty() ? "0.0f" : extra) + ")";
+        else if (std::strcmp(mode, "bias") == 0)
+          sample = tex + ".SampleBias(" + smp + ", " + c + ", clamp(" + extra + ", -15.99f, 15.99f))";
+        else if (std::strcmp(mode, "grad") == 0)
+          sample = tex + ".SampleGrad(" + smp + ", " + c + ", " + extra + ")";
+        else
+          sample = tex + ".Sample(" + smp + ", " + c + ")";
+        if (!vertex && ((options.blueOneSamplers >> sampler) & 1))
+          sample = "dxup_blueOne(" + sample + ")";
+        return sample;
       }
 
       void open(const std::string& text) {
@@ -903,6 +908,8 @@ namespace dxup::legacy {
     s += "float dxup_log(float x) { return x == 0.0f ? -3.402823466e38f : log2(abs(x)); }\n";
     s += "float dxup_pow(float x, float y) { return y == 0.0f ? 1.0f : exp2(y * dxup_log(x)); }\n";
     s += "float4 dxup_nrm(float4 x) { float l = dot(x.xyz, x.xyz); return l > 0.0f ? x * rsqrt(l) : 0.0f.xxxx; }\n";
+    if (options.blueOneSamplers)
+      s += "float4 dxup_blueOne(float4 t) { return float4(t.rg, 1.0f, t.a); }\n";
     if (options.floatEmulation || options.dotEmulation) {
       // 0 times anything is 0 (Direct3D 9), not NaN for infinity or NaN.
       s += "float4 dxup_mul(float4 a, float4 b) { return a == 0.0f || b == 0.0f ? 0.0f.xxxx : a * b; }\n";

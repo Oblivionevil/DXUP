@@ -478,7 +478,10 @@ namespace dxup::legacy {
   }
 
   size_t Texture::levelSize(uint32_t subresource) const {
-    return size_t(slicePitch(subresource)) * depth(subresource);
+    // At least what a lock lets the application write (ATI1: height rows of
+    // the pitch it reports, twice its blocks).
+    const size_t locked = size_t(legacyLockPitch(m_desc.format, width(subresource))) * height(subresource);
+    return (std::max)(size_t(slicePitch(subresource)), locked) * depth(subresource);
   }
 
   ID3D11RenderTargetView* Texture::rtv(uint32_t subresource, bool srgb) {
@@ -539,7 +542,7 @@ namespace dxup::legacy {
     }
     *data = level.data.data() + offset;
     if (rowPitch)
-      *rowPitch = rowBytes;
+      *rowPitch = box ? rowBytes : legacyLockPitch(m_desc.format, width(subresource));
     if (slicePitchOut)
       *slicePitchOut = sliceBytes;
     return true;
@@ -624,6 +627,15 @@ namespace dxup::legacy {
       }
     }
     const bool keyed = m_colorKeyEnabled;
+    if (m_desc.format == FormatATI2) {
+      // ATI2 holds its two channels in the other order than BC5 (Direct3D 9
+      // samples the first block as green): the blocks' halves swapped.
+      std::vector<uint8_t> swapped(level.data.begin(), level.data.begin() + size_t(srcSlice) * d);
+      for (size_t i = 0; i + 16 <= swapped.size(); i += 16)
+        std::swap_ranges(swapped.begin() + i, swapped.begin() + i + 8, swapped.begin() + i + 8);
+      write(subresource, box, swapped.data(), srcPitch, srcSlice);
+      return;
+    }
     if (!m_convert && !keyed && m_desc.format != FormatX1R5G5B5) {
       write(subresource, box, level.data.data(), srcPitch, srcSlice);
       return;
@@ -1172,6 +1184,7 @@ namespace dxup::legacy {
     for (uint32_t i = 0; i < 16; i++)
       if (m_info.samplerTypes[i]) usedSamplers |= uint16_t(1u << i);
     options.shadowSamplers &= usedSamplers;
+    options.blueOneSamplers &= usedSamplers;
     uint8_t usedTypes[16] = {};
     if (options.boundSamplerTypes) {
       bool other = false;
@@ -1186,6 +1199,7 @@ namespace dxup::legacy {
     key = fnv64Multiply(key ^ options.uintInputs);
     key = fnv64Multiply(key ^ options.sintInputs);
     key = fnv64Multiply(key ^ options.shadowSamplers);
+    key = fnv64Multiply(key ^ (uint32_t(options.blueOneSamplers) << 16));
     key = fnv64Multiply(key ^ (uint32_t(options.clipPlanes) << 16));
     key = fnv64Multiply(key ^ ((options.floatEmulation ? 0x1000000u : 0u) | (options.dotEmulation ? 0x2000000u : 0u)
       | (options.nanDepthZero ? 0x4000000u : 0u)));
@@ -1456,6 +1470,7 @@ namespace dxup::legacy {
     m_depthStencil = nullptr;
     m_psTextureTypes = 0;
     m_shadowMask = 0;
+    m_blueOneMask = 0;
     m_ffpFvf = 0;
     // Direct3D 9's default states.
     auto& rs = m_renderStates;
@@ -1633,6 +1648,16 @@ namespace dxup::legacy {
       if (m_pixelShader)
         m_dirty |= DirtyShaders;
       m_samplerDirtyMask |= 1u << stage;
+    }
+    // Direct3D 9 samples ATI2 as (green, red, 1, 1); BC5 gives blue 0.
+    const bool oldBlueOne = m_textures[stage] && m_textures[stage]->desc().format == FormatATI2;
+    const bool newBlueOne = texture && texture->desc().format == FormatATI2;
+    if (oldBlueOne != newBlueOne && stage < kPixelSamplers) {
+      m_blueOneMask = newBlueOne ? (m_blueOneMask | (1u << stage)) : (m_blueOneMask & ~(1u << stage));
+      if (m_pixelShader)
+        m_dirty |= DirtyShaders;
+      if (stage < kFixedStages)
+        m_pixelConstantsDirty = true;
     }
     m_textures[stage] = texture;
     m_textureDirtyMask |= 1u << stage;
@@ -2502,7 +2527,7 @@ namespace dxup::legacy {
       c->stageOps[stage][0] = tss[TssColorOp];
       c->stageOps[stage][1] = tss[TssAlphaOp];
       c->stageOps[stage][2] = tss[TssResultArg] == 5 ? 1u : 0u;
-      c->stageOps[stage][3] = type | (projected << 4) | ((flags & 0xf) << 8);
+      c->stageOps[stage][3] = type | (projected << 4) | ((flags & 0xf) << 8) | (((m_blueOneMask >> stage) & 1u) << 12);
       c->stageArgs[stage][0] = tss[TssColorArg1];
       c->stageArgs[stage][1] = tss[TssColorArg2];
       c->stageArgs[stage][2] = tss[TssColorArg0];
@@ -2751,6 +2776,7 @@ namespace dxup::legacy {
         if ((m_shadowMask >> i) & 1 && (m_pixelShader->info().samplerTypes[i] == Sampler2D || m_pixelShader->info().major == 1))
           shadow |= uint16_t(1u << i);
       options.shadowSamplers = shadow;
+      options.blueOneSamplers = uint16_t(m_blueOneMask);
       m_psVariant = m_pixelShader->variant(options);
       if (m_psVariant)
         pixelVaryings = m_psVariant->info.varyingCount;

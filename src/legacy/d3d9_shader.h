@@ -66,6 +66,8 @@ namespace dxup::legacy {
     uint16_t shadowSamplers = 0;
     // Vertex shaders: user clip planes enabled (clip space, cbuffer b3).
     uint8_t clipPlanes = 0;
+    // Pixel shaders: samplers of ATI2 textures, whose blue reads 1 (BC5 0).
+    uint16_t blueOneSamplers = 0;
     // 0 times infinity or NaN gives 0 (as Direct3D 9 drivers do) in mul and
     // mad (floatEmulation), and in dp2add, dp3, dp4 and the matrix products
     // (dotEmulation); IEEE gives NaN.

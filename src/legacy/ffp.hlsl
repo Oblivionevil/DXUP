@@ -236,7 +236,7 @@ Texture3D    textures3d[MAX_STAGES]   : register(t16);
 SamplerState samplers[MAX_STAGES]     : register(s0);
 
 cbuffer FfpPixel : register(b1) {
-  uint4  stageOps[MAX_STAGES];   // color op, alpha op, result (0 current, 1 temp), texture type | projected << 4 | count << 8
+  uint4  stageOps[MAX_STAGES];   // color op, alpha op, result (0 current, 1 temp), texture type | projected << 4 | count << 8 | ATI2 (blue 1) << 12
   uint4  stageArgs[MAX_STAGES];  // color arg 1, 2, 0, alpha args 1 | 2 << 8 | 0 << 16
   float4 stageConstant[MAX_STAGES];
   float4 bumpMatrix[MAX_STAGES];
@@ -334,6 +334,9 @@ float4 ps_main(PSInput input) : SV_Target {
       texel = texturesCube[stage].Sample(samplers[stage], tc.xyz);
     else if (textureType == 3)
       texel = textures3d[stage].Sample(samplers[stage], tc.xyz);
+    // ATI2 reads (green, red, 1, 1); BC5 gives blue 0.
+    if ((ops.w >> 12) & 1u)
+      texel.b = 1.0f;
     texel.rgb *= bumpScale;
     bumpOffset = 0.0f;
     bumpScale = 1.0f;

@@ -68,10 +68,23 @@ namespace dxup::legacy {
     }
   }
 
-  // Bytes per row of a subresource in the application's layout.
+  // Bytes per row of a subresource in the application's layout (rows of
+  // blocks for compressed formats), whole DWORDs as Direct3D 9 drivers
+  // give them (an L8 surface 6 pixels wide has a pitch of 8).
   inline uint32_t legacyPitch(Format format, uint32_t width) {
     const FormatInfo info = formatInfo(format);
-    return info.block ? ((width + 3) / 4) * info.bytesPerBlock : width * info.bytesPerBlock;
+    const uint32_t bytes = info.block ? ((width + 3) / 4) * info.bytesPerBlock : width * info.bytesPerBlock;
+    return (bytes + 3) & ~3u;
+  }
+
+  // The pitch a lock reports. Direct3D 9 drivers give ATI1 and ATI2 (BC4,
+  // BC5) the pitch of an 8-bit format, the width in whole DWORDs, and games
+  // write height rows of it (Trine 2 its ATI2 normal maps); the blocks lie
+  // in the same bytes for ATI2 as with a pitch of block rows.
+  inline uint32_t legacyLockPitch(Format format, uint32_t width) {
+    if (format == FormatATI1 || format == FormatATI2)
+      return (width + 3) & ~3u;
+    return legacyPitch(format, width);
   }
 
   inline uint32_t legacyRows(Format format, uint32_t height) {
