@@ -2,6 +2,7 @@
 #include "legacy_formats.h"
 
 #include "../util/util_types.h"
+#include "../util/util_config.h"
 #include "../util/util_thread.h"
 
 #include "ffp_vs.h"
@@ -1118,6 +1119,7 @@ namespace dxup::legacy {
     shader->m_hash = hash;
     std::string hlsl;
     TranslateOptions9 options;
+    options.floatEmulation = UserOverrides::get().d3d9FloatEmulation;
     if (!translateShader9(shader->m_tokens.data(), shader->m_tokens.size(), options, hlsl, shader->m_info, error))
       return nullptr;
     // The likely variant now, on a worker: compiling at the first draw
@@ -1146,6 +1148,7 @@ namespace dxup::legacy {
   const Shader::Variant* Shader::variant(const TranslateOptions9& in) {
     // A vertex shader writes its own varyings at least: the same variant.
     TranslateOptions9 options = in;
+    options.floatEmulation = UserOverrides::get().d3d9FloatEmulation;
     if (vertex())
       options.minVaryings = (std::max)(options.minVaryings, m_info.varyingCount);
     else
@@ -1171,6 +1174,7 @@ namespace dxup::legacy {
     key = fnv64Multiply(key ^ options.sintInputs);
     key = fnv64Multiply(key ^ options.shadowSamplers);
     key = fnv64Multiply(key ^ (uint32_t(options.clipPlanes) << 16));
+    key = fnv64Multiply(key ^ (options.floatEmulation ? 0x1000000u : 0u));
     if (options.boundSamplerTypes)
       for (int i = 0; i < 16; i++)
         key = fnv64Multiply(key ^ (options.boundSamplerTypes[i] + 0x100u * uint32_t(i)));
@@ -2519,6 +2523,84 @@ namespace dxup::legacy {
     m_pixelConstantsDirty = false;
   }
 
+  // dxup_frame_dump.txt next to the DLL (DXUP Manager's "Record a problem").
+  bool glitchReportsEnabled() {
+    static const bool enabled = [] {
+      HMODULE self = nullptr;
+      GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        reinterpret_cast<LPCWSTR>(&glitchReportsEnabled), &self);
+      wchar_t path[MAX_PATH] = {};
+      if (!self || !GetModuleFileNameW(self, path, MAX_PATH))
+        return false;
+      wchar_t* name = wcsrchr(path, L'\\');
+      if (!name)
+        return false;
+      wcscpy_s(name + 1, MAX_PATH - (name + 1 - path), L"dxup_frame_dump.txt");
+      const DWORD attributes = GetFileAttributesW(path);
+      return attributes != INVALID_FILE_ATTRIBUTES && !(attributes & FILE_ATTRIBUTE_DIRECTORY);
+    }();
+    return enabled;
+  }
+
+  // The float constants a shader reads: the first NaN or infinity of the
+  // frame is kept for the log at Present.
+  void Device::checkConstants(bool pixel, uint32_t floats) {
+    const float* values = &m_constants[pixel].f[0][0];
+    for (uint32_t i = 0; i < floats * 4; i++) {
+      if (std::isfinite(values[i]))
+        continue;
+      const Shader* shader = pixel ? m_pixelShader : m_vertexShader;
+      if (!m_nonFinite.uploads++) {
+        m_nonFinite.pixel = pixel;
+        m_nonFinite.reg = i / 4;
+        m_nonFinite.component = i % 4;
+        m_nonFinite.value = values[i];
+        m_nonFinite.shader = shader ? shader->hash() : 0;
+      }
+      // Once per shader (8 at most): which constants, and what it does with
+      // them (its HLSL as DXUP writes it).
+      static std::mutex s_loggedMutex;
+      static std::vector<uint64_t> s_logged;
+      if (!shader)
+        return;
+      {
+        std::lock_guard<std::mutex> lock(s_loggedMutex);
+        if (s_logged.size() >= 8 || std::find(s_logged.begin(), s_logged.end(), shader->hash()) != s_logged.end())
+          return;
+        s_logged.push_back(shader->hash());
+      }
+      std::string registers;
+      for (uint32_t j = i; j < floats * 4 && registers.size() < 400; j++) {
+        if (!std::isfinite(values[j])) {
+          char text[48];
+          sprintf_s(text, " c%u.%c=%g", j / 4, "xyzw"[j % 4], values[j]);
+          registers += text;
+        }
+      }
+      std::string hlsl, error;
+      ShaderInfo9 info;
+      if (!translateShader9(shader->tokens().data(), shader->tokens().size(), TranslateOptions9(), hlsl, info, error))
+        hlsl = "(not translated: " + error + ")";
+      logMessage(LogLevel::Warn, "glitch: %s shader %016llX reads NaN or infinite constants:%s; its HLSL:\n%s",
+        pixel ? "pixel" : "vertex", static_cast<unsigned long long>(shader->hash()), registers.c_str(), hlsl.c_str());
+      return;
+    }
+  }
+
+  void Device::logNonFiniteConstants() {
+    m_nonFinite.presents++;
+    if (!m_nonFinite.uploads)
+      return;
+    // Every frame with any for the first 20, then every 100th.
+    m_nonFinite.frames++;
+    if (m_nonFinite.frames <= 20 || m_nonFinite.frames % 100 == 0)
+      logMessage(LogLevel::Warn, "glitch: present %u: %u draws read NaN or infinite constants (first: %s shader %016llX c%u.%c = %g)%s",
+        m_nonFinite.presents, m_nonFinite.uploads, m_nonFinite.pixel ? "pixel" : "vertex",
+        static_cast<unsigned long long>(m_nonFinite.shader), m_nonFinite.reg, "xyzw"[m_nonFinite.component],
+        m_nonFinite.value, m_nonFinite.frames == 20 ? "; from now on every 100th such frame" : "");
+    m_nonFinite.uploads = 0;
+  }
+
   void Device::updateShaderConstants(bool pixel) {
     const Shader::Variant* variant = pixel ? m_psVariant : m_vsVariant;
     if (!variant)
@@ -2541,6 +2623,8 @@ namespace dxup::legacy {
     // Whole 64-byte lines: the ring is write-combined memory, and partly
     // written lines wait in the CPU until the next locked instruction.
     const uint32_t copied = (std::min)((floats + 3) & ~3u, 256u);
+    if (glitchReportsEnabled())
+      checkConstants(pixel, floats);
     std::memcpy(static_cast<uint8_t*>(mapped.pData) + offset, m_constants[pixel].f, size_t(copied) * 16);
     m_context->Unmap(ring, 0);
     const UINT first = offset / 16, count = window;
@@ -3562,6 +3646,8 @@ namespace dxup::legacy {
 
   HRESULT Device::present(Texture* source, const Rect* sourceRect, HWND window, uint32_t syncInterval,
                           const uint16_t* gammaRamp) {
+    if (glitchReportsEnabled())
+      logNonFiniteConstants();
     // A ramp other than the identity goes through its lookup table.
     ID3D11ShaderResourceView* gamma = nullptr;
     if (gammaRamp) {

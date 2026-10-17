@@ -510,6 +510,20 @@ namespace dxup::legacy {
     // The pipeline the bound state selects.
     const Shader::Variant* m_vsVariant = nullptr;
     const Shader::Variant* m_psVariant = nullptr;
+    // Glitch reports (dxup_frame_dump.txt): shader constants that are NaN or
+    // infinite turn what a shader draws black (checkConstants).
+    struct NonFiniteConstants {
+      uint32_t uploads = 0;        // this frame
+      uint32_t frames = 0;         // frames with any, logged so far
+      uint32_t presents = 0;
+      bool     pixel = false;      // the first of this frame
+      uint32_t reg = 0, component = 0;
+      float    value = 0.0f;
+      uint64_t shader = 0;
+    };
+    NonFiniteConstants m_nonFinite;
+    void checkConstants(bool pixel, uint32_t floats);
+    void logNonFiniteConstants();
     uint32_t m_ffpFvf = 0;                  // what the fixed function sees
     uint32_t m_psTextureTypes = 0;          // 2 bits per sampler: the bound textures' types
     uint32_t m_shadowMask = 0;              // samplers with depth textures compared

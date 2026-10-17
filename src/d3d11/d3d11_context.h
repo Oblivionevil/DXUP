@@ -1353,7 +1353,7 @@ namespace dxup {
       DXUP_CONTEXT_MT_GUARD;
       if (m_device->diagTraceDraws.load(std::memory_order_relaxed))
         traceDrawState("Draw");
-      if (!preparePipeline()) return;
+      if (!prepareRecorded(RecordOp::Draw, VertexCount, 1, StartVertexLocation, 0)) return;
       flushPendingBufferUpdates();
       rebindGraphicsDrawState();
       m_backendCtx->draw(VertexCount, 1, StartVertexLocation, 0);
@@ -1368,7 +1368,7 @@ namespace dxup {
         traceDrawState("DrawIndexed");
       if (m_infoLogging)
         logTrackedFinalPassState("DrawIndexed", IndexCount, 1u, StartIndexLocation, BaseVertexLocation, 0u);
-      if (!preparePipeline()) return;
+      if (!prepareRecorded(RecordOp::DrawIndexed, IndexCount, 1, StartIndexLocation, BaseVertexLocation)) return;
       flushPendingBufferUpdates();
       rebindGraphicsDrawState();
       m_backendCtx->drawIndexed(IndexCount, 1, StartIndexLocation, BaseVertexLocation, 0);
@@ -1382,7 +1382,7 @@ namespace dxup {
       DXUP_CONTEXT_MT_GUARD;
       if (m_device->diagTraceDraws.load(std::memory_order_relaxed))
         traceDrawState("DrawInstanced");
-      if (!preparePipeline()) return;
+      if (!prepareRecorded(RecordOp::Draw, VertexCountPerInstance, InstanceCount, StartVertexLocation, 0)) return;
       flushPendingBufferUpdates();
       rebindGraphicsDrawState();
       m_backendCtx->draw(VertexCountPerInstance, InstanceCount, StartVertexLocation, StartInstanceLocation);
@@ -1399,7 +1399,7 @@ namespace dxup {
         traceDrawState("DrawIndexedInstanced");
       if (m_infoLogging)
         logTrackedFinalPassState("DrawIndexedInstanced", IndexCountPerInstance, InstanceCount, StartIndexLocation, BaseVertexLocation, StartInstanceLocation);
-      if (!preparePipeline()) return;
+      if (!prepareRecorded(RecordOp::DrawIndexed, IndexCountPerInstance, InstanceCount, StartIndexLocation, BaseVertexLocation)) return;
       flushPendingBufferUpdates();
       rebindGraphicsDrawState();
       m_backendCtx->drawIndexed(IndexCountPerInstance, InstanceCount,
@@ -1415,7 +1415,7 @@ namespace dxup {
       const uint32_t stride = m_state.ia.vertexStrides[0];
       if (!vertexBuffer || !stride) return;
 
-      if (!preparePipeline()) return;
+      if (!prepareRecorded(RecordOp::DrawAuto, 0, 1, 0, 0)) return;
       flushPendingBufferUpdates();
       rebindGraphicsDrawState();
       m_backendCtx->drawAuto(vertexBuffer, stride);
@@ -1428,7 +1428,7 @@ namespace dxup {
       if (m_device->diagTraceDraws.load(std::memory_order_relaxed))
         traceDrawState(("DrawInstancedIndirect" + traceIndirectArgs(pBufferForArgs, AlignedByteOffsetForArgs, 4)).c_str());
       if (!pBufferForArgs) return;
-      if (!preparePipeline()) return;
+      if (!prepareRecorded(RecordOp::DrawIndirect, 0, 0, AlignedByteOffsetForArgs, 0)) return;
       flushPendingBufferUpdates();
       rebindGraphicsDrawState();
       IBackendBuffer* backendBuf = getBackendBuffer(pBufferForArgs);
@@ -1444,7 +1444,7 @@ namespace dxup {
       if (m_device->diagTraceDraws.load(std::memory_order_relaxed))
         traceDrawState(("DrawIndexedInstancedIndirect" + traceIndirectArgs(pBufferForArgs, AlignedByteOffsetForArgs, 5)).c_str());
       if (!pBufferForArgs) return;
-      if (!preparePipeline()) return;
+      if (!prepareRecorded(RecordOp::DrawIndirect, 0, 0, AlignedByteOffsetForArgs, 0)) return;
       flushPendingBufferUpdates();
       rebindGraphicsDrawState();
       IBackendBuffer* backendBuf = getBackendBuffer(pBufferForArgs);
@@ -1570,7 +1570,10 @@ namespace dxup {
       DXUP_CONTEXT_MT_GUARD;
       if (m_device->diagTraceDraws.load(std::memory_order_relaxed))
         traceDispatch("Dispatch", ThreadGroupCountX, ThreadGroupCountY, ThreadGroupCountZ);
-      if (!prepareComputePipeline()) return;
+      const bool computePrepared = prepareComputePipeline();
+      if (m_historyOn && !m_isDeferred)
+        recordCall(RecordOp::Dispatch, ThreadGroupCountX, ThreadGroupCountY, ThreadGroupCountZ, 0, !computePrepared);
+      if (!computePrepared) return;
       flushPendingBufferUpdates();
       if (m_injectTaa)
         injectObserveDispatch();
@@ -1688,12 +1691,288 @@ namespace dxup {
     // At each Present of the swap chain (application thread).
     void NoteFramePresented() {
       DXUP_CONTEXT_MT_GUARD;
+      if (m_historyOn && !m_isDeferred) {
+        m_historyFrame++;
+        m_history[m_historyFrame % kHistoryFrames].clear();
+      }
       if (m_autoTaa)
         m_autoTaa->endFrame();
       if (m_injectTaa) {
         if (m_injectTaa->atPresent())
           runInjectedPass();
         m_injectTaa->endFrame();
+      }
+    }
+
+    // ---- Draw history (glitch reports) ----
+    // With saved frames on (dxup_frame_dump.txt), each draw, dispatch and
+    // clear of the immediate context leaves a compact record, and the last
+    // frames' records stay. When the swap chain sees a frame flicker, it
+    // logs the records of that frame against the frame before: draws only
+    // one of them has, and draws whose shaders, targets, textures, constant
+    // buffers or states changed; that names the draw behind the glitch.
+    // Objects are named by their addresses, shaders by bytecode hash (as
+    // the shader dumps name them).
+    enum class RecordOp : uint8_t { Draw, DrawIndexed, DrawAuto, DrawIndirect, Dispatch, ClearColor, ClearDepth };
+
+    struct DrawRecord {
+      RecordOp    op = RecordOp::Draw;
+      bool        dropped = false;   // the pipeline could not be prepared: not drawn
+      bool        swapChainTarget = false;
+      uint8_t     targets = 0;       // bound render targets
+      uint32_t    count = 0, instances = 0, start = 0;
+      int32_t     base = 0;
+      uint64_t    vs = 0, ps = 0;    // compute shader in ps for dispatches
+      const void* target = nullptr;  // render target 0 (or the cleared view)
+      const void* depth = nullptr;   // depth-stencil view
+      uint16_t    width = 0, height = 0, format = 0;
+      const void* srv[4] = {};
+      uint16_t    srvWidth[4] = {}, srvHeight[4] = {}, srvFormat[4] = {};
+      const void* cb[2] = {};        // vertex and pixel (or compute) b0
+      uint32_t    cbFirst[2] = {};
+      const void* blend = nullptr;
+      const void* depthState = nullptr;
+      const void* raster = nullptr;
+      uint32_t    stencilRef = 0;
+      float       viewport[2] = {};
+      float       value[4] = {};     // clear color, or depth, stencil, flags
+    };
+
+    static constexpr uint32_t kHistoryFrames = 8;
+    std::vector<DrawRecord> m_history[kHistoryFrames];
+    uint32_t                m_historyFrame = 0;
+    bool                    m_historyOn = d3d11GlitchReportsEnabled();
+
+    static void describeImageView(IBackendImageView* view, uint16_t& width, uint16_t& height, uint16_t& format) {
+      if (!view || !view->getImage())
+        return;
+      const ImageDesc& desc = view->getImage()->getDesc();
+      width = uint16_t((std::min)(desc.width, 65535u));
+      height = uint16_t((std::min)(desc.height, 65535u));
+      format = uint16_t(view->getDesc().format ? view->getDesc().format : desc.format);
+    }
+
+    template <typename Shader>
+    static uint64_t shaderHash(ID3D11DeviceChild* shader) {
+      IBackendShader* backend = shader ? reinterpret_cast<Shader*>(shader)->GetBackendShader() : nullptr;
+      return backend ? backend->getBytecodeHash() : 0;
+    }
+
+    bool prepareRecorded(RecordOp op, uint32_t count, uint32_t instances, uint32_t start, int32_t base) {
+      const bool prepared = preparePipeline();
+      if (m_historyOn && !m_isDeferred)
+        recordCall(op, count, instances, start, base, !prepared);
+      return prepared;
+    }
+
+    void recordCall(RecordOp op, uint32_t count, uint32_t instances, uint32_t start, int32_t base, bool dropped) {
+      DrawRecord r;
+      r.op = op;
+      r.dropped = dropped;
+      r.count = count;
+      r.instances = instances;
+      r.start = start;
+      r.base = base;
+      const bool compute = op == RecordOp::Dispatch;
+      const ShaderStageState& stage = compute ? m_state.cs : m_state.ps;
+      if (compute) {
+        r.ps = shaderHash<D3D11ComputeShader>(m_state.cs.shader);
+      } else {
+        r.vs = shaderHash<D3D11VertexShader>(m_state.vs.shader);
+        r.ps = shaderHash<D3D11PixelShader>(m_state.ps.shader);
+        r.targets = uint8_t(m_state.om.numRenderTargets);
+        r.target = m_state.om.renderTargets[0];
+        r.swapChainTarget = isSwapChainView(m_state.om.renderTargets[0]);
+        r.depth = m_state.om.depthStencilView;
+        describeImageView(getBackendRTV(m_state.om.renderTargets[0]), r.width, r.height, r.format);
+        if (!r.width && m_state.om.depthStencilView)
+          describeImageView(getBackendDSV(m_state.om.depthStencilView), r.width, r.height, r.format);
+        r.cb[0] = m_state.vs.constantBuffers[0];
+        r.cbFirst[0] = m_state.vs.constantBufferFirst[0];
+        r.blend = m_state.om.blendState;
+        r.depthState = m_state.om.depthStencilState;
+        r.raster = m_state.rs.state;
+        r.stencilRef = m_state.om.stencilRef;
+        if (m_state.rs.numViewports) {
+          r.viewport[0] = m_state.rs.viewports[0].Width;
+          r.viewport[1] = m_state.rs.viewports[0].Height;
+        }
+      }
+      r.cb[1] = stage.constantBuffers[0];
+      r.cbFirst[1] = stage.constantBufferFirst[0];
+      for (uint32_t slot = 0; slot < 4; slot++) {
+        r.srv[slot] = stage.srvs[slot];
+        describeImageView(getBackendImageSRV(stage.srvs[slot]), r.srvWidth[slot], r.srvHeight[slot], r.srvFormat[slot]);
+      }
+      m_history[m_historyFrame % kHistoryFrames].push_back(r);
+    }
+
+    void recordClear(RecordOp op, ID3D11View* view, IBackendImageView* backendView, const float value[4]) {
+      DrawRecord r;
+      r.op = op;
+      r.target = view;
+      r.swapChainTarget = isSwapChainView(view);
+      describeImageView(backendView, r.width, r.height, r.format);
+      std::memcpy(r.value, value, sizeof(r.value));
+      m_history[m_historyFrame % kHistoryFrames].push_back(r);
+    }
+
+    // A view of a swap chain buffer (they carry kDxupSwapChainBufferGuid).
+    static bool isSwapChainView(ID3D11View* view) {
+      if (!view)
+        return false;
+      ComPtr<ID3D11Resource> resource;
+      view->GetResource(resource.GetAddressOf());
+      UINT marker = 0, size = sizeof(marker);
+      return resource && SUCCEEDED(resource->GetPrivateData(kDxupSwapChainBufferGuid, &size, &marker)) && marker;
+    }
+
+    static std::string describeRecord(const DrawRecord& r) {
+      static const char* kOps[] = { "Draw", "DrawIndexed", "DrawAuto", "DrawIndirect", "Dispatch", "ClearColor", "ClearDepth" };
+      char text[640];
+      if (r.op == RecordOp::ClearColor || r.op == RecordOp::ClearDepth) {
+        sprintf_s(text, "%s %p %ux%u/%u value=%g,%g,%g,%g", kOps[uint32_t(r.op)], r.target, r.width, r.height, r.format,
+          r.value[0], r.value[1], r.value[2], r.value[3]);
+        return text;
+      }
+      int length = sprintf_s(text, "%s%s n=%u x%u start=%u base=%d %s=%016llX", kOps[uint32_t(r.op)],
+        r.dropped ? " DROPPED" : "", r.count, r.instances, r.start, r.base, r.op == RecordOp::Dispatch ? "cs" : "ps",
+        static_cast<unsigned long long>(r.ps));
+      if (r.op != RecordOp::Dispatch)
+        length += sprintf_s(text + length, sizeof(text) - length, " vs=%016llX rt=%p %ux%u/%u targets=%u ds=%p vp=%gx%g blend=%p dss=%p rs=%p ref=%u",
+          static_cast<unsigned long long>(r.vs), r.target, r.width, r.height, r.format, r.targets, r.depth,
+          r.viewport[0], r.viewport[1], r.blend, r.depthState, r.raster, r.stencilRef);
+      for (uint32_t slot = 0; slot < 4; slot++) {
+        if (r.srv[slot])
+          length += sprintf_s(text + length, sizeof(text) - length, " t%u=%p %ux%u/%u", slot, r.srv[slot],
+            r.srvWidth[slot], r.srvHeight[slot], r.srvFormat[slot]);
+      }
+      sprintf_s(text + length, sizeof(text) - length, " cb=%p+%u,%p+%u", r.cb[0], r.cbFirst[0], r.cb[1], r.cbFirst[1]);
+      return text;
+    }
+
+    // The same call in two frames: kind, shaders and the target's size and
+    // format (the swap chain's buffers take turns from frame to frame).
+    static bool sameCall(const DrawRecord& a, const DrawRecord& b) {
+      return a.op == b.op && a.vs == b.vs && a.ps == b.ps && a.width == b.width && a.height == b.height
+          && a.format == b.format;
+    }
+
+    // What else differs between two records of the same call.
+    static std::string recordChanges(const DrawRecord& before, const DrawRecord& now) {
+      std::string changes;
+      char text[160];
+      if (before.target != now.target && !(before.swapChainTarget && now.swapChainTarget)) {
+        sprintf_s(text, " rt %p -> %p", before.target, now.target);
+        changes += text;
+      }
+      if (before.dropped != now.dropped)
+        changes += now.dropped ? " now DROPPED" : " was dropped";
+      if (before.count != now.count || before.instances != now.instances || before.start != now.start || before.base != now.base) {
+        sprintf_s(text, " count %u x%u start %u base %d -> %u x%u start %u base %d", before.count, before.instances,
+          before.start, before.base, now.count, now.instances, now.start, now.base);
+        changes += text;
+      }
+      for (uint32_t slot = 0; slot < 4; slot++) {
+        if (before.srv[slot] != now.srv[slot]) {
+          sprintf_s(text, " t%u %p %ux%u/%u -> %p %ux%u/%u", slot, before.srv[slot], before.srvWidth[slot],
+            before.srvHeight[slot], before.srvFormat[slot], now.srv[slot], now.srvWidth[slot], now.srvHeight[slot],
+            now.srvFormat[slot]);
+          changes += text;
+        }
+      }
+      for (uint32_t stage = 0; stage < 2; stage++) {
+        if (before.cb[stage] != now.cb[stage]) {
+          sprintf_s(text, " cb%u %p -> %p", stage, before.cb[stage], now.cb[stage]);
+          changes += text;
+        }
+      }
+      if (before.depth != now.depth) {
+        sprintf_s(text, " ds %p -> %p", before.depth, now.depth);
+        changes += text;
+      }
+      if (before.blend != now.blend || before.depthState != now.depthState || before.raster != now.raster
+       || before.stencilRef != now.stencilRef) {
+        sprintf_s(text, " states %p,%p,%p,%u -> %p,%p,%p,%u", before.blend, before.depthState, before.raster,
+          before.stencilRef, now.blend, now.depthState, now.raster, now.stencilRef);
+        changes += text;
+      }
+      if (std::memcmp(before.value, now.value, sizeof(now.value)) != 0) {
+        sprintf_s(text, " value %g,%g,%g,%g -> %g,%g,%g,%g", before.value[0], before.value[1], before.value[2],
+          before.value[3], now.value[0], now.value[1], now.value[2], now.value[3]);
+        changes += text;
+      }
+      return changes;
+    }
+
+  public:
+    // The number of calls of the frame presented `back` presents ago.
+    size_t HistoryCalls(uint32_t back) const {
+      if (!m_historyOn || m_isDeferred || back >= kHistoryFrames || m_historyFrame < back)
+        return SIZE_MAX;
+      return m_history[(m_historyFrame - back) % kHistoryFrames].size();
+    }
+
+    // The calls of the frame presented `back` presents ago (0: the frame
+    // being presented) against the frame before it, into the log (glitch
+    // `event` of the swap chain, at its present `present`). With `full`,
+    // also every call of the glitch frame.
+    void LogDrawHistory(uint32_t back, uint32_t present, uint32_t event, bool full) {
+      if (!m_historyOn || m_isDeferred || back + 1 >= kHistoryFrames || m_historyFrame < back + 1)
+        return;
+      const auto& now = m_history[(m_historyFrame - back) % kHistoryFrames];
+      const auto& before = m_history[(m_historyFrame - back - 1) % kHistoryFrames];
+      uint32_t dropped = 0;
+      for (const auto& r : now)
+        dropped += r.dropped ? 1u : 0u;
+      logMessage(LogLevel::Warn, "glitch %u: the frame before (present %u) has %zu calls, the glitch frame (present %u) %zu, %u of them dropped; differences:",
+        event, present - 1, before.size(), present, now.size(), dropped);
+      // Calls match in order by kind, shaders and target; a call with no
+      // match among the next 64 is in one frame only.
+      constexpr size_t kWindow = 64;
+      uint32_t lines = 0, suppressed = 0;
+      auto line = [&](const char* what, size_t index, const std::string& text) {
+        if (lines++ < 200)
+          logMessage(LogLevel::Warn, "glitch %u:   %s #%zu %s", event, what, index, text.c_str());
+        else
+          suppressed++;
+      };
+      size_t i = 0, j = 0;
+      while (i < before.size() || j < now.size()) {
+        if (i < before.size() && j < now.size() && sameCall(before[i], now[j])) {
+          const std::string changes = recordChanges(before[i], now[j]);
+          if (!changes.empty())
+            line("changed", j, describeRecord(now[j]) + " |" + changes);
+          i++, j++;
+          continue;
+        }
+        size_t aheadNow = j, aheadBefore = i;
+        while (aheadNow < now.size() && aheadNow < j + kWindow && !(i < before.size() && sameCall(before[i], now[aheadNow])))
+          aheadNow++;
+        if (i < before.size() && aheadNow < now.size() && aheadNow < j + kWindow) {
+          for (; j < aheadNow; j++)
+            line("only in the glitch frame", j, describeRecord(now[j]));
+          continue;
+        }
+        while (aheadBefore < before.size() && aheadBefore < i + kWindow && !(j < now.size() && sameCall(before[aheadBefore], now[j])))
+          aheadBefore++;
+        if (j < now.size() && aheadBefore < before.size() && aheadBefore < i + kWindow) {
+          for (; i < aheadBefore; i++)
+            line("only in the frame before", i, describeRecord(before[i]));
+          continue;
+        }
+        if (i < before.size())
+          line("only in the frame before", i, describeRecord(before[i])), i++;
+        if (j < now.size())
+          line("only in the glitch frame", j, describeRecord(now[j])), j++;
+      }
+      if (suppressed)
+        logMessage(LogLevel::Warn, "glitch %u:   %u more differences", event, suppressed);
+      if (!lines)
+        logMessage(LogLevel::Warn, "glitch %u:   none: the same calls with the same objects (the glitch comes from the data or the GPU)", event);
+      if (full) {
+        for (size_t index = 0; index < now.size() && index < 4000; index++)
+          logMessage(LogLevel::Warn, "glitch %u: call #%zu %s", event, index, describeRecord(now[index]).c_str());
       }
     }
 
@@ -2060,7 +2339,10 @@ namespace dxup {
       if (m_device->diagTraceDraws.load(std::memory_order_relaxed))
         traceDispatch(("DispatchIndirect" + traceIndirectArgs(pBufferForArgs, AlignedByteOffsetForArgs, 3)).c_str());
       if (!pBufferForArgs) return;
-      if (!prepareComputePipeline()) return;
+      const bool computePrepared = prepareComputePipeline();
+      if (m_historyOn && !m_isDeferred)
+        recordCall(RecordOp::Dispatch, 0, 0, AlignedByteOffsetForArgs, 0, !computePrepared);
+      if (!computePrepared) return;
       flushPendingBufferUpdates();
       rebindComputeDispatchState();
       IBackendBuffer* backendBuf = getBackendBuffer(pBufferForArgs);
@@ -2853,6 +3135,8 @@ namespace dxup {
       DXUP_CONTEXT_MT_GUARD;
       if (!pRenderTargetView || !ColorRGBA) return;
       IBackendImageView* backendRTV = getBackendRTV(pRenderTargetView);
+      if (m_historyOn && !m_isDeferred)
+        recordClear(RecordOp::ClearColor, pRenderTargetView, backendRTV, ColorRGBA);
       {
         auto* view = static_cast<D3D11RenderTargetView*>(pRenderTargetView);
         if (IBackendImageView* shadow = clearedForcedMsaaShadow(view->GetResourceRaw(), view->GetShadowView(), true))
@@ -2872,6 +3156,10 @@ namespace dxup {
       DXUP_CONTEXT_MT_GUARD;
       if (!pDepthStencilView) return;
       IBackendImageView* backendDSV = getBackendDSV(pDepthStencilView);
+      if (m_historyOn && !m_isDeferred) {
+        const float value[4] = { Depth, float(Stencil), float(ClearFlags), 0.0f };
+        recordClear(RecordOp::ClearDepth, pDepthStencilView, backendDSV, value);
+      }
       {
         auto* view = static_cast<D3D11DepthStencilView*>(pDepthStencilView);
         // All of it is cleared when every plane of the format is.

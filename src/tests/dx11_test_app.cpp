@@ -470,6 +470,7 @@ void main(uint2 id : SV_DispatchThreadID) {
         {"forced_msaa_nan_samples", &Dx11TestApp::testForcedMsaaNanSamples},
         {"spatial_upscale", &Dx11TestApp::testSpatialUpscale},
         {"render_scale", &Dx11TestApp::testRenderScale},
+        {"glitch_report", &Dx11TestApp::testGlitchReport},
         {"upscaler_auto_detect", &Dx11TestApp::testUpscalerAutoDetect},
         {"upscaler_inject_detect", &Dx11TestApp::testUpscalerInjectDetect},
         {"async_shaders", &Dx11TestApp::testAsyncShaders},
@@ -7897,6 +7898,41 @@ float4 main(float4 position : SV_Position, float4 t0 : TEXCOORD0, float4 t : TEX
     // share of the size it asks for (natively the size it asks for).
     bool testRenderScale(std::string& error) {
       return runChildWithConfig("dxgi.renderScale = 0.5\n", "--spatial-child scale", error);
+    }
+
+    // Glitch reports (with dxup_frame_dump.txt next to the DLL): a triangle
+    // that goes black for one frame (it reads another constant buffer) is
+    // seen as a flicker; the glitch frame is saved and the log names the
+    // changed constant buffer of the draw (see runGlitchChild).
+    bool testGlitchReport(std::string& error) {
+      if (!runsOnDxup()) {
+        error = "SKIP: needs DXUP";
+        return false;
+      }
+      char path[MAX_PATH] = {};
+      GetModuleFileNameA(nullptr, path, MAX_PATH);
+      std::string dir = path;
+      dir.resize(dir.find_last_of('\\') + 1);
+      const std::string marker = dir + "dxup_frame_dump.txt";
+      auto removeImages = [&] {
+        WIN32_FIND_DATAA found = {};
+        for (const char* pattern : { "dxup_frame_*.bmp", "dxup_glitch_*.bmp" }) {
+          HANDLE find = FindFirstFileA((dir + pattern).c_str(), &found);
+          if (find == INVALID_HANDLE_VALUE)
+            continue;
+          do
+            DeleteFileA((dir + found.cFileName).c_str());
+          while (FindNextFileA(find, &found));
+          FindClose(find);
+        }
+      };
+      removeImages();
+      if (FILE* file = std::fopen(marker.c_str(), "w"))
+        std::fclose(file);
+      const bool passed = runChildProcess("--glitch-child", error);
+      DeleteFileA(marker.c_str());
+      removeImages();
+      return passed;
     }
 
     // d3d11.upscalerInject on a game without TAA: a turning camera over a
@@ -20956,6 +20992,126 @@ float4 main() : SV_Target { return color; }
     return result;
   }
 
+  // See testGlitchReport. Returns 0 or the failed check.
+  int runGlitchChild() {
+    WNDCLASSA windowClass = {};
+    windowClass.lpfnWndProc = DefWindowProcA;
+    windowClass.hInstance = GetModuleHandleA(nullptr);
+    windowClass.lpszClassName = "Dx11TestGlitch";
+    RegisterClassA(&windowClass);
+    RECT rect = { 0, 0, 320, 180 };
+    AdjustWindowRect(&rect, WS_OVERLAPPEDWINDOW, FALSE);
+    HWND window = CreateWindowExA(0, windowClass.lpszClassName, "glitch report", WS_OVERLAPPEDWINDOW,
+      CW_USEDEFAULT, CW_USEDEFAULT, rect.right - rect.left, rect.bottom - rect.top, nullptr, nullptr,
+      windowClass.hInstance, nullptr);
+    if (!window)
+      return 2;
+    DXGI_SWAP_CHAIN_DESC scDesc = {};
+    scDesc.BufferDesc.Width = 320;
+    scDesc.BufferDesc.Height = 180;
+    scDesc.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    scDesc.SampleDesc.Count = 1;
+    scDesc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    scDesc.BufferCount = 2;
+    scDesc.OutputWindow = window;
+    scDesc.Windowed = TRUE;
+    scDesc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+    ComPtr<ID3D11Device> device;
+    ComPtr<ID3D11DeviceContext> context;
+    ComPtr<IDXGISwapChain> swapChain;
+    D3D_FEATURE_LEVEL level = D3D_FEATURE_LEVEL_11_0;
+    if (FAILED(D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, &level, 1,
+          D3D11_SDK_VERSION, &scDesc, swapChain.GetAddressOf(), device.GetAddressOf(), nullptr, context.GetAddressOf())))
+      return 3;
+    // A triangle over the left half, its color from b0.
+    static const char* kVs = R"(
+float4 main(uint vertexId : SV_VertexID) : SV_Position {
+  float2 position = float2((vertexId << 1) & 2, vertexId & 2);
+  return float4(position * float2(1.0f, -2.0f) + float2(-1.0f, 1.0f), 0.0f, 1.0f);
+}
+)";
+    static const char* kPs = R"(
+cbuffer DrawColor : register(b0) { float4 color; };
+float4 main() : SV_Target { return color; }
+)";
+    ShaderCompiler compiler;
+    std::string compileError;
+    ComPtr<ID3DBlob> vsBlob, psBlob;
+    ComPtr<ID3D11VertexShader> vs;
+    ComPtr<ID3D11PixelShader> ps;
+    ComPtr<ID3D11Buffer> white, black;
+    const float whiteColor[4] = { 1.0f, 1.0f, 1.0f, 1.0f }, blackColor[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+    D3D11_BUFFER_DESC cbDesc = {};
+    cbDesc.ByteWidth = 16;
+    cbDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    D3D11_SUBRESOURCE_DATA whiteData = { whiteColor }, blackData = { blackColor };
+    if (!compiler.compile(kVs, "main", "vs_5_0", vsBlob, compileError)
+     || !compiler.compile(kPs, "main", "ps_5_0", psBlob, compileError)
+     || FAILED(device->CreateVertexShader(vsBlob->GetBufferPointer(), vsBlob->GetBufferSize(), nullptr, vs.GetAddressOf()))
+     || FAILED(device->CreatePixelShader(psBlob->GetBufferPointer(), psBlob->GetBufferSize(), nullptr, ps.GetAddressOf()))
+     || FAILED(device->CreateBuffer(&cbDesc, &whiteData, white.GetAddressOf()))
+     || FAILED(device->CreateBuffer(&cbDesc, &blackData, black.GetAddressOf())))
+      return 4;
+    ComPtr<ID3D11Texture2D> buffer;
+    ComPtr<ID3D11RenderTargetView> rtv;
+    if (FAILED(swapChain->GetBuffer(0, IID_PPV_ARGS(buffer.GetAddressOf())))
+     || FAILED(device->CreateRenderTargetView(buffer.Get(), nullptr, rtv.GetAddressOf())))
+      return 5;
+    const D3D11_VIEWPORT viewport = { 0.0f, 0.0f, 320.0f, 180.0f, 0.0f, 1.0f };
+    const float gray[4] = { 0.5f, 0.5f, 0.5f, 1.0f };
+    // Frame 20 (present 20) draws the triangle black.
+    for (int frame = 1; frame <= 40; frame++) {
+      context->OMSetRenderTargets(1, rtv.GetAddressOf(), nullptr);
+      context->RSSetViewports(1, &viewport);
+      context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+      context->VSSetShader(vs.Get(), nullptr, 0);
+      context->PSSetShader(ps.Get(), nullptr, 0);
+      context->PSSetConstantBuffers(0, 1, frame == 20 ? black.GetAddressOf() : white.GetAddressOf());
+      context->ClearRenderTargetView(rtv.Get(), gray);
+      // As many calls as a game frame has at least (fewer count as video).
+      for (int draw = 0; draw < 12; draw++)
+        context->Draw(3, 0);
+      if (FAILED(swapChain->Present(0, 0)))
+        return 6;
+      Sleep(5);
+    }
+    rtv.Reset();
+    buffer.Reset();
+    context->ClearState();
+    context->Flush();
+    // The glitch frame as an image, and the log.
+    char path[MAX_PATH] = {};
+    GetModuleFileNameA(nullptr, path, MAX_PATH);
+    std::string dir = path;
+    dir.resize(dir.find_last_of('\\') + 1);
+    const bool image = GetFileAttributesA((dir + "dxup_glitch_20.bmp").c_str()) != INVALID_FILE_ATTRIBUTES
+      && GetFileAttributesA((dir + "dxup_glitch_20_before.bmp").c_str()) != INVALID_FILE_ATTRIBUTES;
+    std::string log;
+    if (FILE* file = _fsopen((dir + "logdxup_dxgi.log").c_str(), "rb", _SH_DENYNO)) {
+      char chunk[4096];
+      for (size_t read; (read = std::fread(chunk, 1, sizeof(chunk), file)) > 0;)
+        log.append(chunk, read);
+      std::fclose(file);
+    }
+    if (FILE* file = _fsopen((dir + "logdxup.log").c_str(), "rb", _SH_DENYNO)) {
+      char chunk[4096];
+      for (size_t read; (read = std::fread(chunk, 1, sizeof(chunk), file)) > 0;)
+        log.append(chunk, read);
+      std::fclose(file);
+    }
+    swapChain.Reset();
+    DestroyWindow(window);
+    if (log.find("glitch 1: present 20, 1 frame") == std::string::npos)
+      return 10;
+    if (!image)
+      return 11;
+    // The draw's constant buffer changed: "changed #1 Draw ... | cb1 <white> -> <black>".
+    const size_t changed = log.find("glitch 1:   changed #1 Draw");
+    if (changed == std::string::npos || log.find(" cb1 ", changed) == std::string::npos)
+      return 12;
+    return 0;
+  }
+
   // See testLazyRenderTargets. Returns 0 or the failed check.
   int runLazyRenderTargetsChild() {
     ComPtr<ID3D11Device> device;
@@ -21608,6 +21764,8 @@ int main(int argc, char** argv) {
     return runUpscalerAutoChild();
   if (argc > 1 && std::strcmp(argv[1], "--spatial-child") == 0)
     return runSpatialChild(argc > 2 && std::strcmp(argv[2], "scale") == 0);
+  if (argc > 1 && std::strcmp(argv[1], "--glitch-child") == 0)
+    return runGlitchChild();
   if (argc > 1 && std::strcmp(argv[1], "--msaa-nan-child") == 0)
     return runMsaaNanChild();
   if (argc > 1 && std::strcmp(argv[1], "--relaxed-uav-child") == 0)
