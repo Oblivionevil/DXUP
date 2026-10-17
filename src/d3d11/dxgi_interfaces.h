@@ -2148,6 +2148,12 @@ namespace dxup {
         if (!after || !before || !middle[0] || (frames == 2 && !middle[1]))
           continue;
         const size_t tiles = after->luma.size();
+        // How much the picture moves: the mean difference of the frames
+        // around (0 for a still camera).
+        uint64_t motionSum = 0;
+        for (size_t t = 0; t < tiles; t++)
+          motionSum += uint32_t(std::abs(int(before->luma[t]) - int(after->luma[t])));
+        const uint32_t motion = uint32_t(motionSum / (std::max)(tiles, size_t(1)));
         uint32_t dark = 0, bright = 0;
         uint32_t box[4] = { UINT32_MAX, UINT32_MAX, 0, 0 };
         uint32_t lumaBefore = 0, lumaGlitch = 0, lumaAfter = 0;
@@ -2176,8 +2182,17 @@ namespace dxup {
           lumaAfter += uint32_t(b);
         }
         const uint32_t count = dark + bright;
-        if (count < 4)
+        // A patch, not tiles strewn over the picture (edges of a moving
+        // camera): at least 6 tiles filling a fifth of their bounding box.
+        const uint32_t area = count ? (box[2] - box[0] + 1) * (box[3] - box[1] + 1) : 0;
+        if (count < 6 || count * 5 < area)
           continue;
+        // With the camera moving, near objects cross the picture within a
+        // frame: then only a larger patch (2 % of the picture) counts.
+        if (motion > 4 && count * 50 < tiles) {
+          m_glitchSuppressed++;
+          continue;
+        }
         const uint32_t glitch = q - frames;
         // One flicker is seen once (as one frame, not again as two).
         if (glitch <= m_glitchLastEvent)
