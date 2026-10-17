@@ -149,6 +149,25 @@ namespace {
 
 using namespace dxup;
 
+extern "C" HRESULT __stdcall DXUPCreateDXGIAdapter(
+    IDXGIAdapter1* realAdapter, IDXGIFactory4* realFactory, IDXGIAdapter1** ppAdapter) {
+  if (!ppAdapter)
+    return E_POINTER;
+  *ppAdapter = nullptr;
+  if (!realAdapter || !realFactory)
+    return E_INVALIDARG;
+
+  auto* factory = new (std::nothrow) DXGIFactory(ComPtr<IDXGIFactory4>(realFactory));
+  if (!factory)
+    return E_OUTOFMEMORY;
+  auto* adapter = new (std::nothrow) DXGIAdapter(ComPtr<IDXGIAdapter1>(realAdapter), factory);
+  factory->Release();
+  if (!adapter)
+    return E_OUTOFMEMORY;
+  *ppAdapter = adapter;
+  return S_OK;
+}
+
 BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
   (void)lpvReserved;
 

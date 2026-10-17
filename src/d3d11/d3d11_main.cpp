@@ -77,6 +77,27 @@ namespace {
     ComPtr<IDXGIFactory4> realFactory = d3d12Backend->getDxgiFactory();
     ComPtr<IDXGIAdapter1> realAdapter = d3d12Backend->getAdapter();
 
+    // Keep device-parent factories in the same DLL as exported factories.
+    // Overlays hook one factory vtable; a second copy in d3d11.dll would
+    // bypass their CreateSwapChain hook when the game uses GetAdapter().
+    wchar_t dxgiPath[MAX_PATH] = {};
+    const DWORD length = GetModuleFileNameW(s_ourDllInstance, dxgiPath, MAX_PATH);
+    wchar_t* name = length && length < MAX_PATH ? wcsrchr(dxgiPath, L'\\') : nullptr;
+    if (name) {
+      wcscpy_s(name + 1, MAX_PATH - size_t(name + 1 - dxgiPath), L"dxgi.dll");
+      HMODULE dxgiModule = GetModuleHandleW(dxgiPath);
+      if (!dxgiModule)
+        dxgiModule = LoadLibraryW(dxgiPath);
+      using CreateAdapter = HRESULT (WINAPI*)(IDXGIAdapter1*, IDXGIFactory4*, IDXGIAdapter1**);
+      auto createAdapter = dxgiModule ? reinterpret_cast<CreateAdapter>(
+        GetProcAddress(dxgiModule, "DXUPCreateDXGIAdapter")) : nullptr;
+      ComPtr<IDXGIAdapter1> sharedAdapter;
+      if (createAdapter && SUCCEEDED(createAdapter(realAdapter.Get(), realFactory.Get(),
+          sharedAdapter.GetAddressOf())) && sharedAdapter)
+        return static_cast<DXGIAdapter*>(sharedAdapter.Detach());
+    }
+
+    // Also support an older dxgi.dll, or a standalone d3d11.dll.
     DXGIFactory* factoryWrapper = realFactory ? new DXGIFactory(realFactory) : nullptr;
     DXGIAdapter* adapterWrapper = new DXGIAdapter(realAdapter, factoryWrapper);
 

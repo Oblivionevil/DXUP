@@ -4,3 +4,4 @@ EXPORTS
   CreateDXGIFactory1
   CreateDXGIFactory2
   DXGIDeclareAdapterRemovalSupport
+  DXUPCreateDXGIAdapter
