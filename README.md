@@ -1,5 +1,7 @@
 # DXUP
 
+[![Downloads](https://img.shields.io/github/downloads/Oblivionevil/DXUP/total)](https://github.com/Oblivionevil/DXUP/releases)
+
 > **Note: this project was written by an AI.** The code, the tests and the
 > documentation were written by Anthropic's Claude (Claude Code). The
 > maintainer directs the work and tests it in games.
