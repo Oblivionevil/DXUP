@@ -1,0 +1,31 @@
+// Version information of DXUP's DLLs: the manager recognizes DXUP's files by
+// their product name.
+#include <winver.h>
+
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION     @VERSION_COMMAS@
+PRODUCTVERSION  @VERSION_COMMAS@
+FILEFLAGSMASK   VS_FFI_FILEFLAGSMASK
+FILEFLAGS       0
+FILEOS          VOS_NT_WINDOWS32
+FILETYPE        VFT_DLL
+FILESUBTYPE     VFT2_UNKNOWN
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    BLOCK "040904B0"
+    BEGIN
+      VALUE "CompanyName",      "DXUP"
+      VALUE "FileDescription",  "DXUP @DLL_NAME@ (Direct3D on Direct3D 12)"
+      VALUE "FileVersion",      "@VERSION@"
+      VALUE "InternalName",     "@DLL_NAME@"
+      VALUE "OriginalFilename", "@DLL_NAME@"
+      VALUE "ProductName",      "DXUP"
+      VALUE "ProductVersion",   "@VERSION@"
+    END
+  END
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x409, 1200
+  END
+END

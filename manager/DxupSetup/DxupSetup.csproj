@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <UseWPF>true</UseWPF>
+    <AssemblyName>DXUP-Setup</AssemblyName>
+    <RootNamespace>Dxup.Setup</RootNamespace>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <ApplicationIcon>..\Shared\dxup.ico</ApplicationIcon>
+    <!-- Staging folder with what the setup installs (build_package.ps1):
+         "DXUP Manager.exe", bin\d3d11.dll, bin\dxgi.dll, README.txt. -->
+    <PayloadDir Condition="'$(PayloadDir)' == ''">$(MSBuildThisFileDirectory)..\..\artifacts\package\payload</PayloadDir>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="..\Shared\*.cs" Link="Shared\%(Filename)%(Extension)" />
+    <Page Include="..\Shared\Themes\*.xaml" Link="Themes\%(Filename)%(Extension)" />
+    <Resource Include="..\Shared\dxup.ico" Link="dxup.ico" />
+    <Reference Include="System.Windows.Forms" />
+    <EmbeddedResource Include="$(PayloadDir)\**\*" LogicalName="payload/%(RecursiveDir)%(Filename)%(Extension)" />
+  </ItemGroup>
+</Project>

@@ -1,0 +1,37 @@
+# Build output
+output/
+build/
+
+# Logs
+*.log
+
+# Windows artifacts
+nul
+
+# Claude config
+.claude/
+
+# Build artifacts
+*.dll
+*.exe
+*.obj
+*.o
+*.pdb
+*.lib
+*.exp
+*.ilk
+
+# Local test, benchmark, trace and package output.
+/artifacts/*
+
+# IDE
+.vs/
+.vscode/
+*.suo
+*.user
+*.sln.docstates
+
+# .NET build output of the manager and setup
+manager/**/bin/
+manager/**/obj/
+artifacts/package/

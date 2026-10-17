@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <UseWPF>true</UseWPF>
+    <AssemblyName>DXUP Manager</AssemblyName>
+    <RootNamespace>Dxup.Manager</RootNamespace>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <ApplicationIcon>..\Shared\dxup.ico</ApplicationIcon>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="..\Shared\*.cs" Link="Shared\%(Filename)%(Extension)" />
+    <Page Include="..\Shared\Themes\*.xaml" Link="Themes\%(Filename)%(Extension)" />
+    <Resource Include="..\Shared\dxup.ico" Link="dxup.ico" />
+    <Reference Include="System.Drawing" />
+    <Reference Include="System.Management" />
+  </ItemGroup>
+</Project>

@@ -1,0 +1,27 @@
+LIBRARY d3d9.dll
+; The ordinals of Windows' d3d9.dll: Windows' compatibility shims call the
+; unnamed ones by ordinal (DXMaximizedWindowedMode: 17, for Gothic II).
+EXPORTS
+  Direct3D9ForceHybridEnumeration @16 NONAME
+  Direct3D9SetMaximizedWindowedModeShim @17 NONAME
+  Direct3D9SetSwapEffectUpgradeShim @18 NONAME
+  Direct3D9Force9on12 @19 NONAME
+  Direct3DCreate9On12 @20
+  Direct3DCreate9On12Ex @21
+  Direct3D9Ordinal22 @22 NONAME
+  Direct3D9Ordinal23 @23 NONAME
+  Direct3DShaderValidatorCreate9 @24
+  PSGPError @25
+  PSGPSampleTexture @26
+  D3DPERF_BeginEvent @27
+  D3DPERF_EndEvent @28
+  D3DPERF_GetStatus @29
+  D3DPERF_QueryRepeatFrame @30
+  D3DPERF_SetMarker @31
+  D3DPERF_SetOptions @32
+  D3DPERF_SetRegion @33
+  DebugSetLevel @34
+  DebugSetMute @35
+  Direct3D9EnableMaximizedWindowedModeShim @36
+  Direct3DCreate9 @37
+  Direct3DCreate9Ex @38

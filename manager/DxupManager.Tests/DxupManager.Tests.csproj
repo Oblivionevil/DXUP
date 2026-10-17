@@ -1,0 +1,11 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- Console checks of the shared manager code: games.cfg, Steam and Battle.net, PE headers. -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <UseWPF>true</UseWPF>
+    <RootNamespace>Dxup.Tests</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="..\Shared\*.cs" Link="Shared\%(Filename)%(Extension)" />
+  </ItemGroup>
+</Project>

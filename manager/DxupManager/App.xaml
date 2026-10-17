@@ -1,0 +1,6 @@
+<Application x:Class="Dxup.Manager.App"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             ShutdownMode="OnMainWindowClose">
+  <!-- Styles and the light or dark colors are merged at startup (Shared/Theme.cs). -->
+</Application>

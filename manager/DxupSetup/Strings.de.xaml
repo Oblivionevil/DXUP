@@ -1,0 +1,35 @@
+<ResourceDictionary xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+                    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+                    xmlns:sys="clr-namespace:System;assembly=mscorlib">
+  <sys:String x:Key="SetupTitle">DXUP {0}</sys:String>
+  <sys:String x:Key="Subtitle">Direct3D 11 über Direct3D 12 – Installation</sys:String>
+  <sys:String x:Key="Welcome">DXUP führt Direct3D-11-Spiele über Direct3D 12 aus. Mit dem DXUP Manager legst du fest, welche Spiele DXUP nutzen und mit welchen Einstellungen (MSAA, Supersampling, Filterung, VSync, vorgerenderte Frames).</sys:String>
+  <sys:String x:Key="InstallTo">Installationsordner</sys:String>
+  <sys:String x:Key="Browse">Ändern …</sys:String>
+  <sys:String x:Key="DesktopShortcut">Verknüpfung auf dem Desktop anlegen</sys:String>
+  <sys:String x:Key="Install">Installieren</sys:String>
+  <sys:String x:Key="Upgrade">Aktualisieren</sys:String>
+  <sys:String x:Key="UpgradeInfo">DXUP {0} ist bereits installiert und wird auf {1} aktualisiert. Deine Spiele und ihre Einstellungen bleiben erhalten; Spiele mit DXUP bekommen die neue Version.</sys:String>
+  <sys:String x:Key="Cancel">Abbrechen</sys:String>
+  <sys:String x:Key="Close">Schließen</sys:String>
+  <sys:String x:Key="Finish">Fertig stellen</sys:String>
+  <sys:String x:Key="Installing">DXUP wird installiert …</sys:String>
+  <sys:String x:Key="Done">DXUP {0} ist installiert.</sys:String>
+  <sys:String x:Key="StartManager">DXUP Manager starten</sys:String>
+  <sys:String x:Key="ManagerRunning">Der DXUP Manager läuft noch. Bitte schließe ihn und klicke dann auf OK.</sys:String>
+  <sys:String x:Key="Uninstall">Deinstallieren</sys:String>
+  <sys:String x:Key="UninstallInfo">DXUP wird aus allen Spielen entfernt – DLLs anderer Programme, die DXUP gesichert hat, kommen zurück – und anschließend deinstalliert.</sys:String>
+  <sys:String x:Key="KeepSettings">Spiele-Einstellungen behalten (games.cfg) für eine spätere Installation</sys:String>
+  <sys:String x:Key="Uninstalling">DXUP wird deinstalliert …</sys:String>
+  <sys:String x:Key="Uninstalled">DXUP wurde deinstalliert.</sys:String>
+  <sys:String x:Key="ErrFailed">Fehler: {0}</sys:String>
+  <sys:String x:Key="GameErrors">Bei diesen Spielen ging es nicht (läuft das Spiel noch?):
+{0}</sys:String>
+  <sys:String x:Key="StepFiles">Dateien kopieren</sys:String>
+  <sys:String x:Key="StepRegistry">Bei Windows registrieren</sys:String>
+  <sys:String x:Key="StepShortcuts">Verknüpfungen</sys:String>
+  <sys:String x:Key="StepGames">Spiele auf die neue DXUP-Version bringen</sys:String>
+  <sys:String x:Key="StepRemoveGames">DXUP aus den Spielen entfernen</sys:String>
+  <sys:String x:Key="StepRemoveFiles">Dateien entfernen</sys:String>
+  <sys:String x:Key="NeedsX64">DXUP benötigt ein 64-Bit-Windows.</sys:String>
+</ResourceDictionary>

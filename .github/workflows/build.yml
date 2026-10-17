@@ -1,0 +1,33 @@
+name: Build
+
+on:
+  push:
+    branches: ['*']
+  pull_request:
+    branches: [master]
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Install Meson and Ninja
+        run: pip install meson ninja
+
+      - name: Configure
+        run: meson setup build --backend=ninja
+
+      - name: Build
+        run: ninja -C build
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dxup-windows
+          path: |
+            build/src/**/d3d11.dll
+            build/src/**/dxgi.dll

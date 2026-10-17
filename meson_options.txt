@@ -1,0 +1,26 @@
+option('enable_d3d12_backend', type : 'boolean', value : true,
+  description : 'Enable D3D12 backend')
+
+option('enable_d3d11', type : 'boolean', value : true,
+  description : 'Build D3D11 wrapper')
+
+option('enable_d3d10', type : 'boolean', value : false,
+  description : 'Build D3D10 wrapper')
+
+option('enable_dxgi', type : 'boolean', value : true,
+  description : 'Build DXGI layer')
+
+option('enable_ddraw', type : 'boolean', value : true,
+  description : 'Build ddraw.dll (DirectDraw 7, Direct3D 7)')
+
+# Temporal upscalers (d3d11.upscaler in dxup.conf). The SDKs stay outside
+# the repository: each option names an SDK folder, empty leaves it out.
+# 64-bit builds only.
+option('dlss_sdk', type : 'string', value : '',
+  description : 'NVIDIA DLSS SDK folder (include/, lib/nvsdk_ngx_s.lib)')
+
+option('ffx_sdk', type : 'string', value : '',
+  description : 'AMD FidelityFX SDK Kits/FidelityFX folder (api/include, upscalers/include)')
+
+option('xess_sdk', type : 'string', value : '',
+  description : 'Intel XeSS SDK folder (inc/xess/)')
