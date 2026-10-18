@@ -329,6 +329,7 @@ namespace dxup::d3d9 {
     if (!window)
       return;
     HMONITOR monitor = MonitorFromWindow(window, MONITOR_DEFAULTTOPRIMARY);
+    dpiAwareForFullScreen(monitor);
     MONITORINFO info = { sizeof(info) };
     if (!GetMonitorInfoW(monitor, &info))
       return;

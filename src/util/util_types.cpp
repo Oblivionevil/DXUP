@@ -129,6 +129,40 @@ namespace dxup {
 #endif
   }
 
+#ifdef _WIN32
+  void dpiAwareForFullScreen(HMONITOR monitor) {
+    // Windows' runtimes do this once: per-monitor (2) where the monitor's
+    // scale differs from what the process's awareness renders at.
+    static bool done = false;
+    if (done || !monitor)
+      return;
+    using GetAwareness = BOOL (WINAPI*)(HANDLE, int*);
+    using SetAwareness = BOOL (WINAPI*)(int);
+    HMODULE user32 = GetModuleHandleA("user32.dll");
+    const auto getAwareness = user32 ? reinterpret_cast<GetAwareness>(GetProcAddress(user32, "GetProcessDpiAwarenessInternal")) : nullptr;
+    const auto setAwareness = user32 ? reinterpret_cast<SetAwareness>(GetProcAddress(user32, "SetProcessDpiAwarenessInternal")) : nullptr;
+    int awareness = 0;
+    if (!getAwareness || !setAwareness || !getAwareness(nullptr, &awareness) || awareness == 2)
+      return;
+    // Scaled for this process: the monitor's size as it sees it differs
+    // from its display mode, which is in pixels.
+    MONITORINFOEXW info = {};
+    info.cbSize = sizeof(info);
+    DEVMODEW mode = {};
+    mode.dmSize = sizeof(mode);
+    if (!GetMonitorInfoW(monitor, &info) || !EnumDisplaySettingsW(info.szDevice, ENUM_CURRENT_SETTINGS, &mode))
+      return;
+    const LONG width = info.rcMonitor.right - info.rcMonitor.left;
+    const LONG height = info.rcMonitor.bottom - info.rcMonitor.top;
+    if (width == LONG(mode.dmPelsWidth) && height == LONG(mode.dmPelsHeight))
+      return;
+    done = true;
+    const BOOL ok = setAwareness(2);
+    logMessageImpl(LogLevel::Info, "DPI: full screen on a monitor of %ldx%ld pixels seen as %ldx%ld: per-monitor DPI aware%s",
+      long(mode.dmPelsWidth), long(mode.dmPelsHeight), long(width), long(height), ok ? "" : " (failed)");
+  }
+#endif
+
   void logMessageImpl(LogLevel level, const char* fmt, ...) {
     if (level < getMinimumLogLevel()) return;
 

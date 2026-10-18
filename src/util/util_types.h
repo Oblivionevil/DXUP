@@ -12,6 +12,7 @@
 
 #ifdef _WIN32
 #include <guiddef.h>
+struct HMONITOR__;   // HMONITOR
 #endif
 
 #if defined(_M_IX86)
@@ -77,6 +78,14 @@ namespace dxup {
   bool processExiting();
 
 #ifdef _WIN32
+  // Full screen on a scaled monitor (Direct3D 9, Direct3D 8, DirectDraw):
+  // a process that is not per-monitor DPI aware becomes so, as Windows'
+  // d3d9.dll, ddraw.dll and dxgi.dll make it there. Its window then covers
+  // the monitor in pixels; else games size their rendering by the scaled
+  // desktop (Trine 2 at 150 %: 2560x1440 of a 3840x2160 screen). Call
+  // before the window is placed on the monitor.
+  void dpiAwareForFullScreen(HMONITOR__* monitor);
+
   // Formats a GUID / interface ID for debug logging.
   std::string formatGuid(const GUID& guid);
 

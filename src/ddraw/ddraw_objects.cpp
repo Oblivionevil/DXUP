@@ -2199,6 +2199,8 @@ namespace dxup::ddraw {
   // Exclusive full screen: the window covers its monitor, without a frame.
   void DirectDraw::coverMonitor() {
     if (m_window && m_fullscreen) {
+      // Before the window's place is kept: in the coordinates it then has.
+      dpiAwareForFullScreen(MonitorFromWindow(m_window, MONITOR_DEFAULTTOPRIMARY));
       if (!m_savedStyle) {
         m_savedStyle = GetWindowLongW(m_window, GWL_STYLE);
         GetWindowRect(m_window, &m_savedRect);

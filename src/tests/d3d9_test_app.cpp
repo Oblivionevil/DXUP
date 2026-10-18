@@ -1569,6 +1569,50 @@ VO main(float3 p : POSITION, float4 c : COLOR0) { VO o; o.p = float4(p.xy, 0.5, 
     return result;
   }
 
+  // Full screen on a scaled monitor: the process becomes per-monitor DPI
+  // aware (as with Windows' d3d9.dll) and the window covers the monitor in
+  // pixels. 0 ok, 1 not DPI aware, 2 window not the monitor's size, 3 the
+  // monitor is not scaled, 4 no device. The window covers the screen for a
+  // moment: run on request only.
+  int dpiFullscreenChild(Runtime& runtime) {
+    HMONITOR monitor = MonitorFromPoint(POINT{ 0, 0 }, MONITOR_DEFAULTTOPRIMARY);
+    MONITORINFOEXW info = {};
+    info.cbSize = sizeof(info);
+    DEVMODEW mode = {};
+    mode.dmSize = sizeof(mode);
+    GetMonitorInfoW(monitor, &info);
+    EnumDisplaySettingsW(info.szDevice, ENUM_CURRENT_SETTINGS, &mode);
+    if (LONG(mode.dmPelsWidth) == info.rcMonitor.right - info.rcMonitor.left)
+      return 3;
+    IDirect3D9* d3d = runtime.create(D3D_SDK_VERSION);
+    if (!d3d) return 4;
+    HWND window = createWindow();
+    D3DPRESENT_PARAMETERS pp = {};
+    pp.Windowed = FALSE;
+    pp.SwapEffect = D3DSWAPEFFECT_DISCARD;
+    pp.BackBufferWidth = mode.dmPelsWidth;
+    pp.BackBufferHeight = mode.dmPelsHeight;
+    pp.BackBufferFormat = D3DFMT_X8R8G8B8;
+    pp.hDeviceWindow = window;
+    pp.PresentationInterval = D3DPRESENT_INTERVAL_IMMEDIATE;
+    IDirect3DDevice9* device = nullptr;
+    if (FAILED(d3d->CreateDevice(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, window, D3DCREATE_HARDWARE_VERTEXPROCESSING, &pp, &device))) {
+      d3d->Release();
+      DestroyWindow(window);
+      return 4;
+    }
+    RECT rect = {};
+    GetWindowRect(window, &rect);
+    const bool aware = GetAwarenessFromDpiAwarenessContext(GetThreadDpiAwarenessContext()) == DPI_AWARENESS_PER_MONITOR_AWARE;
+    const bool covers = rect.right - rect.left == LONG(mode.dmPelsWidth) && rect.bottom - rect.top == LONG(mode.dmPelsHeight);
+    std::printf("window %ldx%ld, monitor %lux%lu pixels, per-monitor aware %d\n", rect.right - rect.left, rect.bottom - rect.top,
+      mode.dmPelsWidth, mode.dmPelsHeight, int(aware));
+    device->Release();
+    d3d->Release();
+    DestroyWindow(window);
+    return !aware ? 1 : !covers ? 2 : 0;
+  }
+
   // Runs this program with the arguments; its exit code (-1: not started).
   int runSelf(const char* arguments) {
     wchar_t exe[MAX_PATH];
@@ -1595,7 +1639,7 @@ int main(int argc, char** argv) {
   bool dumpImages = false, memory = false;
   const char* filter = nullptr;
   int benchFrames = 0, benchDraws = 0;
-  bool childForcedMsaa = false, identifier = false;
+  bool childForcedMsaa = false, identifier = false, childDpi = false;
   unsigned variantNonce = 0;
   for (int i = 1; i < argc; i++) {
     if (std::strcmp(argv[i], "--dump") == 0) dumpImages = true;
@@ -1603,6 +1647,7 @@ int main(int argc, char** argv) {
     else if (std::strcmp(argv[i], "--memory") == 0) memory = true;
     else if (std::strcmp(argv[i], "--forced-msaa-child") == 0) childForcedMsaa = true;
     else if (std::strcmp(argv[i], "--identifier") == 0) identifier = true;
+    else if (std::strcmp(argv[i], "--dpi-child") == 0) childDpi = true;
     else if (std::strcmp(argv[i], "--variant-child") == 0 && i + 1 < argc) variantNonce = unsigned(std::strtoul(argv[++i], nullptr, 10));
     else if (std::strcmp(argv[i], "--bench") == 0 && i + 2 < argc) { benchFrames = std::atoi(argv[i + 1]); benchDraws = std::atoi(argv[i + 2]); i += 2; }
     else filter = argv[i];
@@ -1630,6 +1675,9 @@ int main(int argc, char** argv) {
     std::printf("%d\n", partial);
     return partial < 0 ? 255 : (std::min)(partial, 254);
   }
+
+  if (childDpi)
+    return dpiFullscreenChild(dxup);
 
   if (variantNonce)
     return variantChild(dxup, variantNonce) == 0 ? 0 : 1;
@@ -1760,6 +1808,19 @@ int main(int argc, char** argv) {
     std::printf("%s %-20s draws compiling or waiting: %d first run, %d second (exit %d, %d)\n", ok ? "ok  " : "FAIL",
                 "shader_warmup", first, second, firstExit, secondExit);
     ok ? passed++ : failed++;
+  }
+  // Full screen on a scaled monitor (requested by name: covers the screen).
+  if (filter && std::strstr("dpi_fullscreen", filter)) {
+    const int code = runSelf("--dpi-child");
+    if (code == 3) {
+      std::printf("skip %-20s the monitor is not scaled\n", "dpi_fullscreen");
+    } else {
+      const bool ok = code == 0;
+      std::printf("%s %-20s %s\n", ok ? "ok  " : "FAIL", "dpi_fullscreen",
+        code == 0 ? "per-monitor DPI aware, window covers the monitor" : code == 1 ? "not DPI aware"
+          : code == 2 ? "window not the monitor's size" : "no device");
+      ok ? passed++ : failed++;
+    }
   }
   std::printf("%d passed, %d failed\n", passed, failed);
   return failed ? 1 : 0;
