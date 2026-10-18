@@ -166,6 +166,24 @@ mov oD0, v3
 mov oD1, v4
 )";
 
+  // vs_1_1 with four texture coordinates (texm3x3 reads t1 to t3).
+  const char* kVsPass11Four = R"(vs_1_1
+dcl_position v0
+dcl_texcoord0 v1
+dcl_texcoord1 v2
+dcl_color0 v3
+dcl_color1 v4
+dcl_normal v5
+mov oPos, v0
+mov oT0, v1
+mov oT1, v2
+mov oT2, v5
+mov oT3.xyz, v1.zxy
+mov oT3.w, v2.x
+mov oD0, v3
+mov oD1, v4
+)";
+
   const char* kPsShow2 = R"(
 float4 main(float4 t0 : TEXCOORD0) : COLOR { return t0; }
 )";
@@ -296,6 +314,85 @@ rep i1
 endrep
 mov oC0, r0
 )", nullptr },
+    { "ps3_texkill", kVsPass, "vs_3_0", R"(ps_3_0
+def c10, 0.5, 0.25, -1.0, 2.0
+dcl_texcoord0 v0
+dcl_texcoord1 v1
+add r0, v0, -c10.x
+texkill r0.xy
+mov oC0, v1
+)", nullptr },
+    { "ps3_subroutines", kVsPass, "vs_3_0", R"(ps_3_0
+def c10, 0.5, 0.25, -1.0, 2.0
+defb b4, true
+dcl_texcoord0 v0
+mov r0, v0
+call l0
+callnz l1, b4
+callnz l1, b3
+mov oC0, r0
+ret
+label l0
+mul r0, r0, c10.w
+ret
+label l1
+add r0, r0, c10.y
+ret
+)", nullptr },
+    { "ps3_breakp", kVsPass, "vs_3_0", R"(ps_3_0
+defi i0, 6, 0, 1, 0
+def c10, 0.5, 0.25, -1.0, 2.0
+dcl_texcoord0 v0
+mov r0, v0
+rep i0
+  add r0, r0, c10.y
+  setp_gt p0.x, r0.x, c10.w
+  breakp p0.x
+endrep
+mov oC0, r0
+)", nullptr },
+    { "ps1_2_reg2", kVsPass11, nullptr, R"(ps_1_2
+tex t0
+texreg2ar t1, t0
+texreg2gb t2, t0
+add r0, t1, t2
+)", nullptr },
+    { "ps1_2_dp3", kVsPass11, nullptr, R"(ps_1_2
+tex t0
+texdp3tex t1, t0_bx2
+texdp3 t2, t0_bx2
+mad r0, t1, t2, c0
+)", nullptr },
+    { "ps1_3_m3x3", kVsPass11Four, nullptr, R"(ps_1_3
+tex t0
+texm3x3pad t1, t0_bx2
+texm3x3pad t2, t0_bx2
+texm3x3tex t3, t0_bx2
+mov r0, t3
+)", nullptr },
+    { "ps1_3_m3x3spec", kVsPass11Four, nullptr, R"(ps_1_3
+tex t0
+texm3x3pad t1, t0_bx2
+texm3x3pad t2, t0_bx2
+texm3x3spec t3, t0_bx2, c0
+mov r0, t3
+)", nullptr },
+    { "ps1_3_m3x3vspec", kVsPass11Four, nullptr, R"(ps_1_3
+tex t0
+texm3x3pad t1, t0_bx2
+texm3x3pad t2, t0_bx2
+texm3x3vspec t3, t0_bx2
+mov r0, t3
+)", nullptr },
+    { "ps1_4_phase", kVsPass11, nullptr, R"(ps_1_4
+texld r0, t0
+texcrd r1.rgb, t1
+phase
+texld r2, r1
+texkill t2
+add r0.rgb, r0, r2
++mov r0.a, r2.a
+)", nullptr },
     { "ps1_1", kVsPass11, nullptr, R"(ps_1_1
 tex t0
 texcoord t1
@@ -382,6 +479,30 @@ mov r1, v1
 mul r0.zw, r1.xyzw, v0.wzyx
 mov oC0, r0
 )", nullptr },
+    { "vs3_subroutine_dst_sincos", R"(vs_3_0
+def c100, 0.5, 0.25, 0.0, 1.0
+dcl_position v0
+dcl_texcoord0 v1
+dcl_texcoord1 v2
+dcl_position o0
+dcl_texcoord0 o1
+dcl_texcoord1 o2
+mov o0, v0
+mov r4, v2
+dst r1, v1, r4
+mov r2, c100
+sincos r2.xy, r4.x
+call l0
+mov o1, r3
+mov o2, r1
+ret
+label l0
+add r3, r1, r2
+mul r3.zw, r3, c100.x
+ret
+)", nullptr, R"(
+float4 main(float4 t0 : TEXCOORD0, float4 t1 : TEXCOORD1) : COLOR { return t0 * 0.5 + t1 * 0.25; }
+)", "ps_3_0" },
     { "vs1_1_asm", R"(vs_1_1
 dcl_position v0
 dcl_texcoord0 v1
