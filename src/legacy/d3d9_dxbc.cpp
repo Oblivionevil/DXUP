@@ -32,6 +32,7 @@ namespace dxup::legacy {
       DxDclResource = 88, DxDclConstantBuffer = 89, DxDclSampler = 90, DxDclInput = 95, DxDclInputPs = 98,
       DxDclInputPsSgv = 99, DxDclInputPsSiv = 100, DxDclOutput = 101, DxDclOutputSiv = 103, DxDclTemps = 104,
       DxDclIndexableTemp = 105, DxDclGlobalFlags = 106, DxDerivRtxCoarse = 122, DxDerivRtyCoarse = 124, DxUBfe = 138,
+      DxIBfe = 139,
     };
 
     enum DxOperandType : uint32_t {
@@ -1256,18 +1257,27 @@ namespace dxup::legacy {
 
       void loadVertexInputs() {
         // Inputs as their bits, floats as the declaration's types say
-        // (dxup_inputModes: 0 float, 1 int, 2 uint).
+        // (dxup_inputModes: 0 float, 1 int, 2 uint, 3 signed 10-bit
+        // normalized; dxup_inputWOne: w = 1).
         for (size_t i = 0; i < info.inputs.size(); i++) {
           const uint32_t r = info.inputs[i].reg;
           scratchNext = scratchBase;
           const uint32_t m = scratch(), u = scratch(), f = scratch();
           const Op bits = inputReg(uint32_t(i));
           emit(DxUBfe, { tempDst(m, 1), immU(2), immU(r * 2), scalar(cbuf(2, 20), 1) });
-          emit(DxIEq, { tempDst(m, 3), comp(temp(m), 0), immBits(1, 2, 0, 0) });
+          emit(DxIEq, { tempDst(m, 7), comp(temp(m), 0), immBits(1, 2, 3, 0) });
           emit(DxUtoF, { tempDst(u), bits });
           emit(DxMovC, { tempDst(f), comp(temp(m), 1), temp(u), bits });
           emit(DxItoF, { tempDst(u), bits });
-          emit(DxMovC, { dstOf(vRegister(r), 0xf), comp(temp(m), 0), temp(u), temp(f) });
+          emit(DxMovC, { tempDst(f), comp(temp(m), 0), temp(u), temp(f) });
+          emit(DxIBfe, { tempDst(u), immU(10), immU(0), bits });
+          emit(DxItoF, { tempDst(u), temp(u) });
+          emit(DxMul, { tempDst(u), temp(u), immF(1.0f / 511.0f) });
+          emit(DxMax, { tempDst(u), temp(u), immF(-1.0f) });
+          emit(DxMovC, { tempDst(f), comp(temp(m), 2), temp(u), temp(f) });
+          emit(DxUBfe, { tempDst(m, 1), immU(1), immU(r), scalar(cbuf(2, 20), 2) });
+          emit(DxMovC, { tempDst(f, 8), comp(temp(m), 0), immF(1.0f), temp(f) });
+          emit(DxMov, { dstOf(vRegister(r), 0xf), temp(f) });
         }
       }
 

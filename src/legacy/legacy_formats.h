@@ -142,6 +142,40 @@ namespace dxup::legacy {
     }
   }
 
+  // How a shader view reads the DXGI format to give what Direct3D 9 gives
+  // (D3D12 shader component mapping; 0: as it is). Direct3D 9 reads missing
+  // color channels as 1, Direct3D 10+ as 0; ATI2 is (green, red, 1, 1), L16
+  // (L, L, L, 1). DXVK swizzles its Vulkan views the same way. The device's
+  // self-test (legacy_selftest.cpp) checks every format against it.
+  inline uint32_t shaderComponentMapping(Format format) {
+    auto map = [](uint32_t r, uint32_t g, uint32_t b, uint32_t a) { return r | (g << 3) | (b << 6) | (a << 9) | (1u << 12); };
+    constexpr uint32_t R = 0, G = 1, One = 5;
+    switch (format) {
+      case FormatATI2:     return map(G, R, One, One);
+      case FormatL16:      return map(R, R, R, One);
+      case FormatG16R16:
+      case FormatV8U8:
+      case FormatV16U16:
+      case FormatG16R16F:
+      case FormatG32R32F:  return map(R, G, One, One);
+      case FormatR16F:
+      case FormatR32F:     return map(R, One, One, One);
+      default:             return 0;
+    }
+  }
+
+  // A2R10G10B10 keeps red in the high bits, DXGI's R10G10B10A2 in the low:
+  // swapped when written to and read from the GPU (so shaders and render
+  // targets see red as red).
+  inline void swapRedBlue1010102(uint8_t* data, size_t texels) {
+    for (size_t i = 0; i < texels; i++) {
+      uint32_t v;
+      std::memcpy(&v, data + i * 4, 4);
+      v = (v & 0xc00ffc00u) | ((v & 0x3ffu) << 20) | ((v >> 20) & 0x3ffu);
+      std::memcpy(data + i * 4, &v, 4);
+    }
+  }
+
   // Formats with an sRGB twin: created typeless, viewed both ways.
   struct SrgbFormats { DXGI_FORMAT typeless, linear, srgb; };
   inline bool srgbFormats(DXGI_FORMAT format, SrgbFormats& out) {

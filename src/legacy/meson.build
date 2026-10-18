@@ -19,7 +19,7 @@ foreach shader : [
 endforeach
 
 legacy_lib = static_library('dxup_legacy',
-  ['legacy_device.cpp', 'd3d9_shader.cpp', 'd3d9_dxbc.cpp', legacy_shaders],
+  ['legacy_device.cpp', 'legacy_selftest.cpp', 'd3d9_shader.cpp', 'd3d9_dxbc.cpp', legacy_shaders],
   include_directories : ['.', '..'],
   dependencies        : [util_dep],
 )

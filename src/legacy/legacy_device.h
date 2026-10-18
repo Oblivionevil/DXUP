@@ -6,6 +6,7 @@
 // its d3d11.dll is next to the front end's DLL, so the work ends in D3D12.
 
 #include "legacy_types.h"
+#include <atomic>
 #include "d3d9_shader.h"
 
 #include <windows.h>
@@ -20,6 +21,10 @@
 #include <vector>
 
 namespace dxup::legacy {
+
+  // The device's self-test draws (legacy_selftest.cpp): not recorded as the
+  // game's shader variants.
+  extern std::atomic<bool> g_selfTesting;
 
   class Device;
 
@@ -384,6 +389,11 @@ namespace dxup::legacy {
     void flush() { m_context->Flush(); }
     // Everything bound on D3D11 is unknown (after foreign D3D11 calls).
     void invalidateBindings();
+    // With diagnostics on: every texture format and vertex element type read
+    // back as shaders read it, against what Direct3D 9 gives
+    // (legacy_selftest.cpp).
+    void selfTestFormats();
+    void selfTestVertexTypes();
     // Direct3D 9's default states, nothing bound (Reset).
     void resetState();
 
@@ -533,7 +543,7 @@ namespace dxup::legacy {
       float    f[256][4];
       int32_t  i[16][4];
       uint32_t b[16];
-      uint32_t limits[4];   // the last float constant, vertex input modes (dxup_inputModes)
+      uint32_t limits[4];   // the last float constant, vertex input modes (dxup_inputModes, dxup_inputWOne)
     };
     ConstantStore m_constants[2] = {};      // vertex, pixel
     bool m_shaderConstantsDirty[2] = { true, true };

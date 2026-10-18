@@ -850,7 +850,8 @@ namespace dxup::legacy {
     // booleans apart (they change rarely).
     s += "cbuffer Constants : register(b0) {\n  float4 c[256];\n};\n";
     s += "cbuffer IntConstants : register(b2) {\n  int4 ci[16];\n  uint4 cb[4];\n  uint dxup_lastConstant;   // 255\n"
-         "  uint dxup_inputModes;     // vertex inputs, 2 bits each: 0 float, 1 int, 2 uint\n};\n";
+         "  uint dxup_inputModes;     // vertex inputs, 2 bits each: 0 float, 1 int, 2 uint, 3 signed 10-bit normalized\n"
+         "  uint dxup_inputWOne;      // vertex inputs read with w = 1 (UDEC3, DEC3N)\n};\n";
     if (vertex && options.clipPlanes)
       s += "cbuffer ClipPlanes : register(b3) {\n  float4 dxup_clipPlanes[6];\n};\n";
     if (!vertex) {
@@ -870,7 +871,9 @@ namespace dxup::legacy {
     s += "float4 dxup_nrm(float4 x) { float l = dot(x.xyz, x.xyz); return l > 0.0f ? x * rsqrt(l) : 0.0f.xxxx; }\n";
     if (vertex)
       s += "float4 dxup_input(uint4 v, uint r) {\n  const uint mode = (dxup_inputModes >> (r * 2u)) & 3u;\n"
-           "  return mode == 1u ? float4(asint(v)) : mode == 2u ? float4(v) : asfloat(v);\n}\n";
+           "  const float4 f = mode == 1u ? float4(asint(v)) : mode == 2u ? float4(v)\n"
+           "    : mode == 3u ? max(float4((asint(v) << 22) >> 22) * (1.0f / 511.0f), -1.0f) : asfloat(v);\n"
+           "  return (dxup_inputWOne >> r) & 1u ? float4(f.xyz, 1.0f) : f;\n}\n";
     if (options.floatEmulation || options.dotEmulation) {
       // 0 times anything is 0 (Direct3D 9), not NaN for infinity or NaN.
       s += "float4 dxup_mul(float4 a, float4 b) { return a == 0.0f || b == 0.0f ? 0.0f.xxxx : a * b; }\n";

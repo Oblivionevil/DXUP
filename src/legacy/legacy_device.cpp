@@ -422,13 +422,7 @@ namespace dxup::legacy {
       sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
       sd.Texture2D.MipLevels = m_desc.levels;
     }
-    // Direct3D 9 samples ATI2 as (green, red, 1, 1) and L16 as (L, L, L, 1):
-    // BC5 and R16 read through the view's component mapping, as DXVK
-    // swizzles its Vulkan view.
-    constexpr UINT kGreenRedOneOne = 1u | (0u << 3) | (5u << 6) | (5u << 9) | (1u << 12);
-    constexpr UINT kRedRedRedOne = 0u | (0u << 3) | (0u << 6) | (5u << 9) | (1u << 12);
-    const UINT mapping = m_desc.format == FormatATI2 ? kGreenRedOneOne : m_desc.format == FormatL16 ? kRedRedRedOne : 0;
-    m_device->createShaderResourceView(d3dResource(), &sd, mapping, view.put());
+    m_device->createShaderResourceView(d3dResource(), &sd, shaderComponentMapping(m_desc.format), view.put());
     return view.get();
   }
 
@@ -640,6 +634,16 @@ namespace dxup::legacy {
       }
     }
     const bool keyed = m_colorKeyEnabled;
+    if (m_desc.format == FormatA2R10G10B10) {
+      std::vector<uint8_t> swapped(size_t(w) * h * d * 4);
+      for (uint32_t z = 0; z < d; z++)
+        for (uint32_t y = 0; y < h; y++)
+          std::memcpy(swapped.data() + (size_t(z) * h + y) * w * 4,
+                      level.data.data() + size_t(z) * srcSlice + size_t(y) * srcPitch, size_t(w) * 4);
+      swapRedBlue1010102(swapped.data(), size_t(w) * h * d);
+      write(subresource, box, swapped.data(), w * 4, w * h * 4);
+      return;
+    }
     if (!m_convert && !keyed && m_desc.format != FormatX1R5G5B5) {
       write(subresource, box, level.data.data(), srcPitch, srcSlice);
       return;
@@ -712,6 +716,8 @@ namespace dxup::legacy {
         uint8_t* dst = level.data.data() + size_t(y) * dstPitch;
         if (!m_convert) {
           std::memcpy(dst, src, size_t(w) * bpp);
+          if (m_desc.format == FormatA2R10G10B10)
+            swapRedBlue1010102(dst, w);
         } else {
           for (uint32_t x = 0; x < w; x++) {
             uint32_t argb;
@@ -902,8 +908,8 @@ namespace dxup::legacy {
         case DeclShort4N:   return DXGI_FORMAT_R16G16B16A16_SNORM;
         case DeclUShort2N:  return DXGI_FORMAT_R16G16_UNORM;
         case DeclUShort4N:  return DXGI_FORMAT_R16G16B16A16_UNORM;
-        case DeclUDec3:     return DXGI_FORMAT_R10G10B10A2_UINT;
-        case DeclDec3N:     return DXGI_FORMAT_R10G10B10A2_UNORM;
+        case DeclUDec3:
+        case DeclDec3N:     return DXGI_FORMAT_R10G10B10A2_UINT;   // w = 1, DEC3N signed: in the shader
         case DeclFloat16x2: return DXGI_FORMAT_R16G16_FLOAT;
         case DeclFloat16x4: return DXGI_FORMAT_R16G16B16A16_FLOAT;
         default:            return DXGI_FORMAT_UNKNOWN;
@@ -912,6 +918,8 @@ namespace dxup::legacy {
 
     bool declUint(uint8_t type) { return type == DeclUByte4 || type == DeclUDec3; }
     bool declSint(uint8_t type) { return type == DeclShort2 || type == DeclShort4; }
+    // Read as w = 1 (Direct3D 9's (x, y, z, 1)).
+    bool declWOne(uint8_t type) { return type == DeclUDec3 || type == DeclDec3N; }
 
     // D3DDECLUSAGE values the fixed function reads.
     enum : uint8_t { UsePosition = 0, UseBlendWeight = 1, UseBlendIndices = 2, UseNormal = 3, UsePSize = 4,
@@ -1108,7 +1116,7 @@ namespace dxup::legacy {
 
     // Changes whenever the translator's output changes (the HLSL path's;
     // DXUP's compiler is not cached, it is faster than reading the cache).
-    constexpr uint64_t kTranslatorVersion = 6;
+    constexpr uint64_t kTranslatorVersion = 7;
 
     // The shaders draws used in this and earlier runs, their code and the
     // variants they were drawn with: compiled at the start of a later run,
@@ -1574,7 +1582,8 @@ namespace dxup::legacy {
         slot->drawn = firstDraw = true;
     }
     if (firstDraw)
-      VariantRecords::instance().note(m_hash, m_tokens, options);
+      if (!g_selfTesting.load(std::memory_order_relaxed))
+        VariantRecords::instance().note(m_hash, m_tokens, options);
     // Draws that compile or wait log it (info log): the stutter of shaders.
     const bool timed = firstDraw && logLevelEnabled(LogLevel::Info);
     const auto start = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
@@ -1710,6 +1719,9 @@ namespace dxup::legacy {
     for (auto& entry : m_samplerStates) if (entry.second) entry.second->Release();
     for (auto& entry : m_pointShaders) if (entry.second) entry.second->Release();
   }
+
+  bool glitchReportsEnabled();
+  std::atomic<bool> g_selfTesting{false};
 
   HRESULT Device::createShaderResourceView(ID3D11Resource* resource, const D3D11_SHADER_RESOURCE_VIEW_DESC* desc, UINT mapping,
                                            ID3D11ShaderResourceView** view) {
@@ -1850,6 +1862,11 @@ namespace dxup::legacy {
     m_device->CreateRasterizerState(&rd, m_quadRaster.put());
 
     resetState();
+    if (glitchReportsEnabled() || logLevelEnabled(LogLevel::Info)) {
+      selfTestFormats();
+      selfTestVertexTypes();
+      resetState();
+    }
     return true;
   }
 
@@ -3276,7 +3293,7 @@ namespace dxup::legacy {
       options.minVaryings = pixelVaryings;
       // How the inputs' bits become floats (dxup_inputModes): integers of
       // the declaration's UBYTE4 and SHORT types.
-      uint32_t inputModes = 0;
+      uint32_t inputModes = 0, inputWOne = 0;
       if (m_decl) {
         for (const auto& in : m_vertexShader->info().inputs) {
           for (const auto& e : m_decl->elements()) {
@@ -3284,12 +3301,15 @@ namespace dxup::legacy {
               continue;
             if (declUint(e.type)) inputModes |= 2u << (in.reg * 2);
             if (declSint(e.type)) inputModes |= 1u << (in.reg * 2);
+            if (e.type == DeclDec3N) inputModes |= 3u << (in.reg * 2);
+            if (declWOne(e.type)) inputWOne |= 1u << in.reg;
             break;
           }
         }
       }
-      if (m_constants[0].limits[1] != inputModes) {
+      if (m_constants[0].limits[1] != inputModes || m_constants[0].limits[2] != inputWOne) {
         m_constants[0].limits[1] = inputModes;
+        m_constants[0].limits[2] = inputWOne;
         m_shaderIntsDirty[0] = true;
       }
       options.clipPlanes = uint8_t(m_renderStates[RsClipPlaneEnable] & 0x3f);

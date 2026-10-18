@@ -547,6 +547,183 @@ float4 main(float2 t : TEXCOORD0) : COLOR {
     return true;
   }
 
+  // What shaders read from formats with fewer than four channels (missing
+  // color channels read 1 in Direct3D 9, 0 in Direct3D 10+) and from
+  // A2R10G10B10 (red in the high bits): one 8x8 cell per format, its left
+  // half (x, y, z), its right half (w, the bits below 8 of x, 0).
+  bool sceneFormatChannels(IDirect3DDevice9* d) {
+    d->Clear(0, nullptr, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, 0xff000000u, 1.0f, 0);
+    const char* psSource = R"(
+sampler s : register(s0);
+float4 main(float2 t : TEXCOORD0) : COLOR {
+  float4 v = tex2D(s, float2(0.5, 0.5));
+  return t.x < 0.5 ? float4(v.xyz, 1) : float4(v.w, frac(v.x * 255.0), 0, 1);
+})";
+    const auto psCode = compile(psSource, "ps_2_0");
+    IDirect3DPixelShader9* ps = nullptr;
+    if (psCode.empty() || FAILED(d->CreatePixelShader(psCode.data(), &ps)))
+      return false;
+    auto half = [](float f) {
+      uint32_t bits; std::memcpy(&bits, &f, 4);
+      return WORD(((bits >> 16) & 0x8000) | (((bits >> 23) & 255) - 112) << 10 | ((bits >> 13) & 1023));
+    };
+    struct Cell { D3DFORMAT format; uint8_t bytes[8]; UINT size; };
+    std::vector<Cell> cells;
+    auto add = [&](D3DFORMAT format, const void* data, UINT size) {
+      Cell c = { format, {}, size };
+      std::memcpy(c.bytes, data, size);
+      cells.push_back(c);
+    };
+    const WORD g16r16[2] = { 0x4000, 0xc123 };
+    const DWORD a2r10 = (3u << 30) | (1000u << 20) | (512u << 10) | 37u;
+    const DWORD a2b10 = (2u << 30) | (37u << 20) | (512u << 10) | 1000u;
+    const BYTE v8u8[2] = { 64, 32 };
+    const WORD v16u16[2] = { 0x2000, 0x4567 };
+    const WORD r16f = half(0.25f), g16r16f[2] = { half(0.25f), half(0.625f) };
+    const float r32f = 0.375f, g32r32f[2] = { 0.375f, 0.8125f };
+    const WORD l16 = 0x80ff;
+    const BYTE a8 = 0xc0, l8 = 0x60, a8l8[2] = { 0x60, 0xc0 };
+    const WORD a16b16[4] = { 0x1234, 0x8000, 0xfedc, 0x4000 };
+    add(D3DFMT_G16R16, g16r16, 4);
+    add(D3DFMT_A2R10G10B10, &a2r10, 4);
+    add(D3DFMT_A2B10G10R10, &a2b10, 4);
+    add(D3DFMT_V8U8, v8u8, 2);
+    add(D3DFMT_V16U16, v16u16, 4);
+    add(D3DFMT_R16F, &r16f, 2);
+    add(D3DFMT_G16R16F, g16r16f, 4);
+    add(D3DFMT_R32F, &r32f, 4);
+    add(D3DFMT_G32R32F, g32r32f, 8);
+    add(D3DFMT_L16, &l16, 2);
+    add(D3DFMT_A8, &a8, 1);
+    add(D3DFMT_L8, &l8, 1);
+    add(D3DFMT_A8L8, a8l8, 2);
+    add(D3DFMT_A16B16G16R16, a16b16, 8);
+    d->SetFVF(D3DFVF_XYZRHW | D3DFVF_TEX1);
+    d->SetPixelShader(ps);
+    d->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_POINT);
+    d->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
+    d->SetRenderState(D3DRS_ZENABLE, D3DZB_FALSE);
+    struct V { float x, y, z, w, u, v; };
+    for (size_t i = 0; i < cells.size(); i++) {
+      IDirect3DTexture9* texture = nullptr;
+      if (FAILED(d->CreateTexture(1, 1, 1, 0, cells[i].format, D3DPOOL_MANAGED, &texture, nullptr)))
+        continue;
+      D3DLOCKED_RECT locked = {};
+      texture->LockRect(0, &locked, nullptr, 0);
+      std::memcpy(locked.pBits, cells[i].bytes, cells[i].size);
+      texture->UnlockRect(0);
+      const float x = float(i % 8) * 8.0f, y = float(i / 8) * 8.0f;
+      const V quad[4] = { { x, y, 0.5f, 1, 0, 0 }, { x + 8, y, 0.5f, 1, 1, 0 }, { x, y + 8, 0.5f, 1, 0, 1 },
+                          { x + 8, y + 8, 0.5f, 1, 1, 1 } };
+      d->SetTexture(0, texture);
+      d->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, quad, sizeof(V));
+      d->SetTexture(0, nullptr);
+      texture->Release();
+    }
+    d->SetPixelShader(nullptr);
+    ps->Release();
+    return true;
+  }
+
+  // Vertex element types as a shader reads them (missing components
+  // (0, 0, 0, 1)): one 8x8 cell
+  // per type, left half (x, y, z), right half (w, 0, 0), as value * scale +
+  // offset.
+  bool sceneDeclTypes(IDirect3DDevice9* d) {
+    d->Clear(0, nullptr, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, 0xff000000u, 1.0f, 0);
+    const char* vsSource = R"(
+float4 scale : register(c0);
+float4 offset : register(c1);
+struct VO { float4 p : POSITION; float4 v : TEXCOORD0; float2 t : TEXCOORD1; };
+VO main(float4 p : POSITION, float4 a : TEXCOORD0, float2 t : TEXCOORD1) {
+  VO o; o.p = p; o.v = a * scale + offset; o.t = t; return o;
+})";
+    const char* psSource = R"(
+float4 main(float4 v : TEXCOORD0, float2 t : TEXCOORD1) : COLOR {
+  return t.x < 0.5 ? float4(v.xyz, 1) : float4(v.w, 0, 0, 1);
+})";
+    const auto vsCode = compile(vsSource, "vs_3_0");
+    const auto psCode = compile(psSource, "ps_3_0");
+    IDirect3DVertexShader9* vs = nullptr;
+    IDirect3DPixelShader9* ps = nullptr;
+    if (vsCode.empty() || psCode.empty() || FAILED(d->CreateVertexShader(vsCode.data(), &vs))
+     || FAILED(d->CreatePixelShader(psCode.data(), &ps)))
+      return false;
+    auto half = [](float f) {
+      uint32_t bits; std::memcpy(&bits, &f, 4);
+      return WORD(((bits >> 16) & 0x8000) | (((bits >> 23) & 255) - 112) << 10 | ((bits >> 13) & 1023));
+    };
+    struct Type { BYTE type; uint8_t bytes[16]; float scale, offset; };
+    std::vector<Type> types;
+    auto add = [&](BYTE type, const void* data, UINT size, float scale, float offset) {
+      Type t = { type, {}, scale, offset };
+      std::memcpy(t.bytes, data, size);
+      types.push_back(t);
+    };
+    const float f4[4] = { 0.25f, 0.5f, 0.75f, 0.875f };
+    const DWORD color = 0x40c08020u;
+    const BYTE ubyte4[4] = { 10, 200, 30, 150 };
+    const SHORT short4[4] = { 100, -200, 300, -400 };
+    const SHORT short4n[4] = { 16000, -16000, 32767, -32768 };
+    const WORD ushort4n[4] = { 0x4000, 0xc000, 0xffff, 0x1234 };
+    const DWORD udec3 = (2u << 30) | (37u << 20) | (512u << 10) | 1000u;
+    const DWORD dec3n = (1u << 30) | ((uint32_t(-511) & 1023u) << 20) | (200u << 10) | (uint32_t(-300) & 1023u);
+    const WORD f16[4] = { half(0.25f), half(0.5f), half(0.75f), half(0.875f) };
+    add(D3DDECLTYPE_FLOAT1, f4, 4, 1.0f, 0.0f);
+    add(D3DDECLTYPE_FLOAT2, f4, 8, 1.0f, 0.0f);
+    add(D3DDECLTYPE_FLOAT3, f4, 12, 1.0f, 0.0f);
+    add(D3DDECLTYPE_FLOAT4, f4, 16, 1.0f, 0.0f);
+    add(D3DDECLTYPE_D3DCOLOR, &color, 4, 1.0f, 0.0f);
+    add(D3DDECLTYPE_UBYTE4, ubyte4, 4, 1.0f / 255.0f, 0.0f);
+    add(D3DDECLTYPE_SHORT2, short4, 4, 1.0f / 1024.0f, 0.5f);
+    add(D3DDECLTYPE_SHORT4, short4, 8, 1.0f / 1024.0f, 0.5f);
+    add(D3DDECLTYPE_UBYTE4N, ubyte4, 4, 1.0f, 0.0f);
+    add(D3DDECLTYPE_SHORT2N, short4n, 4, 0.5f, 0.5f);
+    add(D3DDECLTYPE_SHORT4N, short4n, 8, 0.5f, 0.5f);
+    // USHORT2N, USHORT4N, UDEC3 and DEC3N: Windows' NVIDIA driver does not
+    // draw them; DXUP's self-test checks them (self_test).
+    (void)ushort4n; (void)udec3; (void)dec3n;
+    add(D3DDECLTYPE_FLOAT16_2, f16, 4, 1.0f, 0.0f);
+    add(D3DDECLTYPE_FLOAT16_4, f16, 8, 1.0f, 0.0f);
+    struct V { float x, y, z, w, u, v; uint8_t a[16]; };
+    d->SetVertexShader(vs);
+    d->SetPixelShader(ps);
+    d->SetRenderState(D3DRS_ZENABLE, D3DZB_FALSE);
+    d->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+    for (size_t i = 0; i < types.size(); i++) {
+      const D3DVERTEXELEMENT9 elements[] = {
+        { 0, 0, D3DDECLTYPE_FLOAT4, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_POSITION, 0 },
+        { 0, 16, D3DDECLTYPE_FLOAT2, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_TEXCOORD, 1 },
+        { 0, 24, types[i].type, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_TEXCOORD, 0 },
+        D3DDECL_END(),
+      };
+      IDirect3DVertexDeclaration9* decl = nullptr;
+      if (FAILED(d->CreateVertexDeclaration(elements, &decl)))
+        continue;
+      // The cell in clip space (64x48 target).
+      const float x0 = float(i % 8) * 8.0f, y0 = float(i / 8) * 8.0f;
+      auto cx = [](float x) { return x / 32.0f - 1.0f; };
+      auto cy = [](float y) { return 1.0f - y / 24.0f; };
+      V quad[4] = { { cx(x0), cy(y0), 0.5f, 1, 0, 0 }, { cx(x0 + 8), cy(y0), 0.5f, 1, 1, 0 },
+                    { cx(x0), cy(y0 + 8), 0.5f, 1, 0, 1 }, { cx(x0 + 8), cy(y0 + 8), 0.5f, 1, 1, 1 } };
+      for (auto& v : quad)
+        std::memcpy(v.a, types[i].bytes, 16);
+      const float scale[4] = { types[i].scale, types[i].scale, types[i].scale, types[i].scale };
+      const float offset[4] = { types[i].offset, types[i].offset, types[i].offset, types[i].offset };
+      d->SetVertexShaderConstantF(0, scale, 1);
+      d->SetVertexShaderConstantF(1, offset, 1);
+      d->SetVertexDeclaration(decl);
+      d->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, quad, sizeof(V));
+      d->SetVertexDeclaration(nullptr);
+      decl->Release();
+    }
+    d->SetVertexShader(nullptr);
+    d->SetPixelShader(nullptr);
+    ps->Release();
+    vs->Release();
+    return true;
+  }
+
   bool sceneInstancing(IDirect3DDevice9* d) {
     d->Clear(0, nullptr, D3DCLEAR_TARGET, 0xff000000u, 1.0f, 0);
     const char* vsSource = R"(
@@ -1361,6 +1538,8 @@ float4 main(float2 t : TEXCOORD0) : COLOR {
     { "instancing", sceneInstancing },
     { "vertex_ranges", sceneVertexRanges },
     { "l16", sceneL16 },
+    { "format_channels", sceneFormatChannels },
+    { "decl_types", sceneDeclTypes },
     { "state_block", sceneStateBlock },
     { "sm3_loops", sceneSm3Loops },
     { "ps_1_4", scenePs14 },
@@ -1800,6 +1979,7 @@ int main(int argc, char** argv) {
   const char* filter = nullptr;
   int benchFrames = 0, benchDraws = 0;
   bool childForcedMsaa = false, identifier = false, childDpi = false, childFloatStrict = false, childDropped = false;
+  bool childSelfTest = false;
   unsigned variantNonce = 0;
   for (int i = 1; i < argc; i++) {
     if (std::strcmp(argv[i], "--dump") == 0) dumpImages = true;
@@ -1810,6 +1990,7 @@ int main(int argc, char** argv) {
     else if (std::strcmp(argv[i], "--dpi-child") == 0) childDpi = true;
     else if (std::strcmp(argv[i], "--float-strict-child") == 0) childFloatStrict = true;
     else if (std::strcmp(argv[i], "--dropped-child") == 0) childDropped = true;
+    else if (std::strcmp(argv[i], "--selftest-child") == 0) childSelfTest = true;
     else if (std::strcmp(argv[i], "--variant-child") == 0 && i + 1 < argc) variantNonce = unsigned(std::strtoul(argv[++i], nullptr, 10));
     else if (std::strcmp(argv[i], "--bench") == 0 && i + 2 < argc) { benchFrames = std::atoi(argv[i + 1]); benchDraws = std::atoi(argv[i + 2]); i += 2; }
     else filter = argv[i];
@@ -1842,6 +2023,25 @@ int main(int argc, char** argv) {
     return dpiFullscreenChild(dxup);
   if (childDropped)
     return droppedChild(dxup);
+  // A device with diagnostics on runs DXUP's self-test.
+  if (childSelfTest) {
+    IDirect3D9* d3d = dxup.create(D3D_SDK_VERSION);
+    HWND window = createWindow();
+    D3DPRESENT_PARAMETERS pp = {};
+    pp.Windowed = TRUE;
+    pp.SwapEffect = D3DSWAPEFFECT_DISCARD;
+    pp.BackBufferWidth = kWidth;
+    pp.BackBufferHeight = kHeight;
+    pp.BackBufferFormat = D3DFMT_X8R8G8B8;
+    pp.hDeviceWindow = window;
+    IDirect3DDevice9* device = nullptr;
+    const HRESULT hr = d3d ? d3d->CreateDevice(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, window, D3DCREATE_HARDWARE_VERTEXPROCESSING,
+                                               &pp, &device) : E_FAIL;
+    if (device) device->Release();
+    if (d3d) d3d->Release();
+    DestroyWindow(window);
+    return SUCCEEDED(hr) ? 0 : 1;
+  }
 
   // float_specials with d3d9.floatEmulation = strict (dxup.conf beside the
   // DLLs): 0 matching, 1 differing, 2 failed.
@@ -2039,6 +2239,36 @@ int main(int argc, char** argv) {
     const bool ok = code == 0 && drawLine && frameLine && callLine && !ringLine;
     std::printf("%s %-20s draw line %d, frame line %d, failed call %d, large draw %s (child exit %d)\n", ok ? "ok  " : "FAIL",
                 "dropped_report", drawLine, frameLine, callLine, ringLine ? "dropped" : "drawn", code);
+    ok ? passed++ : failed++;
+  }
+  // DXUP's self-test of texture formats and vertex element types against
+  // Direct3D 9 (with diagnostics on): nothing differs.
+  if (!filter || std::strstr("self_test", filter)) {
+    const std::wstring marker = dir + L"dxup_frame_dump.txt";
+    const std::wstring log = dir + L"logdxup_dxup_d3d9.log";
+    int code = -1, differing = 0;
+    bool formats = false, types = false;
+    if (FILE* f = _wfopen(marker.c_str(), L"w")) {
+      std::fclose(f);
+      DeleteFileW(log.c_str());
+      code = runSelf("--selftest-child");
+      DeleteFileW(marker.c_str());
+      if (FILE* l = _wfopen(log.c_str(), L"r")) {
+        char line[2048];
+        while (std::fgets(line, sizeof(line), l)) {
+          formats |= std::strstr(line, "texture formats read as with Direct3D 9") != nullptr;
+          types |= std::strstr(line, "vertex element types read as with Direct3D 9") != nullptr;
+          if (std::strstr(line, "glitch: self-test:")) {
+            differing++;
+            std::printf("     %s", std::strstr(line, "self-test:"));
+          }
+        }
+        std::fclose(l);
+      }
+    }
+    const bool ok = code == 0 && formats && types && !differing;
+    std::printf("%s %-20s texture formats %s, vertex element types %s, %d differences (child exit %d)\n", ok ? "ok  " : "FAIL",
+                "self_test", formats ? "ok" : "not checked", types ? "ok" : "not checked", differing, code);
     ok ? passed++ : failed++;
   }
   // Full screen on a scaled monitor (requested by name: covers the screen).
