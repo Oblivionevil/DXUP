@@ -509,6 +509,44 @@ float4 main(float4 c : COLOR0, float2 t : TEXCOORD0) : COLOR { return tex2D(tex,
     return true;
   }
 
+  // L16 keeps 16 bits: two texels 0x8000 and 0x80ff, the difference times
+  // 200 (0 with 8 bits), and L16 read as (L, L, L, 1).
+  bool sceneL16(IDirect3DDevice9* d) {
+    d->Clear(0, nullptr, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, 0xff000000u, 1.0f, 0);
+    const char* psSource = R"(
+sampler s : register(s0);
+float4 main(float2 t : TEXCOORD0) : COLOR {
+  float4 a = tex2D(s, float2(0.25, 0.5)), b = tex2D(s, float2(0.75, 0.5));
+  return t.x < 0.5 ? float4((b.x - a.x) * 200.0, (b.y - a.y) * 200.0, (b.z - a.z) * 200.0, 1) : float4(a.xyz, a.w * 0.5);
+})";
+    const auto psCode = compile(psSource, "ps_2_0");
+    IDirect3DPixelShader9* ps = nullptr;
+    IDirect3DTexture9* texture = nullptr;
+    if (psCode.empty() || FAILED(d->CreatePixelShader(psCode.data(), &ps))
+     || FAILED(d->CreateTexture(2, 1, 1, 0, D3DFMT_L16, D3DPOOL_MANAGED, &texture, nullptr)))
+      return false;
+    D3DLOCKED_RECT locked = {};
+    texture->LockRect(0, &locked, nullptr, 0);
+    static_cast<WORD*>(locked.pBits)[0] = 0x8000;
+    static_cast<WORD*>(locked.pBits)[1] = 0x80ff;
+    texture->UnlockRect(0);
+    struct V { float x, y, z, w, u, v; };
+    const V quad[4] = { { 0, 0, 0.5f, 1, 0, 0 }, { float(kWidth), 0, 0.5f, 1, 1, 0 }, { 0, float(kHeight), 0.5f, 1, 0, 1 },
+                        { float(kWidth), float(kHeight), 0.5f, 1, 1, 1 } };
+    d->SetFVF(D3DFVF_XYZRHW | D3DFVF_TEX1);
+    d->SetPixelShader(ps);
+    d->SetTexture(0, texture);
+    d->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_POINT);
+    d->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
+    d->SetRenderState(D3DRS_ZENABLE, D3DZB_FALSE);
+    d->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, quad, sizeof(V));
+    d->SetPixelShader(nullptr);
+    d->SetTexture(0, nullptr);
+    texture->Release();
+    ps->Release();
+    return true;
+  }
+
   bool sceneInstancing(IDirect3DDevice9* d) {
     d->Clear(0, nullptr, D3DCLEAR_TARGET, 0xff000000u, 1.0f, 0);
     const char* vsSource = R"(
@@ -1322,6 +1360,7 @@ float4 main(float2 t : TEXCOORD0) : COLOR {
     { "dynamic_buffer", sceneDynamicBuffer },
     { "instancing", sceneInstancing },
     { "vertex_ranges", sceneVertexRanges },
+    { "l16", sceneL16 },
     { "state_block", sceneStateBlock },
     { "sm3_loops", sceneSm3Loops },
     { "ps_1_4", scenePs14 },

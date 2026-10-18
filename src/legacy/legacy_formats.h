@@ -129,6 +129,9 @@ namespace dxup::legacy {
       case FormatV16U16:   return DXGI_FORMAT_R16G16_SNORM;
       case FormatQ8W8V8U8: return DXGI_FORMAT_R8G8B8A8_SNORM;
       case FormatQ16W16V16U16: return DXGI_FORMAT_R16G16B16A16_SNORM;
+      // Read as (L, L, L, 1) through the view (Texture::srv): all 16 bits
+      // (heightmaps: Risen 3's terrain), not converted to 8.
+      case FormatL16:      return DXGI_FORMAT_R16_UNORM;
       case FormatR16F:     return DXGI_FORMAT_R16_FLOAT;
       case FormatG16R16F:  return DXGI_FORMAT_R16G16_FLOAT;
       case FormatA16B16G16R16F: return DXGI_FORMAT_R16G16B16A16_FLOAT;

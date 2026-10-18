@@ -300,6 +300,10 @@ namespace dxup::legacy {
         return;
       format = DXGI_FORMAT_B8G8R8A8_UNORM;
       m_convert = true;
+      static std::atomic<uint64_t> s_logged{0};
+      const uint64_t bit = 1ull << (uint32_t(m_desc.format) & 63);
+      if (!(s_logged.fetch_or(bit) & bit))
+        logMessage(LogLevel::Info, "D3D9: textures of format %u converted to B8G8R8A8", uint32_t(m_desc.format));
     }
     m_dxgiFormat = format;
     DXGI_FORMAT resourceFormat = format;
@@ -418,10 +422,13 @@ namespace dxup::legacy {
       sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
       sd.Texture2D.MipLevels = m_desc.levels;
     }
-    // Direct3D 9 samples ATI2 as (green, red, 1, 1): BC5 read through the
-    // view's component mapping, as DXVK swizzles its Vulkan view.
+    // Direct3D 9 samples ATI2 as (green, red, 1, 1) and L16 as (L, L, L, 1):
+    // BC5 and R16 read through the view's component mapping, as DXVK
+    // swizzles its Vulkan view.
     constexpr UINT kGreenRedOneOne = 1u | (0u << 3) | (5u << 6) | (5u << 9) | (1u << 12);
-    m_device->createShaderResourceView(d3dResource(), &sd, m_desc.format == FormatATI2 ? kGreenRedOneOne : 0, view.put());
+    constexpr UINT kRedRedRedOne = 0u | (0u << 3) | (0u << 6) | (5u << 9) | (1u << 12);
+    const UINT mapping = m_desc.format == FormatATI2 ? kGreenRedOneOne : m_desc.format == FormatL16 ? kRedRedRedOne : 0;
+    m_device->createShaderResourceView(d3dResource(), &sd, mapping, view.put());
     return view.get();
   }
 
