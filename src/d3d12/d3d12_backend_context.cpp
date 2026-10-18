@@ -3276,7 +3276,7 @@ namespace dxup::d3d12 {
 #ifdef _WIN32
     ContextLock ctxLock(*this);
     if (m_graphicsPipelineFailed)
-      return;
+      return m_device->noteFailedPipelineDraw();
     if (accessTracking())
       trackCommand(false);
     if (m_gpuProfiler.capturing())
@@ -3359,7 +3359,7 @@ namespace dxup::d3d12 {
 #ifdef _WIN32
     ContextLock ctxLock(*this);
     if (m_graphicsPipelineFailed)
-      return;
+      return m_device->noteFailedPipelineDraw();
     if (accessTracking())
       trackCommand(false);
     if (m_gpuProfiler.capturing())
@@ -3492,7 +3492,7 @@ namespace dxup::d3d12 {
 #ifdef _WIN32
     ContextLock ctxLock(*this);
     if (m_graphicsPipelineFailed)
-      return;
+      return m_device->noteFailedPipelineDraw();
     if (accessTracking())
       trackCommand(false);
     if (m_gpuProfiler.capturing())
@@ -3524,7 +3524,7 @@ namespace dxup::d3d12 {
 #ifdef _WIN32
     ContextLock ctxLock(*this);
     if (m_graphicsPipelineFailed)
-      return;
+      return m_device->noteFailedPipelineDraw();
     if (accessTracking())
       trackCommand(false);
     if (m_gpuProfiler.capturing())

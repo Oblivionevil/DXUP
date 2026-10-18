@@ -33,6 +33,11 @@ namespace dxup::d3d9 {
 
   // Reports a method the layer does not implement, once per name.
   void logUnsupported(const char* what);
+  // A call of the game that failed: each kind once (64 in all) - games
+  // leave out what they could not create, which shows as missing objects.
+  void logFailedCall(HRESULT hr, const char* format, ...);
+  // A format as D3D9 names it (FOURCC codes as their letters).
+  std::string formatName(D3DFORMAT format);
 
   // ---- Reference counting ----
 

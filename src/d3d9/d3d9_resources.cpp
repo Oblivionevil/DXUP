@@ -6,6 +6,8 @@
 #include "../util/util_types.h"
 
 #include <algorithm>
+#include <cstdarg>
+#include <cstdio>
 #include <mutex>
 #include <set>
 
@@ -17,6 +19,59 @@ namespace dxup::d3d9 {
     std::lock_guard<std::mutex> lock(mutex);
     if (reported.insert(what).second)
       logMessage(LogLevel::Warn, "D3D9: unsupported: %s", what);
+  }
+
+  void logFailedCall(HRESULT hr, const char* format, ...) {
+    char text[384];
+    va_list args;
+    va_start(args, format);
+    vsnprintf(text, sizeof(text), format, args);
+    va_end(args);
+    static std::mutex mutex;
+    static std::set<std::string> reported;
+    std::lock_guard<std::mutex> lock(mutex);
+    if (reported.size() >= 64 || !reported.insert(text).second)
+      return;
+    const char* name = hr == D3DERR_INVALIDCALL ? "D3DERR_INVALIDCALL" : hr == D3DERR_NOTAVAILABLE ? "D3DERR_NOTAVAILABLE"
+                     : hr == D3DERR_OUTOFVIDEOMEMORY ? "D3DERR_OUTOFVIDEOMEMORY" : hr == E_OUTOFMEMORY ? "E_OUTOFMEMORY"
+                     : hr == D3DERR_WASSTILLDRAWING ? "D3DERR_WASSTILLDRAWING" : nullptr;
+    char code[16];
+    if (!name) {
+      snprintf(code, sizeof(code), "0x%08lx", static_cast<unsigned long>(hr));
+      name = code;
+    }
+    logMessage(LogLevel::Warn, "glitch: the game's call failed with %s: %s%s", name, text,
+      reported.size() == 64 ? " (no more such lines)" : "");
+  }
+
+  std::string formatName(D3DFORMAT format) {
+    switch (format) {
+#define DXUP_FORMAT(name) case D3DFMT_##name: return #name;
+      DXUP_FORMAT(UNKNOWN) DXUP_FORMAT(R8G8B8) DXUP_FORMAT(A8R8G8B8) DXUP_FORMAT(X8R8G8B8) DXUP_FORMAT(R5G6B5)
+      DXUP_FORMAT(X1R5G5B5) DXUP_FORMAT(A1R5G5B5) DXUP_FORMAT(A4R4G4B4) DXUP_FORMAT(R3G3B2) DXUP_FORMAT(A8)
+      DXUP_FORMAT(A8R3G3B2) DXUP_FORMAT(X4R4G4B4) DXUP_FORMAT(A2B10G10R10) DXUP_FORMAT(A8B8G8R8) DXUP_FORMAT(X8B8G8R8)
+      DXUP_FORMAT(G16R16) DXUP_FORMAT(A2R10G10B10) DXUP_FORMAT(A16B16G16R16) DXUP_FORMAT(A8P8) DXUP_FORMAT(P8)
+      DXUP_FORMAT(L8) DXUP_FORMAT(A8L8) DXUP_FORMAT(A4L4) DXUP_FORMAT(V8U8) DXUP_FORMAT(L6V5U5) DXUP_FORMAT(X8L8V8U8)
+      DXUP_FORMAT(Q8W8V8U8) DXUP_FORMAT(V16U16) DXUP_FORMAT(A2W10V10U10) DXUP_FORMAT(D16_LOCKABLE) DXUP_FORMAT(D32)
+      DXUP_FORMAT(D15S1) DXUP_FORMAT(D24S8) DXUP_FORMAT(D24X8) DXUP_FORMAT(D24X4S4) DXUP_FORMAT(D16)
+      DXUP_FORMAT(D32F_LOCKABLE) DXUP_FORMAT(D24FS8) DXUP_FORMAT(L16) DXUP_FORMAT(INDEX16) DXUP_FORMAT(INDEX32)
+      DXUP_FORMAT(Q16W16V16U16) DXUP_FORMAT(R16F) DXUP_FORMAT(G16R16F) DXUP_FORMAT(A16B16G16R16F) DXUP_FORMAT(R32F)
+      DXUP_FORMAT(G32R32F) DXUP_FORMAT(A32B32G32R32F) DXUP_FORMAT(CxV8U8) DXUP_FORMAT(VERTEXDATA)
+#undef DXUP_FORMAT
+      default: break;
+    }
+    const uint32_t value = uint32_t(format);
+    char text[16];
+    if (value > 0xffff) {
+      const char c[5] = { char(value & 0xff), char((value >> 8) & 0xff), char((value >> 16) & 0xff), char(value >> 24), 0 };
+      bool printable = true;
+      for (int i = 0; i < 4; i++)
+        printable = printable && c[i] >= 32 && c[i] < 127;
+      if (printable)
+        return std::string("'") + c + "'";
+    }
+    snprintf(text, sizeof(text), "%u", value);
+    return text;
   }
 
   // ============================================================
@@ -174,27 +229,32 @@ namespace dxup::d3d9 {
   }
 
   HRESULT Surface::LockRect(D3DLOCKED_RECT* locked, const RECT* rect, DWORD flags) {
-    if (!locked)
-      return D3DERR_INVALIDCALL;
-    std::unique_lock<std::recursive_mutex> guard(m_device->mutex(), std::defer_lock);
-    if (m_device->multithreaded()) guard.lock();
-    if (m_locked)
-      return D3DERR_INVALIDCALL;
-    legacy::Rect r = {};
-    if (rect)
-      r = { rect->left, rect->top, rect->right, rect->bottom };
-    void* data = nullptr;
-    uint32_t pitch = 0;
-    if (!m_texture->lock(m_subresource, rect ? &r : nullptr, (flags & D3DLOCK_READONLY) != 0, &data, &pitch,
-                         (flags & D3DLOCK_DISCARD) != 0)) {
-      locked->pBits = nullptr;
-      locked->Pitch = 0;
-      return D3DERR_INVALIDCALL;
-    }
-    locked->pBits = data;
-    locked->Pitch = INT(pitch);
-    m_locked = true;
-    return D3D_OK;
+    const HRESULT hr = [&]() -> HRESULT {
+      if (!locked)
+        return D3DERR_INVALIDCALL;
+      std::unique_lock<std::recursive_mutex> guard(m_device->mutex(), std::defer_lock);
+      if (m_device->multithreaded()) guard.lock();
+      if (m_locked)
+        return D3DERR_INVALIDCALL;
+      legacy::Rect r = {};
+      if (rect)
+        r = { rect->left, rect->top, rect->right, rect->bottom };
+      void* data = nullptr;
+      uint32_t pitch = 0;
+      if (!m_texture->lock(m_subresource, rect ? &r : nullptr, (flags & D3DLOCK_READONLY) != 0, &data, &pitch,
+                           (flags & D3DLOCK_DISCARD) != 0)) {
+        locked->pBits = nullptr;
+        locked->Pitch = 0;
+        return D3DERR_INVALIDCALL;
+      }
+      locked->pBits = data;
+      locked->Pitch = INT(pitch);
+      m_locked = true;
+      return D3D_OK;
+    }();
+    if (FAILED(hr))
+      logFailedCall(hr, "LockRect of a %ux%u %s surface, flags 0x%lx%s", m_texture->width(m_subresource), m_texture->height(m_subresource), formatName(D3DFORMAT(m_texture->desc().format)).c_str(), flags, m_locked ? " (locked already)" : "");
+    return hr;
   }
 
   HRESULT Surface::UnlockRect() {

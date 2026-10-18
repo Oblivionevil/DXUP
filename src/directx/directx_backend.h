@@ -1240,6 +1240,9 @@ namespace dxup {
     // background threads it compiles like createGraphicsPipeline. Pipelines
     // being compiled make the create functions wait for them.
     virtual bool asyncPipelines() const { return false; }
+    // Draws skipped since the last call because their pipeline could not be
+    // compiled (glitch reports).
+    virtual uint32_t takeFailedPipelineDraws() { return 0; }
     // Background threads compile pipelines (precompiled ones, compute
     // pipelines of new shaders); nothing is skipped while they do.
     virtual bool compilesInBackground() const { return false; }

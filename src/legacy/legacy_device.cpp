@@ -754,7 +754,40 @@ namespace dxup::legacy {
 
   Buffer::~Buffer() = default;
 
+  bool Buffer::indexRange(uint32_t start, uint32_t count, bool index32, uint32_t& lo, uint32_t& hi) {
+    const uint32_t size = index32 ? 4 : 2;
+    if (!count || (uint64_t(start) + count) * size > m_data.size())
+      return false;
+    const uint64_t key = (uint64_t(start) << 33) ^ (uint64_t(count) << 1) ^ (index32 ? 1u : 0u);
+    auto it = m_indexRanges.find(key);
+    if (it != m_indexRanges.end() && it->second.version == m_version) {
+      lo = it->second.lo;
+      hi = it->second.hi;
+      return true;
+    }
+    lo = UINT32_MAX;
+    hi = 0;
+    if (index32) {
+      const auto* indices = reinterpret_cast<const uint32_t*>(m_data.data()) + start;
+      for (uint32_t i = 0; i < count; i++) {
+        lo = (std::min)(lo, indices[i]);
+        hi = (std::max)(hi, indices[i]);
+      }
+    } else {
+      const auto* indices = reinterpret_cast<const uint16_t*>(m_data.data()) + start;
+      for (uint32_t i = 0; i < count; i++) {
+        lo = (std::min)(lo, uint32_t(indices[i]));
+        hi = (std::max)(hi, uint32_t(indices[i]));
+      }
+    }
+    if (m_indexRanges.size() >= 4096)
+      m_indexRanges.clear();
+    m_indexRanges[key] = { m_version, lo, hi };
+    return true;
+  }
+
   void Buffer::invalidate(uint32_t offset, uint32_t size) {
+    m_version++;
     // Written again and again (vertices of a frame, without a dynamic flag):
     // streamed like a dynamic buffer from now on.
     m_drawsSinceWrite = 0;
@@ -3003,6 +3036,97 @@ namespace dxup::legacy {
     m_nonFinite.uploads = 0;
   }
 
+  namespace {
+    const char* declTypeName(uint8_t type) {
+      static const char* const kNames[] = { "FLOAT1", "FLOAT2", "FLOAT3", "FLOAT4", "D3DCOLOR", "UBYTE4", "SHORT2",
+        "SHORT4", "UBYTE4N", "SHORT2N", "SHORT4N", "USHORT2N", "USHORT4N", "UDEC3", "DEC3N", "FLOAT16_2", "FLOAT16_4",
+        "UNUSED" };
+      return type < sizeof(kNames) / sizeof(kNames[0]) ? kNames[type] : "?";
+    }
+  }
+
+  void Device::dropDraw(DropReason reason, uint32_t bytes) {
+    m_dropped.counts[reason]++;
+    const Shader* shader = reason == DropVertexShader || reason == DropInputLayout ? m_vertexShader
+                         : reason == DropPixelShader ? m_pixelShader : nullptr;
+    uint64_t cause = fnv64Multiply(uint64_t(reason) + 1);
+    cause = fnv64Multiply(cause ^ (shader ? shader->hash() : 0));
+    if (reason == DropInputLayout && m_decl)
+      cause = fnv64Multiply(cause ^ m_decl->hash());
+    if (m_dropped.causes.size() >= 32
+     || std::find(m_dropped.causes.begin(), m_dropped.causes.end(), cause) != m_dropped.causes.end())
+      return;
+    m_dropped.causes.push_back(cause);
+    std::string what;
+    char text[160];
+    switch (reason) {
+      case DropDeclaration:
+        what = "no vertex declaration or FVF set";
+        break;
+      case DropVertexShader:
+      case DropPixelShader:
+        sprintf_s(text, "%s shader %016llX did not compile for it (see the compile error above)",
+          reason == DropVertexShader ? "vertex" : "pixel", static_cast<unsigned long long>(shader ? shader->hash() : 0));
+        what = text;
+        break;
+      case DropInputLayout: {
+        sprintf_s(text, "no input layout for vertex shader %016llX and the declaration:",
+          static_cast<unsigned long long>(shader ? shader->hash() : 0));
+        what = text;
+        if (m_decl) {
+          for (const auto& e : m_decl->elements()) {
+            sprintf_s(text, " stream %u +%u %s usage %u/%u%s;", e.stream, e.offset, declTypeName(e.type), e.usage,
+              e.usageIndex, (m_streams[e.stream & 15].frequency & kInstanceData) ? " per instance" : "");
+            what += text;
+          }
+        }
+        if (shader) {
+          what += " shader reads";
+          for (const auto& in : shader->info().inputs) {
+            sprintf_s(text, " v%u usage %u/%u;", in.reg, in.usage, in.usageIndex);
+            what += text;
+          }
+        }
+        break;
+      }
+      case DropUpload:
+        sprintf_s(text, "its %u bytes of application vertices or indices did not fit a ring", bytes);
+        what = text;
+        break;
+      case DropIndices:
+        what = "no index buffer set for an indexed draw";
+        break;
+      default:
+        break;
+    }
+    logMessage(LogLevel::Warn, "glitch: a draw was not drawn: %s", what.c_str());
+  }
+
+  void Device::logDroppedDraws() {
+    uint32_t total = 0;
+    for (uint32_t count : m_dropped.counts)
+      total += count;
+    if (!total)
+      return;
+    // Every frame with any for the first 20, then every 100th.
+    m_dropped.frames++;
+    if (m_dropped.frames <= 20 || m_dropped.frames % 100 == 0) {
+      static const char* const kReasons[DropReasons] = { "without declaration", "vertex shader not compiled",
+        "pixel shader not compiled", "no input layout", "data too large", "without index buffer" };
+      std::string reasons;
+      for (uint32_t i = 0; i < DropReasons; i++) {
+        if (!m_dropped.counts[i])
+          continue;
+        char text[64];
+        sprintf_s(text, "%s%u %s", reasons.empty() ? "" : ", ", m_dropped.counts[i], kReasons[i]);
+        reasons += text;
+      }
+      logMessage(LogLevel::Warn, "glitch: present %u: %u draws not drawn (%s)%s", m_nonFinite.presents, total,
+        reasons.c_str(), m_dropped.frames == 20 ? "; from now on every 100th such frame" : "");
+    }
+    std::memset(m_dropped.counts, 0, sizeof(m_dropped.counts));
+  }
+
   void Device::updateShaderConstants(bool pixel) {
     const Shader::Variant* variant = pixel ? m_psVariant : m_vsVariant;
     if (!variant)
@@ -3344,8 +3468,33 @@ namespace dxup::legacy {
     m_dirty = 0;
   }
 
+  // A ring for one draw's data larger than it: twice as large, enough for
+  // it (256 MB at most). Bindings of the old one are set again by pointer.
+  bool Device::growRing(Ref<ID3D11Buffer>& ring, uint32_t& ringSize, uint32_t& ringOffset, uint32_t size, UINT bind) {
+    if (size > (256u << 20))
+      return false;
+    uint32_t grown = ringSize;
+    while (grown < size)
+      grown *= 2;
+    D3D11_BUFFER_DESC bd = {};
+    bd.ByteWidth = grown;
+    bd.Usage = D3D11_USAGE_DYNAMIC;
+    bd.BindFlags = bind;
+    bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    ID3D11Buffer* buffer = nullptr;
+    if (FAILED(m_device->CreateBuffer(&bd, nullptr, &buffer)))
+      return false;
+    logMessage(LogLevel::Info, "D3D9: %s ring %u -> %u KB for a draw of %u KB", bind == D3D11_BIND_INDEX_BUFFER ? "index" : "vertex",
+      ringSize >> 10, grown >> 10, size >> 10);
+    *ring.put() = buffer;
+    ringSize = grown;
+    ringOffset = grown;   // the next map discards
+    return true;
+  }
+
   uint32_t Device::uploadVertices(const void* data, uint32_t size) {
-    if (((size + 63) & ~63u) > m_vertexRingSize)
+    if (((size + 63) & ~63u) > m_vertexRingSize
+     && !growRing(m_vertexRing, m_vertexRingSize, m_vertexRingOffset, (size + 63) & ~63u, D3D11_BIND_VERTEX_BUFFER))
       return UINT32_MAX;
     D3D11_MAP mode = D3D11_MAP_WRITE_NO_OVERWRITE;
     if (m_vertexRingOffset + ((size + 63) & ~63u) > m_vertexRingSize) {
@@ -3363,7 +3512,8 @@ namespace dxup::legacy {
   }
 
   uint32_t Device::uploadIndices(const void* data, uint32_t size) {
-    if (((size + 63) & ~63u) > m_indexRingSize)
+    if (((size + 63) & ~63u) > m_indexRingSize
+     && !growRing(m_indexRing, m_indexRingSize, m_indexRingOffset, (size + 63) & ~63u, D3D11_BIND_INDEX_BUFFER))
       return UINT32_MAX;
     D3D11_MAP mode = D3D11_MAP_WRITE_NO_OVERWRITE;
     if (m_indexRingOffset + ((size + 63) & ~63u) > m_indexRingSize) {
@@ -3413,21 +3563,61 @@ namespace dxup::legacy {
         target->markGpuWritten();
   }
 
-  void Device::drawWith(const DrawArgs& a) {
-    if (!m_decl)
+  // Games give vertex ranges their indices do not keep to (Direct3D 9
+  // drivers do not need them); DXUP uploads and streams that range only, so
+  // vertices beyond it were missing: the range the indices reach instead.
+  // Not for application vertices: Direct3D 9 copies the range given (and
+  // memory beyond it may not be there).
+  void Device::widenVertexRange(DrawArgs& a) {
+    if (a.userVertices)
       return;
+    uint32_t lo = 0, hi = 0;
+    if (a.userIndices) {
+      lo = UINT32_MAX;
+      for (uint32_t i = 0; i < a.indexCount; i++) {
+        const uint32_t index = a.userIndex32 ? static_cast<const uint32_t*>(a.userIndices)[i]
+                                             : static_cast<const uint16_t*>(a.userIndices)[i];
+        lo = (std::min)(lo, index);
+        hi = (std::max)(hi, index);
+      }
+    } else if (!m_indices || !m_indices->indexRange(a.startIndex, a.indexCount, m_index32, lo, hi)) {
+      return;
+    }
+    const uint32_t end = a.minIndex + a.vertexCount;
+    if (lo >= a.minIndex && hi < end)
+      return;
+    if (m_rangeReports < 8) {
+      m_rangeReports++;
+      logMessage(LogLevel::Warn, "D3D9: a draw's indices reach vertices %u to %u, the game gave %u to %u: drawn with the vertices the indices reach%s",
+        lo, hi, a.minIndex, end ? end - 1 : 0, m_rangeReports == 8 ? " (no more such lines)" : "");
+    }
+    const uint32_t first = (std::min)(lo, a.minIndex);
+    a.vertexCount = (std::max)(hi + 1, end) - first;
+    a.minIndex = first;
+  }
+
+  void Device::drawWith(const DrawArgs& args) {
+    DrawArgs a = args;
+    if (a.indexed && a.indexCount)
+      widenVertexRange(a);
+    if (!m_decl)
+      return dropDraw(DropDeclaration);
     // Application vertices into the ring first: its offset binds stream 0.
     uint32_t userOffset = 0;
     if (a.userVertices) {
       const uint32_t vertices = a.indexed ? a.minIndex + a.vertexCount : a.vertexCount;
       userOffset = uploadVertices(a.userVertices, vertices * a.userStride);
       if (userOffset == UINT32_MAX)
-        return;
+        return dropDraw(DropUpload, vertices * a.userStride);
     }
     markTargetsWritten();
     applyState();
-    if ((m_vertexShader && !m_vsVariant) || (m_pixelShader && !m_psVariant) || !m_boundLayout)
-      return;
+    if (m_vertexShader && !m_vsVariant)
+      return dropDraw(DropVertexShader);
+    if (m_pixelShader && !m_psVariant)
+      return dropDraw(DropPixelShader);
+    if (!m_boundLayout)
+      return dropDraw(DropInputLayout);
 
     // Instances: stream 0 counts them, others step per instance.
     uint32_t instances = 1;
@@ -3515,7 +3705,7 @@ namespace dxup::legacy {
           source = m_indices->data() + size_t(a.startIndex) * (index32 ? 4 : 2);
         }
         if (!source)
-          return;
+          return dropDraw(DropIndices);
         list = index32 ? fanToList(static_cast<const uint32_t*>(source), a.indexCount)
                        : fanToList(static_cast<const uint16_t*>(source), a.indexCount);
         base = rebase ? int32_t(int64_t(a.baseVertex) - firstVertex) : a.baseVertex;
@@ -3527,7 +3717,7 @@ namespace dxup::legacy {
         return;
       const uint32_t indexOffset = uploadIndices(list.data(), uint32_t(list.size() * 4));
       if (indexOffset == UINT32_MAX)
-        return;
+        return dropDraw(DropUpload, uint32_t(list.size() * 4));
       m_context->IASetIndexBuffer(m_indexRing.get(), DXGI_FORMAT_R32_UINT, indexOffset);
       m_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
       if (instances > 1)
@@ -3562,12 +3752,12 @@ namespace dxup::legacy {
       const uint32_t size = a.indexCount * (a.userIndex32 ? 4 : 2);
       const uint32_t indexOffset = uploadIndices(a.userIndices, size);
       if (indexOffset == UINT32_MAX)
-        return;
+        return dropDraw(DropUpload, size);
       m_context->IASetIndexBuffer(m_indexRing.get(), a.userIndex32 ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R16_UINT, indexOffset);
       startIndex = 0;
     } else {
       if (!m_indices)
-        return;
+        return dropDraw(DropIndices);
       m_indices->prepare(a.startIndex * (m_index32 ? 4 : 2), a.indexCount * (m_index32 ? 4 : 2));
       m_context->IASetIndexBuffer(m_indices->resource(), m_index32 ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R16_UINT, 0);
     }
@@ -4055,8 +4245,12 @@ namespace dxup::legacy {
 
   HRESULT Device::present(Texture* source, const Rect* sourceRect, HWND window, uint32_t syncInterval,
                           const uint16_t* gammaRamp) {
-    if (glitchReportsEnabled())
+    if (glitchReportsEnabled()) {
       logNonFiniteConstants();
+      logDroppedDraws();
+    } else {
+      std::memset(m_dropped.counts, 0, sizeof(m_dropped.counts));
+    }
     // A ramp other than the identity goes through its lookup table.
     ID3D11ShaderResourceView* gamma = nullptr;
     if (gammaRamp) {

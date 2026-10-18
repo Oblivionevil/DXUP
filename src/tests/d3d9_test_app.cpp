@@ -460,6 +460,55 @@ float4 main(float4 c : COLOR0, float2 t : TEXCOORD0) : COLOR { return tex2D(tex,
     return true;
   }
 
+  // Indexed draws whose vertex range (MinVertexIndex, NumVertices) is
+  // smaller than what their indices reach: Direct3D 9 drivers draw all, as
+  // games rely on. A buffer written once, and one written every frame.
+  bool sceneVertexRanges(IDirect3DDevice9* d) {
+    d->Clear(0, nullptr, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, 0xff000000u, 1.0f, 0);
+    d->SetRenderState(D3DRS_ZENABLE, D3DZB_FALSE);
+    d->SetRenderState(D3DRS_LIGHTING, FALSE);
+    d->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+    d->SetFVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE);
+    IDirect3DIndexBuffer9* ib = nullptr;
+    if (FAILED(d->CreateIndexBuffer(6 * sizeof(WORD), D3DUSAGE_WRITEONLY, D3DFMT_INDEX16, D3DPOOL_MANAGED, &ib, nullptr)))
+      return false;
+    WORD* indices = nullptr;
+    ib->Lock(0, 0, reinterpret_cast<void**>(&indices), 0);
+    for (WORD i = 0; i < 6; i++) indices[i] = i;
+    ib->Unlock();
+    d->SetIndices(ib);
+    for (int buffer = 0; buffer < 2; buffer++) {
+      IDirect3DVertexBuffer9* vb = nullptr;
+      if (FAILED(d->CreateVertexBuffer(sizeof(TLVertex) * 6, D3DUSAGE_WRITEONLY, D3DFVF_XYZRHW | D3DFVF_DIFFUSE,
+                                       D3DPOOL_MANAGED, &vb, nullptr)))
+        return false;
+      const float y = buffer * 24.0f;
+      const DWORD c = buffer ? 0xff00ff00u : 0xffff8000u;
+      // Written again and again by the second: DXUP streams it.
+      for (int write = 0; write < (buffer ? 6 : 1); write++) {
+        TLVertex* v = nullptr;
+        vb->Lock(0, 0, reinterpret_cast<void**>(&v), 0);
+        v[0] = { 2.0f, y + 2.0f, 0.5f, 1.0f, c };
+        v[1] = { 28.0f, y + 2.0f, 0.5f, 1.0f, c };
+        v[2] = { 2.0f, y + 20.0f, 0.5f, 1.0f, c };
+        v[3] = { 34.0f, y + 2.0f, 0.5f, 1.0f, c | 0xff };
+        v[4] = { 62.0f, y + 2.0f, 0.5f, 1.0f, c | 0xff };
+        v[5] = { 34.0f, y + 20.0f, 0.5f, 1.0f, c | 0xff };
+        vb->Unlock();
+        d->SetStreamSource(0, vb, 0, sizeof(TLVertex));
+        // Earlier writes drawn too, with the right range.
+        if (write + 1 < (buffer ? 6 : 1))
+          d->DrawIndexedPrimitive(D3DPT_TRIANGLELIST, 0, 0, 6, 0, 2);
+      }
+      d->DrawIndexedPrimitive(D3DPT_TRIANGLELIST, 0, 0, 3, 0, 2);
+      d->SetStreamSource(0, nullptr, 0, 0);
+      vb->Release();
+    }
+    d->SetIndices(nullptr);
+    ib->Release();
+    return true;
+  }
+
   bool sceneInstancing(IDirect3DDevice9* d) {
     d->Clear(0, nullptr, D3DCLEAR_TARGET, 0xff000000u, 1.0f, 0);
     const char* vsSource = R"(
@@ -1272,6 +1321,7 @@ float4 main(float2 t : TEXCOORD0) : COLOR {
     { "fog", sceneFog, 3 },
     { "dynamic_buffer", sceneDynamicBuffer },
     { "instancing", sceneInstancing },
+    { "vertex_ranges", sceneVertexRanges },
     { "state_block", sceneStateBlock },
     { "sm3_loops", sceneSm3Loops },
     { "ps_1_4", scenePs14 },
@@ -1574,6 +1624,72 @@ VO main(float3 p : POSITION, float4 c : COLOR0) { VO o; o.p = float4(p.xy, 0.5, 
     return result;
   }
 
+  // With saved frames on (dxup_frame_dump.txt): a draw without vertex
+  // declaration, a texture Direct3D 9 does not allow (generated mipmaps in
+  // system memory), and a draw of application vertices larger than DXUP's
+  // ring (drawn: the ring grows).
+  int droppedChild(Runtime& runtime) {
+    IDirect3D9* d3d = runtime.create(D3D_SDK_VERSION);
+    if (!d3d) return -1;
+    HWND window = createWindow();
+    D3DPRESENT_PARAMETERS pp = {};
+    pp.Windowed = TRUE;
+    pp.SwapEffect = D3DSWAPEFFECT_DISCARD;
+    pp.BackBufferWidth = kWidth;
+    pp.BackBufferHeight = kHeight;
+    pp.BackBufferFormat = D3DFMT_X8R8G8B8;
+    pp.hDeviceWindow = window;
+    pp.PresentationInterval = D3DPRESENT_INTERVAL_IMMEDIATE;
+    IDirect3DDevice9* device = nullptr;
+    if (FAILED(d3d->CreateDevice(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, window, D3DCREATE_HARDWARE_VERTEXPROCESSING, &pp, &device))) {
+      d3d->Release();
+      DestroyWindow(window);
+      return -1;
+    }
+    IDirect3DTexture9* texture = nullptr;
+    const HRESULT textureHr = device->CreateTexture(64, 64, 0, D3DUSAGE_AUTOGENMIPMAP, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM,
+                                                    &texture, nullptr);
+    if (texture) texture->Release();
+    struct V { float x, y, z; DWORD color; };
+    // 10 MB of degenerate triangles, then one over the whole target.
+    std::vector<V> big((size_t(10) << 20) / sizeof(V) / 3 * 3);
+    for (auto& v : big) v = { 0.0f, 0.0f, 0.5f, 0xffffffffu };
+    const V cover[3] = { { -1.0f, -1.0f, 0.5f, 0xffffffffu }, { -1.0f, 3.0f, 0.5f, 0xffffffffu }, { 3.0f, -1.0f, 0.5f, 0xffffffffu } };
+    std::copy(cover, cover + 3, big.end() - 3);
+    DWORD center = 0;
+    for (int frame = 0; frame < 2; frame++) {
+      device->Clear(0, nullptr, D3DCLEAR_TARGET, 0xff000000u, 1.0f, 0);
+      device->BeginScene();
+      device->SetRenderState(D3DRS_LIGHTING, FALSE);
+      device->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+      device->SetVertexDeclaration(nullptr);
+      device->DrawPrimitiveUP(D3DPT_TRIANGLELIST, 1, cover, sizeof(V));
+      device->SetFVF(D3DFVF_XYZ | D3DFVF_DIFFUSE);
+      device->DrawPrimitiveUP(D3DPT_TRIANGLELIST, UINT(big.size() / 3), big.data(), sizeof(V));
+      device->EndScene();
+      if (frame == 1) {
+        IDirect3DSurface9* backBuffer = nullptr;
+        IDirect3DSurface9* copy = nullptr;
+        if (SUCCEEDED(device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &backBuffer))
+         && SUCCEEDED(device->CreateOffscreenPlainSurface(kWidth, kHeight, D3DFMT_X8R8G8B8, D3DPOOL_SYSTEMMEM, &copy, nullptr))
+         && SUCCEEDED(device->GetRenderTargetData(backBuffer, copy))) {
+          D3DLOCKED_RECT locked = {};
+          if (SUCCEEDED(copy->LockRect(&locked, nullptr, D3DLOCK_READONLY))) {
+            center = static_cast<const DWORD*>(locked.pBits)[(kHeight / 2) * (locked.Pitch / 4) + kWidth / 2];
+            copy->UnlockRect();
+          }
+        }
+        if (copy) copy->Release();
+        if (backBuffer) backBuffer->Release();
+      }
+      device->Present(nullptr, nullptr, nullptr, nullptr);
+    }
+    device->Release();
+    d3d->Release();
+    DestroyWindow(window);
+    return SUCCEEDED(textureHr) ? 2 : (center & 0xffffff) == 0xffffff ? 0 : 1;
+  }
+
   // Full screen on a scaled monitor: the process becomes per-monitor DPI
   // aware (as with Windows' d3d9.dll) and the window covers the monitor in
   // pixels. 0 ok, 1 not DPI aware, 2 window not the monitor's size, 3 the
@@ -1644,7 +1760,7 @@ int main(int argc, char** argv) {
   bool dumpImages = false, memory = false;
   const char* filter = nullptr;
   int benchFrames = 0, benchDraws = 0;
-  bool childForcedMsaa = false, identifier = false, childDpi = false, childFloatStrict = false;
+  bool childForcedMsaa = false, identifier = false, childDpi = false, childFloatStrict = false, childDropped = false;
   unsigned variantNonce = 0;
   for (int i = 1; i < argc; i++) {
     if (std::strcmp(argv[i], "--dump") == 0) dumpImages = true;
@@ -1654,6 +1770,7 @@ int main(int argc, char** argv) {
     else if (std::strcmp(argv[i], "--identifier") == 0) identifier = true;
     else if (std::strcmp(argv[i], "--dpi-child") == 0) childDpi = true;
     else if (std::strcmp(argv[i], "--float-strict-child") == 0) childFloatStrict = true;
+    else if (std::strcmp(argv[i], "--dropped-child") == 0) childDropped = true;
     else if (std::strcmp(argv[i], "--variant-child") == 0 && i + 1 < argc) variantNonce = unsigned(std::strtoul(argv[++i], nullptr, 10));
     else if (std::strcmp(argv[i], "--bench") == 0 && i + 2 < argc) { benchFrames = std::atoi(argv[i + 1]); benchDraws = std::atoi(argv[i + 2]); i += 2; }
     else filter = argv[i];
@@ -1684,6 +1801,8 @@ int main(int argc, char** argv) {
 
   if (childDpi)
     return dpiFullscreenChild(dxup);
+  if (childDropped)
+    return droppedChild(dxup);
 
   // float_specials with d3d9.floatEmulation = strict (dxup.conf beside the
   // DLLs): 0 matching, 1 differing, 2 failed.
@@ -1849,6 +1968,38 @@ int main(int argc, char** argv) {
     const bool ok = code == 0;
     std::printf("%s %-20s mul, mad, dp3 with d3d9.floatEmulation = strict (child exit %d)\n", ok ? "ok  " : "FAIL", "float_strict",
                 code);
+    ok ? passed++ : failed++;
+  }
+  // What leaves objects out is logged with saved frames on: a draw DXUP
+  // could not draw and a failed call (a child with dxup_frame_dump.txt).
+  if (!filter || std::strstr("dropped_report", filter)) {
+    const std::wstring marker = dir + L"dxup_frame_dump.txt";
+    const std::wstring log = dir + L"logdxup_dxup_d3d9.log";
+    int code = -1;
+    bool drawLine = false, frameLine = false, callLine = false, ringLine = false;
+    if (FILE* f = _wfopen(marker.c_str(), L"w")) {
+      std::fclose(f);
+      DeleteFileW(log.c_str());
+      code = runSelf("--dropped-child");
+      DeleteFileW(marker.c_str());
+      if (FILE* l = _wfopen(log.c_str(), L"r")) {
+        char line[2048];
+        while (std::fgets(line, sizeof(line), l)) {
+          drawLine |= std::strstr(line, "a draw was not drawn: no vertex declaration") != nullptr;
+          frameLine |= std::strstr(line, "draws not drawn (1 without declaration)") != nullptr;
+          callLine |= std::strstr(line, "call failed with D3DERR_INVALIDCALL: CreateTexture 64x64") != nullptr
+                   && std::strstr(line, "A8R8G8B8, pool 2") != nullptr;
+          ringLine |= std::strstr(line, "did not fit") != nullptr;
+        }
+        std::fclose(l);
+      }
+      // The child's frames are saved as images.
+      for (const wchar_t* name : { L"dxup_frame_60.bmp", L"dxup_frame_300.bmp" })
+        DeleteFileW((dir + name).c_str());
+    }
+    const bool ok = code == 0 && drawLine && frameLine && callLine && !ringLine;
+    std::printf("%s %-20s draw line %d, frame line %d, failed call %d, large draw %s (child exit %d)\n", ok ? "ok  " : "FAIL",
+                "dropped_report", drawLine, frameLine, callLine, ringLine ? "dropped" : "drawn", code);
     ok ? passed++ : failed++;
   }
   // Full screen on a scaled monitor (requested by name: covers the screen).

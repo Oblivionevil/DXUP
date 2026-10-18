@@ -21232,6 +21232,11 @@ float4 main() : SV_Target { return color; }
       // As many calls as a game frame has at least (fewer count as video).
       for (int draw = 0; draw < 12; draw++)
         context->Draw(3, 0);
+      // Frame 30: a draw that cannot be drawn (no vertex shader) is logged.
+      if (frame == 30) {
+        context->VSSetShader(nullptr, nullptr, 0);
+        context->Draw(3, 0);
+      }
       if (FAILED(swapChain->Present(0, 0)))
         return 6;
       Sleep(5);
@@ -21270,6 +21275,8 @@ float4 main() : SV_Target { return color; }
     const size_t changed = log.find("glitch 1:   changed #1 Draw");
     if (changed == std::string::npos || log.find(" cb1 ", changed) == std::string::npos)
       return 12;
+    if (log.find("present 30: 1 draws not drawn (1 without vertex shader)") == std::string::npos)
+      return 13;
     return 0;
   }
 

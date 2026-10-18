@@ -175,7 +175,13 @@ namespace dxup::legacy {
     // Uploads what of [offset, offset + size) changed since its last upload.
     void prepare(uint32_t offset, uint32_t size);
     ID3D11Buffer* resource() const { return m_buffer.get(); }
+    // The smallest and largest of `count` indices from index `start`, kept
+    // until the buffer is written again; false past the buffer's end.
+    bool indexRange(uint32_t start, uint32_t count, bool index32, uint32_t& lo, uint32_t& hi);
   private:
+    struct IndexRange { uint32_t version, lo, hi; };
+    std::unordered_map<uint64_t, IndexRange> m_indexRanges;
+    uint32_t           m_version = 0;   // counts writes
     Device*            m_device;
     std::vector<uint8_t> m_data;
     Ref<ID3D11Buffer>  m_buffer;
@@ -415,6 +421,7 @@ namespace dxup::legacy {
     void bindTargets();
     void bindTextures();
     void drawWith(const DrawArgs& args);
+    void widenVertexRange(DrawArgs& a);
     // Uploads application data into the ring buffers; returns offsets.
     uint32_t uploadVertices(const void* data, uint32_t size);
     uint32_t uploadIndices(const void* data, uint32_t size);
@@ -549,6 +556,21 @@ namespace dxup::legacy {
     NonFiniteConstants m_nonFinite;
     void checkConstants(bool pixel, uint32_t floats);
     void logNonFiniteConstants();
+    // Draws DXUP could not draw: each cause logged once with what the draw
+    // lacked, and with saved frames on how many per frame (missing objects
+    // leave no other trace).
+    enum DropReason : uint32_t { DropDeclaration, DropVertexShader, DropPixelShader, DropInputLayout, DropUpload,
+                                 DropIndices, DropReasons };
+    struct DroppedDraws {
+      uint32_t counts[DropReasons] = {};   // this frame
+      uint32_t frames = 0;                 // frames with any, logged so far
+      std::vector<uint64_t> causes;        // logged once
+    };
+    DroppedDraws m_dropped;
+    void dropDraw(DropReason reason, uint32_t bytes = 0);
+    void logDroppedDraws();
+    bool growRing(Ref<ID3D11Buffer>& ring, uint32_t& ringSize, uint32_t& ringOffset, uint32_t size, UINT bind);
+    uint32_t m_rangeReports = 0;
     uint32_t m_ffpFvf = 0;                  // what the fixed function sees
     uint32_t m_psTextureTypes = 0;          // 2 bits per sampler: the bound textures' types
     uint32_t m_shadowMask = 0;              // samplers with depth textures compared

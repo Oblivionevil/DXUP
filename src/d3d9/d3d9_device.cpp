@@ -616,144 +616,174 @@ namespace dxup::d3d9 {
 
   HRESULT Device::CreateTexture(UINT width, UINT height, UINT levels, DWORD usage, D3DFORMAT format, D3DPOOL pool,
                                 IDirect3DTexture9** texture, HANDLE* shared) {
-    if (!texture || !width || !height || shared)
-      return D3DERR_INVALIDCALL;
-    *texture = nullptr;
-    DeviceLock lock(this);
-    const UINT fullChain = UINT(std::floor(std::log2(double((std::max)(width, height))))) + 1;
-    if (!levels || levels > fullChain)
-      levels = fullChain;
-    if ((usage & D3DUSAGE_AUTOGENMIPMAP) && pool == D3DPOOL_SYSTEMMEM)
-      return D3DERR_INVALIDCALL;
-    legacy::TextureDesc desc;
-    desc.width = width;
-    desc.height = height;
-    desc.levels = levels;
-    desc.format = legacy::Format(format);
-    desc.renderTarget = (usage & D3DUSAGE_RENDERTARGET) != 0;
-    desc.depthStencil = (usage & D3DUSAGE_DEPTHSTENCIL) != 0;
-    desc.sampledDepth = desc.depthStencil;
-    desc.systemMemory = pool == D3DPOOL_SYSTEMMEM || pool == D3DPOOL_SCRATCH;
-    desc.srgb = true;
-    desc.autoMips = (usage & D3DUSAGE_AUTOGENMIPMAP) != 0;
-    auto shared_ = std::make_shared<legacy::Texture>(m_core.get(), desc);
-    if (!shared_->valid())
-      return D3DERR_INVALIDCALL;
-    auto* object = new Texture2D(this, std::move(shared_), pool, usage);
-    object->AddRef();
-    *texture = object;
-    return D3D_OK;
+    const HRESULT hr = [&]() -> HRESULT {
+      if (!texture || !width || !height || shared)
+        return D3DERR_INVALIDCALL;
+      *texture = nullptr;
+      DeviceLock lock(this);
+      const UINT fullChain = UINT(std::floor(std::log2(double((std::max)(width, height))))) + 1;
+      if (!levels || levels > fullChain)
+        levels = fullChain;
+      if ((usage & D3DUSAGE_AUTOGENMIPMAP) && pool == D3DPOOL_SYSTEMMEM)
+        return D3DERR_INVALIDCALL;
+      legacy::TextureDesc desc;
+      desc.width = width;
+      desc.height = height;
+      desc.levels = levels;
+      desc.format = legacy::Format(format);
+      desc.renderTarget = (usage & D3DUSAGE_RENDERTARGET) != 0;
+      desc.depthStencil = (usage & D3DUSAGE_DEPTHSTENCIL) != 0;
+      desc.sampledDepth = desc.depthStencil;
+      desc.systemMemory = pool == D3DPOOL_SYSTEMMEM || pool == D3DPOOL_SCRATCH;
+      desc.srgb = true;
+      desc.autoMips = (usage & D3DUSAGE_AUTOGENMIPMAP) != 0;
+      auto shared_ = std::make_shared<legacy::Texture>(m_core.get(), desc);
+      if (!shared_->valid())
+        return D3DERR_INVALIDCALL;
+      auto* object = new Texture2D(this, std::move(shared_), pool, usage);
+      object->AddRef();
+      *texture = object;
+      return D3D_OK;
+    }();
+    if (FAILED(hr))
+      logFailedCall(hr, "CreateTexture %ux%u, %u levels, usage 0x%lx, format %s, pool %u", width, height, levels, usage, formatName(format).c_str(), unsigned(pool));
+    return hr;
   }
 
   HRESULT Device::CreateVolumeTexture(UINT width, UINT height, UINT depth, UINT levels, DWORD usage, D3DFORMAT format,
                                       D3DPOOL pool, IDirect3DVolumeTexture9** texture, HANDLE* shared) {
-    if (!texture || !width || !height || !depth || shared)
-      return D3DERR_INVALIDCALL;
-    *texture = nullptr;
-    DeviceLock lock(this);
-    const UINT fullChain = UINT(std::floor(std::log2(double((std::max)((std::max)(width, height), depth))))) + 1;
-    if (!levels || levels > fullChain)
-      levels = fullChain;
-    legacy::TextureDesc desc;
-    desc.width = width;
-    desc.height = height;
-    desc.depth = depth;
-    desc.volume = true;
-    desc.levels = levels;
-    desc.format = legacy::Format(format);
-    desc.systemMemory = pool == D3DPOOL_SYSTEMMEM || pool == D3DPOOL_SCRATCH;
-    auto shared_ = std::make_shared<legacy::Texture>(m_core.get(), desc);
-    if (!shared_->valid())
-      return D3DERR_INVALIDCALL;
-    auto* object = new VolumeTexture(this, std::move(shared_), pool, usage);
-    object->AddRef();
-    *texture = object;
-    return D3D_OK;
+    const HRESULT hr = [&]() -> HRESULT {
+      if (!texture || !width || !height || !depth || shared)
+        return D3DERR_INVALIDCALL;
+      *texture = nullptr;
+      DeviceLock lock(this);
+      const UINT fullChain = UINT(std::floor(std::log2(double((std::max)((std::max)(width, height), depth))))) + 1;
+      if (!levels || levels > fullChain)
+        levels = fullChain;
+      legacy::TextureDesc desc;
+      desc.width = width;
+      desc.height = height;
+      desc.depth = depth;
+      desc.volume = true;
+      desc.levels = levels;
+      desc.format = legacy::Format(format);
+      desc.systemMemory = pool == D3DPOOL_SYSTEMMEM || pool == D3DPOOL_SCRATCH;
+      auto shared_ = std::make_shared<legacy::Texture>(m_core.get(), desc);
+      if (!shared_->valid())
+        return D3DERR_INVALIDCALL;
+      auto* object = new VolumeTexture(this, std::move(shared_), pool, usage);
+      object->AddRef();
+      *texture = object;
+      return D3D_OK;
+    }();
+    if (FAILED(hr))
+      logFailedCall(hr, "CreateVolumeTexture %ux%ux%u, %u levels, usage 0x%lx, format %s, pool %u", width, height, depth, levels, usage, formatName(format).c_str(), unsigned(pool));
+    return hr;
   }
 
   HRESULT Device::CreateCubeTexture(UINT edge, UINT levels, DWORD usage, D3DFORMAT format, D3DPOOL pool,
                                     IDirect3DCubeTexture9** texture, HANDLE* shared) {
-    if (!texture || !edge || shared)
-      return D3DERR_INVALIDCALL;
-    *texture = nullptr;
-    DeviceLock lock(this);
-    const UINT fullChain = UINT(std::floor(std::log2(double(edge)))) + 1;
-    if (!levels || levels > fullChain)
-      levels = fullChain;
-    legacy::TextureDesc desc;
-    desc.width = desc.height = edge;
-    desc.levels = levels;
-    desc.cube = true;
-    desc.format = legacy::Format(format);
-    desc.renderTarget = (usage & D3DUSAGE_RENDERTARGET) != 0;
-    desc.depthStencil = (usage & D3DUSAGE_DEPTHSTENCIL) != 0;
-    desc.sampledDepth = desc.depthStencil;
-    desc.systemMemory = pool == D3DPOOL_SYSTEMMEM || pool == D3DPOOL_SCRATCH;
-    desc.srgb = true;
-    desc.autoMips = (usage & D3DUSAGE_AUTOGENMIPMAP) != 0;
-    auto shared_ = std::make_shared<legacy::Texture>(m_core.get(), desc);
-    if (!shared_->valid())
-      return D3DERR_INVALIDCALL;
-    auto* object = new CubeTexture(this, std::move(shared_), pool, usage);
-    object->AddRef();
-    *texture = object;
-    return D3D_OK;
+    const HRESULT hr = [&]() -> HRESULT {
+      if (!texture || !edge || shared)
+        return D3DERR_INVALIDCALL;
+      *texture = nullptr;
+      DeviceLock lock(this);
+      const UINT fullChain = UINT(std::floor(std::log2(double(edge)))) + 1;
+      if (!levels || levels > fullChain)
+        levels = fullChain;
+      legacy::TextureDesc desc;
+      desc.width = desc.height = edge;
+      desc.levels = levels;
+      desc.cube = true;
+      desc.format = legacy::Format(format);
+      desc.renderTarget = (usage & D3DUSAGE_RENDERTARGET) != 0;
+      desc.depthStencil = (usage & D3DUSAGE_DEPTHSTENCIL) != 0;
+      desc.sampledDepth = desc.depthStencil;
+      desc.systemMemory = pool == D3DPOOL_SYSTEMMEM || pool == D3DPOOL_SCRATCH;
+      desc.srgb = true;
+      desc.autoMips = (usage & D3DUSAGE_AUTOGENMIPMAP) != 0;
+      auto shared_ = std::make_shared<legacy::Texture>(m_core.get(), desc);
+      if (!shared_->valid())
+        return D3DERR_INVALIDCALL;
+      auto* object = new CubeTexture(this, std::move(shared_), pool, usage);
+      object->AddRef();
+      *texture = object;
+      return D3D_OK;
+    }();
+    if (FAILED(hr))
+      logFailedCall(hr, "CreateCubeTexture %u, %u levels, usage 0x%lx, format %s, pool %u", edge, levels, usage, formatName(format).c_str(), unsigned(pool));
+    return hr;
   }
 
   HRESULT Device::CreateVertexBuffer(UINT length, DWORD usage, DWORD fvf, D3DPOOL pool, IDirect3DVertexBuffer9** buffer,
                                      HANDLE* shared) {
-    if (!buffer || !length || shared)
-      return D3DERR_INVALIDCALL;
-    *buffer = nullptr;
-    DeviceLock lock(this);
-    auto core = std::make_unique<legacy::Buffer>(m_core.get(), length, false, (usage & D3DUSAGE_DYNAMIC) != 0);
-    if (!core->valid())
-      return D3DERR_OUTOFVIDEOMEMORY;
-    D3DVERTEXBUFFER_DESC desc = { D3DFMT_VERTEXDATA, D3DRTYPE_VERTEXBUFFER, usage, pool, length, fvf };
-    auto* object = new VertexBuffer(this, std::move(core), desc);
-    object->AddRef();
-    *buffer = object;
-    return D3D_OK;
+    const HRESULT hr = [&]() -> HRESULT {
+      if (!buffer || !length || shared)
+        return D3DERR_INVALIDCALL;
+      *buffer = nullptr;
+      DeviceLock lock(this);
+      auto core = std::make_unique<legacy::Buffer>(m_core.get(), length, false, (usage & D3DUSAGE_DYNAMIC) != 0);
+      if (!core->valid())
+        return D3DERR_OUTOFVIDEOMEMORY;
+      D3DVERTEXBUFFER_DESC desc = { D3DFMT_VERTEXDATA, D3DRTYPE_VERTEXBUFFER, usage, pool, length, fvf };
+      auto* object = new VertexBuffer(this, std::move(core), desc);
+      object->AddRef();
+      *buffer = object;
+      return D3D_OK;
+    }();
+    if (FAILED(hr))
+      logFailedCall(hr, "CreateVertexBuffer %u bytes, usage 0x%lx, FVF 0x%lx, pool %u", length, usage, fvf, unsigned(pool));
+    return hr;
   }
 
   HRESULT Device::CreateIndexBuffer(UINT length, DWORD usage, D3DFORMAT format, D3DPOOL pool, IDirect3DIndexBuffer9** buffer,
                                     HANDLE* shared) {
-    if (!buffer || !length || shared || (format != D3DFMT_INDEX16 && format != D3DFMT_INDEX32))
-      return D3DERR_INVALIDCALL;
-    *buffer = nullptr;
-    DeviceLock lock(this);
-    auto core = std::make_unique<legacy::Buffer>(m_core.get(), length, true, (usage & D3DUSAGE_DYNAMIC) != 0);
-    if (!core->valid())
-      return D3DERR_OUTOFVIDEOMEMORY;
-    D3DINDEXBUFFER_DESC desc = { format, D3DRTYPE_INDEXBUFFER, usage, pool, length };
-    auto* object = new IndexBuffer(this, std::move(core), desc);
-    object->AddRef();
-    *buffer = object;
-    return D3D_OK;
+    const HRESULT hr = [&]() -> HRESULT {
+      if (!buffer || !length || shared || (format != D3DFMT_INDEX16 && format != D3DFMT_INDEX32))
+        return D3DERR_INVALIDCALL;
+      *buffer = nullptr;
+      DeviceLock lock(this);
+      auto core = std::make_unique<legacy::Buffer>(m_core.get(), length, true, (usage & D3DUSAGE_DYNAMIC) != 0);
+      if (!core->valid())
+        return D3DERR_OUTOFVIDEOMEMORY;
+      D3DINDEXBUFFER_DESC desc = { format, D3DRTYPE_INDEXBUFFER, usage, pool, length };
+      auto* object = new IndexBuffer(this, std::move(core), desc);
+      object->AddRef();
+      *buffer = object;
+      return D3D_OK;
+    }();
+    if (FAILED(hr))
+      logFailedCall(hr, "CreateIndexBuffer %u bytes, usage 0x%lx, format %s, pool %u", length, usage, formatName(format).c_str(), unsigned(pool));
+    return hr;
   }
 
   HRESULT Device::createSurface(UINT width, UINT height, D3DFORMAT format, D3DPOOL pool, DWORD usage,
                                 D3DMULTISAMPLE_TYPE multisample, DWORD quality, IDirect3DSurface9** surface) {
-    if (!surface || !width || !height)
-      return D3DERR_INVALIDCALL;
-    *surface = nullptr;
-    DeviceLock lock(this);
-    legacy::TextureDesc desc;
-    desc.width = width;
-    desc.height = height;
-    desc.format = legacy::Format(format);
-    desc.renderTarget = (usage & D3DUSAGE_RENDERTARGET) != 0;
-    desc.depthStencil = (usage & D3DUSAGE_DEPTHSTENCIL) != 0;
-    desc.systemMemory = pool == D3DPOOL_SYSTEMMEM || pool == D3DPOOL_SCRATCH;
-    desc.srgb = desc.renderTarget;
-    desc.samples = samplesOf(multisample, quality);
-    auto texture = std::make_shared<legacy::Texture>(m_core.get(), desc);
-    if (!texture->valid())
-      return D3DERR_INVALIDCALL;
-    auto* object = new Surface(this, pool, std::move(texture), 0, nullptr, nullptr, usage, multisample, quality);
-    object->AddRef();
-    *surface = object;
-    return D3D_OK;
+    const HRESULT hr = [&]() -> HRESULT {
+      if (!surface || !width || !height)
+        return D3DERR_INVALIDCALL;
+      *surface = nullptr;
+      DeviceLock lock(this);
+      legacy::TextureDesc desc;
+      desc.width = width;
+      desc.height = height;
+      desc.format = legacy::Format(format);
+      desc.renderTarget = (usage & D3DUSAGE_RENDERTARGET) != 0;
+      desc.depthStencil = (usage & D3DUSAGE_DEPTHSTENCIL) != 0;
+      desc.systemMemory = pool == D3DPOOL_SYSTEMMEM || pool == D3DPOOL_SCRATCH;
+      desc.srgb = desc.renderTarget;
+      desc.samples = samplesOf(multisample, quality);
+      auto texture = std::make_shared<legacy::Texture>(m_core.get(), desc);
+      if (!texture->valid())
+        return D3DERR_INVALIDCALL;
+      auto* object = new Surface(this, pool, std::move(texture), 0, nullptr, nullptr, usage, multisample, quality);
+      object->AddRef();
+      *surface = object;
+      return D3D_OK;
+    }();
+    if (FAILED(hr))
+      logFailedCall(hr, "surface %ux%u, format %s, pool %u, usage 0x%lx, multisample %u/%lu", width, height, formatName(format).c_str(), unsigned(pool), usage, unsigned(multisample), quality);
+    return hr;
   }
 
   HRESULT Device::CreateRenderTarget(UINT width, UINT height, D3DFORMAT format, D3DMULTISAMPLE_TYPE multisample, DWORD quality,
@@ -1933,22 +1963,27 @@ namespace dxup::d3d9 {
   }
 
   HRESULT Device::CreateQuery(D3DQUERYTYPE type, IDirect3DQuery9** query) {
-    DeviceLock lock(this);
-    auto* object = new Query(this, type);
-    if (!object->valid()) {
+    const HRESULT hr = [&]() -> HRESULT {
+      DeviceLock lock(this);
+      auto* object = new Query(this, type);
+      if (!object->valid()) {
+        object->AddRef();
+        object->Release();
+        return D3DERR_NOTAVAILABLE;
+      }
+      // A null pointer asks whether the type is supported.
+      if (!query) {
+        object->AddRef();
+        object->Release();
+        return D3D_OK;
+      }
       object->AddRef();
-      object->Release();
-      return D3DERR_NOTAVAILABLE;
-    }
-    // A null pointer asks whether the type is supported.
-    if (!query) {
-      object->AddRef();
-      object->Release();
+      *query = object;
       return D3D_OK;
-    }
-    object->AddRef();
-    *query = object;
-    return D3D_OK;
+    }();
+    if (FAILED(hr))
+      logFailedCall(hr, "CreateQuery type %u", unsigned(type));
+    return hr;
   }
 
   // ---- Direct3D 9Ex ----

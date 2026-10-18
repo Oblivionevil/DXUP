@@ -1694,6 +1694,7 @@ namespace dxup {
       if (m_historyOn && !m_isDeferred) {
         m_historyFrame++;
         m_history[m_historyFrame % kHistoryFrames].clear();
+        logDroppedDraws();
       }
       if (m_autoTaa)
         m_autoTaa->endFrame();
@@ -1759,10 +1760,50 @@ namespace dxup {
     }
 
     bool prepareRecorded(RecordOp op, uint32_t count, uint32_t instances, uint32_t start, int32_t base) {
+      m_dropReason = DropNone;
       const bool prepared = preparePipeline();
-      if (m_historyOn && !m_isDeferred)
+      if (m_historyOn && !m_isDeferred) {
         recordCall(op, count, instances, start, base, !prepared);
+        if (!prepared)
+          m_droppedDraws[m_dropReason]++;
+      }
       return prepared;
+    }
+
+    // Draws not drawn (glitch reports): no vertex shader bound, a pipeline
+    // that failed to compile, one still compiling (d3d11.asyncShaders).
+    enum DropReason : uint32_t { DropNone, DropNoVertexShader, DropPipelineFailed, DropPipelinePending, DropReasons };
+    DropReason m_dropReason = DropNone;
+    uint32_t   m_droppedDraws[DropReasons] = {};
+    uint32_t   m_droppedFrames = 0, m_presents = 0;
+
+    void logDroppedDraws() {
+      m_presents++;
+      if (auto* backend = m_device->GetBackend())
+        m_droppedDraws[DropPipelineFailed] += backend->takeFailedPipelineDraws();
+      uint32_t total = 0;
+      for (uint32_t i = 1; i < DropReasons; i++)
+        total += m_droppedDraws[i];
+      total += m_droppedDraws[DropNone];   // dropped for another reason
+      if (!total)
+        return;
+      // Every frame with any for the first 20, then every 100th.
+      m_droppedFrames++;
+      if (m_droppedFrames <= 20 || m_droppedFrames % 100 == 0) {
+        static const char* const kReasons[DropReasons] = { "other", "without vertex shader",
+          "pipeline failed to compile (see the error above)", "pipeline still compiling (d3d11.asyncShaders)" };
+        std::string reasons;
+        for (uint32_t i = 0; i < DropReasons; i++) {
+          if (!m_droppedDraws[i])
+            continue;
+          char text[96];
+          snprintf(text, sizeof(text), "%s%u %s", reasons.empty() ? "" : ", ", m_droppedDraws[i], kReasons[i]);
+          reasons += text;
+        }
+        logMessage(LogLevel::Warn, "glitch: present %u: %u draws not drawn (%s)%s", m_presents, total, reasons.c_str(),
+          m_droppedFrames == 20 ? "; from now on every 100th such frame" : "");
+      }
+      std::memset(m_droppedDraws, 0, sizeof(m_droppedDraws));
     }
 
     void recordCall(RecordOp op, uint32_t count, uint32_t instances, uint32_t start, int32_t base, bool dropped) {
@@ -4947,7 +4988,10 @@ namespace dxup {
         : nullptr;
 
       // At minimum we need a vertex shader
-      if (!vs) return false;
+      if (!vs) {
+        m_dropReason = DropNoVertexShader;
+        return false;
+      }
 
       auto* ps = m_state.ps.shader
         ? static_cast<D3D11PixelShader*>(m_state.ps.shader)->GetBackendShader()
@@ -5165,8 +5209,10 @@ namespace dxup {
         pipeline = backend->requestGraphicsPipeline(desc, pending);
       else
         pipeline = backend->createGraphicsPipelineDeferred(desc);
-      if (!pipeline)
+      if (!pipeline) {
+        m_dropReason = pending ? DropPipelinePending : DropPipelineFailed;
         return false;
+      }
 
       if (keyed)
         m_pipelineLookup.insert(key, keyHash, pipeline.get());

@@ -10,6 +10,8 @@
 
 #include <algorithm>
 #include <float.h>
+#include <mutex>
+#include <set>
 
 namespace dxup::d3d9 {
 
@@ -344,8 +346,18 @@ namespace dxup::d3d9 {
   HRESULT Interface::CheckDeviceFormat(UINT adapter, D3DDEVTYPE, D3DFORMAT, DWORD usage, D3DRESOURCETYPE type, D3DFORMAT format) {
     if (adapter >= m_adapters.size())
       return D3DERR_INVALIDCALL;
-    if (!supportsFormat(format, usage, type))
+    if (!supportsFormat(format, usage, type)) {
+      // What the game asked for and did not get: it may leave out what
+      // needs it (info log, each once).
+      static std::mutex mutex;
+      static std::set<uint64_t> reported;
+      const uint64_t key = (uint64_t(uint32_t(format)) << 32) ^ (uint64_t(usage) << 4) ^ uint64_t(type);
+      std::lock_guard<std::mutex> lock(mutex);
+      if (reported.size() < 128 && reported.insert(key).second)
+        logMessage(LogLevel::Info, "D3D9: format %s with usage 0x%lx for resource type %u not offered",
+          formatName(format).c_str(), usage, unsigned(type));
       return D3DERR_NOTAVAILABLE;
+    }
     if ((usage & D3DUSAGE_AUTOGENMIPMAP) && !isRenderTargetFormat(format))
       return D3DOK_NOAUTOGEN;
     return D3D_OK;

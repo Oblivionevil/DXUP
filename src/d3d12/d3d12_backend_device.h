@@ -1018,6 +1018,9 @@ namespace dxup::d3d12 {
     Rc<IBackendPipeline> createGraphicsPipeline(const GraphicsPipelineDesc& desc) override;
     Rc<IBackendPipeline> createComputePipeline(const ComputePipelineDesc& desc) override;
     bool asyncPipelines() const override { return m_asyncDraws && !m_compileThreads.empty(); }
+    uint32_t takeFailedPipelineDraws() override { return m_failedPipelineDraws.exchange(0, std::memory_order_relaxed); }
+    void noteFailedPipelineDraw() { m_failedPipelineDraws.fetch_add(1, std::memory_order_relaxed); }
+    std::atomic<uint32_t> m_failedPipelineDraws{0};
     bool compilesInBackground() const override { return !m_compileThreads.empty(); }
     Rc<IBackendPipeline> requestGraphicsPipeline(const GraphicsPipelineDesc& desc, bool& pending) override;
     void requestComputePipeline(const ComputePipelineDesc& desc) override;
