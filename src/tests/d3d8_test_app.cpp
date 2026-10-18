@@ -375,9 +375,43 @@ namespace {
 
 }
 
+// Windows has no 64-bit d3d8.dll: the 32-bit run saves Windows' images
+// (--save-reference DIR), the 64-bit run compares DXUP's against them
+// (--reference DIR).
+static bool writeReference(const std::wstring& path, const std::vector<DWORD>& pixels) {
+  FILE* f = nullptr;
+  if (_wfopen_s(&f, path.c_str(), L"wb") != 0 || !f)
+    return false;
+  const bool ok = std::fwrite(pixels.data(), 4, pixels.size(), f) == pixels.size();
+  std::fclose(f);
+  return ok;
+}
+
+static bool readReference(const std::wstring& path, std::vector<DWORD>& pixels) {
+  FILE* f = nullptr;
+  if (_wfopen_s(&f, path.c_str(), L"rb") != 0 || !f)
+    return false;
+  pixels.assign(size_t(kWidth) * kHeight, 0);
+  const bool ok = std::fread(pixels.data(), 4, pixels.size(), f) == pixels.size();
+  std::fclose(f);
+  return ok;
+}
+
+static std::wstring widen(const char* text) {
+  std::wstring w;
+  for (const char* c = text; *c; c++) w += wchar_t(*c);
+  return w;
+}
+
 int main(int argc, char** argv) {
   setvbuf(stdout, nullptr, _IONBF, 0);
-  const char* filter = argc > 1 ? argv[1] : nullptr;
+  const char* filter = nullptr;
+  std::wstring saveDir, referenceDir;
+  for (int i = 1; i < argc; i++) {
+    if (std::strcmp(argv[i], "--save-reference") == 0 && i + 1 < argc) saveDir = widen(argv[++i]) + L"\\";
+    else if (std::strcmp(argv[i], "--reference") == 0 && i + 1 < argc) referenceDir = widen(argv[++i]) + L"\\";
+    else filter = argv[i];
+  }
   wchar_t systemDir[MAX_PATH];
   GetSystemDirectoryW(systemDir, MAX_PATH);
   Runtime windows = { "Windows" };
@@ -390,12 +424,14 @@ int main(int argc, char** argv) {
   HMODULE ours = LoadLibraryW((dir + L"dxup_d3d8.dll").c_str());
   windows.create = native ? reinterpret_cast<CreateFunction>(GetProcAddress(native, "Direct3DCreate8")) : nullptr;
   dxup.create = ours ? reinterpret_cast<CreateFunction>(GetProcAddress(ours, "Direct3DCreate8")) : nullptr;
-  if (!windows.create || !dxup.create) {
+  if ((!windows.create && referenceDir.empty()) || !dxup.create) {
     std::printf("FAIL: d3d8.dll (Windows %s, DXUP %s)\n", windows.create ? "ok" : "missing", dxup.create ? "ok" : "missing");
     return 1;
   }
   int passed = 0, failed = 0;
   for (Runtime* r : { &windows, &dxup }) {
+    if (!r->create)
+      continue;
     std::vector<DWORD> unused;
     std::string error;
     const bool ok = run(*r, nullptr, unused, error);
@@ -407,11 +443,19 @@ int main(int argc, char** argv) {
       continue;
     std::vector<DWORD> reference, result;
     std::string error;
-    if (!run(windows, &scene, reference, error)) {
+    if (!referenceDir.empty()) {
+      if (!readReference(referenceDir + widen(scene.name) + L".ref", reference)) {
+        std::printf("FAIL %-18s no reference image\n", scene.name);
+        failed++;
+        continue;
+      }
+    } else if (!run(windows, &scene, reference, error)) {
       std::printf("FAIL %-18s Windows: %s\n", scene.name, error.c_str());
       failed++;
       continue;
     }
+    if (!saveDir.empty() && !writeReference(saveDir + widen(scene.name) + L".ref", reference))
+      std::printf("     %-18s reference not saved\n", scene.name);
     if (!run(dxup, &scene, result, error)) {
       std::printf("FAIL %-18s DXUP: %s\n", scene.name, error.c_str());
       failed++;
