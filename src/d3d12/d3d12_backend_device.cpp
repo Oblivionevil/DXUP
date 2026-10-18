@@ -4931,12 +4931,16 @@ namespace dxup::d3d12 {
   // ============================================================
 
   void D3D12BackendDevice::startCompileThreads() {
-    // A quarter of the CPU's threads: the application keeps the rest.
+    // A quarter of the CPU's threads: the application keeps the rest. While
+    // more than kBurstBacklog jobs wait (a game creating its shaders while it
+    // loads), up to half: the stages warm before the draws that need them.
     const unsigned cores = (std::max)(1u, std::thread::hardware_concurrency());
     const unsigned count = (std::min)(6u, (std::max)(1u, cores / 4));
-    for (unsigned i = 0; i < count; i++) {
+    const unsigned burst = (std::min)(12u, (std::max)(count, cores / 2));
+    for (unsigned i = 0; i < burst; i++) {
       try {
-        m_compileThreads.emplace_back([this] { runCompileThread(); });
+        const bool extra = i >= count;
+        m_compileThreads.emplace_back([this, extra] { runCompileThread(extra); });
       } catch (const std::exception& e) {
         logMessage(LogLevel::Warn, "Async shaders: failed to start a compiler thread: %s", e.what());
         break;
@@ -4945,15 +4949,17 @@ namespace dxup::d3d12 {
     logMessage(LogLevel::Info, "Async shaders: %zu compiler threads", m_compileThreads.size());
   }
 
-  void D3D12BackendDevice::runCompileThread() {
-    SetThreadDescription(GetCurrentThread(), L"dxup-compile");
+  void D3D12BackendDevice::runCompileThread(bool burst) {
+    SetThreadDescription(GetCurrentThread(), burst ? L"dxup-compile-burst" : L"dxup-compile");
     // Below the application's threads: pipelines take longer, frames do not.
-    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    SetThreadPriority(GetCurrentThread(), burst ? THREAD_PRIORITY_LOWEST : THREAD_PRIORITY_BELOW_NORMAL);
     for (;;) {
       std::shared_ptr<CompileJob> job;
       {
         std::unique_lock<std::mutex> lock(m_compileMutex);
-        m_compileCv.wait(lock, [this] { return m_stopCompileThreads || !m_compileJobs.empty(); });
+        m_compileCv.wait(lock, [this, burst] {
+          return m_stopCompileThreads || (!m_compileJobs.empty() && (!burst || m_compileJobs.size() > kBurstBacklog));
+        });
         if (m_stopCompileThreads)
           return;
         job = std::move(m_compileJobs.front());
@@ -4974,7 +4980,9 @@ namespace dxup::d3d12 {
       else
         m_compileJobs.push_back(std::move(job));
     }
-    m_compileCv.notify_one();
+    // All waiting threads: burst ones go back to sleep while few jobs wait,
+    // and the one notify_one picks could be such a thread.
+    m_compileCv.notify_all();
     return true;
   }
 

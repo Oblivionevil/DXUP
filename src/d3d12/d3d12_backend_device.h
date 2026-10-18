@@ -1359,7 +1359,10 @@ namespace dxup::d3d12 {
     void createNullDescriptors();
     // Started with the device; the list does not change afterwards.
     void startCompileThreads();
-    void runCompileThread();
+    void runCompileThread(bool burst);
+    // Compiler threads of their own; the burst ones take jobs only while
+    // many wait (loading screens create shaders by the thousand).
+    static constexpr size_t kBurstBacklog = 32;
     void stopCompileThreads();
     // False when no thread takes the job. Urgent jobs (a draw waits for
     // them) go before the precompiled ones.
