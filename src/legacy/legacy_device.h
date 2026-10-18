@@ -237,8 +237,9 @@ namespace dxup::legacy {
     // ahead in later runs.
     const Variant* variant(const TranslateOptions9& options, bool draw = true);
     // Compiles a variant on a worker thread (loading screens create many).
-    void prepare(const TranslateOptions9& options);
+    void prepare(const TranslateOptions9& options, bool first = false);
   private:
+    friend class Device;
     struct Slot {
       std::once_flag once;
       Variant        variant;
@@ -250,6 +251,7 @@ namespace dxup::legacy {
     std::vector<uint32_t>   m_tokens;
     ShaderInfo9             m_info;
     uint64_t                m_hash = 0;
+    bool                    m_ahead = false;   // compiled ahead (Device::takeWarmShader)
     std::mutex              m_mutex;
     std::unordered_map<uint64_t, std::shared_ptr<Slot>> m_variants;
   };
@@ -263,6 +265,10 @@ namespace dxup::legacy {
     // On DXUP's D3D11: targets of this size are a swap chain's (dxup.conf
     // d3d11.msaaForce covers them). Before the back buffer is made.
     void noteBackBufferSize(uint32_t width, uint32_t height);
+    // A texture view whose components come as the D3D12 mapping says (0 the
+    // default; on DXUP's D3D11 only).
+    HRESULT createShaderResourceView(ID3D11Resource* resource, const D3D11_SHADER_RESOURCE_VIEW_DESC* desc, UINT mapping,
+                                     ID3D11ShaderResourceView** view);
     // A texture has writes for the GPU: draws flush their textures.
     void noteTexturePending() { m_texturesPending = true; }
     // Vertex shaders have drawn with the fixed-function pixel stage, which
@@ -423,6 +429,8 @@ namespace dxup::legacy {
     // ---- D3D11 objects ----
     HMODULE                         m_d3d11Module = nullptr;
     void (WINAPI* m_noteBackBufferSize)(IUnknown*, UINT, UINT) = nullptr;   // DXUP's d3d11.dll only
+    HRESULT (WINAPI* m_createMappedView)(IUnknown*, ID3D11Resource*, const D3D11_SHADER_RESOURCE_VIEW_DESC*, UINT,
+                                         ID3D11ShaderResourceView**) = nullptr;   // DXUP's d3d11.dll only
     Ref<ID3D11Device>               m_device;
     Ref<ID3D11DeviceContext>        m_context;
     Ref<IDXGIFactory2>              m_factory;
@@ -517,7 +525,7 @@ namespace dxup::legacy {
       float    f[256][4];
       int32_t  i[16][4];
       uint32_t b[16];
-      uint32_t limits[4];   // the last float constant
+      uint32_t limits[4];   // the last float constant, vertex input modes (dxup_inputModes)
     };
     ConstantStore m_constants[2] = {};      // vertex, pixel
     bool m_shaderConstantsDirty[2] = { true, true };
@@ -543,7 +551,6 @@ namespace dxup::legacy {
     uint32_t m_ffpFvf = 0;                  // what the fixed function sees
     uint32_t m_psTextureTypes = 0;          // 2 bits per sampler: the bound textures' types
     uint32_t m_shadowMask = 0;              // samplers with depth textures compared
-    uint32_t m_blueOneMask = 0;             // samplers with ATI2 textures: blue reads 1
 
     // What changed since the last draw: draws set only that on D3D11.
     enum Dirty : uint32_t {

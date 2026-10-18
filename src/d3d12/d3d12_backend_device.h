@@ -1433,6 +1433,7 @@ namespace dxup::d3d12 {
       std::atomic<uint64_t> compileUs{0};
       std::atomic<uint64_t> maxUs{0};
       std::atomic<uint64_t> waitUs{0};
+      std::atomic<int64_t>  loggedAt{0};   // hitch timestamp of the last stats line
     } m_psoStats;
     uint64_t notePsoCompile(int64_t start);
     void notePsoWait(int64_t start);

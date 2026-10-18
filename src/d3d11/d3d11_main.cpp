@@ -743,6 +743,18 @@ UINT WINAPI DXUPGetVendorId(IUnknown* pDevice) {
   return backend ? static_cast<d3d12::D3D12BackendDevice*>(backend)->getVendorId() : 0;
 }
 
+// A texture view of DXUP's device whose components come as the D3D12
+// Shader4ComponentMapping says, as Vulkan image views swizzle: DXUP's
+// Direct3D 9 layer reads ATI2 (BC5) as green, red, 1, 1 with it.
+HRESULT WINAPI DXUPCreateShaderResourceView(IUnknown* pDevice, ID3D11Resource* pResource,
+    const D3D11_SHADER_RESOURCE_VIEW_DESC* pDesc, UINT ComponentMapping, ID3D11ShaderResourceView** ppView) {
+  ComPtr<ID3D11Device5> dxupDevice;
+  if (!pDevice
+   || FAILED(pDevice->QueryInterface(kDxupD3D11DeviceIid, reinterpret_cast<void**>(dxupDevice.GetAddressOf()))))
+    return E_INVALIDARG;
+  return static_cast<D3D11Device*>(dxupDevice.Get())->CreateMappedShaderResourceView(pResource, pDesc, ComponentMapping, ppView);
+}
+
 } // extern "C"
 
 #endif // _WIN32

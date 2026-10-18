@@ -555,6 +555,7 @@ float4 main(float4 t0 : TEXCOORD0, float4 t1 : TEXCOORD1, float4 t2 : TEXCOORD2)
     ID3D11Buffer* vertices = nullptr;
     ID3D11Buffer* constants = nullptr;
     ID3D11Buffer* intConstants = nullptr;
+    std::vector<uint8_t> intData;   // ci[16], cb[4], last constant, vertex input modes
     ID3D11Buffer* fixed = nullptr;
     ID3D11ShaderResourceView* views[3] = {};
     ID3D11SamplerState* sampler = nullptr;
@@ -589,7 +590,7 @@ float4 main(float4 t0 : TEXCOORD0, float4 t1 : TEXCOORD1, float4 t2 : TEXCOORD2)
       init.pSysMem = k.c;
       if (FAILED(device->CreateBuffer(&bd, &init, &constants)))
         return false;
-      std::vector<uint8_t> intData(256 + 64 + 16, 0);
+      intData.assign(256 + 64 + 16, 0);
       std::memcpy(intData.data(), k.i, 256);
       std::memcpy(intData.data() + 256, k.b, 64);
       intData[320] = 255;   // the last float constant
@@ -719,6 +720,12 @@ float4 main(float4 t0 : TEXCOORD0, float4 t1 : TEXCOORD1, float4 t2 : TEXCOORD2)
       context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
       context->VSSetShader(vs, nullptr, 0);
       context->PSSetShader(ps, nullptr, 0);
+      // BLENDINDICES (UBYTE4) feeds integers: dxup_inputModes 2.
+      uint32_t inputModes = 0;
+      for (const auto& in : vsInfo.inputs)
+        if (in.usage == UsageBlendIndices) inputModes |= 2u << (in.reg * 2);
+      std::memcpy(intData.data() + 324, &inputModes, 4);
+      context->UpdateSubresource(intConstants, 0, nullptr, intData.data(), 0, 0);
       ID3D11Buffer* buffers[3] = { constants, fixed, intConstants };
       ID3D11Buffer* vsBuffers[3] = { constants, nullptr, intConstants };
       context->VSSetConstantBuffers(0, 3, vsBuffers);
@@ -778,8 +785,55 @@ float4 main(float4 t0 : TEXCOORD0, float4 t1 : TEXCOORD1, float4 t2 : TEXCOORD2)
 
 }
 
+// fxc time and size of the shaders in a d3d9_variants.bin (dxup_pso_cache)
+// per float emulation mode: --compile-records FILE.
+static int compileRecords(const char* path) {
+  FILE* f = std::fopen(path, "rb");
+  if (!f) { std::printf("cannot open %s\n", path); return 1; }
+  std::vector<std::vector<uint32_t>> shaders;
+  uint32_t header[2] = {}, head[2];
+  if (std::fread(header, sizeof(header), 1, f) == 1)
+    while (std::fread(head, sizeof(head), 1, f) == 1 && head[1] <= (4u << 20)) {
+      std::vector<uint8_t> data(head[1]);
+      if (std::fread(data.data(), 1, data.size(), f) != data.size()) break;
+      if (head[0] == 1 && data.size() > 8) {
+        std::vector<uint32_t> tokens((data.size() - 8) / 4);
+        std::memcpy(tokens.data(), data.data() + 8, tokens.size() * 4);
+        shaders.push_back(std::move(tokens));
+      }
+    }
+  std::fclose(f);
+  const char* names[3] = { "IEEE", "dot products 0 * x = 0", "mul, mad, dot 0 * x = 0" };
+  for (int mode = 0; mode < 3; mode++) {
+    double ms = 0.0, worst = 0.0;
+    size_t bytes = 0;
+    int count = 0;
+    for (const auto& tokens : shaders) {
+      TranslateOptions9 options;
+      options.dotEmulation = mode >= 1;
+      options.floatEmulation = mode == 2;
+      std::string hlsl, error;
+      ShaderInfo9 info;
+      if (!translateShader9(tokens.data(), tokens.size(), options, hlsl, info, error)) continue;
+      const auto start = std::chrono::steady_clock::now();
+      ID3DBlob* code = nullptr;
+      ID3DBlob* errors = nullptr;
+      D3DCompile(hlsl.data(), hlsl.size(), "r", nullptr, nullptr, "main", info.stage == ShaderStage9::Vertex ? "vs_5_0" : "ps_5_0",
+        D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &errors);
+      const double t = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+      ms += t; worst = (std::max)(worst, t);
+      if (code) { bytes += code->GetBufferSize(); code->Release(); count++; }
+      if (errors) errors->Release();
+    }
+    std::printf("%-26s %d shaders: %.0f ms (slowest %.1f ms), %zu bytes\n", names[mode], count, ms, worst, bytes);
+  }
+  return 0;
+}
+
 int main(int argc, char** argv) {
   bool dumpAll = false, compileBench = false, floatEmulation = false;
+  for (int i = 1; i + 1 < argc; i++)
+    if (std::strcmp(argv[i], "--compile-records") == 0) return compileRecords(argv[i + 1]);
   const char* filter = nullptr;
   for (int i = 1; i < argc; i++) {
     if (std::strcmp(argv[i], "--dump") == 0) dumpAll = true;
@@ -823,17 +877,11 @@ int main(int argc, char** argv) {
       failed++;
       continue;
     }
-    options.uintInputs = 0;
-    // BLENDINDICES (UBYTE4) feeds integers.
     for (int pass = 0; pass < 2; pass++) {
       if (!translateShader9(vs.tokens.data(), vs.tokens.size(), options, vsHlsl, vsInfo, error))
         break;
-      uint16_t uints = 0;
-      for (const auto& in : vsInfo.inputs)
-        if (in.usage == UsageBlendIndices) uints |= uint16_t(1u << in.reg);
-      if (uints == options.uintInputs && vsInfo.varyingCount >= psInfo.varyingCount)
+      if (vsInfo.varyingCount >= psInfo.varyingCount)
         break;
-      options.uintInputs = uints;
       options.minVaryings = psInfo.varyingCount;
     }
     if (!error.empty()) {

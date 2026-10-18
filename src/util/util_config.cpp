@@ -423,7 +423,7 @@ namespace dxup {
     overrides.directBackBuffer = config.getBool("dxgi.directBackBuffer", true);
     {
       const std::string emulation = config.getString("d3d9.floatEmulation", "auto");
-      overrides.d3d9FloatEmulation = emulation == "true" || emulation == "on" || emulation == "1" ? 1
+      overrides.d3d9FloatEmulation = emulation == "strict" || emulation == "true" || emulation == "on" || emulation == "1" ? 1
         : emulation == "false" || emulation == "off" || emulation == "0" ? 0 : -1;
       const std::string nanDepth = config.getString("d3d9.nanDepth", "auto");
       overrides.d3d9NanDepth = nanDepth == "zero" || nanDepth == "true" || nanDepth == "1" ? 1

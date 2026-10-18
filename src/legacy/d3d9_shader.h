@@ -58,16 +58,11 @@ namespace dxup::legacy {
     const uint8_t* boundSamplerTypes = nullptr;
     // Vertex shaders: write at least this many varying slots.
     uint32_t minVaryings = 0;
-    // Vertex shaders: input registers fed integers (UBYTE4, SHORT2/4).
-    uint16_t uintInputs = 0;
-    uint16_t sintInputs = 0;
     // Pixel shaders: samplers of depth textures compared with the third
     // coordinate (shadow maps), the result in all components.
     uint16_t shadowSamplers = 0;
     // Vertex shaders: user clip planes enabled (clip space, cbuffer b3).
     uint8_t clipPlanes = 0;
-    // Pixel shaders: samplers of ATI2 textures, whose blue reads 1 (BC5 0).
-    uint16_t blueOneSamplers = 0;
     // 0 times infinity or NaN gives 0 (as Direct3D 9 drivers do) in mul and
     // mad (floatEmulation), and in dp2add, dp3, dp4 and the matrix products
     // (dotEmulation); IEEE gives NaN.

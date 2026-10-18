@@ -146,12 +146,14 @@ namespace dxup {
     // Render targets get their memory when first written, as Direct3D 11
     // drivers do (d3d12.lazyTargets): -1 NVIDIA only, 0 off, 1 on.
     int32_t  lazyTargets      = -1;
-    // Where Direct3D 9 drivers differ, DXUP does as the driver of the GPU it
-    // runs on would (Mirror's Edge has infinities and NaN in its data):
-    // 0 times infinity or NaN (d3d9.floatEmulation): -1 auto, as NVIDIA's
-    // driver 0 in mul, mad and the dot products, as Intel's 0 in the dot
-    // products only (NaN in mul and mad); 0 IEEE (NaN) everywhere; 1 0
-    // everywhere.
+    // 0 times infinity or NaN in Direct3D 9 shaders (d3d9.floatEmulation;
+    // Mirror's Edge has NaN in its data): -1 auto, 0 in the dot products
+    // (as NVIDIA's and Intel's drivers), mul and mad IEEE (as Intel's; DXVK
+    // too where the GPU has no such multiply: emulating it in mul and mad
+    // nearly doubles what shaders cost to compile, see d3d9_shader_test
+    // --compile-records), and rcp, rsq, log of 0 finite, so the shader makes
+    // no infinities itself; 1 "strict", 0 also in mul and mad (as NVIDIA's
+    // driver); 0 IEEE (NaN) everywhere.
     int32_t  d3d9FloatEmulation = -1;
     // A vertex with NaN depth (d3d9.nanDepth): -1 auto, as NVIDIA's driver
     // its primitive is not drawn, as Intel's it is drawn at depth 0; 0 not

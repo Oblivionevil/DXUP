@@ -355,7 +355,7 @@ namespace dxup::d3d12 {
         D3D12_SHADER_RESOURCE_VIEW_DESC& srvDesc) {
       srvDesc = {};
       srvDesc.Format = getImageViewFormat(desc, imageDesc);
-      srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+      srvDesc.Shader4ComponentMapping = desc.componentMapping ? desc.componentMapping : D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
       // Stencil views read the second plane of depth-stencil images; D3D12
       // removes the device for a stencil format on the depth plane.
       const UINT planeSlice = srvDesc.Format == DXGI_FORMAT_X24_TYPELESS_G8_UINT
@@ -4860,8 +4860,20 @@ namespace dxup::d3d12 {
     m_psoStats.compileUs.fetch_add(us, std::memory_order_relaxed);
     uint64_t max = m_psoStats.maxUs.load(std::memory_order_relaxed);
     while (us > max && !m_psoStats.maxUs.compare_exchange_weak(max, us, std::memory_order_relaxed)) {}
-    if ((m_psoStats.compiles.fetch_add(1, std::memory_order_relaxed) + 1) % 256 == 0)
-      logPsoStats("running");
+    m_psoStats.compiles.fetch_add(1, std::memory_order_relaxed);
+    // While pipelines compile, the totals every two seconds (hitch trace):
+    // games are often ended without destroying their device.
+    if (hitchTraceEnabled()) {
+      static const int64_t frequency = [] {
+        LARGE_INTEGER value;
+        QueryPerformanceFrequency(&value);
+        return value.QuadPart;
+      }();
+      const int64_t now = hitchTimestamp();
+      int64_t last = m_psoStats.loggedAt.load(std::memory_order_relaxed);
+      if (now - last >= 2 * frequency && m_psoStats.loggedAt.compare_exchange_strong(last, now, std::memory_order_relaxed))
+        logPsoStats("running");
+    }
     return us;
   }
 

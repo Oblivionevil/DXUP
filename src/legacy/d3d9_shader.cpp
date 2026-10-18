@@ -476,8 +476,6 @@ namespace dxup::legacy {
           sample = tex + ".SampleGrad(" + smp + ", " + c + ", " + extra + ")";
         else
           sample = tex + ".Sample(" + smp + ", " + c + ")";
-        if (!vertex && ((options.blueOneSamplers >> sampler) & 1))
-          sample = "dxup_blueOne(" + sample + ")";
         return sample;
       }
 
@@ -890,7 +888,8 @@ namespace dxup::legacy {
     // Floats bound as a window of what the shader reads; integers and
     // booleans apart (they change rarely).
     s += "cbuffer Constants : register(b0) {\n  float4 c[256];\n};\n";
-    s += "cbuffer IntConstants : register(b2) {\n  int4 ci[16];\n  uint4 cb[4];\n  uint dxup_lastConstant;   // 255\n};\n";
+    s += "cbuffer IntConstants : register(b2) {\n  int4 ci[16];\n  uint4 cb[4];\n  uint dxup_lastConstant;   // 255\n"
+         "  uint dxup_inputModes;     // vertex inputs, 2 bits each: 0 float, 1 int, 2 uint\n};\n";
     if (vertex && options.clipPlanes)
       s += "cbuffer ClipPlanes : register(b3) {\n  float4 dxup_clipPlanes[6];\n};\n";
     if (!vertex) {
@@ -908,8 +907,9 @@ namespace dxup::legacy {
     s += "float dxup_log(float x) { return x == 0.0f ? -3.402823466e38f : log2(abs(x)); }\n";
     s += "float dxup_pow(float x, float y) { return y == 0.0f ? 1.0f : exp2(y * dxup_log(x)); }\n";
     s += "float4 dxup_nrm(float4 x) { float l = dot(x.xyz, x.xyz); return l > 0.0f ? x * rsqrt(l) : 0.0f.xxxx; }\n";
-    if (options.blueOneSamplers)
-      s += "float4 dxup_blueOne(float4 t) { return float4(t.rg, 1.0f, t.a); }\n";
+    if (vertex)
+      s += "float4 dxup_input(uint4 v, uint r) {\n  const uint mode = (dxup_inputModes >> (r * 2u)) & 3u;\n"
+           "  return mode == 1u ? float4(asint(v)) : mode == 2u ? float4(v) : asfloat(v);\n}\n";
     if (options.floatEmulation || options.dotEmulation) {
       // 0 times anything is 0 (Direct3D 9), not NaN for infinity or NaN.
       s += "float4 dxup_mul(float4 a, float4 b) { return a == 0.0f || b == 0.0f ? 0.0f.xxxx : a * b; }\n";
@@ -947,13 +947,13 @@ namespace dxup::legacy {
     std::string outputStruct = "struct ShaderOutput {\n";
     std::string storeOutputs;
     if (vertex) {
+      // Inputs as their bits, made floats as the vertex declaration's types
+      // say (UBYTE4 and SHORT2/4 give integers): one shader for every
+      // declaration, as DXVK's Vulkan formats scale integers to floats.
       for (const auto& in : info.inputs) {
         const std::string reg = std::to_string(in.reg);
-        const bool isUint = (options.uintInputs >> in.reg) & 1;
-        const bool isSint = (options.sintInputs >> in.reg) & 1;
-        inputStruct += std::string("  ") + (isUint ? "uint4" : isSint ? "int4" : "float4") + " v" + reg + " : "
-          + semantic9(in.usage, in.usageIndex) + ";\n";
-        loadInputs += "  " + w.input(in.reg) + " = " + (isUint || isSint ? "float4(input.v" + reg + ")" : "input.v" + reg) + ";\n";
+        inputStruct += "  uint4 v" + reg + " : " + semantic9(in.usage, in.usageIndex) + ";\n";
+        loadInputs += "  " + w.input(in.reg) + " = dxup_input(input.v" + reg + ", " + reg + "u);\n";
       }
       // Slots: what the shader writes, then up to minVaryings.
       std::string slotValue[kVaryingSlots9];

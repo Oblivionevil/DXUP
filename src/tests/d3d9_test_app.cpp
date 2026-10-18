@@ -855,8 +855,13 @@ PO main(float4 c : COLOR0) { PO o; o.c0 = c; o.c1 = c.gbra * 0.8; return o; }
     return true;
   }
 
-  // 0 times infinity or NaN in mul, mad and dp3 of a pixel shader: 0 with
-  // Direct3D 9 drivers (IEEE would give NaN, written as black).
+  // d3d9.floatEmulation = strict (the float_specials child): mul and mad too.
+  bool g_floatStrict = false;
+
+  // 0 times infinity or NaN in dp3 of a pixel shader, and with
+  // d3d9.floatEmulation = strict in mul and mad: 0 with Direct3D 9 drivers
+  // (IEEE would give NaN, written as black). DXUP's default leaves mul and
+  // mad IEEE, as Intel's driver and DXVK where the GPU lacks such a multiply.
   bool sceneFloatSpecials(IDirect3DDevice9* d) {
     d->Clear(0, nullptr, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, 0xff336699u, 1.0f, 0);
     d->SetRenderState(D3DRS_LIGHTING, FALSE);
@@ -872,7 +877,7 @@ PO main(float4 c : COLOR0) { PO o; o.c0 = c; o.c1 = c.gbra * 0.8; return o; }
     d->SetPixelShaderConstantF(1, specials, 1);
     d->SetPixelShaderConstantF(2, half, 1);
     d->SetFVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE);
-    for (int i = 0; i < 3; i++) {
+    for (int i = g_floatStrict ? 0 : 2; i < 3; i++) {
       const auto code = assemble(sources[i]);
       IDirect3DPixelShader9* ps = nullptr;
       if (code.empty() || FAILED(d->CreatePixelShader(code.data(), &ps)))
@@ -1639,7 +1644,7 @@ int main(int argc, char** argv) {
   bool dumpImages = false, memory = false;
   const char* filter = nullptr;
   int benchFrames = 0, benchDraws = 0;
-  bool childForcedMsaa = false, identifier = false, childDpi = false;
+  bool childForcedMsaa = false, identifier = false, childDpi = false, childFloatStrict = false;
   unsigned variantNonce = 0;
   for (int i = 1; i < argc; i++) {
     if (std::strcmp(argv[i], "--dump") == 0) dumpImages = true;
@@ -1648,6 +1653,7 @@ int main(int argc, char** argv) {
     else if (std::strcmp(argv[i], "--forced-msaa-child") == 0) childForcedMsaa = true;
     else if (std::strcmp(argv[i], "--identifier") == 0) identifier = true;
     else if (std::strcmp(argv[i], "--dpi-child") == 0) childDpi = true;
+    else if (std::strcmp(argv[i], "--float-strict-child") == 0) childFloatStrict = true;
     else if (std::strcmp(argv[i], "--variant-child") == 0 && i + 1 < argc) variantNonce = unsigned(std::strtoul(argv[++i], nullptr, 10));
     else if (std::strcmp(argv[i], "--bench") == 0 && i + 2 < argc) { benchFrames = std::atoi(argv[i + 1]); benchDraws = std::atoi(argv[i + 2]); i += 2; }
     else filter = argv[i];
@@ -1678,6 +1684,26 @@ int main(int argc, char** argv) {
 
   if (childDpi)
     return dpiFullscreenChild(dxup);
+
+  // float_specials with d3d9.floatEmulation = strict (dxup.conf beside the
+  // DLLs): 0 matching, 1 differing, 2 failed.
+  if (childFloatStrict) {
+    g_floatStrict = true;
+    for (const Scene& scene : kScenes) {
+      if (std::strcmp(scene.name, "float_specials") != 0)
+        continue;
+      std::vector<DWORD> reference, result;
+      std::string error;
+      if (!run(windows, scene, reference, error) || !run(dxup, scene, result, error))
+        return 2;
+      int differing = 0;
+      for (size_t i = 0; i < reference.size(); i++)
+        differing += reference[i] != result[i];
+      std::printf("%d pixels differ\n", differing);
+      return differing <= int(reference.size() / 200) ? 0 : 1;
+    }
+    return 2;
+  }
 
   if (variantNonce)
     return variantChild(dxup, variantNonce) == 0 ? 0 : 1;
@@ -1807,6 +1833,22 @@ int main(int argc, char** argv) {
     const bool ok = firstExit == 0 && secondExit == 0 && first >= 1 && second == 0;
     std::printf("%s %-20s draws compiling or waiting: %d first run, %d second (exit %d, %d)\n", ok ? "ok  " : "FAIL",
                 "shader_warmup", first, second, firstExit, secondExit);
+    ok ? passed++ : failed++;
+  }
+  // 0 times infinity or NaN in mul, mad and dp3 with d3d9.floatEmulation =
+  // strict, as Direct3D 9 drivers on NVIDIA (a child with dxup.conf).
+  if (!filter || std::strstr("float_strict", filter)) {
+    const std::wstring conf = dir + L"dxup.conf";
+    int code = -1;
+    if (FILE* f = _wfopen(conf.c_str(), L"w")) {
+      std::fputs("d3d9.floatEmulation = strict\n", f);
+      std::fclose(f);
+      code = runSelf("--float-strict-child");
+      DeleteFileW(conf.c_str());
+    }
+    const bool ok = code == 0;
+    std::printf("%s %-20s mul, mad, dp3 with d3d9.floatEmulation = strict (child exit %d)\n", ok ? "ok  " : "FAIL", "float_strict",
+                code);
     ok ? passed++ : failed++;
   }
   // Full screen on a scaled monitor (requested by name: covers the screen).

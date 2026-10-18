@@ -3706,6 +3706,16 @@ namespace dxup {
         ID3D11Resource*                        pResource,
         const D3D11_SHADER_RESOURCE_VIEW_DESC* pDesc,
         ID3D11ShaderResourceView**             ppSRView) override {
+      return CreateMappedShaderResourceView(pResource, pDesc, 0, ppSRView);
+    }
+
+    // A texture view whose components come as the D3D12 mapping says (0 the
+    // default): DXUPCreateShaderResourceView, for DXUP's Direct3D 9 layer.
+    HRESULT CreateMappedShaderResourceView(
+        ID3D11Resource*                        pResource,
+        const D3D11_SHADER_RESOURCE_VIEW_DESC* pDesc,
+        UINT                                   ComponentMapping,
+        ID3D11ShaderResourceView**             ppSRView) {
       if (!pResource) return E_INVALIDARG;
       D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
       if (HRESULT hr = resolveSrvDesc(pResource, pDesc, formatSupportQuery(), srvDesc); FAILED(hr))
@@ -3757,6 +3767,7 @@ namespace dxup {
       ImageViewDesc viewDesc = getDefaultImageViewDesc(imgDesc, ImageViewUsage::ShaderResource);
       if (pDesc && !initImageViewDescFromSrv(*pDesc, imgDesc, viewDesc))
         return E_INVALIDARG;
+      viewDesc.componentMapping = ComponentMapping;
 
       auto backendView = m_backendDevice.getBackend()->createImageView(backendImage, viewDesc);
       if (!backendView) return E_FAIL;

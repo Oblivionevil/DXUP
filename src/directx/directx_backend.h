@@ -527,6 +527,9 @@ namespace dxup {
     uint32_t        mipLevelCount  = 1;
     uint32_t        baseArrayLayer = 0;
     uint32_t        arrayLayerCount = 1;
+    // Shader resource views: D3D12 Shader4ComponentMapping, 0 the default
+    // (DXUP's Direct3D 9 layer reads ATI2 as green, red, 1, 1).
+    uint32_t        componentMapping = 0;
   };
 
   struct SamplerDesc {

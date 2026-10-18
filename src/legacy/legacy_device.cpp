@@ -418,7 +418,10 @@ namespace dxup::legacy {
       sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
       sd.Texture2D.MipLevels = m_desc.levels;
     }
-    m_device->d3d11()->CreateShaderResourceView(d3dResource(), &sd, view.put());
+    // Direct3D 9 samples ATI2 as (green, red, 1, 1): BC5 read through the
+    // view's component mapping, as DXVK swizzles its Vulkan view.
+    constexpr UINT kGreenRedOneOne = 1u | (0u << 3) | (5u << 6) | (5u << 9) | (1u << 12);
+    m_device->createShaderResourceView(d3dResource(), &sd, m_desc.format == FormatATI2 ? kGreenRedOneOne : 0, view.put());
     return view.get();
   }
 
@@ -630,15 +633,6 @@ namespace dxup::legacy {
       }
     }
     const bool keyed = m_colorKeyEnabled;
-    if (m_desc.format == FormatATI2) {
-      // ATI2 holds its two channels in the other order than BC5 (Direct3D 9
-      // samples the first block as green): the blocks' halves swapped.
-      std::vector<uint8_t> swapped(level.data.begin(), level.data.begin() + size_t(srcSlice) * d);
-      for (size_t i = 0; i + 16 <= swapped.size(); i += 16)
-        std::swap_ranges(swapped.begin() + i, swapped.begin() + i + 8, swapped.begin() + i + 8);
-      write(subresource, box, swapped.data(), srcPitch, srcSlice);
-      return;
-    }
     if (!m_convert && !keyed && m_desc.format != FormatX1R5G5B5) {
       write(subresource, box, level.data.data(), srcPitch, srcSlice);
       return;
@@ -1073,7 +1067,7 @@ namespace dxup::legacy {
     };
 
     // Changes whenever the translator's output changes.
-    constexpr uint64_t kTranslatorVersion = 5;
+    constexpr uint64_t kTranslatorVersion = 6;
 
     // The shaders draws used in this and earlier runs, their code and the
     // variants they were drawn with: compiled at the start of a later run,
@@ -1089,7 +1083,7 @@ namespace dxup::legacy {
       struct Record {
         uint64_t shader;
         uint32_t minVaryings;
-        uint16_t uintInputs, sintInputs, shadowSamplers, blueOneSamplers;
+        uint16_t reserved0, reserved1, shadowSamplers, reserved2;
         uint8_t  clipPlanes, typed, reserved[2];
         uint8_t  types[16];
       };
@@ -1105,10 +1099,7 @@ namespace dxup::legacy {
         Record record = {};
         record.shader = shader;
         record.minVaryings = options.minVaryings;
-        record.uintInputs = options.uintInputs;
-        record.sintInputs = options.sintInputs;
         record.shadowSamplers = options.shadowSamplers;
-        record.blueOneSamplers = options.blueOneSamplers;
         record.clipPlanes = options.clipPlanes;
         if (options.boundSamplerTypes) {
           record.typed = 1;
@@ -1152,10 +1143,7 @@ namespace dxup::legacy {
       // Options of a record; the sampler types point into it.
       static void apply(const Record& record, TranslateOptions9& options) {
         options.minVaryings = record.minVaryings;
-        options.uintInputs = record.uintInputs;
-        options.sintInputs = record.sintInputs;
         options.shadowSamplers = record.shadowSamplers;
-        options.blueOneSamplers = record.blueOneSamplers;
         options.clipPlanes = record.clipPlanes;
         options.boundSamplerTypes = record.typed ? record.types : nullptr;
       }
@@ -1246,12 +1234,12 @@ namespace dxup::legacy {
   // The PCI vendor of the GPU DXUP renders on (DXUPGetVendorId), 0 unknown.
   std::atomic<uint32_t> g_vendorId{0};
 
-  // Where Direct3D 9 drivers differ: as the driver of that GPU's maker, or
-  // as dxup.conf says (UserOverrides::d3d9FloatEmulation, d3d9NanDepth).
+  // Where Direct3D 9 drivers differ: as dxup.conf says, or as the driver of
+  // the GPU's maker (UserOverrides::d3d9FloatEmulation, d3d9NanDepth).
   void driverBehavior(TranslateOptions9& options) {
     const UserOverrides& overrides = UserOverrides::get();
     const bool intel = g_vendorId.load(std::memory_order_relaxed) == 0x8086;
-    options.floatEmulation = overrides.d3d9FloatEmulation == 1 || (overrides.d3d9FloatEmulation < 0 && !intel);
+    options.floatEmulation = overrides.d3d9FloatEmulation == 1;
     options.dotEmulation = overrides.d3d9FloatEmulation != 0;
     options.nanDepthZero = overrides.d3d9NanDepth == 1 || (overrides.d3d9NanDepth < 0 && intel);
   }
@@ -1264,10 +1252,15 @@ namespace dxup::legacy {
         static CompilePool* pool = new CompilePool();   // lives until the process ends
         return *pool;
       }
-      void post(std::function<void()> task) {
+      // First: ahead of the queue (a shader the game just created, likely
+      // drawn next; loading screens queue hundreds before it).
+      void post(std::function<void()> task, bool first = false) {
         {
           std::lock_guard<std::mutex> lock(m_mutex);
-          m_tasks.push_back(std::move(task));
+          if (first)
+            m_tasks.push_front(std::move(task));
+          else
+            m_tasks.push_back(std::move(task));
         }
         m_wake.notify_one();
       }
@@ -1324,7 +1317,7 @@ namespace dxup::legacy {
       return nullptr;
     // The likely variant now, on a worker: compiling at the first draw
     // would stall it, and loading screens create shaders by the hundred.
-    shader->prepare(options);
+    shader->prepare(options, true);
     // Vertex shaders 1.x, and any once the game drew them so, also for the
     // fixed-function pixel stage.
     if (shader->vertex() && shader->m_info.varyingCount < Device::kFixedPixelVaryings
@@ -1436,16 +1429,20 @@ namespace dxup::legacy {
       return nullptr;
     ShaderWarmup& warmup = *m_shaderWarmup;
     std::unique_lock<std::mutex> lock(warmup.mutex);
-    warmup.queued.erase(hash);
+    const bool queued = warmup.queued.erase(hash) != 0;
     warmup.changed.wait(lock, [&] { return !warmup.building.count(hash); });
     auto it = warmup.ready.find(hash);
-    if (it == warmup.ready.end())
+    if (it == warmup.ready.end()) {
+      if (queued)
+        logMessage(LogLevel::Info, "D3D9 shaders: shader %016llx created before its compile ahead started", (unsigned long long)hash);
       return nullptr;
+    }
     std::shared_ptr<Shader> shader = std::move(it->second);
     warmup.ready.erase(it);
     lock.unlock();
     if (shader->tokens().size() != count || std::memcmp(shader->tokens().data(), tokens, count * sizeof(uint32_t)) != 0)
       return nullptr;
+    shader->m_ahead = true;
     return shader;
   }
 
@@ -1467,7 +1464,7 @@ namespace dxup::legacy {
     m_shaderWarmup.reset();
   }
 
-  void Shader::prepare(const TranslateOptions9& options) {
+  void Shader::prepare(const TranslateOptions9& options, bool first) {
     TranslateOptions9 copy = options;
     std::array<uint8_t, 16> types = {};
     const bool typed = options.boundSamplerTypes != nullptr;
@@ -1480,7 +1477,7 @@ namespace dxup::legacy {
         copy.boundSamplerTypes = types.data();
       if (auto shader = self.lock())
         shader->variant(copy, false);
-    });
+    }, first);
   }
 
   const Shader::Variant* Shader::variant(const TranslateOptions9& in, bool draw) {
@@ -1497,7 +1494,6 @@ namespace dxup::legacy {
     for (uint32_t i = 0; i < 16; i++)
       if (m_info.samplerTypes[i]) usedSamplers |= uint16_t(1u << i);
     options.shadowSamplers &= usedSamplers;
-    options.blueOneSamplers &= usedSamplers;
     uint8_t usedTypes[16] = {};
     if (options.boundSamplerTypes) {
       bool other = false;
@@ -1509,10 +1505,7 @@ namespace dxup::legacy {
     }
     uint64_t key = kTranslatorVersion;
     key = fnv64Multiply(key ^ options.minVaryings);
-    key = fnv64Multiply(key ^ options.uintInputs);
-    key = fnv64Multiply(key ^ options.sintInputs);
     key = fnv64Multiply(key ^ options.shadowSamplers);
-    key = fnv64Multiply(key ^ (uint32_t(options.blueOneSamplers) << 16));
     key = fnv64Multiply(key ^ (uint32_t(options.clipPlanes) << 16));
     key = fnv64Multiply(key ^ ((options.floatEmulation ? 0x1000000u : 0u) | (options.dotEmulation ? 0x2000000u : 0u)
       | (options.nanDepthZero ? 0x4000000u : 0u)));
@@ -1539,9 +1532,18 @@ namespace dxup::legacy {
     std::call_once(slot->once, [&] { compiledHere = true; slot->ok = compile(options, key, slot->variant); });
     if (timed) {
       const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
-      if (compiledHere)
-        logMessage(LogLevel::Info, "D3D9 shaders: a draw compiled %s shader %016llx's variant %016llx (%.1f ms)",
-          vertex() ? "vertex" : "pixel", (unsigned long long)m_hash, (unsigned long long)key, ms);
+      if (compiledHere) {
+        size_t variants = 0;
+        {
+          std::lock_guard<std::mutex> lock(m_mutex);
+          variants = m_variants.size() - 1;
+        }
+        logMessage(LogLevel::Info, "D3D9 shaders: a draw compiled %s shader %016llx's variant %016llx (%.1f ms; shader %s, %zu other variants;"
+          " varyings %u/%u, shadow %x, clip %x, types %d)",
+          vertex() ? "vertex" : "pixel", (unsigned long long)m_hash, (unsigned long long)key, ms,
+          m_ahead ? "compiled ahead" : "new", variants, options.minVaryings, m_info.varyingCount,
+          options.shadowSamplers, options.clipPlanes, options.boundSamplerTypes ? 1 : 0);
+      }
       else if (ms >= 1.0)
         logMessage(LogLevel::Info, "D3D9 shaders: a draw waited %.1f ms for %s shader %016llx's variant %016llx",
           ms, vertex() ? "vertex" : "pixel", (unsigned long long)m_hash, (unsigned long long)key);
@@ -1646,6 +1648,13 @@ namespace dxup::legacy {
     for (auto& entry : m_pointShaders) if (entry.second) entry.second->Release();
   }
 
+  HRESULT Device::createShaderResourceView(ID3D11Resource* resource, const D3D11_SHADER_RESOURCE_VIEW_DESC* desc, UINT mapping,
+                                           ID3D11ShaderResourceView** view) {
+    if (mapping && m_createMappedView)
+      return m_createMappedView(m_device.get(), resource, desc, mapping, view);
+    return m_device->CreateShaderResourceView(resource, desc, view);
+  }
+
   void Device::noteBackBufferSize(uint32_t width, uint32_t height) {
     if (m_noteBackBufferSize && m_device)
       m_noteBackBufferSize(m_device.get(), width, height);
@@ -1669,6 +1678,8 @@ namespace dxup::legacy {
     }
     m_noteBackBufferSize = reinterpret_cast<decltype(m_noteBackBufferSize)>(
       GetProcAddress(m_d3d11Module, "DXUPNoteBackBufferSize"));
+    m_createMappedView = reinterpret_cast<decltype(m_createMappedView)>(
+      GetProcAddress(m_d3d11Module, "DXUPCreateShaderResourceView"));
     // The GPU's maker, before the first shader is translated.
     using GetVendorId = UINT (WINAPI*)(IUnknown*);
     if (auto getVendorId = reinterpret_cast<GetVendorId>(GetProcAddress(m_d3d11Module, "DXUPGetVendorId")))
@@ -1804,7 +1815,6 @@ namespace dxup::legacy {
     m_depthStencil = nullptr;
     m_psTextureTypes = 0;
     m_shadowMask = 0;
-    m_blueOneMask = 0;
     m_ffpFvf = 0;
     // Direct3D 9's default states.
     auto& rs = m_renderStates;
@@ -1982,16 +1992,6 @@ namespace dxup::legacy {
       if (m_pixelShader)
         m_dirty |= DirtyShaders;
       m_samplerDirtyMask |= 1u << stage;
-    }
-    // Direct3D 9 samples ATI2 as (green, red, 1, 1); BC5 gives blue 0.
-    const bool oldBlueOne = m_textures[stage] && m_textures[stage]->desc().format == FormatATI2;
-    const bool newBlueOne = texture && texture->desc().format == FormatATI2;
-    if (oldBlueOne != newBlueOne && stage < kPixelSamplers) {
-      m_blueOneMask = newBlueOne ? (m_blueOneMask | (1u << stage)) : (m_blueOneMask & ~(1u << stage));
-      if (m_pixelShader)
-        m_dirty |= DirtyShaders;
-      if (stage < kFixedStages)
-        m_pixelConstantsDirty = true;
     }
     m_textures[stage] = texture;
     m_textureDirtyMask |= 1u << stage;
@@ -2861,7 +2861,7 @@ namespace dxup::legacy {
       c->stageOps[stage][0] = tss[TssColorOp];
       c->stageOps[stage][1] = tss[TssAlphaOp];
       c->stageOps[stage][2] = tss[TssResultArg] == 5 ? 1u : 0u;
-      c->stageOps[stage][3] = type | (projected << 4) | ((flags & 0xf) << 8) | (((m_blueOneMask >> stage) & 1u) << 12);
+      c->stageOps[stage][3] = type | (projected << 4) | ((flags & 0xf) << 8);
       c->stageArgs[stage][0] = tss[TssColorArg1];
       c->stageArgs[stage][1] = tss[TssColorArg2];
       c->stageArgs[stage][2] = tss[TssColorArg0];
@@ -3110,7 +3110,6 @@ namespace dxup::legacy {
         if ((m_shadowMask >> i) & 1 && (m_pixelShader->info().samplerTypes[i] == Sampler2D || m_pixelShader->info().major == 1))
           shadow |= uint16_t(1u << i);
       options.shadowSamplers = shadow;
-      options.blueOneSamplers = uint16_t(m_blueOneMask);
       m_psVariant = m_pixelShader->variant(options);
       if (m_psVariant)
         pixelVaryings = m_psVariant->info.varyingCount;
@@ -3121,16 +3120,23 @@ namespace dxup::legacy {
         m_fixedPixelsWithShaders = true;
       TranslateOptions9 options;
       options.minVaryings = pixelVaryings;
+      // How the inputs' bits become floats (dxup_inputModes): integers of
+      // the declaration's UBYTE4 and SHORT types.
+      uint32_t inputModes = 0;
       if (m_decl) {
         for (const auto& in : m_vertexShader->info().inputs) {
           for (const auto& e : m_decl->elements()) {
             if (e.usage != in.usage || e.usageIndex != in.usageIndex)
               continue;
-            if (declUint(e.type)) options.uintInputs |= uint16_t(1u << in.reg);
-            if (declSint(e.type)) options.sintInputs |= uint16_t(1u << in.reg);
+            if (declUint(e.type)) inputModes |= 2u << (in.reg * 2);
+            if (declSint(e.type)) inputModes |= 1u << (in.reg * 2);
             break;
           }
         }
+      }
+      if (m_constants[0].limits[1] != inputModes) {
+        m_constants[0].limits[1] = inputModes;
+        m_shaderIntsDirty[0] = true;
       }
       options.clipPlanes = uint8_t(m_renderStates[RsClipPlaneEnable] & 0x3f);
       m_vsVariant = m_vertexShader->variant(options);
