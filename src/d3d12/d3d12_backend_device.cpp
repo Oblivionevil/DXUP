@@ -1406,6 +1406,16 @@ namespace dxup::d3d12 {
   // D3D12BackendGraphicsPipeline
   // ============================================================
 
+#ifdef _WIN32
+  void D3D12BackendGraphicsPipeline::replacePSO(ComPtr<ID3D12PipelineState> pso) {
+    std::lock_guard<std::mutex> lock(m_resolveMutex);
+    if (!pso || m_replacement)
+      return;
+    m_replacement = std::move(pso);
+    m_current.store(m_replacement.Get(), std::memory_order_release);
+  }
+#endif
+
   D3D12BackendGraphicsPipeline::D3D12BackendGraphicsPipeline(
 #ifdef _WIN32
     ComPtr<ID3D12PipelineState>  pso,
@@ -1420,6 +1430,7 @@ namespace dxup::d3d12 {
   , m_resourceLimits(resourceLimits)
   , m_activeStageMask(activeStageMask ? activeStageMask : 0x1Fu)
   , m_topology(topology) {
+    m_current.store(m_pso.Get(), std::memory_order_relaxed);
 #else
   : m_topology(topology) {
 #endif
@@ -3760,12 +3771,9 @@ namespace dxup::d3d12 {
     ComPtr<ID3D12PipelineState> pso;
     if (perPixel && FAILED(safeCreateGraphicsPSO(m_device.Get(), &desc, pso.GetAddressOf())))
       return;
-    if (hitchTraceEnabled()) {
-      const uint64_t hash = stageHash(bytecode.data(), bytecode.size());
-      std::lock_guard<std::mutex> lock(m_probeMutex);
-      if (m_warmedStages.size() < 65536)
-        m_warmedStages.insert(hash);
-    }
+    if (perPixel)
+      noteDriverStages(stage == ShaderStage::Vertex ? desc.VS : D3D12_SHADER_BYTECODE{},
+                       stage == ShaderStage::Pixel ? desc.PS : D3D12_SHADER_BYTECODE{});
     // Supersampled draws run the pixel shader per sample: that variant too.
     const UserOverrides& overrides = UserOverrides::get();
     std::vector<uint8_t> sampleFrequency;
@@ -3776,7 +3784,8 @@ namespace dxup::d3d12 {
      && dxbc::makeSampleFrequency(bytecode.data(), bytecode.size(), sampleFrequency)) {
       desc.PS = { sampleFrequency.data(), sampleFrequency.size() };
       desc.SampleDesc.Count = overrides.msaaSamples;
-      safeCreateGraphicsPSO(m_device.Get(), &desc, pso.ReleaseAndGetAddressOf());
+      if (SUCCEEDED(safeCreateGraphicsPSO(m_device.Get(), &desc, pso.ReleaseAndGetAddressOf())))
+        noteDriverStages({}, desc.PS);
     }
     m_psoStats.warmed.fetch_add(1, std::memory_order_relaxed);
   }
@@ -4171,7 +4180,8 @@ namespace dxup::d3d12 {
     return pipeline;
   }
 
-  Rc<IBackendPipeline> D3D12BackendDevice::buildGraphicsPipeline(const GraphicsPipelineDesc& desc, const PsoCacheKey& cacheKey) {
+  Rc<IBackendPipeline> D3D12BackendDevice::buildGraphicsPipeline(const GraphicsPipelineDesc& desc, const PsoCacheKey& cacheKey,
+                                                                 bool masksLater) {
     // Compiler threads count too.
     static std::atomic<int> gfxPipeCreateLogCount{0};
     if (gfxPipeCreateLogCount < 128) {
@@ -4338,6 +4348,9 @@ namespace dxup::d3d12 {
     if (desc.sampleShading && psoDesc.PS.pShaderBytecode
      && dxbc::makeSampleFrequency(psoDesc.PS.pShaderBytecode, psoDesc.PS.BytecodeLength, sampleFrequencyPs))
       psoDesc.PS = { sampleFrequencyPs.data(), sampleFrequencyPs.size() };
+
+    // The stages without masked outputs: what warm-ups compiled.
+    const D3D12_SHADER_BYTECODE unmaskedVs = psoDesc.VS, unmaskedPs = psoDesc.PS;
 
     // What no target takes leaves the pixel shader (d3d12.pixelOutputMasks,
     // see dxbc::maskOutputWrites).
@@ -4508,6 +4521,19 @@ namespace dxup::d3d12 {
       psoDesc.CachedPSO.CachedBlobSizeInBytes = diskBlob.size();
     }
 
+    // Masked outputs make shaders the driver has not seen: such a pipeline
+    // compiles from scratch (Trine 2: 5-17 ms on the first draws) although a
+    // warm-up compiled the shaders as they are. It starts without the masks,
+    // which the driver finds compiled (~0.2 ms), and a compiler thread builds
+    // the masked one to replace it (as DXVK links pipeline libraries first
+    // and compiles the optimized pipeline in the background).
+    masksLater = masksLater && outputsMasked && !hadDiskCache && !m_compileThreads.empty()
+      && driverHasStages(unmaskedVs, unmaskedPs) && !driverHasStages(psoDesc.VS, psoDesc.PS);
+    if (masksLater) {
+      psoDesc.VS = unmaskedVs;
+      psoDesc.PS = unmaskedPs;
+    }
+
     ID3D12PipelineState* rawPso = nullptr;
     HRESULT hr = safeCreateGraphicsPSO(m_device.Get(), &psoDesc, &rawPso);
 
@@ -4559,6 +4585,7 @@ namespace dxup::d3d12 {
       return nullptr;
     }
     logMessage(LogLevel::Debug, "createGfxPSO-returning: OK rootSig=%p topo=%u", m_graphicsRootSignature.Get(), static_cast<uint32_t>(desc.topology));
+    noteDriverStages(psoDesc.VS, psoDesc.PS);
 
     PipelineResourceLimits resourceLimits = {};
     uint32_t activeStageMask = 0;
@@ -4600,12 +4627,39 @@ namespace dxup::d3d12 {
 
     // GetCachedBlob and file writes can stall the render thread. Keep the PSO
     // alive and let the low-priority cache worker serialize it instead.
-    if (!hadDiskCache)
+    // Pipelines that get their masks later store the masked one.
+    if (masksLater)
+      queueMaskedPipeline(desc, cacheKey, pipeline);
+    else if (!hadDiskCache)
       deferPsoBlobWrite(psoKeyHash, pipeline->getPSO());
     else
       m_psoStats.diskHits.fetch_add(1, std::memory_order_relaxed);
 
     return pipeline;
+  }
+
+  void D3D12BackendDevice::queueMaskedPipeline(const GraphicsPipelineDesc& desc, const PsoCacheKey& key,
+                                               const std::shared_ptr<D3D12BackendGraphicsPipeline>& pipeline) {
+    auto owned = std::make_shared<OwnedGraphicsPipelineDesc>(desc);
+    std::weak_ptr<D3D12BackendGraphicsPipeline> target = pipeline;
+    auto job = std::make_shared<CompileJob>();
+    // Behind the pipelines draws wait for and the warm-ups.
+    job->run = [this, owned, key, target] {
+      if (m_stopCompileThreads || target.expired())
+        return;
+      Rc<IBackendPipeline> masked;
+      try {
+        masked = buildGraphicsPipeline(owned->desc, key, false);
+      } catch (const std::exception& e) {
+        logMessage(LogLevel::Error, "masked pipeline: %s", e.what());
+      }
+      auto unmasked = target.lock();
+      if (!masked || !unmasked)
+        return;
+      unmasked->replacePSO(static_cast<D3D12BackendGraphicsPipeline*>(masked.get())->m_pso);
+      m_psoStats.masksLater.fetch_add(1, std::memory_order_relaxed);
+    };
+    enqueueCompile(std::move(job), false);
   }
 #endif
 
@@ -4885,6 +4939,27 @@ namespace dxup::d3d12 {
     return hash;
   }
 
+  void D3D12BackendDevice::noteDriverStages(const D3D12_SHADER_BYTECODE& vs, const D3D12_SHADER_BYTECODE& ps) {
+    const uint64_t vsHash = vs.pShaderBytecode ? stageHash(vs.pShaderBytecode, vs.BytecodeLength) : 0;
+    const uint64_t psHash = ps.pShaderBytecode ? stageHash(ps.pShaderBytecode, ps.BytecodeLength) : 0;
+    std::lock_guard<std::mutex> lock(m_probeMutex);
+    if (m_warmedStages.size() >= 65536)
+      return;
+    if (vsHash)
+      m_warmedStages.insert(vsHash);
+    if (psHash)
+      m_warmedStages.insert(psHash);
+  }
+
+  // Whether the driver compiled the given stages (absent ones count as
+  // compiled).
+  bool D3D12BackendDevice::driverHasStages(const D3D12_SHADER_BYTECODE& vs, const D3D12_SHADER_BYTECODE& ps) {
+    const uint64_t vsHash = vs.pShaderBytecode ? stageHash(vs.pShaderBytecode, vs.BytecodeLength) : 0;
+    const uint64_t psHash = ps.pShaderBytecode ? stageHash(ps.pShaderBytecode, ps.BytecodeLength) : 0;
+    std::lock_guard<std::mutex> lock(m_probeMutex);
+    return (!vsHash || m_warmedStages.count(vsHash)) && (!psHash || m_warmedStages.count(psHash));
+  }
+
   // What a pipeline that compiled slowly had, and which of its stages a
   // warm-up had compiled before: tells which pipelines the warm-up misses.
   void D3D12BackendDevice::logSlowPipeline(const GraphicsPipelineDesc& desc, uint64_t us) {
@@ -4920,8 +4995,9 @@ namespace dxup::d3d12 {
     if (!hitchTraceEnabled())
       return;
     logMessageImpl(LogLevel::Warn,
-      "pso stats (%s): %u compiled (%u from disk cache, %u precompiled, %u shader stages warmed) in %.1f ms, slowest %.1f ms; draws waited %u times for %.1f ms",
+      "pso stats (%s): %u compiled (%u from disk cache, %u precompiled, %u shader stages warmed, %u masked later) in %.1f ms, slowest %.1f ms; draws waited %u times for %.1f ms",
       when, m_psoStats.compiles.load(), m_psoStats.diskHits.load(), m_psoStats.precompiled.load(), m_psoStats.warmed.load(),
+      m_psoStats.masksLater.load(),
       m_psoStats.compileUs.load() / 1000.0,
       m_psoStats.maxUs.load() / 1000.0, m_psoStats.waits.load(), m_psoStats.waitUs.load() / 1000.0);
   }

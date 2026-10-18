@@ -68,15 +68,18 @@ them (Microsoft's HLSL compiler takes 20-120 ms for a large shader, which
 showed as stutter). Shaders DXUP's compiler does not handle go through the
 HLSL compiler.
 
-Direct3D 12 pipelines are compiled by the GPU driver, and DXUP keeps a
-record of each game's pipelines so they are ready before the game draws
-from its second start on. At the very first start the game waits briefly
-for new pipelines (Trine 2 with an empty driver cache: 26 waits, 83 ms in
-all). With `d3d11.asyncShaders = true` (**Shader compilation: In the
-background** in the manager) it never waits (Trine 2: 0 waits, 2 instead of
-17 frames over 16.7 ms); what needs a pipeline that is not ready is drawn a
-few frames later instead, and something a game draws only once while it
-loads can be missing until it is drawn again.
+Direct3D 12 pipelines are compiled by the GPU driver. DXUP has the driver
+compile each new shader on its own as soon as the game creates it, so a
+pipeline of shaders the driver knows takes a fraction of a millisecond, and
+keeps a record of each game's pipelines to build them ahead from its second
+start on. Even at the very first start a game hardly waits (Trine 2 with an
+empty driver cache: 15 waits, 3.4 ms in all; about as many frames over
+16.7 ms as at later starts). Only a shader the game draws right after
+creating it makes it wait for the driver. With `d3d11.asyncShaders = true`
+(**Shader compilation: In the background** in the manager) it never waits:
+what needs a pipeline that is not ready is drawn a few frames later
+instead, and something a game draws only once while it loads can be
+missing until it is drawn again.
 
 The full list with explanations is in `dxup.conf.example` in the portable
 zip and in [`src/util/util_config.h`](src/util/util_config.h).

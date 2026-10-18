@@ -35,7 +35,7 @@
   <sys:String x:Key="PrecompileHint">DXUP merkt sich, welche Shader-Kombinationen das Spiel braucht, und kompiliert sie ab dem zweiten Start im Hintergrund, sobald das Spiel die Shader lädt. Weniger Ruckler, es fehlt nichts.</sys:String>
   <sys:String x:Key="AsyncShaders">Shader-Kompilierung</sys:String>
   <sys:String x:Key="AsyncOn">Im Hintergrund (async)</sys:String>
-  <sys:String x:Key="AsyncHint">Kaum noch Ruckler, wenn das Spiel neue Shader braucht, auch beim allerersten Start. Was einen noch nicht fertigen Shader braucht, fehlt dafür kurz (meist ein paar Frames); selten fehlt etwas, das das Spiel nur einmal beim Laden zeichnet, bis es wieder gezeichnet wird.</sys:String>
+  <sys:String x:Key="AsyncHint">Weniger Ruckler, wenn das Spiel neue Shader braucht. Was einen noch nicht fertigen Shader braucht, fehlt dafür kurz (meist ein paar Frames); selten fehlt etwas, das das Spiel nur einmal beim Laden zeichnet, bis es wieder gezeichnet wird.</sys:String>
   <sys:String x:Key="OptGame">Wie im Spiel</sys:String>
   <sys:String x:Key="OptOff">Aus</sys:String>
   <sys:String x:Key="OptOn">An</sys:String>

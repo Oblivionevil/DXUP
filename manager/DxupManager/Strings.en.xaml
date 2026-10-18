@@ -35,7 +35,7 @@
   <sys:String x:Key="PrecompileHint">DXUP remembers which shader combinations the game needs and, from the second start on, compiles them in the background as soon as the game loads the shaders. Fewer stutters, nothing is missing.</sys:String>
   <sys:String x:Key="AsyncShaders">Shader compilation</sys:String>
   <sys:String x:Key="AsyncOn">In the background (async)</sys:String>
-  <sys:String x:Key="AsyncHint">Hardly any stutters when the game needs new shaders, also at its very first start. Whatever needs a shader that is not ready yet is missing for a moment instead (usually a few frames); in rare cases something the game draws only once, while loading, stays missing until it is drawn again.</sys:String>
+  <sys:String x:Key="AsyncHint">Fewer stutters when the game needs new shaders. Whatever needs a shader that is not ready yet is missing for a moment instead (usually a few frames); in rare cases something the game draws only once, while loading, stays missing until it is drawn again.</sys:String>
   <sys:String x:Key="OptGame">As the game sets</sys:String>
   <sys:String x:Key="OptOff">Off</sys:String>
   <sys:String x:Key="OptOn">On</sys:String>

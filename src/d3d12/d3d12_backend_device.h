@@ -764,7 +764,11 @@ namespace dxup::d3d12 {
       uint32_t                     activeStageMask = 0x1Fu);
 
 #ifdef _WIN32
-    ID3D12PipelineState* getPSO() const { return m_pso.Get(); }
+    ID3D12PipelineState* getPSO() const { return m_current.load(std::memory_order_acquire); }
+    // The same pipeline compiled better (masked outputs, built later on a
+    // compiler thread): draws bind it from then on. The first one stays for
+    // command lists that still use it.
+    void replacePSO(ComPtr<ID3D12PipelineState> pso);
     ID3D12RootSignature* getRootSignature() const { return m_rootSignature; }
     const PipelineResourceLimits& getResourceLimits() const { return m_resourceLimits; }
     uint32_t getActiveStageMask() const { return m_activeStageMask; }
@@ -792,6 +796,8 @@ namespace dxup::d3d12 {
     std::atomic<bool>            m_failed{false};
     std::mutex                   m_resolveMutex;
     ComPtr<ID3D12PipelineState>  m_pso;
+    ComPtr<ID3D12PipelineState>  m_replacement;   // under m_resolveMutex
+    std::atomic<ID3D12PipelineState*> m_current{nullptr};
     ID3D12RootSignature*         m_rootSignature = nullptr;
     PipelineResourceLimits       m_resourceLimits = {};
     uint32_t                     m_activeStageMask = 0x1Fu;
@@ -1331,7 +1337,13 @@ namespace dxup::d3d12 {
     // Compile a pipeline marked as compiling, cache it and wake the waiters.
     Rc<IBackendPipeline> compileGraphicsPipeline(const GraphicsPipelineDesc& desc, const PsoCacheKey& key);
     Rc<IBackendPipeline> compileComputePipeline(const ComputePipelineDesc& desc, const ComputePsoCacheKey& key);
-    Rc<IBackendPipeline> buildGraphicsPipeline(const GraphicsPipelineDesc& desc, const PsoCacheKey& key);
+    // masksLater: a pipeline whose masked outputs (d3d12.pixelOutputMasks)
+    // give the driver shaders it has not compiled starts without the masks
+    // and gets them later (queueMaskedPipeline).
+    Rc<IBackendPipeline> buildGraphicsPipeline(const GraphicsPipelineDesc& desc, const PsoCacheKey& key,
+                                               bool masksLater = true);
+    void queueMaskedPipeline(const GraphicsPipelineDesc& desc, const PsoCacheKey& key,
+                             const std::shared_ptr<D3D12BackendGraphicsPipeline>& pipeline);
     Rc<IBackendPipeline> buildComputePipeline(const ComputePipelineDesc& desc, const ComputePsoCacheKey& key);
 
     // Background compiler threads (d3d11.asyncShaders, precompiled pipelines).
@@ -1416,9 +1428,12 @@ namespace dxup::d3d12 {
     ProbeBytecode m_probePs;
     bool m_probePsCompiled = false;
     std::unordered_map<std::string, ProbeBytecode> m_probeVs;
-    // With the hitch trace: the stages warmed, for the slow pipeline lines.
+    // The stage bytecode the driver compiled in this process (warm-ups and
+    // pipelines): another pipeline with it takes ~0.2 ms, not ~10 ms.
     std::unordered_set<uint64_t> m_warmedStages;
     static uint64_t stageHash(const void* bytecode, size_t size);
+    void noteDriverStages(const D3D12_SHADER_BYTECODE& vs, const D3D12_SHADER_BYTECODE& ps);
+    bool driverHasStages(const D3D12_SHADER_BYTECODE& vs, const D3D12_SHADER_BYTECODE& ps);
     void logSlowPipeline(const GraphicsPipelineDesc& desc, uint64_t us);
     void queuePrecompile(uint32_t index);
     void storePipelineRecord(const GraphicsPipelineDesc& desc, const PsoCacheKey& key);
@@ -1432,6 +1447,7 @@ namespace dxup::d3d12 {
       std::atomic<uint32_t> diskHits{0};
       std::atomic<uint32_t> precompiled{0};
       std::atomic<uint32_t> warmed{0};
+      std::atomic<uint32_t> masksLater{0};   // pipelines that got their masked outputs later
       std::atomic<uint32_t> waits{0};
       std::atomic<uint64_t> compileUs{0};
       std::atomic<uint64_t> maxUs{0};

@@ -435,6 +435,7 @@ void main(uint2 id : SV_DispatchThreadID) {
         {"heavy_pass_chain_gpu_cost", &Dx11TestApp::testHeavyPassChainGpuCost},
         {"clear_gpu_cost", &Dx11TestApp::testClearGpuCost},
         {"pixel_output_masks", &Dx11TestApp::testPixelOutputMasks},
+        {"pixel_output_masks_later", &Dx11TestApp::testPixelOutputMasksLater},
         {"constant_buffer_same_data_updates", &Dx11TestApp::testConstantBufferSameDataUpdates},
         {"pixel_output_mask_gpu_cost", &Dx11TestApp::testPixelOutputMaskGpuCost},
         {"depth_readback_gpu_cost", &Dx11TestApp::testDepthReadbackGpuCost},
@@ -14918,6 +14919,95 @@ float4 main(I i) : SV_Target { return float4(i.read, 0.0f, 1.0f); }
         error = formatString("two targets: %u | %u %u %u %u, want 64 | 191 128 64 128", texel[0], second[0], second[1],
           second[2], second[3]);
         return false;
+      }
+      return true;
+    }
+
+    // Shaders a warm-up compiled while the pipeline's masked outputs
+    // (d3d12.pixelOutputMasks) are new to the driver: DXUP draws first with
+    // the shaders as they are and replaces the pipeline with the masked one
+    // once a compiler thread built it. Both draw the same red into an R8
+    // target, and an alpha blend that reads the dropped alpha still works.
+    bool testPixelOutputMasksLater(std::string& error) {
+      static const char* kVs = R"(
+float4 main(uint id : SV_VertexID) : SV_Position {
+  float2 uv = float2((id << 1) & 2, id & 2);
+  return float4(uv * float2(2.0f, -2.0f) + float2(-1.0f, 1.0f), 0.0f, 0.5f);
+}
+)";
+      static const char* kPs = R"(
+cbuffer C : register(b0) { float4 a; };
+float4 main(float4 p : SV_Position) : SV_Target { return float4(a.x * 0.5f, sqrt(a.yz), a.w); }
+)";
+      ComPtr<ID3D11VertexShader> vs;
+      ComPtr<ID3DBlob> vsBytecode;
+      ComPtr<ID3D11PixelShader> ps;
+      if (!createVertexShader(kVs, "main", vs, vsBytecode, error) || !createPixelShader(kPs, "main", ps, error))
+        return false;
+      D3D11_TEXTURE2D_DESC desc = { 4, 4, 1, 1, DXGI_FORMAT_R8_UNORM, { 1, 0 }, D3D11_USAGE_DEFAULT, D3D11_BIND_RENDER_TARGET, 0, 0 };
+      ComPtr<ID3D11Texture2D> target, staging;
+      ComPtr<ID3D11RenderTargetView> rtv;
+      HRESULT hr = m_device->CreateTexture2D(&desc, nullptr, target.GetAddressOf());
+      if (SUCCEEDED(hr)) hr = m_device->CreateRenderTargetView(target.Get(), nullptr, rtv.GetAddressOf());
+      desc.BindFlags = 0;
+      desc.Usage = D3D11_USAGE_STAGING;
+      desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+      if (SUCCEEDED(hr)) hr = m_device->CreateTexture2D(&desc, nullptr, staging.GetAddressOf());
+      D3D11_BUFFER_DESC cbDesc = { 16, D3D11_USAGE_DEFAULT, D3D11_BIND_CONSTANT_BUFFER, 0, 0, 0 };
+      ComPtr<ID3D11Buffer> cb;
+      if (SUCCEEDED(hr)) hr = m_device->CreateBuffer(&cbDesc, nullptr, cb.GetAddressOf());
+      D3D11_BLEND_DESC blendDesc = {};
+      blendDesc.RenderTarget[0].BlendEnable = TRUE;
+      blendDesc.RenderTarget[0].SrcBlend = D3D11_BLEND_SRC_ALPHA;
+      blendDesc.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
+      blendDesc.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
+      blendDesc.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
+      blendDesc.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ZERO;
+      blendDesc.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+      blendDesc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+      ComPtr<ID3D11BlendState> blend;
+      if (SUCCEEDED(hr)) hr = m_device->CreateBlendState(&blendDesc, blend.GetAddressOf());
+      if (FAILED(hr)) {
+        error = "resource creation failed: " + formatHResult(hr);
+        return false;
+      }
+      // Red of texel (1, 1) after a draw.
+      auto drawAndRead = [&](ID3D11BlendState* state, const float a[4], uint8_t& red) {
+        const float white[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+        m_context->UpdateSubresource(cb.Get(), 0, nullptr, a, 0, 0);
+        m_context->ClearState();
+        m_context->ClearRenderTargetView(rtv.Get(), white);
+        setViewport(4, 4);
+        m_context->OMSetRenderTargets(1, rtv.GetAddressOf(), nullptr);
+        m_context->OMSetBlendState(state, nullptr, 0xffffffff);
+        m_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        m_context->VSSetShader(vs.Get(), nullptr, 0);
+        m_context->PSSetShader(ps.Get(), nullptr, 0);
+        m_context->PSSetConstantBuffers(0, 1, cb.GetAddressOf());
+        m_context->Draw(3, 0);
+        m_context->CopyResource(staging.Get(), target.Get());
+        D3D11_MAPPED_SUBRESOURCE mapped = {};
+        const HRESULT mapHr = m_context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped);
+        if (FAILED(mapHr)) {
+          error = "Map failed: " + formatHResult(mapHr);
+          return false;
+        }
+        red = static_cast<const uint8_t*>(mapped.pData)[mapped.RowPitch + 1];
+        m_context->Unmap(staging.Get(), 0);
+        return true;
+      };
+      const float opaque[4] = { 1.0f, 0.25f, 0.5f, 1.0f };      // red 0.5
+      const float quarter[4] = { 0.0f, 0.25f, 0.5f, 0.25f };    // red 0 at alpha 0.25 over 1: 0.75
+      for (int round = 0; round < 2; round++) {
+        // The warm-ups first, then (second round) the masked pipelines.
+        Sleep(400);
+        uint8_t red = 0, blended = 0;
+        if (!drawAndRead(nullptr, opaque, red) || !drawAndRead(blend.Get(), quarter, blended))
+          return false;
+        if (std::abs(int(red) - 128) > 1 || std::abs(int(blended) - 191) > 1) {
+          error = formatString("round %d: red %u, blended %u, want 128, 191", round, red, blended);
+          return false;
+        }
       }
       return true;
     }
