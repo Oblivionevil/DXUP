@@ -159,6 +159,11 @@ namespace dxup {
     // its primitive is not drawn, as Intel's it is drawn at depth 0; 0 not
     // drawn; 1 drawn at depth 0.
     int32_t  d3d9NanDepth = -1;
+    // Direct3D 7-9 shaders straight to DXBC by DXUP (d3d9.shaderCompiler =
+    // dxup, default), a fraction of a millisecond per shader, or as HLSL
+    // through Microsoft's compiler (fxc: 20-120 ms per large shader, cached
+    // on disk). Shaders DXUP's compiler does not handle take fxc either way.
+    bool     d3d9DxupCompiler = true;
     // Flip model applications draw into the real swap chain buffers, no
     // proxy copied at Present (dxgi.directBackBuffer).
     bool     directBackBuffer = true;

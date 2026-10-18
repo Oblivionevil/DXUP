@@ -1,4 +1,4 @@
-#include "d3d9_shader.h"
+#include "d3d9_shader_internal.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -8,55 +8,22 @@
 
 namespace dxup::legacy {
 
+  namespace sm9 {
+    const SlotUsage kSlots[kVaryingSlots9] = {
+      { UsageFog, 0 }, { UsageColor, 0 }, { UsageColor, 1 },
+      { UsageTexCoord, 0 }, { UsageTexCoord, 1 }, { UsageTexCoord, 2 }, { UsageTexCoord, 3 },
+      { UsageTexCoord, 4 }, { UsageTexCoord, 5 }, { UsageTexCoord, 6 }, { UsageTexCoord, 7 },
+      { UsageTexCoord, 8 }, { UsageTexCoord, 9 }, { UsageTexCoord, 10 }, { UsageTexCoord, 11 },
+      { UsageTexCoord, 12 }, { UsageTexCoord, 13 }, { UsageTexCoord, 14 }, { UsageTexCoord, 15 },
+      { UsageNormal, 0 }, { UsageNormal, 1 }, { UsageTangent, 0 }, { UsageTangent, 1 },
+      { UsageBinormal, 0 }, { UsageBinormal, 1 }, { UsagePosition, 1 }, { UsagePSize, 0 },
+      { UsageBlendWeight, 0 }, { UsageBlendIndices, 0 }, { UsageDepth, 0 },
+    };
+  }
+
   namespace {
 
-    // ---- Tokens ----
-
-    enum Opcode : uint32_t {
-      OpNop = 0, OpMov, OpAdd, OpSub, OpMad, OpMul, OpRcp, OpRsq, OpDp3, OpDp4, OpMin, OpMax, OpSlt, OpSge, OpExp,
-      OpLog, OpLit, OpDst, OpLrp, OpFrc, OpM4x4, OpM4x3, OpM3x4, OpM3x3, OpM3x2, OpCall, OpCallNz, OpLoop, OpRet,
-      OpEndLoop, OpLabel, OpDcl, OpPow, OpCrs, OpSgn, OpAbs, OpNrm, OpSinCos, OpRep, OpEndRep, OpIf, OpIfC, OpElse,
-      OpEndIf, OpBreak, OpBreakC, OpMova, OpDefB, OpDefI,
-      OpTexCoord = 64, OpTexKill, OpTex, OpTexBem, OpTexBemL, OpTexReg2Ar, OpTexReg2Gb, OpTexM3x2Pad, OpTexM3x2Tex,
-      OpTexM3x3Pad, OpTexM3x3Tex, OpReserved0, OpTexM3x3Spec, OpTexM3x3VSpec, OpExpP, OpLogP, OpCnd, OpDef,
-      OpTexReg2Rgb, OpTexDp3Tex, OpTexM3x2Depth, OpTexDp3, OpTexM3x3, OpTexDepth, OpCmp, OpBem, OpDp2Add, OpDsx, OpDsy,
-      OpTexLdd, OpSetP, OpTexLdl, OpBreakP,
-      OpPhase = 0xfffd, OpComment = 0xfffe, OpEnd = 0xffff,
-    };
-
-    enum RegType : uint32_t {
-      RegTemp = 0, RegInput = 1, RegConst = 2, RegAddr = 3 /* texture in pixel shaders */, RegRastOut = 4,
-      RegAttrOut = 5, RegOutput = 6 /* texture coordinates before 3.0 */, RegConstInt = 7, RegColorOut = 8,
-      RegDepthOut = 9, RegSampler = 10, RegConst2 = 11, RegConst3 = 12, RegConst4 = 13, RegConstBool = 14,
-      RegLoop = 15, RegTempFloat16 = 16, RegMisc = 17, RegLabel = 18, RegPredicate = 19,
-    };
-
-    constexpr uint32_t kModifierNot = 13;
-
-    struct Operand {
-      uint32_t type = 0;
-      uint32_t index = 0;
-      uint32_t swizzle = 0xe4;   // xyzw
-      uint32_t mask = 0xf;
-      uint32_t modifier = 0;     // source modifier
-      uint32_t resultModifier = 0;
-      int32_t  shift = 0;
-      bool     relative = false;
-      uint32_t relType = RegAddr;
-      uint32_t relIndex = 0;
-      uint32_t relComponent = 0;
-    };
-
-    struct Instruction {
-      uint32_t opcode = 0;
-      uint32_t controls = 0;
-      bool     predicated = false;
-      Operand  predicate;
-      std::vector<Operand> dst;
-      std::vector<Operand> src;
-      uint32_t literal[4] = {};
-      uint32_t declToken = 0;
-    };
+    using namespace sm9;
 
     uint32_t regType(uint32_t token) {
       return ((token >> 28) & 0x7) | ((token >> 8) & 0x18);
@@ -170,23 +137,6 @@ namespace dxup::legacy {
           ins.src.push_back(readSrc(end));
       }
     };
-
-    // ---- Varying slots ----
-
-    struct SlotUsage { uint8_t usage, index; };
-
-    const SlotUsage kSlots[kVaryingSlots9] = {
-      { UsageFog, 0 }, { UsageColor, 0 }, { UsageColor, 1 },
-      { UsageTexCoord, 0 }, { UsageTexCoord, 1 }, { UsageTexCoord, 2 }, { UsageTexCoord, 3 },
-      { UsageTexCoord, 4 }, { UsageTexCoord, 5 }, { UsageTexCoord, 6 }, { UsageTexCoord, 7 },
-      { UsageTexCoord, 8 }, { UsageTexCoord, 9 }, { UsageTexCoord, 10 }, { UsageTexCoord, 11 },
-      { UsageTexCoord, 12 }, { UsageTexCoord, 13 }, { UsageTexCoord, 14 }, { UsageTexCoord, 15 },
-      { UsageNormal, 0 }, { UsageNormal, 1 }, { UsageTangent, 0 }, { UsageTangent, 1 },
-      { UsageBinormal, 0 }, { UsageBinormal, 1 }, { UsagePosition, 1 }, { UsagePSize, 0 },
-      { UsageBlendWeight, 0 }, { UsageBlendIndices, 0 }, { UsageDepth, 0 },
-    };
-
-    constexpr int kSlotFog = 0, kSlotColor = 1, kSlotTexCoord = 3;
 
     // ---- HLSL writing ----
 
@@ -802,6 +752,11 @@ namespace dxup::legacy {
 
   bool translateShader9(const uint32_t* tokens, size_t tokenCount, const TranslateOptions9& options,
                         std::string& hlsl, ShaderInfo9& info, std::string& error) {
+    return sm9::translateShader9(tokens, tokenCount, options, hlsl, info, error, nullptr);
+  }
+
+  bool sm9::translateShader9(const uint32_t* tokens, size_t tokenCount, const TranslateOptions9& options,
+                             std::string& hlsl, ShaderInfo9& info, std::string& error, Layout9* layout) {
     if (!tokens || tokenCount < 2) {
       error = "empty shader";
       return false;
@@ -848,13 +803,19 @@ namespace dxup::legacy {
         const uint32_t index = d.index + (d.type == RegConst2 ? 2048 : d.type == RegConst3 ? 4096 : d.type == RegConst4 ? 6144 : 0);
         w.floatDefs[index] = "float4(" + floatLiteral(i.literal[0]) + ", " + floatLiteral(i.literal[1]) + ", "
           + floatLiteral(i.literal[2]) + ", " + floatLiteral(i.literal[3]) + ")";
+        if (layout)
+          layout->floatDefs[index] = { i.literal[0], i.literal[1], i.literal[2], i.literal[3] };
       } else if (i.opcode == OpDefI) {
         char text[96];
         snprintf(text, sizeof(text), "int4(%d, %d, %d, %d)", int32_t(i.literal[0]), int32_t(i.literal[1]),
           int32_t(i.literal[2]), int32_t(i.literal[3]));
         w.intDefs[d.index] = text;
+        if (layout)
+          layout->intDefs[d.index] = { int32_t(i.literal[0]), int32_t(i.literal[1]), int32_t(i.literal[2]), int32_t(i.literal[3]) };
       } else if (i.opcode == OpDefB) {
         w.boolDefs[d.index] = i.literal[0] ? "true" : "false";
+        if (layout)
+          layout->boolDefs[d.index] = i.literal[0] != 0;
       } else if (i.opcode == OpDcl) {
         const uint8_t usage = uint8_t(i.declToken & 0x1f);
         const uint8_t usageIndex = uint8_t((i.declToken >> 16) & 0xf);
@@ -1179,6 +1140,24 @@ namespace dxup::legacy {
 
     info.floatConstantCount = info.relativeConstants ? 256 : (std::min)(w.maxConst, 256u);
     hlsl = std::move(s);
+    if (layout) {
+      layout->instructions = std::move(instructions);
+      layout->relativeInputs = w.relativeInputs;
+      layout->relativeOutputs = w.relativeOutputs;
+      layout->usedInputs = w.usedInputs;
+      layout->usedOutputs = w.usedOutputs;
+      layout->usedT = w.usedT;
+      layout->usedTc = w.usedTc;
+      layout->usedTm = w.usedTm;
+      layout->usedColors = w.usedColors;
+      layout->colorInputs = w.colorInputs;
+      layout->texCoordInputs = w.texCoordInputs;
+      layout->colorOutputMask = w.colorOutputMask;
+      layout->texCoordOutputs = w.texCoordOutputs;
+      layout->writesPointSize = w.writesPointSize;
+      layout->usesVFace = w.usesVFace;
+      layout->maxTemp = temps;
+    }
     return true;
   }
 

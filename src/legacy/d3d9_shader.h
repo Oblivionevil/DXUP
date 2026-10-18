@@ -81,6 +81,12 @@ namespace dxup::legacy {
   std::string varyingSemantic9(uint32_t slot);
 
   // Writes the HLSL of a shader.
+  // The shader as DXBC (shader model 5.0) without HLSL or the HLSL compiler
+  // (d3d9_dxbc.cpp): the same registers, linkage and info as the HLSL. False
+  // (error says why) for what the emitter does not handle.
+  bool compileShader9(const uint32_t* tokens, size_t tokenCount, const TranslateOptions9& options,
+                      std::vector<uint8_t>& dxbc, ShaderInfo9& info, std::string& error);
+
   bool translateShader9(const uint32_t* tokens, size_t tokenCount, const TranslateOptions9& options,
                         std::string& hlsl, ShaderInfo9& info, std::string& error);
 

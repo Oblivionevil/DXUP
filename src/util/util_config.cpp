@@ -425,6 +425,7 @@ namespace dxup {
       const std::string emulation = config.getString("d3d9.floatEmulation", "auto");
       overrides.d3d9FloatEmulation = emulation == "strict" || emulation == "true" || emulation == "on" || emulation == "1" ? 1
         : emulation == "false" || emulation == "off" || emulation == "0" ? 0 : -1;
+      overrides.d3d9DxupCompiler = config.getString("d3d9.shaderCompiler", "dxup") != "fxc";
       const std::string nanDepth = config.getString("d3d9.nanDepth", "auto");
       overrides.d3d9NanDepth = nanDepth == "zero" || nanDepth == "true" || nanDepth == "1" ? 1
         : nanDepth == "discard" || nanDepth == "false" || nanDepth == "0" ? 0 : -1;

@@ -59,7 +59,14 @@ dxgi.maxFrameLatency = 1       # pre-rendered frames (1-16)
 dxgi.renderScale = 0.75        # render at this share of the resolution, scaled up by DXUP
 dxgi.upscale = spatial         # scale a back buffer smaller than the window with DXUP's filter
 dxgi.spoofVendor = nvidia      # the game sees an NVIDIA, AMD or Intel GPU; DXUP renders on the real one
+d3d9.shaderCompiler = fxc      # Direct3D 7-9 shaders through Microsoft's HLSL compiler, not DXUP's
 ```
+
+Direct3D 7-9 shaders are compiled by DXUP itself, straight from the game's
+shader code to DXBC, in a fraction of a millisecond when the game creates
+them (Microsoft's HLSL compiler takes 20-120 ms for a large shader, which
+showed as stutter). Shaders DXUP's compiler does not handle go through the
+HLSL compiler.
 
 The full list with explanations is in `dxup.conf.example` in the portable
 zip and in [`src/util/util_config.h`](src/util/util_config.h).

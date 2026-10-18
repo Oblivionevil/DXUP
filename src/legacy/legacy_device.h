@@ -247,6 +247,7 @@ namespace dxup::legacy {
       bool           drawn = false;   // under m_mutex
     };
     bool compile(const TranslateOptions9& options, uint64_t key, Variant& v);
+    bool createVariant(const TranslateOptions9& options, Variant& v);
     Ref<ID3D11Device>       m_d3d11;
     std::vector<uint32_t>   m_tokens;
     ShaderInfo9             m_info;

@@ -1066,7 +1066,8 @@ namespace dxup::legacy {
       std::unordered_map<uint64_t, std::vector<uint8_t>> m_entries;
     };
 
-    // Changes whenever the translator's output changes.
+    // Changes whenever the translator's output changes (the HLSL path's;
+    // DXUP's compiler is not cached, it is faster than reading the cache).
     constexpr uint64_t kTranslatorVersion = 6;
 
     // The shaders draws used in this and earlier runs, their code and the
@@ -1315,22 +1316,31 @@ namespace dxup::legacy {
       shader = make(device->d3d11(), tokens, count, hash, error);
     if (!shader)
       return nullptr;
-    // The likely variant now, on a worker: compiling at the first draw
-    // would stall it, and loading screens create shaders by the hundred.
-    shader->prepare(options, true);
+    // The likely variants now: compiling at the first draw would stall it.
+    // DXUP's compiler takes a fraction of a millisecond, as Direct3D 9
+    // drivers compile when the shader is created; fxc runs on workers
+    // (loading screens create shaders by the hundred).
+    const bool now = UserOverrides::get().d3d9DxupCompiler;
+    auto ahead = [&](const TranslateOptions9& o, bool first) {
+      if (now)
+        shader->variant(o, false);
+      else
+        shader->prepare(o, first);
+    };
+    ahead(options, true);
     // Vertex shaders 1.x, and any once the game drew them so, also for the
     // fixed-function pixel stage.
     if (shader->vertex() && shader->m_info.varyingCount < Device::kFixedPixelVaryings
      && (shader->m_info.major == 1 || device->fixedPixelsWithShaders())) {
       TranslateOptions9 fixed = options;
       fixed.minVaryings = Device::kFixedPixelVaryings;
-      shader->prepare(fixed);
+      ahead(fixed, false);
     }
     // And every variant draws used in earlier runs.
     for (const VariantRecords::Record& record : VariantRecords::instance().find(hash)) {
       TranslateOptions9 recorded = options;
       VariantRecords::apply(record, recorded);
-      shader->prepare(recorded);
+      ahead(recorded, false);
     }
     return shader;
   }
@@ -1555,6 +1565,15 @@ namespace dxup::legacy {
     static std::atomic<uint32_t> s_nextId{1};
     v.id = s_nextId++;
     std::string hlsl, error;
+    // DXUP's compiler: DXBC straight from the tokens (d3d9_dxbc.cpp).
+    if (UserOverrides::get().d3d9DxupCompiler) {
+      if (compileShader9(m_tokens.data(), m_tokens.size(), options, v.bytecode, v.info, error))
+        return createVariant(options, v);
+      logMessage(LogLevel::Info, "D3D9 shaders: %s shader %016llx through fxc: %s", vertex() ? "vertex" : "pixel",
+        (unsigned long long)m_hash, error.c_str());
+      error.clear();
+      v.bytecode.clear();
+    }
     if (!translateShader9(m_tokens.data(), m_tokens.size(), options, hlsl, v.info, error)) {
       logMessage(LogLevel::Warn, "D3D9 shader translation failed: %s", error.c_str());
       return false;
@@ -1582,6 +1601,10 @@ namespace dxup::legacy {
       if (errors) errors->Release();
       ShaderDiskCache::instance().store(cacheKey, v.bytecode.data(), v.bytecode.size());
     }
+    return createVariant(options, v);
+  }
+
+  bool Shader::createVariant(const TranslateOptions9& options, Variant& v) {
     HRESULT hr;
     if (vertex())
       hr = m_d3d11->CreateVertexShader(v.bytecode.data(), v.bytecode.size(), nullptr, v.vs.put());
