@@ -1511,6 +1511,64 @@ float4 main(float2 t : TEXCOORD0) : COLOR {
     return partial;
   }
 
+  // A vertex shader new to DXUP (nonce in its code), drawn with a user clip
+  // plane (a variant its creation does not compile ahead) right after its
+  // creation. DXUP records the shaders and variants draws use and compiles
+  // them from the device's creation on in a later run. Returns 0, or -1.
+  int variantChild(Runtime& runtime, unsigned nonce) {
+    IDirect3D9* d3d = runtime.create(D3D_SDK_VERSION);
+    if (!d3d) return -1;
+    HWND window = createWindow();
+    D3DPRESENT_PARAMETERS pp = {};
+    pp.Windowed = TRUE;
+    pp.SwapEffect = D3DSWAPEFFECT_DISCARD;
+    pp.BackBufferWidth = kWidth;
+    pp.BackBufferHeight = kHeight;
+    pp.BackBufferFormat = D3DFMT_X8R8G8B8;
+    pp.hDeviceWindow = window;
+    pp.PresentationInterval = D3DPRESENT_INTERVAL_IMMEDIATE;
+    IDirect3DDevice9* device = nullptr;
+    if (FAILED(d3d->CreateDevice(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, window, D3DCREATE_HARDWARE_VERTEXPROCESSING, &pp, &device))) {
+      d3d->Release();
+      DestroyWindow(window);
+      return -1;
+    }
+    char source[512];
+    std::snprintf(source, sizeof(source), R"(
+struct VO { float4 p : POSITION; float4 c : COLOR0; };
+VO main(float3 p : POSITION, float4 c : COLOR0) { VO o; o.p = float4(p.xy, 0.5, 1) + float4(%u.0e-9, 0, 0, 0); o.c = c; return o; })",
+      nonce);
+    const auto code = compile(source, "vs_2_0");
+    // What DXUP compiles ahead from earlier runs is done by now; the draw
+    // follows the shader's creation at once.
+    Sleep(1500);
+    IDirect3DVertexShader9* vs = nullptr;
+    int result = -1;
+    if (!code.empty() && SUCCEEDED(device->CreateVertexShader(code.data(), &vs))) {
+      struct V { float x, y, z; DWORD color; };
+      const V triangle[3] = { { -1.0f, -1.0f, 0.5f, 0xffffffffu }, { -1.0f, 1.0f, 0.5f, 0xffffffffu }, { 1.0f, -1.0f, 0.5f, 0xffffffffu } };
+      const float plane[4] = { 1.0f, 0.0f, 0.0f, 0.0f };
+      device->Clear(0, nullptr, D3DCLEAR_TARGET, 0xff000000u, 1.0f, 0);
+      device->BeginScene();
+      device->SetRenderState(D3DRS_LIGHTING, FALSE);
+      device->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+      device->SetClipPlane(0, plane);
+      device->SetRenderState(D3DRS_CLIPPLANEENABLE, 1);
+      device->SetVertexShader(vs);
+      device->SetFVF(D3DFVF_XYZ | D3DFVF_DIFFUSE);
+      device->DrawPrimitiveUP(D3DPT_TRIANGLELIST, 1, triangle, sizeof(V));
+      device->EndScene();
+      device->Present(nullptr, nullptr, nullptr, nullptr);
+      device->SetVertexShader(nullptr);
+      vs->Release();
+      result = 0;
+    }
+    device->Release();
+    d3d->Release();
+    DestroyWindow(window);
+    return result;
+  }
+
   // Runs this program with the arguments; its exit code (-1: not started).
   int runSelf(const char* arguments) {
     wchar_t exe[MAX_PATH];
@@ -1538,12 +1596,14 @@ int main(int argc, char** argv) {
   const char* filter = nullptr;
   int benchFrames = 0, benchDraws = 0;
   bool childForcedMsaa = false, identifier = false;
+  unsigned variantNonce = 0;
   for (int i = 1; i < argc; i++) {
     if (std::strcmp(argv[i], "--dump") == 0) dumpImages = true;
     else if (std::strcmp(argv[i], "--trace") == 0) g_trace = true;
     else if (std::strcmp(argv[i], "--memory") == 0) memory = true;
     else if (std::strcmp(argv[i], "--forced-msaa-child") == 0) childForcedMsaa = true;
     else if (std::strcmp(argv[i], "--identifier") == 0) identifier = true;
+    else if (std::strcmp(argv[i], "--variant-child") == 0 && i + 1 < argc) variantNonce = unsigned(std::strtoul(argv[++i], nullptr, 10));
     else if (std::strcmp(argv[i], "--bench") == 0 && i + 2 < argc) { benchFrames = std::atoi(argv[i + 1]); benchDraws = std::atoi(argv[i + 2]); i += 2; }
     else filter = argv[i];
   }
@@ -1570,6 +1630,9 @@ int main(int argc, char** argv) {
     std::printf("%d\n", partial);
     return partial < 0 ? 255 : (std::min)(partial, 254);
   }
+
+  if (variantNonce)
+    return variantChild(dxup, variantNonce) == 0 ? 0 : 1;
 
   // The first adapter as each runtime describes it (dxgi.spoofVendor).
   if (identifier) {
@@ -1660,6 +1723,42 @@ int main(int argc, char** argv) {
     const bool ok = with >= 40 && with < 255 && without == 0;
     std::printf("%s %-20s edge pixels partly covered: %d forced, %d without\n", ok ? "ok  " : "FAIL", "forced_msaa", with,
                 without);
+    ok ? passed++ : failed++;
+  }
+  // Shader variants draws needed are compiled ahead in a later run: the
+  // info log names the variants draws compiled (children, as two runs).
+  if (!filter || std::strstr("shader_warmup", filter)) {
+    const std::wstring marker = dir + L"dxup_info_log.txt";
+    const std::wstring log = dir + L"logdxup_dxup_d3d9.log";
+    // Draws that compiled or waited for a vertex shader's variant.
+    auto compiledAtDraws = [&] {
+      int count = 0;
+      if (FILE* f = _wfopen(log.c_str(), L"r")) {
+        char line[1024];
+        while (std::fgets(line, sizeof(line), f))
+          count += std::strstr(line, "a draw compiled vertex shader") != nullptr
+                || (std::strstr(line, "a draw waited") != nullptr && std::strstr(line, "for vertex shader") != nullptr);
+        std::fclose(f);
+      }
+      return count;
+    };
+    int first = -1, second = -1, firstExit = -1, secondExit = -1;
+    if (FILE* f = _wfopen(marker.c_str(), L"w")) {
+      std::fclose(f);
+      const unsigned nonce = (GetTickCount() ^ (GetCurrentProcessId() << 12)) % 1000000000u + 1;
+      const std::string arguments = "--variant-child " + std::to_string(nonce);
+      firstExit = runSelf(arguments.c_str());
+      first = compiledAtDraws();
+      // As after an update that changed the translator: no compiled shader
+      // kept, the second run compiles from the recorded code.
+      DeleteFileW((dir + L"dxup_pso_cache\\d3d9_shaders.bin").c_str());
+      secondExit = runSelf(arguments.c_str());
+      second = compiledAtDraws();
+      DeleteFileW(marker.c_str());
+    }
+    const bool ok = firstExit == 0 && secondExit == 0 && first >= 1 && second == 0;
+    std::printf("%s %-20s draws compiling or waiting: %d first run, %d second (exit %d, %d)\n", ok ? "ok  " : "FAIL",
+                "shader_warmup", first, second, firstExit, secondExit);
     ok ? passed++ : failed++;
   }
   std::printf("%d passed, %d failed\n", passed, failed);

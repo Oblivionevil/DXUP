@@ -224,13 +224,18 @@ namespace dxup::legacy {
       uint8_t                 clipPlanes = 0;   // vertex: clip distances written
     };
     static std::shared_ptr<Shader> create(Device* device, const uint32_t* tokens, size_t tokenCount, std::string& error);
+    // A shader of the tokens (count of them, hash as create forms it), no
+    // variant compiled yet.
+    static std::shared_ptr<Shader> make(ID3D11Device* d3d11, const uint32_t* tokens, size_t count, uint64_t hash,
+                                        std::string& error);
     const ShaderInfo9& info() const { return m_info; }
     const std::vector<uint32_t>& tokens() const { return m_tokens; }
     bool vertex() const { return m_info.stage == ShaderStage9::Vertex; }
     uint64_t hash() const { return m_hash; }
     // Null when the variant does not compile. Waits for a compile of the
-    // same variant on a worker.
-    const Variant* variant(const TranslateOptions9& options);
+    // same variant on a worker. Variants of draws are recorded and compiled
+    // ahead in later runs.
+    const Variant* variant(const TranslateOptions9& options, bool draw = true);
     // Compiles a variant on a worker thread (loading screens create many).
     void prepare(const TranslateOptions9& options);
   private:
@@ -238,6 +243,7 @@ namespace dxup::legacy {
       std::once_flag once;
       Variant        variant;
       bool           ok = false;
+      bool           drawn = false;   // under m_mutex
     };
     bool compile(const TranslateOptions9& options, uint64_t key, Variant& v);
     Ref<ID3D11Device>       m_d3d11;
@@ -262,6 +268,9 @@ namespace dxup::legacy {
     // Vertex shaders have drawn with the fixed-function pixel stage, which
     // reads all its varyings: their variants for it are compiled ahead.
     bool fixedPixelsWithShaders() const { return m_fixedPixelsWithShaders; }
+    // A shader drawn in earlier runs that was compiled ahead (the game's
+    // first creation of it takes it), or null.
+    std::shared_ptr<Shader> takeWarmShader(uint64_t hash, const uint32_t* tokens, size_t count);
     static constexpr uint32_t kFixedPixelVaryings = 11;   // fog, two colors, eight coordinates
     ID3D11DeviceContext* context() const { return m_context.get(); }
     // Whether textures of a format can be created directly (else converted).
@@ -374,6 +383,13 @@ namespace dxup::legacy {
     struct PixelConstants;
     struct ShaderFixedConstants;
     struct DrawArgs;
+    struct ShaderWarmup;
+
+    // Compiles the shaders draws used in earlier runs on workers, from the
+    // device's creation on (the game creates them later).
+    void startShaderWarmup();
+    void stopShaderWarmup();
+    std::shared_ptr<ShaderWarmup> m_shaderWarmup;
 
     void applyState();
     void selectShaders();

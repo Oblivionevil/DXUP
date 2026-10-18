@@ -17,6 +17,8 @@
 #endif
 #include <xmmintrin.h>
 #include <algorithm>
+#include <array>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdio>
@@ -26,6 +28,7 @@
 #include <functional>
 #include <mutex>
 #include <thread>
+#include <unordered_set>
 
 #include <d3dcompiler.h>
 #include <dxgi1_5.h>
@@ -987,6 +990,23 @@ namespace dxup::legacy {
       return function;
     }
 
+    // dxup_pso_cache next to the DLL (created), empty when unknown.
+    std::wstring cacheDirectory() {
+      HMODULE self = nullptr;
+      GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        reinterpret_cast<LPCWSTR>(&compiler), &self);
+      wchar_t path[MAX_PATH] = {};
+      if (!self || !GetModuleFileNameW(self, path, MAX_PATH))
+        return std::wstring();
+      wchar_t* name = wcsrchr(path, L'\\');
+      if (!name)
+        return std::wstring();
+      name[1] = 0;
+      std::wstring dir = std::wstring(path) + L"dxup_pso_cache";
+      CreateDirectoryW(dir.c_str(), nullptr);
+      return dir;
+    }
+
     // Translated and compiled shaders of this and earlier runs, by the hash
     // of bytecode and variant: dxup_pso_cache\d3d9_shaders.bin next to the
     // DLL, records of hash, size and DXBC appended as they compile.
@@ -1026,18 +1046,9 @@ namespace dxup::legacy {
 
     private:
       ShaderDiskCache() {
-        HMODULE self = nullptr;
-        GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-          reinterpret_cast<LPCWSTR>(&compiler), &self);
-        wchar_t path[MAX_PATH] = {};
-        if (!self || !GetModuleFileNameW(self, path, MAX_PATH))
+        const std::wstring dir = cacheDirectory();
+        if (dir.empty())
           return;
-        wchar_t* name = wcsrchr(path, L'\\');
-        if (!name)
-          return;
-        name[1] = 0;
-        std::wstring dir = std::wstring(path) + L"dxup_pso_cache";
-        CreateDirectoryW(dir.c_str(), nullptr);
         m_path = dir + L"\\d3d9_shaders.bin";
         FILE* file = nullptr;
         if (_wfopen_s(&file, m_path.c_str(), L"rb") != 0)
@@ -1063,6 +1074,173 @@ namespace dxup::legacy {
 
     // Changes whenever the translator's output changes.
     constexpr uint64_t kTranslatorVersion = 5;
+
+    // The shaders draws used in this and earlier runs, their code and the
+    // variants they were drawn with: compiled at the start of a later run,
+    // before the game creates them (Device::startShaderWarmup), and compiled
+    // anew from their code when the translator changed with an update. A
+    // variant a draw needs first (a shadow map, a clip plane, integer inputs,
+    // more varyings) stalls the draw while it compiles, and so does the
+    // Direct3D 12 pipeline of a shader new to the driver.
+    // dxup_pso_cache\d3d9_variants.bin: entries of type, size and data
+    // appended (1: hash and tokens of a shader, 2: a variant).
+    class VariantRecords {
+    public:
+      struct Record {
+        uint64_t shader;
+        uint32_t minVaryings;
+        uint16_t uintInputs, sintInputs, shadowSamplers, blueOneSamplers;
+        uint8_t  clipPlanes, typed, reserved[2];
+        uint8_t  types[16];
+      };
+      static_assert(sizeof(Record) == 40, "record layout");
+
+      static VariantRecords& instance() {
+        static VariantRecords records;
+        return records;
+      }
+
+      // A variant a draw used (options as Shader::variant keys them).
+      void note(uint64_t shader, const std::vector<uint32_t>& tokens, const TranslateOptions9& options) {
+        Record record = {};
+        record.shader = shader;
+        record.minVaryings = options.minVaryings;
+        record.uintInputs = options.uintInputs;
+        record.sintInputs = options.sintInputs;
+        record.shadowSamplers = options.shadowSamplers;
+        record.blueOneSamplers = options.blueOneSamplers;
+        record.clipPlanes = options.clipPlanes;
+        if (options.boundSamplerTypes) {
+          record.typed = 1;
+          std::memcpy(record.types, options.boundSamplerTypes, sizeof(record.types));
+        }
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (!m_known.insert(digest(record)).second)
+          return;
+        m_records.emplace(shader, record);
+        if (!m_code.count(shader)) {
+          m_code.emplace(shader, std::make_shared<std::vector<uint32_t>>(tokens));
+          m_order.push_back(shader);
+          std::vector<uint8_t> entry(sizeof(uint64_t) + tokens.size() * sizeof(uint32_t));
+          std::memcpy(entry.data(), &shader, sizeof(shader));
+          std::memcpy(entry.data() + sizeof(shader), tokens.data(), tokens.size() * sizeof(uint32_t));
+          append(kCode, entry.data(), entry.size());
+        }
+        append(kVariant, &record, sizeof(record));
+      }
+
+      // The variants earlier draws used of a shader.
+      std::vector<Record> find(uint64_t shader) {
+        std::vector<Record> found;
+        std::lock_guard<std::mutex> lock(m_mutex);
+        auto range = m_records.equal_range(shader);
+        for (auto it = range.first; it != range.second; ++it)
+          found.push_back(it->second);
+        return found;
+      }
+
+      // The shaders draws used, in the order they were first drawn.
+      std::vector<std::pair<uint64_t, std::shared_ptr<const std::vector<uint32_t>>>> shaders() {
+        std::vector<std::pair<uint64_t, std::shared_ptr<const std::vector<uint32_t>>>> list;
+        std::lock_guard<std::mutex> lock(m_mutex);
+        list.reserve(m_order.size());
+        for (uint64_t shader : m_order)
+          list.emplace_back(shader, m_code[shader]);
+        return list;
+      }
+
+      // Options of a record; the sampler types point into it.
+      static void apply(const Record& record, TranslateOptions9& options) {
+        options.minVaryings = record.minVaryings;
+        options.uintInputs = record.uintInputs;
+        options.sintInputs = record.sintInputs;
+        options.shadowSamplers = record.shadowSamplers;
+        options.blueOneSamplers = record.blueOneSamplers;
+        options.clipPlanes = record.clipPlanes;
+        options.boundSamplerTypes = record.typed ? record.types : nullptr;
+      }
+
+    private:
+      static constexpr uint32_t kHeader[2] = { 0x39565844u /* "DXV9" */, 2 };
+      static constexpr uint32_t kCode = 1, kVariant = 2;
+      static constexpr size_t kMaxBytes = 64u << 20;
+      static constexpr size_t kMaxEntry = 4u << 20;
+
+      static uint64_t digest(const Record& record) {
+        uint64_t hash = 14695981039346656037ull;
+        const uint8_t* bytes = reinterpret_cast<const uint8_t*>(&record);
+        for (size_t i = 0; i < sizeof(record); i++)
+          hash = (hash ^ bytes[i]) * 1099511628211ull;
+        return hash;
+      }
+
+      // One write per entry (other processes of the game may append too).
+      void append(uint32_t type, const void* data, size_t size) {
+        if (m_path.empty() || m_size + size > kMaxBytes)
+          return;
+        std::vector<uint8_t> entry;
+        if (m_size == 0)
+          entry.insert(entry.end(), reinterpret_cast<const uint8_t*>(kHeader), reinterpret_cast<const uint8_t*>(kHeader) + sizeof(kHeader));
+        const uint32_t head[2] = { type, uint32_t(size) };
+        entry.insert(entry.end(), reinterpret_cast<const uint8_t*>(head), reinterpret_cast<const uint8_t*>(head) + sizeof(head));
+        entry.insert(entry.end(), static_cast<const uint8_t*>(data), static_cast<const uint8_t*>(data) + size);
+        FILE* file = nullptr;
+        if (_wfopen_s(&file, m_path.c_str(), L"ab") != 0 || !file)
+          return;
+        fwrite(entry.data(), 1, entry.size(), file);
+        fclose(file);
+        m_size += entry.size();
+      }
+
+      VariantRecords() {
+        const std::wstring dir = cacheDirectory();
+        if (dir.empty())
+          return;
+        m_path = dir + L"\\d3d9_variants.bin";
+        FILE* file = nullptr;
+        if (_wfopen_s(&file, m_path.c_str(), L"rb") != 0)
+          file = nullptr;
+        if (!file)
+          return;
+        uint32_t header[2] = {};
+        const bool valid = fread(header, sizeof(header), 1, file) == 1 && header[0] == kHeader[0] && header[1] == kHeader[1];
+        uint32_t head[2];
+        std::vector<uint8_t> data;
+        while (valid && fread(head, sizeof(head), 1, file) == 1 && head[1] <= kMaxEntry) {
+          data.resize(head[1]);
+          if (fread(data.data(), 1, data.size(), file) != data.size())
+            break;
+          if (head[0] == kCode && data.size() > sizeof(uint64_t) && (data.size() - sizeof(uint64_t)) % sizeof(uint32_t) == 0) {
+            uint64_t shader;
+            std::memcpy(&shader, data.data(), sizeof(shader));
+            if (!m_code.count(shader)) {
+              auto tokens = std::make_shared<std::vector<uint32_t>>((data.size() - sizeof(uint64_t)) / sizeof(uint32_t));
+              std::memcpy(tokens->data(), data.data() + sizeof(uint64_t), tokens->size() * sizeof(uint32_t));
+              m_code.emplace(shader, std::move(tokens));
+              m_order.push_back(shader);
+            }
+          } else if (head[0] == kVariant && data.size() == sizeof(Record)) {
+            Record record;
+            std::memcpy(&record, data.data(), sizeof(record));
+            if (m_known.insert(digest(record)).second)
+              m_records.emplace(record.shader, record);
+          }
+        }
+        m_size = valid ? size_t(_ftelli64(file)) : 0;
+        fclose(file);
+        // Another layout: started anew.
+        if (!valid)
+          DeleteFileW(m_path.c_str());
+      }
+
+      std::mutex m_mutex;
+      std::wstring m_path;
+      size_t m_size = 0;
+      std::unordered_set<uint64_t> m_known;
+      std::unordered_multimap<uint64_t, Record> m_records;
+      std::unordered_map<uint64_t, std::shared_ptr<const std::vector<uint32_t>>> m_code;
+      std::vector<uint64_t> m_order;
+    };
   }
 
   // The PCI vendor of the GPU DXUP renders on (DXUPGetVendorId), 0 unknown.
@@ -1133,19 +1311,16 @@ namespace dxup::legacy {
       count++;
     }
     count = (std::min)(count + 1, tokenCount);
-    auto shader = std::make_shared<Shader>();
-    ID3D11Device* d3d11 = device->d3d11();
-    d3d11->AddRef();
-    *shader->m_d3d11.put() = d3d11;
-    shader->m_tokens.assign(tokens, tokens + count);
     uint64_t hash = 14695981039346656037ull;
-    for (uint32_t token : shader->m_tokens)
-      hash = fnv64Multiply(hash ^ token);
-    shader->m_hash = hash;
-    std::string hlsl;
+    for (size_t i = 0; i < count; i++)
+      hash = fnv64Multiply(hash ^ tokens[i]);
     TranslateOptions9 options;
     driverBehavior(options);
-    if (!translateShader9(shader->m_tokens.data(), shader->m_tokens.size(), options, hlsl, shader->m_info, error))
+    // Drawn in an earlier run: compiled since the device was made.
+    std::shared_ptr<Shader> shader = device->takeWarmShader(hash, tokens, count);
+    if (!shader)
+      shader = make(device->d3d11(), tokens, count, hash, error);
+    if (!shader)
       return nullptr;
     // The likely variant now, on a worker: compiling at the first draw
     // would stall it, and loading screens create shaders by the hundred.
@@ -1154,23 +1329,161 @@ namespace dxup::legacy {
     // fixed-function pixel stage.
     if (shader->vertex() && shader->m_info.varyingCount < Device::kFixedPixelVaryings
      && (shader->m_info.major == 1 || device->fixedPixelsWithShaders())) {
-      options.minVaryings = Device::kFixedPixelVaryings;
-      shader->prepare(options);
+      TranslateOptions9 fixed = options;
+      fixed.minVaryings = Device::kFixedPixelVaryings;
+      shader->prepare(fixed);
+    }
+    // And every variant draws used in earlier runs.
+    for (const VariantRecords::Record& record : VariantRecords::instance().find(hash)) {
+      TranslateOptions9 recorded = options;
+      VariantRecords::apply(record, recorded);
+      shader->prepare(recorded);
     }
     return shader;
   }
 
+  std::shared_ptr<Shader> Shader::make(ID3D11Device* d3d11, const uint32_t* tokens, size_t count, uint64_t hash,
+                                       std::string& error) {
+    auto shader = std::make_shared<Shader>();
+    d3d11->AddRef();
+    *shader->m_d3d11.put() = d3d11;
+    shader->m_tokens.assign(tokens, tokens + count);
+    shader->m_hash = hash;
+    std::string hlsl;
+    TranslateOptions9 options;
+    driverBehavior(options);
+    if (!translateShader9(shader->m_tokens.data(), shader->m_tokens.size(), options, hlsl, shader->m_info, error))
+      return nullptr;
+    return shader;
+  }
+
+  // ---- Shaders compiled ahead ----
+
+  struct Device::ShaderWarmup {
+    ID3D11Device*           d3d11 = nullptr;   // the device's, used while active
+    std::mutex              mutex;
+    std::condition_variable changed;
+    std::unordered_set<uint64_t> queued;      // not yet started
+    std::unordered_set<uint64_t> building;    // being made
+    std::unordered_map<uint64_t, std::shared_ptr<Shader>> ready;   // not yet created by the game
+    uint32_t                active = 0;
+    std::atomic<bool>       cancelled{false};
+  };
+
+  void Device::startShaderWarmup() {
+    auto shaders = VariantRecords::instance().shaders();
+    if (shaders.empty())
+      return;
+    // At most what the address space of a 32-bit game affords.
+    const size_t limit = sizeof(void*) == 4 ? 2048 : 16384;
+    if (shaders.size() > limit)
+      shaders.resize(limit);
+    m_shaderWarmup = std::make_shared<ShaderWarmup>();
+    m_shaderWarmup->d3d11 = m_device.get();
+    for (const auto& entry : shaders)
+      m_shaderWarmup->queued.insert(entry.first);
+    logMessage(LogLevel::Info, "D3D9 shaders: compiling %zu shaders of earlier runs ahead", shaders.size());
+    std::weak_ptr<ShaderWarmup> weak = m_shaderWarmup;
+    for (const auto& entry : shaders) {
+      const uint64_t hash = entry.first;
+      std::shared_ptr<const std::vector<uint32_t>> tokens = entry.second;
+      CompilePool::instance().post([weak, hash, tokens] {
+        auto warmup = weak.lock();
+        if (!warmup)
+          return;
+        {
+          std::lock_guard<std::mutex> lock(warmup->mutex);
+          if (warmup->cancelled || !warmup->queued.erase(hash))
+            return;
+          warmup->building.insert(hash);
+          warmup->active++;
+        }
+        std::string error;
+        std::shared_ptr<Shader> shader = Shader::make(warmup->d3d11, tokens->data(), tokens->size(), hash, error);
+        {
+          std::lock_guard<std::mutex> lock(warmup->mutex);
+          warmup->building.erase(hash);
+          if (shader && !warmup->cancelled)
+            warmup->ready.emplace(hash, shader);
+        }
+        warmup->changed.notify_all();
+        // Its variants: what the game's creation compiles ahead, and what
+        // draws used.
+        if (shader) {
+          TranslateOptions9 options;
+          driverBehavior(options);
+          shader->variant(options, false);
+          for (const VariantRecords::Record& record : VariantRecords::instance().find(hash)) {
+            if (warmup->cancelled)
+              break;
+            TranslateOptions9 recorded = options;
+            VariantRecords::apply(record, recorded);
+            shader->variant(recorded, false);
+          }
+          shader.reset();
+        }
+        {
+          std::lock_guard<std::mutex> lock(warmup->mutex);
+          warmup->active--;
+        }
+        warmup->changed.notify_all();
+      });
+    }
+  }
+
+  std::shared_ptr<Shader> Device::takeWarmShader(uint64_t hash, const uint32_t* tokens, size_t count) {
+    if (!m_shaderWarmup)
+      return nullptr;
+    ShaderWarmup& warmup = *m_shaderWarmup;
+    std::unique_lock<std::mutex> lock(warmup.mutex);
+    warmup.queued.erase(hash);
+    warmup.changed.wait(lock, [&] { return !warmup.building.count(hash); });
+    auto it = warmup.ready.find(hash);
+    if (it == warmup.ready.end())
+      return nullptr;
+    std::shared_ptr<Shader> shader = std::move(it->second);
+    warmup.ready.erase(it);
+    lock.unlock();
+    if (shader->tokens().size() != count || std::memcmp(shader->tokens().data(), tokens, count * sizeof(uint32_t)) != 0)
+      return nullptr;
+    return shader;
+  }
+
+  void Device::stopShaderWarmup() {
+    if (!m_shaderWarmup)
+      return;
+    std::unordered_map<uint64_t, std::shared_ptr<Shader>> ready;
+    {
+      std::unique_lock<std::mutex> lock(m_shaderWarmup->mutex);
+      m_shaderWarmup->cancelled = true;
+      m_shaderWarmup->queued.clear();
+      ready.swap(m_shaderWarmup->ready);
+      // Compiles in progress use the device; a process that exits has
+      // ended its workers.
+      if (!processExiting())
+        m_shaderWarmup->changed.wait(lock, [&] { return m_shaderWarmup->active == 0; });
+    }
+    ready.clear();
+    m_shaderWarmup.reset();
+  }
+
   void Shader::prepare(const TranslateOptions9& options) {
     TranslateOptions9 copy = options;
+    std::array<uint8_t, 16> types = {};
+    const bool typed = options.boundSamplerTypes != nullptr;
+    if (typed)
+      std::memcpy(types.data(), options.boundSamplerTypes, types.size());
     copy.boundSamplerTypes = nullptr;
     std::weak_ptr<Shader> self = shared_from_this();
-    CompilePool::instance().post([self, copy] {
+    CompilePool::instance().post([self, copy, types, typed]() mutable {
+      if (typed)
+        copy.boundSamplerTypes = types.data();
       if (auto shader = self.lock())
-        shader->variant(copy);
+        shader->variant(copy, false);
     });
   }
 
-  const Shader::Variant* Shader::variant(const TranslateOptions9& in) {
+  const Shader::Variant* Shader::variant(const TranslateOptions9& in, bool draw) {
     // A vertex shader writes its own varyings at least: the same variant.
     TranslateOptions9 options = in;
     driverBehavior(options);
@@ -1207,14 +1520,32 @@ namespace dxup::legacy {
       for (int i = 0; i < 16; i++)
         key = fnv64Multiply(key ^ (options.boundSamplerTypes[i] + 0x100u * uint32_t(i)));
     std::shared_ptr<Slot> slot;
+    bool firstDraw = false;
     {
       std::lock_guard<std::mutex> lock(m_mutex);
       auto& entry = m_variants[key];
       if (!entry)
         entry = std::make_shared<Slot>();
       slot = entry;
+      if (draw && !slot->drawn)
+        slot->drawn = firstDraw = true;
     }
-    std::call_once(slot->once, [&] { slot->ok = compile(options, key, slot->variant); });
+    if (firstDraw)
+      VariantRecords::instance().note(m_hash, m_tokens, options);
+    // Draws that compile or wait log it (info log): the stutter of shaders.
+    const bool timed = firstDraw && logLevelEnabled(LogLevel::Info);
+    const auto start = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
+    bool compiledHere = false;
+    std::call_once(slot->once, [&] { compiledHere = true; slot->ok = compile(options, key, slot->variant); });
+    if (timed) {
+      const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+      if (compiledHere)
+        logMessage(LogLevel::Info, "D3D9 shaders: a draw compiled %s shader %016llx's variant %016llx (%.1f ms)",
+          vertex() ? "vertex" : "pixel", (unsigned long long)m_hash, (unsigned long long)key, ms);
+      else if (ms >= 1.0)
+        logMessage(LogLevel::Info, "D3D9 shaders: a draw waited %.1f ms for %s shader %016llx's variant %016llx",
+          ms, vertex() ? "vertex" : "pixel", (unsigned long long)m_hash, (unsigned long long)key);
+    }
     return slot->ok ? &slot->variant : nullptr;
   }
 
@@ -1304,6 +1635,7 @@ namespace dxup::legacy {
   }
 
   Device::~Device() {
+    stopShaderWarmup();
     if (m_context)
       m_context->ClearState();
     for (auto& entry : m_inputLayouts) if (entry.second) entry.second->Release();
@@ -1341,6 +1673,8 @@ namespace dxup::legacy {
     using GetVendorId = UINT (WINAPI*)(IUnknown*);
     if (auto getVendorId = reinterpret_cast<GetVendorId>(GetProcAddress(m_d3d11Module, "DXUPGetVendorId")))
       g_vendorId.store(getVendorId(m_device.get()), std::memory_order_relaxed);
+    // The shaders of earlier runs, compiled while the game loads.
+    startShaderWarmup();
     // Constant buffers bound with offsets (Direct3D 11.1).
     if (FAILED(m_context->QueryInterface(__uuidof(ID3D11DeviceContext1), reinterpret_cast<void**>(m_context1.put())))) {
       error = "no ID3D11DeviceContext1";

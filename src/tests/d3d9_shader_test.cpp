@@ -779,11 +779,12 @@ float4 main(float4 t0 : TEXCOORD0, float4 t1 : TEXCOORD1, float4 t2 : TEXCOORD2)
 }
 
 int main(int argc, char** argv) {
-  bool dumpAll = false, compileBench = false;
+  bool dumpAll = false, compileBench = false, floatEmulation = false;
   const char* filter = nullptr;
   for (int i = 1; i < argc; i++) {
     if (std::strcmp(argv[i], "--dump") == 0) dumpAll = true;
     else if (std::strcmp(argv[i], "--compile-bench") == 0) compileBench = true;
+    else if (std::strcmp(argv[i], "--float-emulation") == 0) floatEmulation = true;
     else filter = argv[i];
   }
   CompileTimes times;
@@ -816,6 +817,7 @@ int main(int argc, char** argv) {
     ShaderInfo9 psInfo, vsInfo;
     std::string psHlsl, vsHlsl;
     TranslateOptions9 options;
+    options.floatEmulation = options.dotEmulation = floatEmulation;
     if (!translateShader9(ps.tokens.data(), ps.tokens.size(), options, psHlsl, psInfo, error)) {
       std::printf("FAIL %-22s pixel translation: %s\n", c.name, error.c_str());
       failed++;
