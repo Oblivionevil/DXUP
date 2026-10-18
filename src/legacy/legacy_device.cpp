@@ -2157,6 +2157,16 @@ namespace dxup::legacy {
   void Device::setRenderTarget(uint32_t index, Texture* target, uint32_t subresource) {
     if (index >= kMaxRenderTargets)
       return;
+    if (target && index == 0) {
+      // As Direct3D 9: the first target sets viewport and scissor to itself,
+      // also when it is the target already bound (UE3 games set their scene
+      // target again after a smaller viewport: The Vanishing of Ethan Carter
+      // drew its world into a 512x512 corner).
+      m_viewport = { 0, 0, target->width(subresource), target->height(subresource), 0.0f, 1.0f };
+      m_scissor = { 0, 0, int32_t(m_viewport.width), int32_t(m_viewport.height) };
+      m_vertexConstantsDirty = true;
+      m_targetsDirty = true;
+    }
     if (m_renderTargets[index] == target && m_renderTargetSubresources[index] == subresource)
       return;
     m_renderTargets[index] = target;
@@ -2165,12 +2175,6 @@ namespace dxup::legacy {
     // A texture bound as the new target is unbound from its stage.
     m_textureDirtyMask = (1u << kSamplerCount) - 1;
     m_dirty |= DirtyBlend;
-    if (target && index == 0) {
-      // As Direct3D 9: the first target sets viewport and scissor to itself.
-      m_viewport = { 0, 0, target->width(subresource), target->height(subresource), 0.0f, 1.0f };
-      m_scissor = { 0, 0, int32_t(m_viewport.width), int32_t(m_viewport.height) };
-      m_vertexConstantsDirty = true;
-    }
   }
 
   void Device::setDepthStencil(Texture* depth) {
@@ -2494,7 +2498,10 @@ namespace dxup::legacy {
     desc.AddressV = address(ss[SampAddressV]);
     desc.AddressW = address(ss[SampAddressW]);
     colorToFloats(ss[SampBorderColor], desc.BorderColor);
-    desc.MipLODBias = asFloat(ss[SampMipMapLodBias]);
+    // Direct3D 9 drivers take any bias (UE3 games set NaN: The Vanishing of
+    // Ethan Carter); D3D11 refuses samplers with NaN or one out of range.
+    const float bias = asFloat(ss[SampMipMapLodBias]);
+    desc.MipLODBias = bias == bias ? (std::max)(-16.0f, (std::min)(bias, 15.99f)) : 0.0f;
     desc.MinLOD = float(ss[SampMaxMipLevel]);
     desc.MaxLOD = mip == 0 ? desc.MinLOD : D3D11_FLOAT32_MAX;
     // Shadow maps: 1 where the reference is not farther than the depth.
@@ -3126,6 +3133,116 @@ namespace dxup::legacy {
     logMessage(LogLevel::Warn, "glitch: a draw was not drawn: %s", what.c_str());
   }
 
+  // Target 0's probe pixel as its bytes (copied to a staging texture of
+  // one texel: synchronizes, tracing only).
+  void Device::traceProbe9() {
+    Texture* target = m_renderTargets[0];
+    if (!target || !target->resource() || m_trace9X < 0)
+      return;
+    const uint32_t sub = m_renderTargetSubresources[0];
+    if (uint32_t(m_trace9X) >= target->width(sub) || uint32_t(m_trace9Y) >= target->height(sub))
+      return;
+    D3D11_TEXTURE2D_DESC td;
+    target->resource()->GetDesc(&td);
+    if (td.SampleDesc.Count > 1)
+      return;
+    if (!m_trace9Staging || m_trace9Format != td.Format) {
+      D3D11_TEXTURE2D_DESC sd = {};
+      sd.Width = sd.Height = 1;
+      sd.MipLevels = sd.ArraySize = 1;
+      sd.Format = td.Format;
+      sd.SampleDesc.Count = 1;
+      sd.Usage = D3D11_USAGE_STAGING;
+      sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+      if (FAILED(m_device->CreateTexture2D(&sd, nullptr, m_trace9Staging.put())))
+        return;
+      m_trace9Format = td.Format;
+    }
+    const D3D11_BOX box = { UINT(m_trace9X), UINT(m_trace9Y), 0, UINT(m_trace9X) + 1, UINT(m_trace9Y) + 1, 1 };
+    m_context->CopySubresourceRegion(m_trace9Staging.get(), 0, 0, 0, 0, target->resource(), sub, &box);
+    D3D11_MAPPED_SUBRESOURCE mapped = {};
+    if (FAILED(m_context->Map(m_trace9Staging.get(), 0, D3D11_MAP_READ, 0, &mapped)))
+      return;
+    uint32_t words[2] = {};
+    std::memcpy(words, mapped.pData, 8);
+    m_context->Unmap(m_trace9Staging.get(), 0);
+    logMessage(LogLevel::Warn, "trace9   probe %08x %08x (target %ux%u format %u)", words[0], words[1], target->width(sub),
+      target->height(sub), uint32_t(target->desc().format));
+  }
+
+  void Device::traceDraw9(const DrawArgs& a) {
+    char line[1024];
+    int n = sprintf_s(line, "trace9 #%u type %u %s count %u start %u base %d min %u verts %u%s vs %016llX ps %016llX",
+      ++m_trace9Draw, unsigned(a.type), a.indexed ? "indexed" : "", a.indexed ? a.indexCount : a.vertexCount,
+      a.indexed ? a.startIndex : a.startVertex, a.baseVertex, a.minIndex, a.vertexCount, a.userVertices ? " UP" : "",
+      static_cast<unsigned long long>(m_vertexShader ? m_vertexShader->hash() : 0),
+      static_cast<unsigned long long>(m_pixelShader ? m_pixelShader->hash() : 0));
+    (void)n;
+    logMessage(LogLevel::Warn, "%s", line);
+    if (m_decl) {
+      std::string decl;
+      for (const auto& e : m_decl->elements()) {
+        char text[64];
+        sprintf_s(text, " s%u+%u t%u u%u/%u", e.stream, e.offset, e.type, e.usage, e.usageIndex);
+        decl += text;
+      }
+      logMessage(LogLevel::Warn, "trace9   decl%s", decl.c_str());
+    }
+    for (uint32_t stream = 0; stream < kMaxStreams; stream++) {
+      if (!m_decl || !((m_decl->streamMask() >> stream) & 1))
+        continue;
+      const Stream& s = m_streams[stream];
+      std::string bytes;
+      const uint8_t* data = nullptr;
+      uint32_t first = 0, size = 0;
+      if (stream == 0 && a.userVertices) {
+        data = static_cast<const uint8_t*>(a.userVertices);
+        size = a.userStride * 2;
+      } else if (s.buffer) {
+        const int64_t vertex = (s.frequency & kInstanceData) ? 0 : a.indexed ? int64_t(a.baseVertex) + a.minIndex : a.startVertex;
+        first = uint32_t((std::max<int64_t>)(0, int64_t(s.offset) + vertex * s.stride));
+        data = s.buffer->data();
+        size = s.buffer->size();
+      }
+      for (uint32_t i = 0; data && i < 32 && first + i < size; i++) {
+        char text[4];
+        sprintf_s(text, "%02x", data[first + i]);
+        bytes += text;
+        if ((i & 3) == 3) bytes += ' ';
+      }
+      logMessage(LogLevel::Warn, "trace9   stream %u buffer %p size %u offset %u stride %u freq 0x%x%s: %s", stream,
+        static_cast<void*>(s.buffer), s.buffer ? s.buffer->size() : 0, s.offset, s.stride, s.frequency,
+        s.buffer && s.buffer->dynamic() ? " dynamic" : "", bytes.c_str());
+    }
+    for (uint32_t sampler = 0; sampler < kSamplerCount; sampler++) {
+      Texture* t = m_textures[sampler];
+      if (!t)
+        continue;
+      const TextureDesc& d = t->desc();
+      const auto& data = t->levelData(0);
+      uint64_t sum = 0;
+      uint32_t nonzero = 0;
+      for (size_t i = 0; i < data.size(); i++) { sum += data[i]; nonzero += data[i] != 0; }
+      logMessage(LogLevel::Warn, "trace9   s%u texture %p %ux%u levels %u format %u%s%s%s, level 0 copy %zu bytes, %u nonzero, sum %llu",
+        sampler, static_cast<void*>(t), d.width, d.height, d.levels, uint32_t(d.format), d.renderTarget ? " target" : "",
+        d.depthStencil ? " depth" : "", d.cube ? " cube" : "", data.size(), nonzero, static_cast<unsigned long long>(sum));
+    }
+    for (int pixel = 0; pixel < 2; pixel++) {
+      const Shader* shader = pixel ? m_pixelShader : m_vertexShader;
+      if (!shader)
+        continue;
+      const uint32_t floats = (std::min)(shader->info().floatConstantCount, 32u);
+      std::string text;
+      for (uint32_t i = 0; i < floats; i++) {
+        char c[96];
+        const float* f = m_constants[pixel].f[i];
+        sprintf_s(c, " c%u(%g %g %g %g)", i, f[0], f[1], f[2], f[3]);
+        text += c;
+      }
+      logMessage(LogLevel::Warn, "trace9   %s constants%s", pixel ? "pixel" : "vertex", text.c_str());
+    }
+  }
+
   void Device::logDroppedDraws() {
     uint32_t total = 0;
     for (uint32_t count : m_dropped.counts)
@@ -3627,6 +3744,12 @@ namespace dxup::legacy {
     DrawArgs a = args;
     if (a.indexed && a.indexCount)
       widenVertexRange(a);
+    if (m_trace9)
+      traceDraw9(a);
+    struct ProbeAfter {
+      Device* device;
+      ~ProbeAfter() { if (device->m_trace9) device->traceProbe9(); }
+    } probeAfter{ this };
     if (!m_decl)
       return dropDraw(DropDeclaration);
     // Application vertices into the ring first: its offset binds stream 0.
@@ -4272,6 +4395,33 @@ namespace dxup::legacy {
 
   HRESULT Device::present(Texture* source, const Rect* sourceRect, HWND window, uint32_t syncInterval,
                           const uint16_t* gammaRamp) {
+    if (m_trace9) {
+      m_trace9 = false;
+      logMessage(LogLevel::Warn, "trace9: end of frame, %u draws", m_trace9Draw);
+    }
+    if (!m_trace9Done && !(m_trace9Presents++ & 63)) {
+      wchar_t path[MAX_PATH] = {};
+      HMODULE self = nullptr;
+      GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        reinterpret_cast<LPCWSTR>(&glitchReportsEnabled), &self);
+      if (self && GetModuleFileNameW(self, path, MAX_PATH)) {
+        if (wchar_t* name = wcsrchr(path, L'\\')) {
+          wcscpy_s(name + 1, MAX_PATH - (name + 1 - path), L"dxup_trace9_go.txt");
+          if (GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES) {
+            m_trace9 = m_trace9Done = true;
+            m_trace9Draw = 0;
+            // "x y": the probe pixel.
+            FILE* f = nullptr;
+            if (_wfopen_s(&f, path, L"r") == 0 && f) {
+              if (fscanf_s(f, "%d %d", &m_trace9X, &m_trace9Y) != 2)
+                m_trace9X = m_trace9Y = -1;
+              std::fclose(f);
+            }
+            logMessage(LogLevel::Warn, "trace9: next frame, probe %d, %d", m_trace9X, m_trace9Y);
+          }
+        }
+      }
+    }
     if (glitchReportsEnabled()) {
       logNonFiniteConstants();
       logDroppedDraws();

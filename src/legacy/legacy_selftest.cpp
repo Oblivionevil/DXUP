@@ -562,6 +562,57 @@ namespace dxup::legacy {
       if (!first.empty())
         differs(first);
     }
+    // Depth textures shaders read (not compare): INTZ gives the depth in
+    // every channel, as NVIDIA's Direct3D 9 does.
+    {
+      TextureDesc desc;
+      desc.width = desc.height = 4;
+      desc.levels = 1;
+      desc.format = FormatINTZ;
+      desc.depthStencil = true;
+      desc.sampledDepth = true;
+      Texture texture(this, desc);
+      tested++;
+      ID3D11ShaderResourceView* view = texture.valid() ? texture.srv(false) : nullptr;
+      std::string what;
+      if (!view || !texture.dsv()) {
+        what = "cannot be read by shaders";
+      } else {
+        m_context->ClearState();
+        m_context->ClearDepthStencilView(texture.dsv(), D3D11_CLEAR_DEPTH, 0.25f, 0);
+        const D3D11_VIEWPORT viewport = { 0.0f, 0.0f, 4.0f, 4.0f, 0.0f, 1.0f };
+        const D3D11_RECT scissor = { 0, 0, 4, 4 };
+        ID3D11RenderTargetView* targets[1] = { rtv.get() };
+        m_context->OMSetRenderTargets(1, targets, nullptr);
+        m_context->RSSetViewports(1, &viewport);
+        m_context->RSSetScissorRects(1, &scissor);
+        m_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        m_context->VSSetShader(vs.get(), nullptr, 0);
+        m_context->PSSetShader(ps.get(), nullptr, 0);
+        m_context->PSSetShaderResources(0, 1, &view);
+        m_context->Draw(3, 0);
+        m_context->CopyResource(readback.get(), target.get());
+        D3D11_MAPPED_SUBRESOURCE mapped = {};
+        if (SUCCEEDED(m_context->Map(readback.get(), 0, D3D11_MAP_READ, 0, &mapped))) {
+          const float* got = static_cast<const float*>(mapped.pData);
+          bool same = true;
+          for (int c = 0; c < 4; c++)
+            same = same && std::fabs(got[c] - 0.25f) <= 1e-5f;
+          if (!same) {
+            char text[160];
+            sprintf_s(text, "read differently from Direct3D 9: depth 0.25 gives (%g, %g, %g, %g), Direct3D 9 (0.25, 0.25, 0.25, 0.25)",
+              got[0], got[1], got[2], got[3]);
+            what = text;
+          }
+          m_context->Unmap(readback.get(), 0);
+        }
+      }
+      if (!what.empty()) {
+        differing++;
+        names += names.empty() ? "INTZ" : ", INTZ";
+        logMessage(LogLevel::Warn, "glitch: self-test: textures of format INTZ %s", what.c_str());
+      }
+    }
     m_context->ClearState();
     invalidateBindings();
     if (differing)

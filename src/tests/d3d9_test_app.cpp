@@ -724,6 +724,57 @@ float4 main(float4 v : TEXCOORD0, float2 t : TEXCOORD1) : COLOR {
     return true;
   }
 
+  // Two elements of a declaration on the same bytes (UE3: COLOR0 and
+  // TEXCOORD1 at one offset, lightmap coordinates): both read them.
+  bool sceneAliasedElements(IDirect3DDevice9* d) {
+    d->Clear(0, nullptr, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, 0xff000000u, 1.0f, 0);
+    const char* vsSource = R"(
+struct VO { float4 p : POSITION; float4 a : TEXCOORD0; float4 b : TEXCOORD1; };
+VO main(float4 p : POSITION, float4 c : COLOR0, float4 t : TEXCOORD1, float4 t2 : TEXCOORD2) {
+  VO o; o.p = p; o.a = float4(c.xy, t.xy); o.b = float4(t2.xy, c.zw); return o;
+})";
+    const char* psSource = R"(
+float4 main(float4 a : TEXCOORD0, float4 b : TEXCOORD1, float2 v : VPOS) : COLOR {
+  return v.x < 32 ? float4(a.xyz, 1) : float4(a.w, b.xy, 1);
+})";
+    const auto vsCode = compile(vsSource, "vs_3_0");
+    const auto psCode = compile(psSource, "ps_3_0");
+    IDirect3DVertexShader9* vs = nullptr;
+    IDirect3DPixelShader9* ps = nullptr;
+    if (vsCode.empty() || psCode.empty() || FAILED(d->CreateVertexShader(vsCode.data(), &vs))
+     || FAILED(d->CreatePixelShader(psCode.data(), &ps)))
+      return false;
+    const D3DVERTEXELEMENT9 elements[] = {
+      { 0, 0, D3DDECLTYPE_FLOAT4, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_POSITION, 0 },
+      { 0, 16, D3DDECLTYPE_FLOAT16_2, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_TEXCOORD, 1 },
+      { 0, 16, D3DDECLTYPE_FLOAT16_2, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_COLOR, 0 },
+      { 0, 20, D3DDECLTYPE_FLOAT16_2, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_TEXCOORD, 3 },
+      { 0, 20, D3DDECLTYPE_FLOAT16_2, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_TEXCOORD, 2 },
+      D3DDECL_END(),
+    };
+    IDirect3DVertexDeclaration9* decl = nullptr;
+    if (FAILED(d->CreateVertexDeclaration(elements, &decl)))
+      return false;
+    auto half = [](float f) {
+      uint32_t bits; std::memcpy(&bits, &f, 4);
+      return WORD(((bits >> 16) & 0x8000) | (((bits >> 23) & 255) - 112) << 10 | ((bits >> 13) & 1023));
+    };
+    struct V { float x, y, z, w; WORD c[2], t[2]; };
+    V quad[4] = { { -1, 1, 0.5f, 1 }, { 1, 1, 0.5f, 1 }, { -1, -1, 0.5f, 1 }, { 1, -1, 0.5f, 1 } };
+    for (auto& v : quad) { v.c[0] = half(0.25f); v.c[1] = half(0.75f); v.t[0] = half(0.5f); v.t[1] = half(0.375f); }
+    d->SetRenderState(D3DRS_ZENABLE, D3DZB_FALSE);
+    d->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+    d->SetVertexDeclaration(decl);
+    d->SetVertexShader(vs);
+    d->SetPixelShader(ps);
+    d->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, quad, sizeof(V));
+    d->SetVertexShader(nullptr);
+    d->SetPixelShader(nullptr);
+    d->SetVertexDeclaration(nullptr);
+    decl->Release(); ps->Release(); vs->Release();
+    return true;
+  }
+
   bool sceneInstancing(IDirect3DDevice9* d) {
     d->Clear(0, nullptr, D3DCLEAR_TARGET, 0xff000000u, 1.0f, 0);
     const char* vsSource = R"(
@@ -988,7 +1039,7 @@ float4 main(float4 t : TEXCOORD0) : COLOR { return tex2Dproj(shadow, float4(t.xy
 )";
     const char* psRead = R"(
 sampler2D depth : register(s0);
-float4 main(float4 t : TEXCOORD0) : COLOR { return tex2D(depth, t.xy).rrrr; }
+float4 main(float4 t : TEXCOORD0) : COLOR { float4 v = tex2D(depth, t.xy); return float4(v.r, v.g * 0.5 + v.b * 0.5, v.a, 1); }
 )";
     struct TLTex { float x, y, z, rhw; float u, v, r, q; };
     for (int i = 0; i < (intz ? 2 : 1); i++) {
@@ -1540,6 +1591,7 @@ float4 main(float2 t : TEXCOORD0) : COLOR {
     { "l16", sceneL16 },
     { "format_channels", sceneFormatChannels },
     { "decl_types", sceneDeclTypes },
+    { "aliased_elements", sceneAliasedElements },
     { "state_block", sceneStateBlock },
     { "sm3_loops", sceneSm3Loops },
     { "ps_1_4", scenePs14 },

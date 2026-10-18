@@ -109,6 +109,8 @@ namespace dxup::legacy {
 
     // GPU contents changed (rendered to): locks read them back first.
     void markGpuWritten();
+    // The application's copy of a subresource (empty when never locked).
+    const std::vector<uint8_t>& levelData(uint32_t subresource) const { return m_levels[subresource].data; }
     // Application writes or mipmaps wait for the next draw.
     bool pending() const { return m_anyDirty || m_mipsDirty; }
 
@@ -579,6 +581,16 @@ namespace dxup::legacy {
     DroppedDraws m_dropped;
     void dropDraw(DropReason reason, uint32_t bytes = 0);
     void logDroppedDraws();
+    // dxup_trace9_go.txt next to the DLL: the draws of the next frame with
+    // their shaders, declaration, streams (and first vertices), indices and
+    // constants (checked every 64 presents, once per file).
+    bool m_trace9 = false, m_trace9Done = false;
+    uint32_t m_trace9Draw = 0, m_trace9Presents = 0;
+    int32_t m_trace9X = -1, m_trace9Y = -1;   // probe pixel of target 0 after each draw
+    Ref<ID3D11Texture2D> m_trace9Staging;
+    DXGI_FORMAT m_trace9Format = DXGI_FORMAT_UNKNOWN;
+    void traceDraw9(const DrawArgs& a);
+    void traceProbe9();
     bool growRing(Ref<ID3D11Buffer>& ring, uint32_t& ringSize, uint32_t& ringOffset, uint32_t size, UINT bind);
     uint32_t m_rangeReports = 0;
     uint32_t m_ffpFvf = 0;                  // what the fixed function sees

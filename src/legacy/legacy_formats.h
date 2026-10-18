@@ -145,14 +145,16 @@ namespace dxup::legacy {
   // How a shader view reads the DXGI format to give what Direct3D 9 gives
   // (D3D12 shader component mapping; 0: as it is). Direct3D 9 reads missing
   // color channels as 1, Direct3D 10+ as 0; ATI2 is (green, red, 1, 1), L16
-  // (L, L, L, 1). DXVK swizzles its Vulkan views the same way. The device's
-  // self-test (legacy_selftest.cpp) checks every format against it.
+  // (L, L, L, 1), INTZ depth (d, d, d, d). DXVK swizzles its Vulkan views the
+  // same way. The device's self-test (legacy_selftest.cpp) checks every
+  // format against it.
   inline uint32_t shaderComponentMapping(Format format) {
     auto map = [](uint32_t r, uint32_t g, uint32_t b, uint32_t a) { return r | (g << 3) | (b << 6) | (a << 9) | (1u << 12); };
     constexpr uint32_t R = 0, G = 1, One = 5;
     switch (format) {
       case FormatATI2:     return map(G, R, One, One);
       case FormatL16:      return map(R, R, R, One);
+      case FormatINTZ:     return map(R, R, R, R);   // depth in every channel (NVIDIA)
       case FormatG16R16:
       case FormatV8U8:
       case FormatV16U16:

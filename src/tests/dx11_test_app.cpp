@@ -5595,6 +5595,12 @@ float4 main(float3 position : POSITION, float2 uv : TEXCOORD0) : SV_Position { r
       { auto d = baseSampler; d.AddressV = D3D11_TEXTURE_ADDRESS_MODE(6); sampler("sampler address 6", d, false); }
       { auto d = baseSampler; d.MipLODBias = 16.0f; sampler("sampler bias 16", d, false); }
       { auto d = baseSampler; d.MipLODBias = 15.99f; sampler("sampler bias 15.99", d, true); }
+      // NaN in the bias or LOD range: refused too.
+      { auto d = baseSampler; d.MipLODBias = std::numeric_limits<float>::quiet_NaN(); sampler("sampler bias nan", d, false); }
+      { auto d = baseSampler; d.Filter = D3D11_FILTER_ANISOTROPIC; d.MaxAnisotropy = 16;
+        d.MipLODBias = -std::numeric_limits<float>::quiet_NaN(); sampler("sampler aniso bias -nan", d, false); }
+      { auto d = baseSampler; d.MinLOD = std::numeric_limits<float>::quiet_NaN(); sampler("sampler min lod nan", d, false); }
+      { auto d = baseSampler; d.MaxLOD = std::numeric_limits<float>::quiet_NaN(); sampler("sampler max lod nan", d, false); }
       { auto d = baseSampler; d.MinLOD = 5.0f; d.MaxLOD = 2.0f; sampler("sampler min > max", d, true); }
       { auto d = baseSampler; d.ComparisonFunc = D3D11_COMPARISON_FUNC(0); sampler("sampler compare 0 unused", d, true); }
       { auto d = baseSampler; d.Filter = D3D11_FILTER_COMPARISON_MIN_MAG_MIP_LINEAR; d.ComparisonFunc = D3D11_COMPARISON_FUNC(0);

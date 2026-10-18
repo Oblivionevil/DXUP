@@ -21,6 +21,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #ifdef _WIN32
@@ -3397,10 +3398,20 @@ namespace dxup {
 
     // Calls refused like D3D11 refuses them, noted so that a check stricter
     // than the native runtime shows in the log of a game.
-    static HRESULT rejectInvalidCall(const char* check, HRESULT hr) {
-      static std::atomic<uint32_t> s_count = { 0 };
-      if (s_count.fetch_add(1, std::memory_order_relaxed) < 64)
-        logMessage(LogLevel::Warn, "Invalid call refused by %s (hr=0x%08x)", check, static_cast<uint32_t>(hr));
+    // A call refused as the native runtime refuses it: logged with what was
+    // wrong, each distinct one once (16 per check) - the application goes
+    // on without the object, which shows as rendering errors.
+    static HRESULT rejectInvalidCall(const char* check, HRESULT hr, const std::string& detail = std::string()) {
+      static std::mutex s_mutex;
+      static std::unordered_map<std::string, uint32_t> s_lines;
+      static std::unordered_set<std::string> s_seen;
+      std::lock_guard<std::mutex> lock(s_mutex);
+      uint32_t& lines = s_lines[check];
+      if (lines >= 16 || s_seen.size() >= 4096 || !s_seen.insert(std::string(check) + detail).second)
+        return hr;
+      lines++;
+      logMessage(LogLevel::Warn, "Invalid call refused by %s (hr=0x%08x)%s%s%s", check, static_cast<uint32_t>(hr),
+        detail.empty() ? "" : ": ", detail.c_str(), lines == 16 ? " (no more such lines)" : "");
       return hr;
     }
 
@@ -4151,6 +4162,14 @@ namespace dxup {
       return func >= D3D11_COMPARISON_NEVER && func <= D3D11_COMPARISON_ALWAYS;
     }
 
+    static std::string describeSamplerDesc(const D3D11_SAMPLER_DESC& desc) {
+      char text[256];
+      snprintf(text, sizeof(text), "filter 0x%x, address %d/%d/%d, LOD bias %g, anisotropy %u, comparison %d, LOD %g..%g",
+        UINT(desc.Filter), int(desc.AddressU), int(desc.AddressV), int(desc.AddressW), desc.MipLODBias, desc.MaxAnisotropy,
+        int(desc.ComparisonFunc), desc.MinLOD, desc.MaxLOD);
+      return text;
+    }
+
     static HRESULT validateSamplerDesc(const D3D11_SAMPLER_DESC& desc) {
       const UINT filter = UINT(desc.Filter);
       const UINT reduction = filter & 0x180u;
@@ -4163,6 +4182,7 @@ namespace dxup {
       if ((filter & ~0x1FFu) || !validBase || desc.MaxAnisotropy > D3D11_MAX_MAXANISOTROPY
        || !validAddress(desc.AddressU) || !validAddress(desc.AddressV) || !validAddress(desc.AddressW)
        || !(desc.MipLODBias >= D3D11_MIP_LOD_BIAS_MIN && desc.MipLODBias <= D3D11_MIP_LOD_BIAS_MAX)
+       || desc.MinLOD != desc.MinLOD || desc.MaxLOD != desc.MaxLOD
        || (reduction == 0x80u && !isValidComparisonFunc(desc.ComparisonFunc)))
         return E_INVALIDARG;
       return S_OK;
@@ -4257,7 +4277,8 @@ namespace dxup {
         const D3D11_SAMPLER_DESC*  pSamplerDesc,
         ID3D11SamplerState**       ppSamplerState) override {
       if (!pSamplerDesc) return E_INVALIDARG;
-      if (HRESULT hr = validateSamplerDesc(*pSamplerDesc); FAILED(hr)) return rejectInvalidCall("validateSamplerDesc", hr);
+      if (HRESULT hr = validateSamplerDesc(*pSamplerDesc); FAILED(hr))
+        return rejectInvalidCall("validateSamplerDesc", hr, describeSamplerDesc(*pSamplerDesc));
       if (!ppSamplerState) return S_FALSE;
 
       // As in D3D11, an identical description returns the same object.

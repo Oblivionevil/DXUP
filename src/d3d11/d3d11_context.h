@@ -1777,10 +1777,89 @@ namespace dxup {
     uint32_t   m_droppedDraws[DropReasons] = {};
     uint32_t   m_droppedFrames = 0, m_presents = 0;
 
+    // NaN and infinity the game puts into constant buffers, and NaN in GPU
+    // results it reads back (glitch reports): either shows as black or
+    // missing pixels, and spreads through the game's own math (exposure,
+    // LOD biases) into later frames.
+    uint32_t m_nonFiniteUploads = 0, m_nonFiniteFrames = 0, m_nanReadbacks = 0;
+    std::unordered_set<ID3D11Resource*> m_nonFiniteLogged;
+
+    void checkConstants(ID3D11Resource* buffer, const float* values, UINT count) {
+      if (!values)
+        return;
+      for (UINT i = 0; i < count; i++) {
+        if (std::isfinite(values[i]))
+          continue;
+        m_nonFiniteUploads++;
+        if (m_nonFiniteLogged.size() < 16 && m_nonFiniteLogged.insert(buffer).second) {
+          std::string which;
+          for (UINT j = i; j < count && which.size() < 200; j++) {
+            if (std::isfinite(values[j]))
+              continue;
+            char text[48];
+            snprintf(text, sizeof(text), " [%u].%c=%g", j / 4, "xyzw"[j % 4], values[j]);
+            which += text;
+          }
+          logMessage(LogLevel::Warn, "glitch: constant buffer %p written with NaN or infinity:%s", static_cast<void*>(buffer),
+            which.c_str());
+        }
+        return;
+      }
+    }
+
+    void checkReadback(ID3D11Resource* resource, const void* data, UINT rowPitch, UINT rows, UINT width, DXGI_FORMAT format,
+                       bool buffer) {
+      if (!data || m_nanReadbacks >= 16)
+        return;
+      UINT components = 0;
+      bool half = false;
+      switch (format) {
+        case DXGI_FORMAT_R32_FLOAT: components = 1; break;
+        case DXGI_FORMAT_R32G32_FLOAT: components = 2; break;
+        case DXGI_FORMAT_R32G32B32A32_FLOAT: components = 4; break;
+        case DXGI_FORMAT_R16_FLOAT: components = 1; half = true; break;
+        case DXGI_FORMAT_R16G16_FLOAT: components = 2; half = true; break;
+        case DXGI_FORMAT_R16G16B16A16_FLOAT: components = 4; half = true; break;
+        default: return;
+      }
+      // Buffers: as floats (structured readbacks), up to 64 KB.
+      const UINT values = buffer ? (std::min)(width, 65536u) / 4 : width * components;
+      for (UINT y = 0; y < (buffer ? 1u : (std::min)(rows, 4096u)); y++) {
+        const uint8_t* row = static_cast<const uint8_t*>(data) + size_t(y) * rowPitch;
+        for (UINT i = 0; i < values; i++) {
+          bool nan;
+          if (half) {
+            uint16_t h;
+            std::memcpy(&h, row + size_t(i) * 2, 2);
+            nan = (h & 0x7c00) == 0x7c00 && (h & 0x3ff);
+          } else {
+            float f;
+            std::memcpy(&f, row + size_t(i) * 4, 4);
+            nan = f != f;
+          }
+          if (!nan)
+            continue;
+          // Buffers of other data: only when they hold floats elsewhere too.
+          m_nanReadbacks++;
+          logMessage(LogLevel::Warn, "glitch: the game read NaN from GPU results: %s %p (%ux%u format %u), at %u, %u",
+            buffer ? "buffer" : "texture", static_cast<void*>(resource), width, rows, unsigned(format),
+            i / (components ? components : 1), y);
+          return;
+        }
+      }
+    }
+
     void logDroppedDraws() {
       m_presents++;
       if (auto* backend = m_device->GetBackend())
         m_droppedDraws[DropPipelineFailed] += backend->takeFailedPipelineDraws();
+      if (m_nonFiniteUploads) {
+        m_nonFiniteFrames++;
+        if (m_nonFiniteFrames <= 20 || m_nonFiniteFrames % 100 == 0)
+          logMessage(LogLevel::Warn, "glitch: present %u: %u constant buffer writes with NaN or infinity%s", m_presents + 1,
+            m_nonFiniteUploads, m_nonFiniteFrames == 20 ? "; from now on every 100th such frame" : "");
+        m_nonFiniteUploads = 0;
+      }
       uint32_t total = 0;
       for (uint32_t i = 1; i < DropReasons; i++)
         total += m_droppedDraws[i];
@@ -2415,6 +2494,10 @@ namespace dxup {
         ID3D11Buffer* buf = static_cast<ID3D11Buffer*>(pDstResource);
         auto* trackedBuffer = static_cast<D3D11Buffer*>(buf);
         IBackendBuffer* backendBuf = getBackendBuffer(trackedBuffer);
+        if (m_historyOn && !m_isDeferred && (trackedBuffer->GetDescRef().BindFlags & D3D11_BIND_CONSTANT_BUFFER)) {
+          const UINT bytes = pDstBox ? pDstBox->right - pDstBox->left : trackedBuffer->GetDescRef().ByteWidth;
+          checkConstants(pDstResource, static_cast<const float*>(pSrcData), bytes / 4);
+        }
         if (backendBuf) {
           const auto& bufferDesc = trackedBuffer->GetDescRef();
           uint64_t offset = pDstBox ? pDstBox->left : 0;
@@ -2970,6 +3053,11 @@ namespace dxup {
         pMappedResource->pData      = ptr;
         pMappedResource->RowPitch   = trackedBuffer->GetDescRef().ByteWidth;
         pMappedResource->DepthPitch = 0;
+        // Mapped constant buffers are write-combined memory, too slow to
+        // read back: only UpdateSubresource's are checked.
+        if (m_historyOn && !m_isDeferred && bufferDesc.Usage == D3D11_USAGE_STAGING
+         && (mode == MapMode::Read || mode == MapMode::ReadWrite))
+          checkReadback(pResource, ptr, bufferDesc.ByteWidth, 1, bufferDesc.ByteWidth, DXGI_FORMAT_R32_FLOAT, true);
 
         if (trackedBuffer->HasShadowData()) {
           BufferMapInfo info = {};
@@ -3004,6 +3092,12 @@ namespace dxup {
           pMappedResource->pData      = mapped;
           pMappedResource->RowPitch   = layout.rowPitch;
           pMappedResource->DepthPitch = layout.depthPitch;
+          if (m_historyOn && !m_isDeferred && MapType == D3D11_MAP_READ) {
+            const auto& d = backendImg->getDesc();
+            const uint32_t mip = Subresource % (std::max)(1u, d.mipLevels);
+            checkReadback(pResource, mapped, layout.rowPitch, (std::max)(1u, d.height >> mip),
+                          (std::max)(1u, d.width >> mip), d.format, false);
+          }
           return S_OK;
         }
 
