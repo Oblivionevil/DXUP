@@ -2486,8 +2486,11 @@ namespace dxup::legacy {
     const auto linear = [](uint32_t f) { return f >= 2 ? D3D11_FILTER_TYPE_LINEAR : D3D11_FILTER_TYPE_POINT; };
     const D3D11_FILTER_REDUCTION_TYPE reduction = compare ? D3D11_FILTER_REDUCTION_TYPE_COMPARISON
                                                           : D3D11_FILTER_REDUCTION_TYPE_STANDARD;
+    // A point mip filter stays (D3D12's anisotropic filter with point
+    // mips through DXUP's D3D11; Unreal Engine 3 sets it).
+    constexpr D3D11_FILTER kAnisotropicPointMip = D3D11_FILTER(0x54);
     if (anisotropic && !compare) {
-      desc.Filter = D3D11_FILTER_ANISOTROPIC;
+      desc.Filter = mip == 1 ? kAnisotropicPointMip : D3D11_FILTER_ANISOTROPIC;
       desc.MaxAnisotropy = (std::max)(1u, (std::min)(16u, ss[SampMaxAnisotropy]));
     } else {
       desc.Filter = D3D11_ENCODE_BASIC_FILTER(linear(min), linear(mag), linear(mip), reduction);
@@ -2498,18 +2501,22 @@ namespace dxup::legacy {
     desc.AddressV = address(ss[SampAddressV]);
     desc.AddressW = address(ss[SampAddressW]);
     colorToFloats(ss[SampBorderColor], desc.BorderColor);
-    // Direct3D 9 drivers take any bias (UE3 games set NaN: The Vanishing of
-    // Ethan Carter); D3D11 refuses samplers with NaN or one out of range.
+    // Direct3D 9 drivers take any bias, NaN as the most detailed level
+    // (UE3 games set NaN: The Vanishing of Ethan Carter); D3D11 refuses
+    // samplers with NaN or one out of range.
     const float bias = asFloat(ss[SampMipMapLodBias]);
     desc.MipLODBias = bias == bias ? (std::max)(-16.0f, (std::min)(bias, 15.99f)) : 0.0f;
     desc.MinLOD = float(ss[SampMaxMipLevel]);
-    desc.MaxLOD = mip == 0 ? desc.MinLOD : D3D11_FLOAT32_MAX;
+    desc.MaxLOD = mip == 0 || bias != bias ? desc.MinLOD : D3D11_FLOAT32_MAX;
     // Shadow maps: 1 where the reference is not farther than the depth.
     desc.ComparisonFunc = compare ? D3D11_COMPARISON_LESS_EQUAL : D3D11_COMPARISON_NEVER;
     const uint64_t key = hashBytes(desc);
     auto& state = m_samplerStates[key];
-    if (!state)
+    if (!state && FAILED(m_device->CreateSamplerState(&desc, &state)) && desc.Filter == kAnisotropicPointMip) {
+      // Windows' own D3D11 (DXUP's fallback) has no point mips here.
+      desc.Filter = D3D11_FILTER_ANISOTROPIC;
       m_device->CreateSamplerState(&desc, &state);
+    }
     return state;
   }
 
@@ -3352,6 +3359,10 @@ namespace dxup::legacy {
       logMessage(LogLevel::Warn, "trace9   s%u texture %p %ux%u levels %u format %u%s%s%s, level 0 copy %zu bytes, %u nonzero, sum %llu",
         sampler, static_cast<void*>(t), d.width, d.height, d.levels, uint32_t(d.format), d.renderTarget ? " target" : "",
         d.depthStencil ? " depth" : "", d.cube ? " cube" : "", data.size(), nonzero, static_cast<unsigned long long>(sum));
+      const auto& ss = m_samplerStatesValues[sampler];
+      logMessage(LogLevel::Warn, "trace9   s%u sampler mag %u min %u mip %u anisotropy %u bias %g (%08x) max mip level %u address %u %u",
+        sampler, ss[SampMagFilter], ss[SampMinFilter], ss[SampMipFilter], ss[SampMaxAnisotropy], asFloat(ss[SampMipMapLodBias]),
+        ss[SampMipMapLodBias], ss[SampMaxMipLevel], ss[SampAddressU], ss[SampAddressV]);
     }
     for (int pixel = 0; pixel < 2; pixel++) {
       const Shader* shader = pixel ? m_pixelShader : m_vertexShader;

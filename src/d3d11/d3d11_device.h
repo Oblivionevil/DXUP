@@ -4174,8 +4174,10 @@ namespace dxup {
       const UINT filter = UINT(desc.Filter);
       const UINT reduction = filter & 0x180u;
       const UINT base = filter & ~0x180u;
+      // 0x54: D3D12's anisotropic filter with point mips, which DXUP's
+      // Direct3D 9 layer passes for D3D9's (native D3D11 refuses it).
       const bool validBase = base == 0x00 || base == 0x01 || base == 0x04 || base == 0x05 || base == 0x10
-        || base == 0x11 || base == 0x14 || base == 0x15 || base == 0x55;
+        || base == 0x11 || base == 0x14 || base == 0x15 || base == 0x54 || base == 0x55;
       auto validAddress = [](D3D11_TEXTURE_ADDRESS_MODE mode) {
         return mode >= D3D11_TEXTURE_ADDRESS_WRAP && mode <= D3D11_TEXTURE_ADDRESS_MIRROR_ONCE;
       };

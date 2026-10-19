@@ -627,12 +627,17 @@ namespace dxup {
     const uint32_t base = filter & ~kReductionBits;
     if ((base & kMinMagLinear) != kMinMagLinear)
       return;
+    // 0x54 (anisotropic, point mips) keeps its mip filter.
+    const bool pointMipAnisotropic = base == 0x54u;
     if (anisotropy > 1) {
-      desc.filter = static_cast<FilterMode>(reduction | D3D11_FILTER_ANISOTROPIC);
+      if (!pointMipAnisotropic)
+        desc.filter = static_cast<FilterMode>(reduction | D3D11_FILTER_ANISOTROPIC);
       desc.maxAnisotropy = static_cast<uint32_t>(anisotropy);
     } else {
       if (base == D3D11_FILTER_ANISOTROPIC)
         desc.filter = static_cast<FilterMode>(reduction | D3D11_FILTER_MIN_MAG_MIP_LINEAR);
+      else if (pointMipAnisotropic)
+        desc.filter = static_cast<FilterMode>(reduction | D3D11_FILTER_MIN_MAG_LINEAR_MIP_POINT);
       desc.maxAnisotropy = 1;
     }
   }

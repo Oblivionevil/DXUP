@@ -2109,6 +2109,10 @@ namespace dxup::d3d12 {
       throw std::runtime_error("Failed to create D3D12 device");
     }
 
+    D3D12_FEATURE_DATA_D3D12_OPTIONS19 options19 = {};
+    m_anisotropicPointMip = SUCCEEDED(m_device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS19, &options19, sizeof(options19)))
+      && options19.AnisoFilterWithPointMipSupported;
+
     D3D12_FEATURE_DATA_D3D12_OPTIONS16 options16 = {};
     // Experiment only: the CPU writes faster, but the GPU snoops every read
     // (Kena: GPU 7.9 -> 21.5 ms per frame).
@@ -3295,6 +3299,8 @@ namespace dxup::d3d12 {
 
     D3D12_SAMPLER_DESC d3d12Desc = {};
     d3d12Desc.Filter         = static_cast<D3D12_FILTER>(desc.filter);
+    if ((d3d12Desc.Filter & ~0x180) == D3D12_FILTER_MIN_MAG_ANISOTROPIC_MIP_POINT && !m_anisotropicPointMip)
+      d3d12Desc.Filter = static_cast<D3D12_FILTER>((d3d12Desc.Filter & 0x180) | D3D12_FILTER_ANISOTROPIC);
     d3d12Desc.AddressU       = static_cast<D3D12_TEXTURE_ADDRESS_MODE>(static_cast<int>(desc.addressU) + 1);
     d3d12Desc.AddressV       = static_cast<D3D12_TEXTURE_ADDRESS_MODE>(static_cast<int>(desc.addressV) + 1);
     d3d12Desc.AddressW       = static_cast<D3D12_TEXTURE_ADDRESS_MODE>(static_cast<int>(desc.addressW) + 1);

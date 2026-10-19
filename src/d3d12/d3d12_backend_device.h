@@ -1192,6 +1192,9 @@ namespace dxup::d3d12 {
     // as fast as committed ones).
     bool m_lazyTargets = false;
     bool m_resourceHeapTier2 = false;
+    // D3D12_FILTER_MIN_MAG_ANISOTROPIC_MIP_POINT (Direct3D 9's anisotropic
+    // filter with point mips); without it such samplers filter mips linearly.
+    bool m_anisotropicPointMip = false;
     std::mutex m_lazyCommitMutex;
     // A reserved render target for the description, or nothing when it
     // does not qualify; tiles is the count it needs.

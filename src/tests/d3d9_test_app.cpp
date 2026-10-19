@@ -1115,6 +1115,67 @@ float4 main(float2 t : TEXCOORD0, float4 n : NORMAL, float face : VFACE) : COLOR
     return true;
   }
 
+  // Sampler states as Unreal Engine 3 sets them: anisotropic minification
+  // with a point mip filter, LOD biases (one NaN). A floor at a flat angle
+  // per quarter, each mip level one color: which levels the filter reads.
+  bool sceneSamplerFilters(IDirect3DDevice9* d) {
+    d->Clear(0, nullptr, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, 0xff000000u, 1.0f, 0);
+    IDirect3DTexture9* texture = nullptr;
+    if (FAILED(d->CreateTexture(64, 64, 0, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, &texture, nullptr)))
+      return false;
+    const DWORD colors[7] = { 0xffff4040u, 0xff40ff40u, 0xff4040ffu, 0xffffff40u, 0xffff40ffu, 0xff40ffffu, 0xffffffffu };
+    for (UINT level = 0; level < texture->GetLevelCount(); level++) {
+      D3DLOCKED_RECT rect;
+      texture->LockRect(level, &rect, nullptr, 0);
+      const UINT s = (std::max)(1u, 64u >> level);
+      for (UINT y = 0; y < s; y++)
+        for (UINT x = 0; x < s; x++)
+          reinterpret_cast<DWORD*>(static_cast<BYTE*>(rect.pBits) + y * rect.Pitch)[x] = colors[level % 7];
+      texture->UnlockRect(level);
+    }
+    D3DMATRIX world = identity(), view = translation(0.0f, -0.4f, 0.3f), proj = perspective(1.2f, 4.0f / 3.0f, 0.1f, 50.0f);
+    d->SetTransform(D3DTS_WORLD, &world);
+    d->SetTransform(D3DTS_VIEW, &view);
+    d->SetTransform(D3DTS_PROJECTION, &proj);
+    d->SetRenderState(D3DRS_LIGHTING, FALSE);
+    d->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+    d->SetTexture(0, texture);
+    d->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
+    const TexVertex floor[4] = {
+      { -4.0f, 0.0f, 0.0f, 0.0f, 0.0f }, { 4.0f, 0.0f, 0.0f, 16.0f, 0.0f },
+      { -4.0f, 0.0f, 30.0f, 0.0f, 60.0f }, { 4.0f, 0.0f, 30.0f, 16.0f, 60.0f },
+    };
+    struct Case { DWORD min, mag, mip, anisotropy; float bias; bool nan; };
+    const Case cases[4] = {
+      { D3DTEXF_ANISOTROPIC, D3DTEXF_LINEAR, D3DTEXF_POINT, 16, 0.0f, false },
+      { D3DTEXF_ANISOTROPIC, D3DTEXF_LINEAR, D3DTEXF_LINEAR, 8, -1.0f, false },
+      { D3DTEXF_LINEAR, D3DTEXF_LINEAR, D3DTEXF_POINT, 1, 1.5f, false },
+      { D3DTEXF_ANISOTROPIC, D3DTEXF_LINEAR, D3DTEXF_POINT, 16, 0.0f, true },
+    };
+    d->SetFVF(D3DFVF_XYZ | D3DFVF_TEX1);
+    for (int i = 0; i < 4; i++) {
+      const D3DVIEWPORT9 viewport = { DWORD(i & 1) * kWidth / 2, DWORD(i >> 1) * kHeight / 2, kWidth / 2, kHeight / 2, 0.0f, 1.0f };
+      d->SetViewport(&viewport);
+      const Case& c = cases[i];
+      d->SetSamplerState(0, D3DSAMP_MINFILTER, c.min);
+      d->SetSamplerState(0, D3DSAMP_MAGFILTER, c.mag);
+      d->SetSamplerState(0, D3DSAMP_MIPFILTER, c.mip);
+      d->SetSamplerState(0, D3DSAMP_MAXANISOTROPY, c.anisotropy);
+      DWORD bias;
+      std::memcpy(&bias, &c.bias, 4);
+      d->SetSamplerState(0, D3DSAMP_MIPMAPLODBIAS, c.nan ? 0xffffffffu : bias);
+      d->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, floor, sizeof(TexVertex));
+    }
+    const D3DVIEWPORT9 full = { 0, 0, kWidth, kHeight, 0.0f, 1.0f };
+    d->SetViewport(&full);
+    d->SetSamplerState(0, D3DSAMP_MIPMAPLODBIAS, 0);
+    d->SetSamplerState(0, D3DSAMP_MAXANISOTROPY, 1);
+    d->SetTexture(0, nullptr);
+    d->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_MODULATE);
+    texture->Release();
+    return true;
+  }
+
   bool sceneClipPlanes(IDirect3DDevice9* d) {
     d->Clear(0, nullptr, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, 0xff000000u, 1.0f, 0);
     // Fixed function: planes in world space.
@@ -1754,6 +1815,7 @@ float4 main(float2 t : TEXCOORD0) : COLOR {
     { "sm3_loops", sceneSm3Loops },
     { "ps_1_4", scenePs14 },
     { "mip_filter", sceneMipFilter, 6 },
+    { "sampler_filters", sceneSamplerFilters, 6 },
   };
 
   // ---- Running ----
