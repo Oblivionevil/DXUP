@@ -386,6 +386,7 @@ namespace dxup::d3d9 {
     D3DQUERYTYPE m_type;
     bool m_valid = false;
     bool m_issued = false;
+    bool m_resultNoted = false;   // this issue's result counted for glitch reports
     legacy::Ref<ID3D11Query> m_query;
     legacy::Ref<ID3D11Query> m_disjoint;
   };

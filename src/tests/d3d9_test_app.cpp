@@ -775,6 +775,163 @@ float4 main(float4 a : TEXCOORD0, float4 b : TEXCOORD1, float2 v : VPOS) : COLOR
     return true;
   }
 
+  // Unreal Engine 3's occlusion tests: boxes with color writes off and a
+  // depth test against an FP16 target's own depth buffer, many queries in a
+  // row, the results read after Present without a flush. Each result is
+  // shown as a bar.
+  bool sceneOcclusionBoxes(IDirect3DDevice9* d) {
+    IDirect3DSurface9 *back = nullptr, *backDepth = nullptr, *target = nullptr, *depth = nullptr;
+    d->GetRenderTarget(0, &back);
+    d->GetDepthStencilSurface(&backDepth);
+    IDirect3DSurface9 *half = nullptr, *halfDepth = nullptr, *readback = nullptr;
+    if (FAILED(d->CreateRenderTarget(kWidth, kHeight, D3DFMT_A16B16G16R16F, D3DMULTISAMPLE_NONE, 0, FALSE, &target, nullptr))
+     || FAILED(d->CreateOffscreenPlainSurface(kWidth, kHeight, D3DFMT_A16B16G16R16F, D3DPOOL_SYSTEMMEM, &readback, nullptr))
+     || FAILED(d->CreateDepthStencilSurface(kWidth, kHeight, D3DFMT_D24S8, D3DMULTISAMPLE_NONE, 0, TRUE, &depth, nullptr))
+     || FAILED(d->CreateRenderTarget(kWidth / 2, kHeight / 2, D3DFMT_A16B16G16R16F, D3DMULTISAMPLE_NONE, 0, FALSE, &half, nullptr))
+     || FAILED(d->CreateDepthStencilSurface(kWidth / 2, kHeight / 2, D3DFMT_D24S8, D3DMULTISAMPLE_NONE, 0, TRUE, &halfDepth,
+                                           nullptr)))
+      return false;
+    // The game's shader: w of the FLOAT3 position read from the stream.
+    const auto vsCode = assemble("vs_3_0\n dcl_position v0\n dcl_position o0\n mul r0, c1, v0.y\n"
+      " mad r0, c0, v0.x, r0\n mad r0, c2, v0.z, r0\n mad o0, c3, v0.w, r0\n");
+    const auto psCode = compile("float4 main() : COLOR { return float4(1, 0.5, 0.25, 1); }", "ps_3_0");
+    IDirect3DVertexShader9* vs = nullptr;
+    IDirect3DPixelShader9* ps = nullptr;
+    if (vsCode.empty() || psCode.empty() || FAILED(d->CreateVertexShader(vsCode.data(), &vs))
+     || FAILED(d->CreatePixelShader(psCode.data(), &ps)))
+      return false;
+    const D3DVERTEXELEMENT9 elements[] = {
+      { 0, 0, D3DDECLTYPE_FLOAT3, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_POSITION, 0 },
+      D3DDECL_END(),
+    };
+    IDirect3DVertexDeclaration9* decl = nullptr;
+    if (FAILED(d->CreateVertexDeclaration(elements, &decl)))
+      return false;
+    // The view-projection, its rows in c0-c3.
+    const D3DMATRIX proj = perspective(1.0f, 4.0f / 3.0f, 0.5f, 100.0f);
+    float columns[16];
+    std::memcpy(columns, &proj, sizeof(columns));
+    // The boxes: in front of the wall, behind it, beside it, around the
+    // camera, through it, far away, partly outside the view.
+    struct Box { float x, y, z, h; };
+    const Box boxes[] = { { -1.5f, 0.5f, 3, 0.5f }, { -1.5f, -0.5f, 8, 0.6f }, { 1.5f, 0, 8, 0.7f }, { 0, 0, 0, 2 },
+                          { -0.3f, 0.2f, 5, 1 }, { 3, 2, 30, 0.8f }, { 2.6f, -1.2f, 4, 1 } };
+    const WORD indices[36] = { 0, 1, 2, 2, 1, 3, 4, 6, 5, 5, 6, 7, 0, 2, 4, 4, 2, 6,
+                               1, 5, 3, 3, 5, 7, 0, 4, 1, 1, 4, 5, 2, 3, 6, 6, 3, 7 };
+    std::vector<IDirect3DQuery9*> queries(2 * (sizeof(boxes) / sizeof(boxes[0])));
+    for (auto& query : queries)
+      if (FAILED(d->CreateQuery(D3DQUERYTYPE_OCCLUSION, &query)))
+        return false;
+    std::vector<DWORD> results;
+    // As the game polls the last frame's result before testing again:
+    // without a flush first.
+    auto poll = [&](IDirect3DQuery9* query) {
+      DWORD pixels = 0;
+      HRESULT hr = S_FALSE;
+      for (int tries = 0; tries < 200 && (hr = query->GetData(&pixels, sizeof(pixels), 0)) == S_FALSE; tries++)
+        Sleep(1);
+      while (hr == S_FALSE)
+        hr = query->GetData(&pixels, sizeof(pixels), D3DGETDATA_FLUSH);
+      results.push_back(hr == S_OK ? pixels : ~0u);
+    };
+    const float wall[4][3] = { { -10, 10, 5 }, { 0, 10, 5 }, { -10, -10, 5 }, { 0, -10, 5 } };
+    const float screen[4][3] = { { -1, 1, 0.5f }, { 1, 1, 0.5f }, { -1, -1, 0.5f }, { 1, -1, 0.5f } };
+    const float identityRows[16] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 };
+    // Three frames: the queries tested in each, read in the next.
+    for (int frame = 0; frame < 3; frame++) {
+      if (frame) {
+        d->EndScene();
+        d->Present(nullptr, nullptr, nullptr, nullptr);
+        d->BeginScene();
+      }
+      d->SetRenderTarget(0, target);
+      d->SetDepthStencilSurface(depth);
+      d->Clear(0, nullptr, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER | D3DCLEAR_STENCIL, 0, 1.0f, 0);
+      d->SetVertexDeclaration(decl);
+      d->SetVertexShader(vs);
+      d->SetPixelShader(ps);
+      d->SetVertexShaderConstantF(0, columns, 4);
+      d->SetRenderState(D3DRS_ZENABLE, D3DZB_TRUE);
+      d->SetRenderState(D3DRS_ZFUNC, D3DCMP_LESSEQUAL);
+      d->SetRenderState(D3DRS_ZWRITEENABLE, TRUE);
+      d->SetRenderState(D3DRS_COLORWRITEENABLE, 0xf);
+      d->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+      // The occluder: the left half at depth 5.
+      d->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, wall, 12);
+      // A pass at half size with its own depth, then back: a quad over
+      // everything without the depth test, as the game draws between.
+      d->SetRenderTarget(0, half);
+      d->SetDepthStencilSurface(halfDepth);
+      d->SetVertexShaderConstantF(0, identityRows, 4);
+      d->SetRenderState(D3DRS_ZFUNC, D3DCMP_ALWAYS);
+      d->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, screen, 12);
+      d->SetRenderTarget(0, target);
+      d->SetDepthStencilSurface(depth);
+      d->SetRenderState(D3DRS_ZENABLE, D3DZB_FALSE);
+      d->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
+      d->SetRenderState(D3DRS_COLORWRITEENABLE, 0);
+      d->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, screen, 12);
+      d->SetVertexShaderConstantF(0, columns, 4);
+      d->SetRenderState(D3DRS_ZENABLE, D3DZB_TRUE);
+      d->SetRenderState(D3DRS_ZFUNC, D3DCMP_LESSEQUAL);
+      d->SetRenderState(D3DRS_CULLMODE, D3DCULL_CW);
+      size_t next = 0;
+      for (int round = 0; round < 2; round++) {
+        for (const Box& b : boxes) {
+          const float o = round * 0.07f, h = b.h;
+          float v[8][3];
+          for (int i = 0; i < 8; i++) {
+            v[i][0] = b.x + o + ((i & 1) ? h : -h);
+            v[i][1] = b.y - o + ((i & 2) ? -h : h);
+            v[i][2] = b.z + ((i & 4) ? h : -h);
+          }
+          IDirect3DQuery9* query = queries[next++];
+          if (frame)
+            poll(query);
+          query->Issue(D3DISSUE_BEGIN);
+          d->DrawIndexedPrimitiveUP(D3DPT_TRIANGLELIST, 0, 8, 12, indices, D3DFMT_INDEX16, v, 12);
+          // In the last frame the second round reads the target back while
+          // the query runs (a submission in the middle).
+          if (frame == 2 && round == 1)
+            d->GetRenderTargetData(target, readback);
+          query->Issue(D3DISSUE_END);
+          // The last frame waits for each result right away.
+          if (frame == 2) {
+            DWORD pixels = 0;
+            while (query->GetData(&pixels, sizeof(pixels), D3DGETDATA_FLUSH) == S_FALSE) {}
+            results.push_back(pixels);
+          }
+        }
+      }
+      // The next pass.
+      d->SetRenderState(D3DRS_COLORWRITEENABLE, 0xf);
+      d->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+      d->SetRenderTarget(0, back);
+      d->SetDepthStencilSurface(backDepth);
+    }
+    for (auto* query : queries)
+      query->Release();
+    d->SetVertexShader(nullptr);
+    d->SetPixelShader(nullptr);
+    d->SetVertexDeclaration(nullptr);
+    d->Clear(0, nullptr, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, 0xff000000u, 1.0f, 0);
+    d->SetRenderState(D3DRS_ZENABLE, D3DZB_FALSE);
+    d->SetFVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE);
+    for (size_t i = 0; i < results.size(); i++) {
+      const bool done = results[i] != ~0u;
+      const float width = done ? float(results[i]) * kWidth / float(kWidth * kHeight) : 0.0f;
+      const float y = float(i) + 3.0f;
+      const DWORD color = done ? 0xffffffffu : 0xffff0000u;
+      const TLVertex bar[4] = { { 0, y, 0.5f, 1, color }, { width + 1, y, 0.5f, 1, color },
+                                { 0, y + 1, 0.5f, 1, color }, { width + 1, y + 1, 0.5f, 1, color } };
+      d->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, bar, sizeof(TLVertex));
+    }
+    decl->Release(); ps->Release(); vs->Release();
+    target->Release(); depth->Release(); half->Release(); halfDepth->Release(); readback->Release();
+    back->Release(); backDepth->Release();
+    return true;
+  }
+
   bool sceneInstancing(IDirect3DDevice9* d) {
     d->Clear(0, nullptr, D3DCLEAR_TARGET, 0xff000000u, 1.0f, 0);
     const char* vsSource = R"(
@@ -1592,6 +1749,7 @@ float4 main(float2 t : TEXCOORD0) : COLOR {
     { "format_channels", sceneFormatChannels },
     { "decl_types", sceneDeclTypes },
     { "aliased_elements", sceneAliasedElements },
+    { "occlusion_boxes", sceneOcclusionBoxes },
     { "state_block", sceneStateBlock },
     { "sm3_loops", sceneSm3Loops },
     { "ps_1_4", scenePs14 },
@@ -1954,6 +2112,29 @@ VO main(float3 p : POSITION, float4 c : COLOR0) { VO o; o.p = float4(p.xy, 0.5, 
       }
       device->Present(nullptr, nullptr, nullptr, nullptr);
     }
+    // Frames whose occlusion queries all see nothing (degenerate triangles),
+    // each read in the next frame: the glitch report names it.
+    std::vector<IDirect3DQuery9*> queries(20);
+    for (auto& query : queries)
+      device->CreateQuery(D3DQUERYTYPE_OCCLUSION, &query);
+    const V nothing[3] = { { 0.0f, 0.0f, 0.5f, 0xffffffffu }, { 0.0f, 0.0f, 0.5f, 0xffffffffu }, { 0.0f, 0.0f, 0.5f, 0xffffffffu } };
+    for (int frame = 0; frame < 35; frame++) {
+      device->BeginScene();
+      for (auto* query : queries) {
+        if (!query) continue;
+        if (frame) {
+          DWORD pixels = 0;
+          while (query->GetData(&pixels, sizeof(pixels), D3DGETDATA_FLUSH) == S_FALSE) {}
+        }
+        query->Issue(D3DISSUE_BEGIN);
+        device->DrawPrimitiveUP(D3DPT_TRIANGLELIST, 1, nothing, sizeof(V));
+        query->Issue(D3DISSUE_END);
+      }
+      device->EndScene();
+      device->Present(nullptr, nullptr, nullptr, nullptr);
+    }
+    for (auto* query : queries)
+      if (query) query->Release();
     device->Release();
     d3d->Release();
     DestroyWindow(window);
@@ -2267,7 +2448,7 @@ int main(int argc, char** argv) {
     const std::wstring marker = dir + L"dxup_frame_dump.txt";
     const std::wstring log = dir + L"logdxup_dxup_d3d9.log";
     int code = -1;
-    bool drawLine = false, frameLine = false, callLine = false, ringLine = false;
+    bool drawLine = false, frameLine = false, callLine = false, ringLine = false, occlusionLine = false;
     if (FILE* f = _wfopen(marker.c_str(), L"w")) {
       std::fclose(f);
       DeleteFileW(log.c_str());
@@ -2281,6 +2462,7 @@ int main(int argc, char** argv) {
           callLine |= std::strstr(line, "call failed with D3DERR_INVALIDCALL: CreateTexture 64x64") != nullptr
                    && std::strstr(line, "A8R8G8B8, pool 2") != nullptr;
           ringLine |= std::strstr(line, "did not fit") != nullptr;
+          occlusionLine |= std::strstr(line, "nearly every occlusion query saw no pixel (now 20 of 20)") != nullptr;
         }
         std::fclose(l);
       }
@@ -2288,9 +2470,10 @@ int main(int argc, char** argv) {
       for (const wchar_t* name : { L"dxup_frame_60.bmp", L"dxup_frame_300.bmp" })
         DeleteFileW((dir + name).c_str());
     }
-    const bool ok = code == 0 && drawLine && frameLine && callLine && !ringLine;
-    std::printf("%s %-20s draw line %d, frame line %d, failed call %d, large draw %s (child exit %d)\n", ok ? "ok  " : "FAIL",
-                "dropped_report", drawLine, frameLine, callLine, ringLine ? "dropped" : "drawn", code);
+    const bool ok = code == 0 && drawLine && frameLine && callLine && !ringLine && occlusionLine;
+    std::printf("%s %-20s draw line %d, frame line %d, failed call %d, large draw %s, occlusion line %d (child exit %d)\n",
+                ok ? "ok  " : "FAIL", "dropped_report", drawLine, frameLine, callLine, ringLine ? "dropped" : "drawn",
+                occlusionLine, code);
     ok ? passed++ : failed++;
   }
   // DXUP's self-test of texture formats and vertex element types against

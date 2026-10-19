@@ -440,6 +440,30 @@ float4 k[64] : register(c0);
 struct VO { float4 p : POSITION; float4 t0 : TEXCOORD0; };
 VO main(float4 p : POSITION, float4 n : NORMAL) { VO o; o.p = p; o.t0 = k[(int)(n.w + 20.0)] + k[(int)n.w]; return o; }
 )", "vs_2_0", kPsShow2, "ps_2_0" },
+    // Relative reads of the shader's own def constants (Unreal Engine 3's
+    // landscape selects rows of a defined identity matrix): Direct3D 9 reads
+    // the defined values there and the set constants beyond.
+    { "vs3_relative_defs", R"(vs_3_0
+def c16, 1, 0, 0, 0
+def c17, 0, 1, 0, 0
+def c18, 0, 0, 1, 0.5
+def c19, 0.25, 0, 0, 1
+dcl_position v0
+dcl_texcoord0 v1
+dcl_normal v3
+dcl_position o0
+dcl_texcoord0 o1
+dcl_texcoord1 o2
+mov o0, v0
+mova a0.x, v3.w
+dp4 r0.x, v1, c16[a0.x]
+mov r1, c17[a0.x]
+add r1, r1, c30[a0.x]
+mov o1, r0.x
+mov o2, r1
+)", nullptr, R"(
+float4 main(float4 t0 : TEXCOORD0, float4 t1 : TEXCOORD1) : COLOR { return t0 * 0.5 + t1 * 0.25; }
+)", "ps_3_0" },
     { "vs2_ubyte_indices", R"(
 float4 k[64] : register(c0);
 struct VO { float4 p : POSITION; float4 t0 : TEXCOORD0; };
@@ -2057,6 +2081,39 @@ namespace {
 
 }
 
+// One shader of a d3d9_variants.bin by its hash (as glitch reports and
+// trace9 name it): disassembly and translation, --dump-record FILE HASH.
+static int dumpRecord(const char* path, const char* hashText) {
+  const uint64_t wanted = std::strtoull(hashText, nullptr, 16);
+  FILE* f = std::fopen(path, "rb");
+  if (!f) { std::printf("cannot open %s\n", path); return 1; }
+  uint32_t header[2] = {}, head[2];
+  std::vector<uint32_t> tokens;
+  if (std::fread(header, sizeof(header), 1, f) == 1)
+    while (tokens.empty() && std::fread(head, sizeof(head), 1, f) == 1 && head[1] <= (4u << 20)) {
+      std::vector<uint8_t> data(head[1]);
+      if (std::fread(data.data(), 1, data.size(), f) != data.size()) break;
+      uint64_t hash = 0;
+      if (head[0] == 1 && data.size() > 8 && (std::memcpy(&hash, data.data(), 8), hash == wanted)) {
+        tokens.resize((data.size() - 8) / 4);
+        std::memcpy(tokens.data(), data.data() + 8, tokens.size() * 4);
+      }
+    }
+  std::fclose(f);
+  if (tokens.empty()) { std::printf("no shader %016llX\n", static_cast<unsigned long long>(wanted)); return 1; }
+  ID3DBlob* text = nullptr;
+  if (SUCCEEDED(D3DDisassemble(tokens.data(), tokens.size() * 4, 0, nullptr, &text)) && text) {
+    std::printf("%.*s\n", int(text->GetBufferSize()), static_cast<const char*>(text->GetBufferPointer()));
+    text->Release();
+  }
+  TranslateOptions9 options;
+  std::string hlsl, error;
+  ShaderInfo9 info;
+  if (!translateShader9(tokens.data(), tokens.size(), options, hlsl, info, error)) { std::printf("%s\n", error.c_str()); return 1; }
+  std::printf("%s\n", hlsl.c_str());
+  return 0;
+}
+
 // fxc time and size of the shaders in a d3d9_variants.bin (dxup_pso_cache)
 // per float emulation mode: --compile-records FILE.
 static int compileRecords(const char* path) {
@@ -2106,6 +2163,7 @@ int main(int argc, char** argv) {
   bool dumpAll = false, compileBench = false, floatEmulation = false, dxbcBackend = false;
   for (int i = 1; i + 1 < argc; i++) {
     if (std::strcmp(argv[i], "--compile-records") == 0) return compileRecords(argv[i + 1]);
+    if (std::strcmp(argv[i], "--dump-record") == 0 && i + 2 < argc) return dumpRecord(argv[i + 1], argv[i + 2]);
     if (std::strcmp(argv[i], "--fuzz") == 0) {
       const int count = std::atoi(argv[i + 1]);
       const uint64_t seed = i + 2 < argc ? std::strtoull(argv[i + 2], nullptr, 10) : 1;

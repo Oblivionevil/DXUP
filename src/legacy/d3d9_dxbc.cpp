@@ -314,6 +314,17 @@ namespace dxup::legacy {
         scratchBase = scratchNext = maxTemps = nextTemp;
       }
 
+      // A def constant as its literal: infinity the largest float, NaN 0
+      // (as the HLSL literal).
+      Op defLiteral(const std::array<uint32_t, 4>& bits) {
+        uint32_t v[4];
+        for (int i = 0; i < 4; i++) {
+          const uint32_t b = bits[i];
+          v[i] = (b & 0x7f800000u) == 0x7f800000u ? ((b & 0x007fffffu) ? 0u : (b & 0x80000000u) | kFltMax) : b;
+        }
+        return immBits(v[0], v[1], v[2], v[3]);
+      }
+
       Op relativeIndex(const Operand& op) const {
         Op r;
         if (op.relType == RegLoop) { r.relReg = AL; r.relComp = 0; }
@@ -362,18 +373,21 @@ namespace dxup::legacy {
               o.relImm = false;
               o.relReg = s;
               o.relComp = 0;
-              return o;
+              if (L.floatDefs.empty())
+                return o;
+              // The shader's own def constants read as their values, then
+              // the buffer (as the HLSL dxup_c).
+              const uint32_t value = scratch(), match = scratch();
+              emit(DxMov, { tempDst(value), o });
+              for (const auto& def : L.floatDefs) {
+                emit(DxIEq, { tempDst(match, 1), scalar(temp(s)), immU(def.first) });
+                emit(DxMovC, { tempDst(value), scalar(temp(match)), defLiteral(def.second), temp(value) });
+              }
+              return temp(value);
             }
             auto def = L.floatDefs.find(index);
-            if (def != L.floatDefs.end()) {
-              uint32_t v[4];
-              for (int i = 0; i < 4; i++) {
-                const uint32_t bits = def->second[i];
-                // As the HLSL literal: infinity the largest float, NaN 0.
-                v[i] = (bits & 0x7f800000u) == 0x7f800000u ? ((bits & 0x007fffffu) ? 0u : (bits & 0x80000000u) | kFltMax) : bits;
-              }
-              return immBits(v[0], v[1], v[2], v[3]);
-            }
+            if (def != L.floatDefs.end())
+              return defLiteral(def->second);
             if (index >= 256) {
               fail("constant beyond 255");
               return immU(0);

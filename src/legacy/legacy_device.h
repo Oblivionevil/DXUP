@@ -398,6 +398,17 @@ namespace dxup::legacy {
     void selfTestVertexTypes();
     // Direct3D 9's default states, nothing bound (Reset).
     void resetState();
+    // A dxup_trace9_go.txt frame is being traced (queries log into it).
+    bool tracing9() const { return m_trace9; }
+    // An occlusion query's result the game read (glitch reports: a game
+    // that sees nothing hides what it would draw).
+    void noteOcclusionResult(uint64_t samples) {
+      m_occlusion.results++;
+      m_occlusion.zeros += samples == 0;
+    }
+    // Traced frames: the bound depth buffer's values (statistics, the probe
+    // pixel, an image next to the DLL), once per frame.
+    void traceDepth9(const char* when);
 
   private:
     Device() = default;
@@ -581,6 +592,12 @@ namespace dxup::legacy {
     DroppedDraws m_dropped;
     void dropDraw(DropReason reason, uint32_t bytes = 0);
     void logDroppedDraws();
+    struct {
+      uint32_t results = 0, zeros = 0;   // this frame
+      uint32_t blindFrames = 0;          // frames in a row with nearly all zero
+      bool logged = false;
+    } m_occlusion;
+    void logOcclusionResults();
     // dxup_trace9_go.txt next to the DLL: the draws of the next frame with
     // their shaders, declaration, streams (and first vertices), indices and
     // constants (checked every 64 presents, once per file).
@@ -591,6 +608,9 @@ namespace dxup::legacy {
     DXGI_FORMAT m_trace9Format = DXGI_FORMAT_UNKNOWN;
     void traceDraw9(const DrawArgs& a);
     void traceProbe9();
+    bool m_trace9DepthDone = false;
+    void traceDepthMean9();
+    Ref<ID3D11Texture2D> m_trace9DepthStaging;
     bool growRing(Ref<ID3D11Buffer>& ring, uint32_t& ringSize, uint32_t& ringOffset, uint32_t size, UINT bind);
     uint32_t m_rangeReports = 0;
     uint32_t m_ffpFvf = 0;                  // what the fixed function sees

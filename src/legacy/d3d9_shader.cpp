@@ -257,6 +257,11 @@ namespace dxup::legacy {
               : op.type == RegConst4 ? 6144 : 0);
             if (op.relative) {
               info.relativeConstants = true;
+              // The shader's own def constants read as their values
+              // (Direct3D 9; Unreal Engine 3's landscape selects rows of a
+              // defined identity matrix).
+              if (!floatDefs.empty())
+                return "dxup_c(uint(" + relativeOffset(op) + str(index) + "))";
               // The last index from the buffer: a bound the compiler can
               // prove makes it much slower; negative indices wrap to it.
               return "c[min(uint(" + relativeOffset(op) + str(index) + "), dxup_lastConstant)]";
@@ -885,6 +890,13 @@ namespace dxup::legacy {
     s += "float4 dxup_lit(float4 s) { float p = clamp(s.w, -127.9961f, 127.9961f); "
          "return float4(1.0f, max(s.x, 0.0f), s.x > 0.0f && s.y > 0.0f ? dxup_pow(s.y, p) : 0.0f, 1.0f); }\n";
     s += "float3 dxup_reflect(float3 n, float3 e) { return 2.0f * dot(n, e) / dot(n, n) * n - e; }\n";
+    if (info.relativeConstants && !w.floatDefs.empty()) {
+      // Relative reads: the defined constants first, then the buffer.
+      s += "float4 dxup_c(uint i) {\n  i = min(i, dxup_lastConstant);\n  return ";
+      for (const auto& def : w.floatDefs)
+        s += "i == " + std::to_string(def.first) + "u ? " + def.second + " : ";
+      s += "c[i];\n}\n";
+    }
     if (vertex && info.major == 1) {
       s += "float4 dxup_expp(float x) { float f = floor(x); return float4(exp2(f), x - f, exp2(x), 1.0f); }\n";
       s += "float4 dxup_logp(float x) { float a = abs(x); if (a == 0.0f) return float4(-3.402823466e38f, 1.0f, -3.402823466e38f, 1.0f);\n"

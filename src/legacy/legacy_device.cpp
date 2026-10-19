@@ -1116,7 +1116,7 @@ namespace dxup::legacy {
 
     // Changes whenever the translator's output changes (the HLSL path's;
     // DXUP's compiler is not cached, it is faster than reading the cache).
-    constexpr uint64_t kTranslatorVersion = 7;
+    constexpr uint64_t kTranslatorVersion = 8;
 
     // The shaders draws used in this and earlier runs, their code and the
     // variants they were drawn with: compiled at the start of a later run,
@@ -3170,6 +3170,116 @@ namespace dxup::legacy {
       target->height(sub), uint32_t(target->desc().format));
   }
 
+  // The bound depth buffer's mean and nearest value (24-bit formats).
+  void Device::traceDepthMean9() {
+    if (!m_depthStencil || !m_depthStencil->resource())
+      return;
+    D3D11_TEXTURE2D_DESC td;
+    m_depthStencil->resource()->GetDesc(&td);
+    if (td.SampleDesc.Count > 1 || td.ArraySize > 1 || td.MipLevels > 1
+     || (td.Format != DXGI_FORMAT_R24G8_TYPELESS && td.Format != DXGI_FORMAT_D24_UNORM_S8_UINT))
+      return;
+    D3D11_TEXTURE2D_DESC sd = {};
+    if (m_trace9DepthStaging)
+      m_trace9DepthStaging->GetDesc(&sd);
+    if (!m_trace9DepthStaging || sd.Width != td.Width || sd.Height != td.Height) {
+      sd = td;
+      sd.Usage = D3D11_USAGE_STAGING;
+      sd.BindFlags = 0;
+      sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+      sd.MiscFlags = 0;
+      if (FAILED(m_device->CreateTexture2D(&sd, nullptr, m_trace9DepthStaging.put())))
+        return;
+    }
+    m_context->CopyResource(m_trace9DepthStaging.get(), m_depthStencil->resource());
+    D3D11_MAPPED_SUBRESOURCE mapped = {};
+    if (FAILED(m_context->Map(m_trace9DepthStaging.get(), 0, D3D11_MAP_READ, 0, &mapped)))
+      return;
+    uint64_t sum = 0;
+    uint32_t nearest = 0xffffff;
+    for (uint32_t y = 0; y < td.Height; y += 4) {
+      const uint32_t* row = reinterpret_cast<const uint32_t*>(static_cast<const uint8_t*>(mapped.pData) + size_t(y) * mapped.RowPitch);
+      for (uint32_t x = 0; x < td.Width; x += 4) {
+        const uint32_t d = row[x] & 0xffffffu;
+        sum += d;
+        nearest = (std::min)(nearest, d);
+      }
+    }
+    m_context->Unmap(m_trace9DepthStaging.get(), 0);
+    const double samples = double((td.Width + 3) / 4) * ((td.Height + 3) / 4);
+    logMessage(LogLevel::Warn, "trace9   depth mean %.6f nearest %.6f", sum / samples / 16777215.0, nearest / 16777215.0);
+  }
+
+  void Device::traceDepth9(const char* when) {
+    if (!m_trace9 || m_trace9DepthDone || !m_depthStencil || !m_depthStencil->resource())
+      return;
+    m_trace9DepthDone = true;
+    D3D11_TEXTURE2D_DESC td;
+    m_depthStencil->resource()->GetDesc(&td);
+    if (td.SampleDesc.Count > 1 || td.ArraySize > 1 || td.MipLevels > 1)
+      return;
+    D3D11_TEXTURE2D_DESC sd = td;
+    sd.Usage = D3D11_USAGE_STAGING;
+    sd.BindFlags = 0;
+    sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    sd.MiscFlags = 0;
+    Ref<ID3D11Texture2D> staging;
+    if (FAILED(m_device->CreateTexture2D(&sd, nullptr, staging.put())))
+      return;
+    m_context->CopyResource(staging.get(), m_depthStencil->resource());
+    D3D11_MAPPED_SUBRESOURCE mapped = {};
+    if (FAILED(m_context->Map(staging.get(), 0, D3D11_MAP_READ, 0, &mapped)))
+      return;
+    // 24-bit depth in the low bits (D24S8, X8 variants); others as 16 or 32.
+    const bool d16 = td.Format == DXGI_FORMAT_D16_UNORM || td.Format == DXGI_FORMAT_R16_TYPELESS;
+    const bool f32 = td.Format == DXGI_FORMAT_D32_FLOAT || td.Format == DXGI_FORMAT_R32_TYPELESS;
+    auto depthAt = [&](uint32_t x, uint32_t y) {
+      const uint8_t* row = static_cast<const uint8_t*>(mapped.pData) + size_t(y) * mapped.RowPitch;
+      if (d16) { uint16_t v; std::memcpy(&v, row + x * 2, 2); return v / 65535.0; }
+      uint32_t v; std::memcpy(&v, row + x * 4, 4);
+      if (f32) { float f; std::memcpy(&f, &v, 4); return double(f); }
+      return (v & 0xffffffu) / 16777215.0;
+    };
+    double minimum = 2.0, maximum = -1.0, sum = 0.0;
+    uint64_t zeros = 0, ones = 0;
+    std::vector<uint8_t> image(size_t(td.Width) * td.Height * 2);
+    for (uint32_t y = 0; y < td.Height; y++) {
+      for (uint32_t x = 0; x < td.Width; x++) {
+        const double d = depthAt(x, y);
+        minimum = (std::min)(minimum, d);
+        maximum = (std::max)(maximum, d);
+        sum += d;
+        zeros += d == 0.0;
+        ones += d == 1.0;
+        // 16 bits, big endian (PGM).
+        const uint16_t v = uint16_t((std::max)(0.0, (std::min)(1.0, d)) * 65535.0 + 0.5);
+        image[(size_t(y) * td.Width + x) * 2] = uint8_t(v >> 8);
+        image[(size_t(y) * td.Width + x) * 2 + 1] = uint8_t(v);
+      }
+    }
+    const double probe = m_trace9X >= 0 && uint32_t(m_trace9X) < td.Width && uint32_t(m_trace9Y) < td.Height
+      ? depthAt(m_trace9X, m_trace9Y) : -1.0;
+    m_context->Unmap(staging.get(), 0);
+    logMessage(LogLevel::Warn, "trace9   depth %s: %ux%u format %u min %.7f max %.7f mean %.7f, %llu at 0, %llu at 1, probe %.7f",
+      when, td.Width, td.Height, unsigned(td.Format), minimum, maximum, sum / (double(td.Width) * td.Height),
+      static_cast<unsigned long long>(zeros), static_cast<unsigned long long>(ones), probe);
+    wchar_t path[MAX_PATH] = {};
+    HMODULE self = nullptr;
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+      reinterpret_cast<LPCWSTR>(&glitchReportsEnabled), &self);
+    if (self && GetModuleFileNameW(self, path, MAX_PATH)) {
+      if (wchar_t* name = wcsrchr(path, L'\\')) {
+        wcscpy_s(name + 1, MAX_PATH - (name + 1 - path), L"dxup_trace9_depth.pgm");
+        FILE* f = nullptr;
+        if (_wfopen_s(&f, path, L"wb") == 0 && f) {
+          std::fprintf(f, "P5 %u %u 65535 ", td.Width, td.Height);
+          std::fwrite(image.data(), 1, image.size(), f);
+          std::fclose(f);
+        }
+      }
+    }
+  }
+
   void Device::traceDraw9(const DrawArgs& a) {
     char line[1024];
     int n = sprintf_s(line, "trace9 #%u type %u %s count %u start %u base %d min %u verts %u%s vs %016llX ps %016llX",
@@ -3179,6 +3289,22 @@ namespace dxup::legacy {
       static_cast<unsigned long long>(m_pixelShader ? m_pixelShader->hash() : 0));
     (void)n;
     logMessage(LogLevel::Warn, "%s", line);
+    {
+      // Targets and the states that decide which pixels pass.
+      const Texture* rt = m_renderTargets[0];
+      const Texture* ds = m_depthStencil;
+      const uint32_t rtSub = m_renderTargetSubresources[0];
+      logMessage(LogLevel::Warn, "trace9   state rt %p %ux%u fmt %u ds %p %ux%u fmt %u z %u func %u write %u cw %x cull %u "
+        "stencil %u func %u ref %u twosided %u alphatest %u blend %u vp %u,%u %ux%u %g-%g scissor %u %d,%d-%d,%d bias %08x %08x",
+        static_cast<const void*>(rt), rt ? rt->width(rtSub) : 0, rt ? rt->height(rtSub) : 0, rt ? uint32_t(rt->desc().format) : 0,
+        static_cast<const void*>(ds), ds ? ds->width(0) : 0, ds ? ds->height(0) : 0, ds ? uint32_t(ds->desc().format) : 0,
+        m_renderStates[RsZEnable], m_renderStates[RsZFunc], m_renderStates[RsZWriteEnable], m_renderStates[RsColorWriteEnable],
+        m_renderStates[RsCullMode], m_renderStates[RsStencilEnable], m_renderStates[RsStencilFunc], m_renderStates[RsStencilRef],
+        m_renderStates[RsTwoSidedStencilMode], m_renderStates[RsAlphaTestEnable], m_renderStates[RsAlphaBlendEnable],
+        m_viewport.x, m_viewport.y, m_viewport.width, m_viewport.height, m_viewport.minZ, m_viewport.maxZ,
+        m_renderStates[RsScissorTestEnable], m_scissor.left, m_scissor.top, m_scissor.right, m_scissor.bottom,
+        m_renderStates[RsDepthBias], m_renderStates[RsSlopeScaleDepthBias]);
+    }
     if (m_decl) {
       std::string decl;
       for (const auto& e : m_decl->elements()) {
@@ -3240,6 +3366,26 @@ namespace dxup::legacy {
         text += c;
       }
       logMessage(LogLevel::Warn, "trace9   %s constants%s", pixel ? "pixel" : "vertex", text.c_str());
+    }
+  }
+
+  // Occlusion queries that saw no pixel at all, frame after frame: the game
+  // then hides nearly everything it tests (a wrong depth buffer or vertex
+  // shader before the tests). Games normally see some of their tests.
+  void Device::logOcclusionResults() {
+    const uint32_t results = m_occlusion.results, zeros = m_occlusion.zeros;
+    m_occlusion.results = m_occlusion.zeros = 0;
+    if (results < 16)
+      return;
+    if (zeros * 20 < results * 19) {
+      m_occlusion.blindFrames = 0;
+      return;
+    }
+    if (++m_occlusion.blindFrames == 30 && !m_occlusion.logged) {
+      m_occlusion.logged = true;
+      logMessage(LogLevel::Warn, "glitch: present %u: for 30 frames nearly every occlusion query saw no pixel (now %u of %u) - "
+        "the game hides what it tests: the depth buffer or a vertex shader before the tests is likely wrong", m_nonFinite.presents,
+        zeros, results);
     }
   }
 
@@ -3748,7 +3894,13 @@ namespace dxup::legacy {
       traceDraw9(a);
     struct ProbeAfter {
       Device* device;
-      ~ProbeAfter() { if (device->m_trace9) device->traceProbe9(); }
+      ~ProbeAfter() {
+        if (!device->m_trace9)
+          return;
+        device->traceProbe9();
+        if (!device->m_trace9DepthDone && device->m_renderStates[RsZEnable] && device->m_renderStates[RsZWriteEnable])
+          device->traceDepthMean9();
+      }
     } probeAfter{ this };
     if (!m_decl)
       return dropDraw(DropDeclaration);
@@ -4409,6 +4561,7 @@ namespace dxup::legacy {
           wcscpy_s(name + 1, MAX_PATH - (name + 1 - path), L"dxup_trace9_go.txt");
           if (GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES) {
             m_trace9 = m_trace9Done = true;
+            m_trace9DepthDone = false;
             m_trace9Draw = 0;
             // "x y": the probe pixel.
             FILE* f = nullptr;
@@ -4425,6 +4578,7 @@ namespace dxup::legacy {
     if (glitchReportsEnabled()) {
       logNonFiniteConstants();
       logDroppedDraws();
+      logOcclusionResults();
     } else {
       std::memset(m_dropped.counts, 0, sizeof(m_dropped.counts));
     }

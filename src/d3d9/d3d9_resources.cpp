@@ -834,11 +834,18 @@ namespace dxup::d3d9 {
       if (beginEnd)
         context->Begin(m_query.get());
     }
+    if (m_device->core()->tracing9()) {
+      logMessage(LogLevel::Warn, "trace9   query %p type %u issue%s%s", static_cast<void*>(this), unsigned(m_type),
+        (flags & D3DISSUE_BEGIN) ? " begin" : "", (flags & D3DISSUE_END) ? " end" : "");
+      if (m_type == D3DQUERYTYPE_OCCLUSION && (flags & D3DISSUE_BEGIN))
+        m_device->core()->traceDepth9("at the first occlusion query");
+    }
     if (flags & D3DISSUE_END) {
       if (beginEnd && m_type != D3DQUERYTYPE_OCCLUSION && !(flags & D3DISSUE_BEGIN) && !m_issued)
         context->Begin(m_query.get());
       context->End(m_query.get());
       m_issued = true;
+      m_resultNoted = false;
     }
     return D3D_OK;
   }
@@ -878,6 +885,13 @@ namespace dxup::d3d9 {
         hr = context->GetData(m_query.get(), &samples, sizeof(samples), getFlags);
         if (hr == S_OK && data && size >= sizeof(DWORD))
           *static_cast<DWORD*>(data) = DWORD((std::min)(samples, UINT64(0xffffffffu)));
+        if (hr == S_OK && !m_resultNoted) {
+          m_resultNoted = true;
+          m_device->core()->noteOcclusionResult(samples);
+        }
+        if (m_device->core()->tracing9())
+          logMessage(LogLevel::Warn, "trace9   query %p getdata %s %llu", static_cast<void*>(this),
+            hr == S_OK ? "done" : "pending", static_cast<unsigned long long>(samples));
         break;
       }
       case D3DQUERYTYPE_TIMESTAMP: {
