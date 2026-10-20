@@ -1182,6 +1182,12 @@ namespace dxup {
       else
         clearUnorderedAccessViewFloat(view, color);
     }
+    // ClearView of a buffer UAV: rects give element ranges (left to right).
+    virtual void clearBufferView(IBackendBufferView* view, const float color[4], uint32_t rectCount, const Rect* rects) {
+      (void)rectCount;
+      (void)rects;
+      clearUnorderedAccessViewFloat(view, color);
+    }
 
     // Misc
     virtual void generateMips(IBackendImageView* srv) = 0;

@@ -289,6 +289,7 @@ namespace dxup::d3d12 {
     void clearUnorderedAccessViewUint(IBackendBufferView* view, const uint32_t values[4]) override;
     void clearUnorderedAccessViewFloat(IBackendImageView* view, const float values[4]) override;
     void clearUnorderedAccessViewFloat(IBackendBufferView* view, const float values[4]) override;
+    void clearBufferView(IBackendBufferView* view, const float color[4], uint32_t rectCount, const Rect* rects) override;
     void clearView(IBackendImageView* view, bool renderTarget, const float color[4],
                    uint32_t rectCount, const Rect* rects) override;
 

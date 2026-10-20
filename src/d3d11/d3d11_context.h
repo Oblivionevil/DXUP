@@ -163,6 +163,13 @@ namespace dxup {
       // The immediate context shares the device's reference count instead.
       if (m_isDeferred && m_device)
         m_device->AddRef();
+      // A command list starts from the default dynamic state, not from the
+      // immediate context's when it runs (setters skip unchanged values).
+      if (m_isDeferred && m_backendCtx) {
+        m_backendCtx->setBlendFactor(m_state.om.blendFactor);
+        m_backendCtx->setStencilRef(m_state.om.stencilRef);
+        m_backendCtx->setViewports(0, nullptr);
+      }
     }
 
     ~D3D11ImmediateContext() {
@@ -959,6 +966,8 @@ namespace dxup {
         ppRenderTargetViews,
         pDepthStencilView,
         D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT_MAX);
+      // The native runtime unbinds the output merger's UAVs here too.
+      clearPixelUnorderedAccessViewsBefore(D3D11_1_UAV_SLOT_COUNT_MAX);
     }
 
     void STDMETHODCALLTYPE OMSetRenderTargetsAndUnorderedAccessViews(
@@ -987,32 +996,28 @@ namespace dxup {
         omSetRtUavLogCount++;
       }
 
-      // Render targets and unordered access views of the same part of a
-      // resource: D3D11 ignores the call.
-      if (NumUAVs != 0 && NumUAVs != D3D11_KEEP_UNORDERED_ACCESS_VIEWS && ppUnorderedAccessViews) {
-        const bool newTargets = NumRTVs != D3D11_KEEP_RENDER_TARGETS_AND_DEPTH_STENCIL;
-        const UINT rtvCount = newTargets
-          ? (std::min)(NumRTVs, UINT(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT_MAX))
-          : m_state.om.numRenderTargets;
-        for (UINT i = 0; i < NumUAVs; i++) {
-          ID3D11UnorderedAccessView* uav = ppUnorderedAccessViews[i];
-          if (!uav)
-            continue;
-          const D3D11ViewRange uavRange = unorderedAccessRange(uav);
-          for (UINT rt = 0; rt < rtvCount; rt++) {
-            ID3D11RenderTargetView* rtv = newTargets
-              ? (ppRenderTargetViews ? ppRenderTargetViews[rt] : nullptr)
-              : m_state.om.renderTargets[rt];
-            if (rtv && viewResource(rtv) == uavRange.resource && viewRangesOverlap(renderTargetRange(rtv), uavRange)) {
+      const bool newTargets = NumRTVs != D3D11_KEEP_RENDER_TARGETS_AND_DEPTH_STENCIL;
+      const bool newUavs = NumUAVs != D3D11_KEEP_UNORDERED_ACCESS_VIEWS;
+      auto overlaps = [&](ID3D11RenderTargetView* rtv, ID3D11UnorderedAccessView* uav) {
+        if (!rtv || !uav)
+          return false;
+        const D3D11ViewRange uavRange = unorderedAccessRange(uav);
+        return viewResource(rtv) == uavRange.resource && viewRangesOverlap(renderTargetRange(rtv), uavRange);
+      };
+      // New render targets and new UAVs of the same part of a resource:
+      // D3D11 ignores the call.
+      if (newTargets && newUavs && NumUAVs && ppUnorderedAccessViews) {
+        const UINT rtvCount = (std::min)(NumRTVs, UINT(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT_MAX));
+        for (UINT i = 0; i < NumUAVs; i++)
+          for (UINT rt = 0; rt < rtvCount; rt++)
+            if (overlaps(ppRenderTargetViews ? ppRenderTargetViews[rt] : nullptr, ppUnorderedAccessViews[i])) {
               logMessage(LogLevel::Warn, "OMSetRenderTargetsAndUnorderedAccessViews: render target and UAV overlap, call ignored");
               return;
             }
-          }
-        }
       }
 
-      if (NumRTVs != D3D11_KEEP_RENDER_TARGETS_AND_DEPTH_STENCIL) {
-        const UINT maxRenderTargetCount = (NumUAVs == 0 || NumUAVs == D3D11_KEEP_UNORDERED_ACCESS_VIEWS)
+      if (newTargets) {
+        const UINT maxRenderTargetCount = !newUavs || NumUAVs == 0
           ? UINT(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT_MAX)
           : UAVStartSlot;
 
@@ -1021,22 +1026,56 @@ namespace dxup {
           ppRenderTargetViews,
           pDepthStencilView,
           maxRenderTargetCount);
+        // Kept UAVs of the new targets' parts are unbound (native runtime).
+        if (!newUavs) {
+          for (UINT slot = 0; slot < D3D11_1_UAV_SLOT_COUNT_MAX; slot++)
+            for (UINT rt = 0; rt < m_state.om.numRenderTargets; rt++)
+              if (overlaps(m_state.om.renderTargets[rt], m_state.om.uavs[slot])) {
+                clearPixelUnorderedAccessView(slot);
+                break;
+              }
+        }
       }
 
-      if (NumUAVs == 0 || NumUAVs == D3D11_KEEP_UNORDERED_ACCESS_VIEWS)
+      if (!newUavs)
         return;
 
-      if (NumRTVs == D3D11_KEEP_RENDER_TARGETS_AND_DEPTH_STENCIL)
+      if (!newTargets && NumUAVs) {
         truncateOutputMergerRenderTargets(UAVStartSlot);
+        // Kept render targets of the new UAVs' parts are unbound (native).
+        if (ppUnorderedAccessViews) {
+          ID3D11RenderTargetView* kept[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT_MAX] = {};
+          bool changed = false;
+          for (UINT rt = 0; rt < m_state.om.numRenderTargets; rt++) {
+            kept[rt] = m_state.om.renderTargets[rt];
+            for (UINT i = 0; i < NumUAVs && kept[rt]; i++)
+              if (overlaps(kept[rt], ppUnorderedAccessViews[i])) {
+                kept[rt] = nullptr;
+                changed = true;
+              }
+          }
+          if (changed)
+            setOutputMergerRenderTargets(m_state.om.numRenderTargets, kept, m_state.om.depthStencilView,
+                                         D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT_MAX);
+        }
+      }
 
-      clearPixelUnorderedAccessViewsBefore(getActiveRenderTargetCount());
+      // The UAVs outside the new range are unbound (native runtime; NumUAVs
+      // of 0 unbinds them all).
+      for (UINT slot = 0; slot < D3D11_1_UAV_SLOT_COUNT_MAX; slot++)
+        if (slot < UAVStartSlot || slot - UAVStartSlot >= NumUAVs)
+          clearPixelUnorderedAccessView(slot);
+      if (!NumUAVs)
+        return;
 
       for (UINT i = 0; i < NumUAVs; i++) {
         UINT slot = UAVStartSlot + i;
-        if (slot < D3D11_PS_CS_UAV_REGISTER_COUNT_MAX) {
+        if (slot < D3D11_1_UAV_SLOT_COUNT_MAX) {
           ID3D11UnorderedAccessView* view = ppUnorderedAccessViews
             ? ppUnorderedAccessViews[i]
             : nullptr;
+          if (view && slot >= m_state.om.uavSlotEnd)
+            m_state.om.uavSlotEnd = slot + 1;
           if (replaceContextReference(m_state.om.uavs[slot], view)) {
             bindUnorderedAccessView(ShaderStage::Pixel, slot, view);
             if (view)
@@ -1072,11 +1111,12 @@ namespace dxup {
       const bool psoChanged = replaceContextReference(m_state.om.blendState, pBlendState)
                            || m_state.om.sampleMask != SampleMask;
       m_state.om.sampleMask = SampleMask;
-      if (BlendFactor) {
-        if (std::memcmp(m_state.om.blendFactor, BlendFactor, sizeof(float) * 4) != 0) {
-          std::memcpy(m_state.om.blendFactor, BlendFactor, sizeof(float) * 4);
-          m_backendCtx->setBlendFactor(BlendFactor);
-        }
+      // A NULL factor is {1, 1, 1, 1}, as with the native runtime.
+      static const float kOnes[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+      const float* factor = BlendFactor ? BlendFactor : kOnes;
+      if (std::memcmp(m_state.om.blendFactor, factor, sizeof(float) * 4) != 0) {
+        std::memcpy(m_state.om.blendFactor, factor, sizeof(float) * 4);
+        m_backendCtx->setBlendFactor(factor);
       }
       if (psoChanged)
         markPipelineDirty();
@@ -1133,7 +1173,7 @@ namespace dxup {
       if (ppUnorderedAccessViews) {
         for (UINT i = 0; i < NumUAVs; i++) {
           UINT slot = UAVStartSlot + i;
-          ppUnorderedAccessViews[i] = (slot < D3D11_PS_CS_UAV_REGISTER_COUNT_MAX)
+          ppUnorderedAccessViews[i] = (slot < D3D11_1_UAV_SLOT_COUNT_MAX)
             ? m_state.om.uavs[slot] : nullptr;
           if (ppUnorderedAccessViews[i])
             ppUnorderedAccessViews[i]->AddRef();
@@ -1223,10 +1263,11 @@ namespace dxup {
         UINT             NumRects,
         const D3D11_RECT* pRects) override {
       DXUP_CONTEXT_MT_GUARD;
-      if (NumRects <= D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE_MAX
-       && m_state.rs.numScissorRects == NumRects
-       && (!NumRects || !pRects
-        || std::memcmp(m_state.rs.scissorRects, pRects, sizeof(D3D11_RECT) * NumRects) == 0))
+      // The native runtime ignores more rects than a pipeline has.
+      if (NumRects > D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE_MAX || (NumRects && !pRects))
+        return;
+      if (m_state.rs.numScissorRects == NumRects
+       && (!NumRects || std::memcmp(m_state.rs.scissorRects, pRects, sizeof(D3D11_RECT) * NumRects) == 0))
         return;
 
       m_state.rs.numScissorRects = NumRects;
@@ -1257,10 +1298,10 @@ namespace dxup {
         *pNumViewports = m_state.rs.numViewports;
         return;
       }
-      UINT count = (*pNumViewports < m_state.rs.numViewports) ? *pNumViewports : m_state.rs.numViewports;
-      for (UINT i = 0; i < count; i++)
-        pViewports[i] = m_state.rs.viewports[i];
-      *pNumViewports = count;
+      // Entries past the bound ones are zeroed (native runtime).
+      for (UINT i = 0; i < *pNumViewports; i++)
+        pViewports[i] = i < m_state.rs.numViewports ? m_state.rs.viewports[i] : D3D11_VIEWPORT{};
+      *pNumViewports = (std::min)(*pNumViewports, m_state.rs.numViewports);
     }
 
     void STDMETHODCALLTYPE RSGetScissorRects(
@@ -1272,10 +1313,9 @@ namespace dxup {
         *pNumRects = m_state.rs.numScissorRects;
         return;
       }
-      UINT count = (*pNumRects < m_state.rs.numScissorRects) ? *pNumRects : m_state.rs.numScissorRects;
-      for (UINT i = 0; i < count; i++)
-        pRects[i] = m_state.rs.scissorRects[i];
-      *pNumRects = count;
+      for (UINT i = 0; i < *pNumRects; i++)
+        pRects[i] = i < m_state.rs.numScissorRects ? m_state.rs.scissorRects[i] : D3D11_RECT{};
+      *pNumRects = (std::min)(*pNumRects, m_state.rs.numScissorRects);
     }
 
     void STDMETHODCALLTYPE RSGetState(
@@ -1317,13 +1357,40 @@ namespace dxup {
       }
     }
 
+    static D3D11_USAGE resourceUsage(ID3D11Resource* resource) {
+      D3D11_RESOURCE_DIMENSION dimension = D3D11_RESOURCE_DIMENSION_UNKNOWN;
+      resource->GetType(&dimension);
+      switch (dimension) {
+        case D3D11_RESOURCE_DIMENSION_BUFFER:
+          return static_cast<D3D11Buffer*>(static_cast<ID3D11Buffer*>(resource))->GetDescRef().Usage;
+        case D3D11_RESOURCE_DIMENSION_TEXTURE1D: {
+          D3D11_TEXTURE1D_DESC desc;
+          static_cast<ID3D11Texture1D*>(resource)->GetDesc(&desc);
+          return desc.Usage;
+        }
+        case D3D11_RESOURCE_DIMENSION_TEXTURE2D: {
+          D3D11_TEXTURE2D_DESC desc;
+          static_cast<ID3D11Texture2D*>(resource)->GetDesc(&desc);
+          return desc.Usage;
+        }
+        case D3D11_RESOURCE_DIMENSION_TEXTURE3D: {
+          D3D11_TEXTURE3D_DESC desc;
+          static_cast<ID3D11Texture3D*>(resource)->GetDesc(&desc);
+          return desc.Usage;
+        }
+        default:
+          return D3D11_USAGE_DEFAULT;
+      }
+    }
+
     void rebindStreamOutputTargets() {
       IBackendBuffer* backendBuffers[D3D11_SO_BUFFER_SLOT_COUNT_MAX] = {};
       uint32_t backendOffsets[D3D11_SO_BUFFER_SLOT_COUNT_MAX] = {};
       UINT count = 0;
       for (UINT i = 0; i < D3D11_SO_BUFFER_SLOT_COUNT_MAX; i++) {
         backendBuffers[i] = getBackendBuffer(m_state.so.targets[i]);
-        backendOffsets[i] = m_state.so.offsets[i];
+        // The remaining targets go on appending where they stopped.
+        backendOffsets[i] = UINT32_MAX;
         if (m_state.so.targets[i])
           count = i + 1;
       }
@@ -1775,7 +1842,7 @@ namespace dxup {
     enum DropReason : uint32_t { DropNone, DropNoVertexShader, DropPipelineFailed, DropPipelinePending, DropReasons };
     DropReason m_dropReason = DropNone;
     uint32_t   m_droppedDraws[DropReasons] = {};
-    uint32_t   m_droppedFrames = 0, m_presents = 0;
+    uint32_t   m_droppedFrames = 0;
 
     // NaN and infinity the game puts into constant buffers, and NaN in GPU
     // results it reads back (glitch reports): either shows as black or
@@ -1849,14 +1916,15 @@ namespace dxup {
       }
     }
 
+    // Per present (m_historyFrame is the present's number, as the swap
+    // chain's frame dumps count them).
     void logDroppedDraws() {
-      m_presents++;
       if (auto* backend = m_device->GetBackend())
         m_droppedDraws[DropPipelineFailed] += backend->takeFailedPipelineDraws();
       if (m_nonFiniteUploads) {
         m_nonFiniteFrames++;
         if (m_nonFiniteFrames <= 20 || m_nonFiniteFrames % 100 == 0)
-          logMessage(LogLevel::Warn, "glitch: present %u: %u constant buffer writes with NaN or infinity%s", m_presents + 1,
+          logMessage(LogLevel::Warn, "glitch: present %u: %u constant buffer writes with NaN or infinity%s", m_historyFrame,
             m_nonFiniteUploads, m_nonFiniteFrames == 20 ? "; from now on every 100th such frame" : "");
         m_nonFiniteUploads = 0;
       }
@@ -1879,7 +1947,7 @@ namespace dxup {
           snprintf(text, sizeof(text), "%s%u %s", reasons.empty() ? "" : ", ", m_droppedDraws[i], kReasons[i]);
           reasons += text;
         }
-        logMessage(LogLevel::Warn, "glitch: present %u: %u draws not drawn (%s)%s", m_presents, total, reasons.c_str(),
+        logMessage(LogLevel::Warn, "glitch: present %u: %u draws not drawn (%s)%s", m_historyFrame, total, reasons.c_str(),
           m_droppedFrames == 20 ? "; from now on every 100th such frame" : "");
       }
       std::memset(m_droppedDraws, 0, sizeof(m_droppedDraws));
@@ -2494,7 +2562,8 @@ namespace dxup {
         ID3D11Buffer* buf = static_cast<ID3D11Buffer*>(pDstResource);
         auto* trackedBuffer = static_cast<D3D11Buffer*>(buf);
         IBackendBuffer* backendBuf = getBackendBuffer(trackedBuffer);
-        if (m_historyOn && !m_isDeferred && (trackedBuffer->GetDescRef().BindFlags & D3D11_BIND_CONSTANT_BUFFER)) {
+        if (m_historyOn && !m_isDeferred && (trackedBuffer->GetDescRef().BindFlags & D3D11_BIND_CONSTANT_BUFFER)
+         && (!pDstBox || (pDstBox->right > pDstBox->left && pDstBox->right <= trackedBuffer->GetDescRef().ByteWidth))) {
           const UINT bytes = pDstBox ? pDstBox->right - pDstBox->left : trackedBuffer->GetDescRef().ByteWidth;
           checkConstants(pDstResource, static_cast<const float*>(pSrcData), bytes / 4);
         }
@@ -2706,7 +2775,11 @@ namespace dxup {
       DXUP_CONTEXT_MT_GUARD;
       if (m_device->diagTraceDraws.load(std::memory_order_relaxed))
         traceCall(formatTrace("CopyResource dst=%p src=%p", static_cast<void*>(pDstResource), static_cast<void*>(pSrcResource)));
-      if (!pDstResource || !pSrcResource) return;
+      // The native runtime drops a copy onto itself or into an immutable
+      // resource.
+      if (!pDstResource || !pSrcResource || pDstResource == pSrcResource
+       || resourceUsage(pDstResource) == D3D11_USAGE_IMMUTABLE)
+        return;
       flushPendingBufferUpdates();
       if (m_autoTaa)
         m_autoTaa->noteCopy(pDstResource, pSrcResource);
@@ -2782,7 +2855,7 @@ namespace dxup {
       DXUP_CONTEXT_MT_GUARD;
       if (m_device->diagTraceDraws.load(std::memory_order_relaxed))
         traceCall(formatTrace("CopySubresourceRegion dst=%p sub=%u at %u,%u,%u src=%p sub=%u box=%d", static_cast<void*>(pDstResource), DstSubresource, DstX, DstY, DstZ, static_cast<void*>(pSrcResource), SrcSubresource, pSrcBox ? 1 : 0));
-      if (!pDstResource || !pSrcResource) return;
+      if (!pDstResource || !pSrcResource || resourceUsage(pDstResource) == D3D11_USAGE_IMMUTABLE) return;
       flushPendingBufferUpdates();
       readForcedMsaa(pSrcResource);
       writeForcedMsaaImage(pDstResource);
@@ -2935,6 +3008,11 @@ namespace dxup {
         D3D11_MAPPED_SUBRESOURCE* pMappedResource) override {
       DXUP_CONTEXT_MT_GUARD;
       if (!pResource || !pMappedResource) return E_INVALIDARG;
+      // Deferred contexts map dynamic resources for writing without reads
+      // only (native runtime).
+      if (m_isDeferred && (resourceUsage(pResource) != D3D11_USAGE_DYNAMIC
+       || (MapType != D3D11_MAP_WRITE_DISCARD && MapType != D3D11_MAP_WRITE_NO_OVERWRITE)))
+        return E_INVALIDARG;
       if (m_device->diagTraceDraws.load(std::memory_order_relaxed) && !m_probing)
         logMessage(LogLevel::Warn, "draw trace%s: Map %p sub=%u type=%u flags=0x%x",
           m_isDeferred ? " (deferred)" : "", static_cast<void*>(pResource), Subresource,
@@ -3663,8 +3741,12 @@ namespace dxup {
       if (m_isDeferred) return DXGI_ERROR_INVALID_CALL;
 
       auto* query = static_cast<D3D11Query*>(pAsync);
-      if (pData && DataSize != query->GetDataSize())
+      // As the native runtime: a size of 0 polls without writing, a size
+      // needs data and must be the query's.
+      if (DataSize && (!pData || DataSize != query->GetDataSize()))
         return E_INVALIDARG;
+      if (!DataSize)
+        pData = nullptr;
 
       IBackendQuery* backendQuery = query->GetBackendQuery();
       if (!backendQuery) return E_FAIL;
@@ -4074,7 +4156,7 @@ namespace dxup {
         if (IBackendImageView* imageView = getBackendImageUAV(uav.Get()))
           m_backendCtx->clearView(imageView, false, Color, NumRects, rects.data());
         else if (IBackendBufferView* bufferView = getBackendBufferUAV(uav.Get()))
-          m_backendCtx->clearUnorderedAccessViewFloat(bufferView, Color);
+          m_backendCtx->clearBufferView(bufferView, Color, NumRects, rects.data());
       }
     }
 
@@ -4123,7 +4205,9 @@ namespace dxup {
       UINT                        sampleMask         = 0xFFFFFFFF;
       ID3D11DepthStencilState*    depthStencilState  = nullptr;
       UINT                        stencilRef         = 0;
-      ID3D11UnorderedAccessView*  uavs[D3D11_PS_CS_UAV_REGISTER_COUNT_MAX] = {};
+      ID3D11UnorderedAccessView*  uavs[D3D11_1_UAV_SLOT_COUNT_MAX] = {};
+      // Above the highest bound UAV slot (scans stop there).
+      UINT                        uavSlotEnd = 0;
     };
 
     struct RasterizerStageState {
@@ -4844,7 +4928,7 @@ namespace dxup {
       }
       traceStage(line, "vs", m_state.vs, false);
       traceStage(line, "ps", m_state.ps, false);
-      for (UINT i = 0; i < D3D11_PS_CS_UAV_REGISTER_COUNT_MAX; i++) {
+      for (UINT i = 0; i < D3D11_1_UAV_SLOT_COUNT_MAX; i++) {
         if (m_state.om.uavs[i])
           line += formatTrace(" om.u%u(%s)", i, traceView(m_state.om.uavs[i], true).c_str());
       }
@@ -5329,7 +5413,8 @@ namespace dxup {
     }
 
     bool boundOmUavs() const {
-      for (auto* uav : m_state.om.uavs) {
+      for (UINT omSlot = 0; omSlot < m_state.om.uavSlotEnd; omSlot++) {
+        auto* uav = m_state.om.uavs[omSlot];
         if (uav)
           return true;
       }
@@ -6099,7 +6184,7 @@ namespace dxup {
         desiredActiveRenderTargetCount--;
 
       bool hasOverlappingPixelUav = false;
-      const UINT overlappingUavCount = (std::min)(desiredActiveRenderTargetCount, UINT(D3D11_PS_CS_UAV_REGISTER_COUNT_MAX));
+      const UINT overlappingUavCount = (std::min)(desiredActiveRenderTargetCount, UINT(D3D11_1_UAV_SLOT_COUNT_MAX));
       for (UINT slot = 0; slot < overlappingUavCount; slot++) {
         if (m_state.om.uavs[slot]) {
           hasOverlappingPixelUav = true;
@@ -6147,7 +6232,7 @@ namespace dxup {
     }
 
     void clearPixelUnorderedAccessView(UINT slot) {
-      if (slot >= D3D11_PS_CS_UAV_REGISTER_COUNT_MAX)
+      if (slot >= D3D11_1_UAV_SLOT_COUNT_MAX)
         return;
 
       if (!m_state.om.uavs[slot])
@@ -6155,10 +6240,12 @@ namespace dxup {
 
       clearContextReference(m_state.om.uavs[slot]);
       bindUnorderedAccessView(ShaderStage::Pixel, slot, nullptr);
+      while (m_state.om.uavSlotEnd && !m_state.om.uavs[m_state.om.uavSlotEnd - 1])
+        m_state.om.uavSlotEnd--;
     }
 
     void clearPixelUnorderedAccessViewsBefore(UINT slotCount) {
-      const UINT clearCount = (std::min)(slotCount, UINT(D3D11_PS_CS_UAV_REGISTER_COUNT_MAX));
+      const UINT clearCount = (std::min)(slotCount, UINT(D3D11_1_UAV_SLOT_COUNT_MAX));
       for (UINT slot = 0; slot < clearCount; slot++)
         clearPixelUnorderedAccessView(slot);
     }
@@ -6293,6 +6380,10 @@ namespace dxup {
           backendRects[i].bottom = m_state.rs.scissorRects[i].bottom;
         }
         m_backendCtx->setScissorRects(m_state.rs.numScissorRects, backendRects);
+      } else if (rasterizerScissorEnabled()) {
+        // Scissoring without rects: nothing is drawn (native runtime).
+        Rect empty[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE_MAX] = {};
+        m_backendCtx->setScissorRects((std::max)(1u, m_state.rs.numViewports), empty);
       } else if (m_state.rs.numViewports) {
         Rect backendRects[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE_MAX] = {};
         for (UINT i = 0; i < m_state.rs.numViewports; i++) {
@@ -6368,7 +6459,7 @@ namespace dxup {
       };
       for (UINT slot = 0; slot < m_state.cs.uavSlotEnd && slot < D3D11_1_UAV_SLOT_COUNT_MAX; slot++)
         reapplyUav(ShaderStage::Compute, slot, m_state.cs.uavs[slot]);
-      for (UINT slot = 0; slot < D3D11_PS_CS_UAV_REGISTER_COUNT_MAX; slot++)
+      for (UINT slot = 0; slot < D3D11_1_UAV_SLOT_COUNT_MAX; slot++)
         reapplyUav(ShaderStage::Pixel, slot, m_state.om.uavs[slot]);
 
       rebindOutputMergerState(false);
@@ -6875,7 +6966,8 @@ namespace dxup {
           }
         }
       }
-      for (auto* uav : m_state.om.uavs) {
+      for (UINT omSlot = 0; omSlot < m_state.om.uavSlotEnd; omSlot++) {
+        auto* uav = m_state.om.uavs[omSlot];
         if (uav)
           writeForcedMsaaImage(static_cast<D3D11UnorderedAccessView*>(uav)->GetResourceRaw());
       }
@@ -6965,7 +7057,7 @@ namespace dxup {
         if (range.planes)
           unbindForWrite(range, WriteSource::OutputMerger);
       }
-      for (UINT slot = 0; slot < D3D11_PS_CS_UAV_REGISTER_COUNT_MAX; slot++) {
+      for (UINT slot = 0; slot < m_state.om.uavSlotEnd; slot++) {
         if (auto* uav = m_state.om.uavs[slot])
           unbindForWrite(unorderedAccessRange(uav), WriteSource::OutputMerger);
       }
@@ -6985,7 +7077,8 @@ namespace dxup {
       }
       if (viewResource(m_state.om.depthStencilView) == resource)
         return true;
-      for (auto* uav : m_state.om.uavs) {
+      for (UINT omSlot = 0; omSlot < m_state.om.uavSlotEnd; omSlot++) {
+        auto* uav = m_state.om.uavs[omSlot];
         if (viewResource(uav) == resource)
           return true;
       }
@@ -7013,7 +7106,8 @@ namespace dxup {
       auto* dsv = m_state.om.depthStencilView;
       if (viewResource(dsv) == resource && viewRangesOverlap(read, depthStencilWriteRange(dsv)))
         return true;
-      for (auto* uav : m_state.om.uavs) {
+      for (UINT omSlot = 0; omSlot < m_state.om.uavSlotEnd; omSlot++) {
+        auto* uav = m_state.om.uavs[omSlot];
         if (viewResource(uav) == resource && viewRangesOverlap(read, unorderedAccessRange(uav)))
           return true;
       }
@@ -7093,7 +7187,7 @@ namespace dxup {
           clearContextReference(m_state.om.depthStencilView);
           outputMergerDirty = true;
         }
-        for (UINT slot = 0; slot < D3D11_PS_CS_UAV_REGISTER_COUNT_MAX; slot++) {
+        for (UINT slot = 0; slot < m_state.om.uavSlotEnd; slot++) {
           auto* uav = m_state.om.uavs[slot];
           if (uav && viewResource(uav) == write.resource && viewRangesOverlap(unorderedAccessRange(uav), write))
             clearPixelUnorderedAccessView(slot);
@@ -7185,7 +7279,7 @@ namespace dxup {
       rebindStageSrvs(ShaderStage::Pixel, m_state.ps);
       rebindStageSrvs(ShaderStage::Compute, m_state.cs);
 
-      rebindStageUavs(ShaderStage::Pixel, m_state.om.uavs, D3D11_PS_CS_UAV_REGISTER_COUNT_MAX);
+      rebindStageUavs(ShaderStage::Pixel, m_state.om.uavs, m_state.om.uavSlotEnd);
       rebindStageUavs(ShaderStage::Compute, m_state.cs.uavs, boundUavSlotEnd(m_state.cs));
     }
 

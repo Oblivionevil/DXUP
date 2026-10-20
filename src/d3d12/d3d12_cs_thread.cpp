@@ -1337,6 +1337,14 @@ namespace dxup {
     emit([=](CsWorkerState& s) { s.ctx->clearUnorderedAccessViewFloat(view, copy.data()); });
   }
 
+  void CsThreadContext::clearBufferView(IBackendBufferView* view, const float color[4], uint32_t rectCount,
+                                        const Rect* rects) {
+    std::array<float, 4> colorCopy = { color[0], color[1], color[2], color[3] };
+    emitArray(rects, rectCount, [view, colorCopy](CsWorkerState& s, const Rect* data, size_t count) {
+      s.ctx->clearBufferView(view, colorCopy.data(), static_cast<uint32_t>(count), data);
+    });
+  }
+
   void CsThreadContext::clearView(IBackendImageView* view, bool renderTarget, const float color[4],
                                   uint32_t rectCount, const Rect* rects) {
     std::array<float, 4> colorCopy = { color[0], color[1], color[2], color[3] };

@@ -392,6 +392,11 @@ void main(uint2 id : SV_DispatchThreadID) {
         {"append_buffer_and_structure_count", &Dx11TestApp::testAppendBufferAndStructureCount},
         {"dispatch_indirect", &Dx11TestApp::testDispatchIndirect},
         {"depth_and_scissor", &Dx11TestApp::testDepthAndScissor},
+        {"rasterizer_blend_rules", &Dx11TestApp::testRasterizerBlendRules},
+        {"copy_clear_query_rules", &Dx11TestApp::testCopyClearQueryRules},
+        {"output_merger_uav_rules", &Dx11TestApp::testOutputMergerUavRules},
+        {"deferred_dynamic_defaults", &Dx11TestApp::testDeferredDynamicDefaults},
+        {"deferred_map_rules", &Dx11TestApp::testDeferredMapRules},
         {"geometry_stream_output_draw_auto", &Dx11TestApp::testGeometryStreamOutputDrawAuto},
         {"stream_output_per_buffer_size", &Dx11TestApp::testStreamOutputPerBufferSize},
         {"tessellation_pipeline", &Dx11TestApp::testTessellationPipeline},
@@ -4686,6 +4691,439 @@ void main(uint3 tid : SV_DispatchThreadID) {
 
       m_context->Unmap(stagingBuffer.Get(), 0);
       return ok;
+    }
+
+    // Rasterizer and blend rules the native runtime applies: more than 16
+    // scissor rects are ignored, scissoring with no rects draws nothing,
+    // a NULL blend factor is {1, 1, 1, 1}, and the getters zero the
+    // entries past the bound ones.
+    bool testRasterizerBlendRules(std::string& error) {
+      static const char* kWhitePs = R"(
+float4 main(float4 position : SV_Position) : SV_Target { return float4(1.0f, 1.0f, 1.0f, 1.0f); }
+)";
+      TextureTarget target;
+      if (!createColorTarget(64, 64, D3D11_BIND_RENDER_TARGET, target, error))
+        return false;
+      ComPtr<ID3D11VertexShader> vs;
+      ComPtr<ID3DBlob> bytecode;
+      ComPtr<ID3D11PixelShader> ps;
+      if (!createVertexShader(kFullscreenTriangleVs, "main", vs, bytecode, error)
+       || !createPixelShader(kWhitePs, "main", ps, error))
+        return false;
+      m_context->ClearState();
+      ID3D11RenderTargetView* rtv = target.rtv.Get();
+      m_context->OMSetRenderTargets(1, &rtv, nullptr);
+      setViewport(64, 64);
+      m_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+      m_context->VSSetShader(vs.Get(), nullptr, 0);
+      m_context->PSSetShader(ps.Get(), nullptr, 0);
+
+      // 17 rects: ignored, the one rect before stays.
+      const D3D11_RECT one = { 0, 0, 32, 64 };
+      m_context->RSSetScissorRects(1, &one);
+      D3D11_RECT many[17] = {};
+      for (UINT i = 0; i < 17; i++)
+        many[i] = { LONG(i), 0, LONG(i + 8), 8 };
+      m_context->RSSetScissorRects(17, many);
+      UINT count = 0;
+      m_context->RSGetScissorRects(&count, nullptr);
+      if (count != 1) {
+        error = formatString("RSSetScissorRects(17) left %u rects bound (expected the call ignored, 1)", count);
+        return false;
+      }
+      // The getters zero what lies past the bound entries.
+      D3D11_RECT rects[3];
+      std::memset(rects, 0x7f, sizeof(rects));
+      count = 3;
+      m_context->RSGetScissorRects(&count, rects);
+      const D3D11_RECT zero = {};
+      if (count != 1 || std::memcmp(&rects[0], &one, sizeof(one)) || std::memcmp(&rects[1], &zero, sizeof(zero))
+       || std::memcmp(&rects[2], &zero, sizeof(zero))) {
+        error = formatString("RSGetScissorRects(3) gave count %u, rect 1 (%ld %ld %ld %ld)", count, rects[1].left, rects[1].top,
+          rects[1].right, rects[1].bottom);
+        return false;
+      }
+      D3D11_VIEWPORT viewports[3];
+      std::memset(viewports, 0x7f, sizeof(viewports));
+      count = 3;
+      m_context->RSGetViewports(&count, viewports);
+      const D3D11_VIEWPORT zeroViewport = {};
+      if (count != 1 || viewports[0].Width != 64.0f || std::memcmp(&viewports[1], &zeroViewport, sizeof(zeroViewport))
+       || std::memcmp(&viewports[2], &zeroViewport, sizeof(zeroViewport))) {
+        error = formatString("RSGetViewports(3) gave count %u, viewport 1 width %g", count, viewports[1].Width);
+        return false;
+      }
+
+      // Scissoring with no rects: nothing is drawn.
+      D3D11_RASTERIZER_DESC rasterDesc = {};
+      rasterDesc.FillMode = D3D11_FILL_SOLID;
+      rasterDesc.CullMode = D3D11_CULL_NONE;
+      rasterDesc.DepthClipEnable = TRUE;
+      rasterDesc.ScissorEnable = TRUE;
+      ComPtr<ID3D11RasterizerState> scissorState;
+      HRESULT hr = m_device->CreateRasterizerState(&rasterDesc, scissorState.GetAddressOf());
+      if (FAILED(hr)) {
+        error = "CreateRasterizerState(scissor) failed: " + formatHResult(hr);
+        return false;
+      }
+      const float black[4] = {};
+      m_context->ClearRenderTargetView(rtv, black);
+      m_context->RSSetState(scissorState.Get());
+      m_context->RSSetScissorRects(0, nullptr);
+      m_context->Draw(3, 0);
+      Rgba8 pixel = {};
+      if (!readBackPixel(target.texture.Get(), 40, 40, pixel, error))
+        return false;
+      if (pixel.r != 0) {
+        error = formatString("scissoring with no rects drew (%u %u %u %u)", pixel.r, pixel.g, pixel.b, pixel.a);
+        return false;
+      }
+      m_context->RSSetState(nullptr);
+
+      // A NULL blend factor is {1, 1, 1, 1}.
+      D3D11_BLEND_DESC blendDesc = {};
+      blendDesc.RenderTarget[0].BlendEnable = TRUE;
+      blendDesc.RenderTarget[0].SrcBlend = D3D11_BLEND_BLEND_FACTOR;
+      blendDesc.RenderTarget[0].DestBlend = D3D11_BLEND_ZERO;
+      blendDesc.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
+      blendDesc.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
+      blendDesc.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ZERO;
+      blendDesc.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+      blendDesc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+      ComPtr<ID3D11BlendState> blendState;
+      hr = m_device->CreateBlendState(&blendDesc, blendState.GetAddressOf());
+      if (FAILED(hr)) {
+        error = "CreateBlendState(blend factor) failed: " + formatHResult(hr);
+        return false;
+      }
+      const float quarter[4] = { 0.25f, 0.25f, 0.25f, 0.25f };
+      m_context->OMSetBlendState(blendState.Get(), quarter, 0xffffffffu);
+      m_context->OMSetBlendState(blendState.Get(), nullptr, 0xffffffffu);
+      FLOAT factor[4] = {};
+      UINT mask = 0;
+      ComPtr<ID3D11BlendState> bound;
+      m_context->OMGetBlendState(bound.GetAddressOf(), factor, &mask);
+      if (factor[0] != 1.0f || factor[3] != 1.0f) {
+        error = formatString("OMSetBlendState(NULL factor) left factor %g", factor[0]);
+        return false;
+      }
+      m_context->ClearRenderTargetView(rtv, black);
+      m_context->Draw(3, 0);
+      if (!readBackPixel(target.texture.Get(), 40, 40, pixel, error))
+        return false;
+      if (pixel.r != 255) {
+        error = formatString("draw with a NULL blend factor gave red %u (expected 255)", pixel.r);
+        return false;
+      }
+      m_context->ClearState();
+      return true;
+    }
+
+    // Copies the native runtime drops (a resource onto itself, into an
+    // immutable resource), ClearView of a buffer UAV limited to its rect's
+    // elements, and GetData polled with a size of 0.
+    bool testCopyClearQueryRules(std::string& error) {
+      auto makeBuffer = [&](UINT bytes, D3D11_USAGE usage, UINT bind, UINT cpu, const void* data, UINT misc,
+                            ComPtr<ID3D11Buffer>& buffer, const char* name) {
+        D3D11_BUFFER_DESC desc = { bytes, usage, bind, cpu, misc, 0 };
+        D3D11_SUBRESOURCE_DATA init = { data, 0, 0 };
+        const HRESULT hr = m_device->CreateBuffer(&desc, data ? &init : nullptr, buffer.GetAddressOf());
+        if (FAILED(hr))
+          error = std::string("CreateBuffer(") + name + ") failed: " + formatHResult(hr);
+        return SUCCEEDED(hr);
+      };
+      auto readFloats = [&](ID3D11Buffer* buffer, std::vector<float>& out) {
+        D3D11_BUFFER_DESC desc = {};
+        buffer->GetDesc(&desc);
+        ComPtr<ID3D11Buffer> staging;
+        if (!makeBuffer(desc.ByteWidth, D3D11_USAGE_STAGING, 0, D3D11_CPU_ACCESS_READ, nullptr, 0, staging, "staging"))
+          return false;
+        m_context->CopyResource(staging.Get(), buffer);
+        D3D11_MAPPED_SUBRESOURCE mapped = {};
+        const HRESULT hr = m_context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped);
+        if (FAILED(hr)) {
+          error = "Map(staging) failed: " + formatHResult(hr);
+          return false;
+        }
+        out.resize(desc.ByteWidth / 4);
+        std::memcpy(out.data(), mapped.pData, desc.ByteWidth);
+        m_context->Unmap(staging.Get(), 0);
+        return true;
+      };
+      std::vector<float> ones(64, 1.0f), twos(64, 2.0f), values;
+      ComPtr<ID3D11Buffer> immutableBuffer, defaultBuffer, uavBuffer;
+      if (!makeBuffer(256, D3D11_USAGE_IMMUTABLE, D3D11_BIND_SHADER_RESOURCE, 0, ones.data(), 0, immutableBuffer, "immutable")
+       || !makeBuffer(256, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, twos.data(), 0, defaultBuffer, "default"))
+        return false;
+      // Into an immutable buffer: dropped.
+      m_context->CopyResource(immutableBuffer.Get(), defaultBuffer.Get());
+      const D3D11_BOX box = { 0, 0, 0, 64, 1, 1 };
+      m_context->CopySubresourceRegion(immutableBuffer.Get(), 0, 0, 0, 0, defaultBuffer.Get(), 0, &box);
+      if (!readFloats(immutableBuffer.Get(), values))
+        return false;
+      if (values[0] != 1.0f || values[63] != 1.0f) {
+        error = formatString("copy into an immutable buffer changed it (%g %g)", values[0], values[63]);
+        return false;
+      }
+      // Onto itself: dropped, the device stays usable.
+      m_context->CopyResource(defaultBuffer.Get(), defaultBuffer.Get());
+      TextureTarget target;
+      if (!createColorTarget(16, 16, D3D11_BIND_RENDER_TARGET, target, error))
+        return false;
+      const float green[4] = { 0.0f, 1.0f, 0.0f, 1.0f };
+      m_context->ClearRenderTargetView(target.rtv.Get(), green);
+      m_context->CopyResource(target.texture.Get(), target.texture.Get());
+      Rgba8 pixel = {};
+      if (!readBackPixel(target.texture.Get(), 3, 3, pixel, error))
+        return false;
+      if (pixel.g != 255 || FAILED(m_device->GetDeviceRemovedReason())) {
+        error = formatString("copy onto itself: pixel g %u, removed reason %s", pixel.g,
+          formatHResult(m_device->GetDeviceRemovedReason()).c_str());
+        return false;
+      }
+      if (!readFloats(defaultBuffer.Get(), values))
+        return false;
+      if (values[0] != 2.0f) {
+        error = formatString("buffer copied onto itself reads %g", values[0]);
+        return false;
+      }
+
+      // ClearView of a buffer UAV: left/right are the element range.
+      ComPtr<ID3D11DeviceContext1> context1;
+      if (SUCCEEDED(m_context.As(&context1))) {
+        std::vector<float> zeros(64, 0.0f);
+        if (!makeBuffer(256, D3D11_USAGE_DEFAULT, D3D11_BIND_UNORDERED_ACCESS, 0, zeros.data(), 0, uavBuffer, "uav"))
+          return false;
+        D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc = {};
+        uavDesc.Format = DXGI_FORMAT_R32_FLOAT;
+        uavDesc.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
+        uavDesc.Buffer.NumElements = 64;
+        ComPtr<ID3D11UnorderedAccessView> uav;
+        HRESULT hr = m_device->CreateUnorderedAccessView(uavBuffer.Get(), &uavDesc, uav.GetAddressOf());
+        if (FAILED(hr)) {
+          error = "CreateUnorderedAccessView(buffer) failed: " + formatHResult(hr);
+          return false;
+        }
+        const FLOAT color[4] = { 5.0f, 5.0f, 5.0f, 5.0f };
+        const D3D11_RECT rect = { 16, 0, 32, 1 };
+        context1->ClearView(uav.Get(), color, &rect, 1);
+        if (!readFloats(uavBuffer.Get(), values))
+          return false;
+        if (values[15] != 0.0f || values[16] != 5.0f || values[31] != 5.0f || values[32] != 0.0f) {
+          error = formatString("ClearView of buffer elements 16-31 gave [15]=%g [16]=%g [31]=%g [32]=%g", values[15],
+            values[16], values[31], values[32]);
+          return false;
+        }
+      }
+
+      // GetData with a size of 0 polls.
+      ComPtr<ID3D11Query> query;
+      if (!createQueryObject(D3D11_QUERY_EVENT, query, error))
+        return false;
+      m_context->End(query.Get());
+      BOOL done = FALSE;
+      HRESULT hr = S_FALSE;
+      for (int i = 0; i < 2000 && (hr = m_context->GetData(query.Get(), &done, 0, 0)) == S_FALSE; i++)
+        Sleep(1);
+      if (hr != S_OK) {
+        error = "GetData(event, size 0) gave " + formatHResult(hr);
+        return false;
+      }
+      hr = m_context->GetData(query.Get(), nullptr, sizeof(BOOL), 0);
+      if (hr != E_INVALIDARG) {
+        error = "GetData(event, NULL, sizeof(BOOL)) gave " + formatHResult(hr) + " (native: E_INVALIDARG)";
+        return false;
+      }
+      return true;
+    }
+
+    // A new deferred context's first command list starts from the default
+    // blend factor, not from the immediate context's when it runs.
+    bool testDeferredDynamicDefaults(std::string& error) {
+      static const char* kWhitePs = R"(
+float4 main(float4 position : SV_Position) : SV_Target { return float4(1.0f, 1.0f, 1.0f, 1.0f); }
+)";
+      TextureTarget target;
+      ComPtr<ID3D11VertexShader> vs;
+      ComPtr<ID3DBlob> bytecode;
+      ComPtr<ID3D11PixelShader> ps;
+      if (!createColorTarget(32, 32, D3D11_BIND_RENDER_TARGET, target, error)
+       || !createVertexShader(kFullscreenTriangleVs, "main", vs, bytecode, error)
+       || !createPixelShader(kWhitePs, "main", ps, error))
+        return false;
+      D3D11_BLEND_DESC blendDesc = {};
+      blendDesc.RenderTarget[0].BlendEnable = TRUE;
+      blendDesc.RenderTarget[0].SrcBlend = D3D11_BLEND_BLEND_FACTOR;
+      blendDesc.RenderTarget[0].DestBlend = D3D11_BLEND_ZERO;
+      blendDesc.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
+      blendDesc.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
+      blendDesc.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ZERO;
+      blendDesc.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+      blendDesc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+      ComPtr<ID3D11BlendState> blendState;
+      ComPtr<ID3D11DeviceContext> deferred;
+      HRESULT hr = m_device->CreateBlendState(&blendDesc, blendState.GetAddressOf());
+      if (SUCCEEDED(hr)) hr = m_device->CreateDeferredContext(0, deferred.GetAddressOf());
+      if (FAILED(hr)) {
+        error = "setup failed: " + formatHResult(hr);
+        return false;
+      }
+      // The immediate context blends with a quarter.
+      m_context->ClearState();
+      const float quarter[4] = { 0.25f, 0.25f, 0.25f, 0.25f };
+      m_context->OMSetBlendState(blendState.Get(), quarter, 0xffffffffu);
+      // The list: the same state with the default factor, a draw.
+      ID3D11RenderTargetView* rtv = target.rtv.Get();
+      D3D11_VIEWPORT viewport = { 0.0f, 0.0f, 32.0f, 32.0f, 0.0f, 1.0f };
+      deferred->OMSetRenderTargets(1, &rtv, nullptr);
+      deferred->RSSetViewports(1, &viewport);
+      deferred->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+      deferred->VSSetShader(vs.Get(), nullptr, 0);
+      deferred->PSSetShader(ps.Get(), nullptr, 0);
+      deferred->OMSetBlendState(blendState.Get(), nullptr, 0xffffffffu);
+      deferred->Draw(3, 0);
+      ComPtr<ID3D11CommandList> list;
+      hr = deferred->FinishCommandList(FALSE, list.GetAddressOf());
+      if (FAILED(hr)) {
+        error = "FinishCommandList failed: " + formatHResult(hr);
+        return false;
+      }
+      const float black[4] = {};
+      m_context->ClearRenderTargetView(rtv, black);
+      m_context->ExecuteCommandList(list.Get(), FALSE);
+      Rgba8 pixel = {};
+      if (!readBackPixel(target.texture.Get(), 16, 16, pixel, error))
+        return false;
+      m_context->ClearState();
+      if (pixel.r != 255) {
+        error = formatString("the first command list drew red %u (expected 255: the default blend factor)", pixel.r);
+        return false;
+      }
+      return true;
+    }
+
+    // Maps a deferred context refuses: staging resources, reads, plain
+    // writes; WRITE_DISCARD of a dynamic buffer works.
+    bool testDeferredMapRules(std::string& error) {
+      ComPtr<ID3D11DeviceContext> deferred;
+      HRESULT hr = m_device->CreateDeferredContext(0, deferred.GetAddressOf());
+      D3D11_BUFFER_DESC stagingDesc = { 256, D3D11_USAGE_STAGING, 0, D3D11_CPU_ACCESS_READ | D3D11_CPU_ACCESS_WRITE, 0, 0 };
+      D3D11_BUFFER_DESC dynamicDesc = { 256, D3D11_USAGE_DYNAMIC, D3D11_BIND_VERTEX_BUFFER, D3D11_CPU_ACCESS_WRITE, 0, 0 };
+      ComPtr<ID3D11Buffer> staging, dynamic;
+      if (SUCCEEDED(hr)) hr = m_device->CreateBuffer(&stagingDesc, nullptr, staging.GetAddressOf());
+      if (SUCCEEDED(hr)) hr = m_device->CreateBuffer(&dynamicDesc, nullptr, dynamic.GetAddressOf());
+      if (FAILED(hr)) {
+        error = "setup failed: " + formatHResult(hr);
+        return false;
+      }
+      std::string observed;
+      auto tryMap = [&](ID3D11Buffer* buffer, D3D11_MAP type) {
+        D3D11_MAPPED_SUBRESOURCE mapped = {};
+        const HRESULT result = deferred->Map(buffer, 0, type, 0, &mapped);
+        if (SUCCEEDED(result))
+          deferred->Unmap(buffer, 0);
+        observed += SUCCEEDED(result) ? "ok " : result == E_INVALIDARG ? "inval " : formatHResult(result) + " ";
+      };
+      tryMap(staging.Get(), D3D11_MAP_READ);
+      tryMap(staging.Get(), D3D11_MAP_WRITE);
+      tryMap(staging.Get(), D3D11_MAP_READ_WRITE);
+      tryMap(dynamic.Get(), D3D11_MAP_WRITE_DISCARD);
+      tryMap(dynamic.Get(), D3D11_MAP_WRITE);
+      const char* expected = "inval inval inval ok inval ";
+      if (observed != expected) {
+        error = "deferred Map results: " + observed + "expected " + expected;
+        return false;
+      }
+      return true;
+    }
+
+    // Which output-merger UAVs stay bound across the native runtime's calls.
+    bool testOutputMergerUavRules(std::string& error) {
+      D3D11_TEXTURE2D_DESC desc = {};
+      desc.Width = desc.Height = 16;
+      desc.MipLevels = desc.ArraySize = 1;
+      desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+      desc.SampleDesc.Count = 1;
+      desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_UNORDERED_ACCESS;
+      ComPtr<ID3D11Texture2D> texX, texA, texB, texC;
+      ComPtr<ID3D11RenderTargetView> rtvX, rtvA;
+      ComPtr<ID3D11UnorderedAccessView> uavA, uavB, uavC;
+      HRESULT hr = S_OK;
+      for (auto* t : { &texX, &texA, &texB, &texC })
+        if (SUCCEEDED(hr)) hr = m_device->CreateTexture2D(&desc, nullptr, t->GetAddressOf());
+      if (SUCCEEDED(hr)) hr = m_device->CreateRenderTargetView(texX.Get(), nullptr, rtvX.GetAddressOf());
+      if (SUCCEEDED(hr)) hr = m_device->CreateRenderTargetView(texA.Get(), nullptr, rtvA.GetAddressOf());
+      if (SUCCEEDED(hr)) hr = m_device->CreateUnorderedAccessView(texA.Get(), nullptr, uavA.GetAddressOf());
+      if (SUCCEEDED(hr)) hr = m_device->CreateUnorderedAccessView(texB.Get(), nullptr, uavB.GetAddressOf());
+      if (SUCCEEDED(hr)) hr = m_device->CreateUnorderedAccessView(texC.Get(), nullptr, uavC.GetAddressOf());
+      if (FAILED(hr)) {
+        error = "resource setup failed: " + formatHResult(hr);
+        return false;
+      }
+      // The bound UAVs of slots 0-3 and the first two RTVs as letters.
+      auto state = [&]() {
+        ID3D11RenderTargetView* rtvs[2] = {};
+        ID3D11UnorderedAccessView* uavs[4] = {};
+        m_context->OMGetRenderTargetsAndUnorderedAccessViews(2, rtvs, nullptr, 0, 4, uavs);
+        std::string s;
+        for (auto* v : rtvs) {
+          s += v == rtvX.Get() ? 'X' : v == rtvA.Get() ? 'A' : v ? '?' : '-';
+          if (v) v->Release();
+        }
+        s += '|';
+        for (auto* v : uavs) {
+          s += v == uavA.Get() ? 'a' : v == uavB.Get() ? 'b' : v == uavC.Get() ? 'c' : v ? '?' : '-';
+          if (v) v->Release();
+        }
+        return s;
+      };
+      std::string observed;
+      m_context->ClearState();
+      ID3D11RenderTargetView* x = rtvX.Get();
+      ID3D11RenderTargetView* a = rtvA.Get();
+      ID3D11UnorderedAccessView* bc[2] = { uavB.Get(), uavC.Get() };
+      // 1: slots 1-2; 2: slot 1 only; 3: no UAVs.
+      m_context->OMSetRenderTargetsAndUnorderedAccessViews(1, &x, nullptr, 1, 2, bc, nullptr);
+      observed += state() + " ";
+      m_context->OMSetRenderTargetsAndUnorderedAccessViews(1, &x, nullptr, 1, 1, bc, nullptr);
+      observed += state() + " ";
+      m_context->OMSetRenderTargetsAndUnorderedAccessViews(1, &x, nullptr, 1, 0, nullptr, nullptr);
+      observed += state() + " ";
+      // 4: OMSetRenderTargets after a UAV at slot 1.
+      m_context->OMSetRenderTargetsAndUnorderedAccessViews(1, &x, nullptr, 1, 1, bc, nullptr);
+      m_context->OMSetRenderTargets(1, &x, nullptr);
+      observed += state() + " ";
+      // 5: the UAV of A at slot 1, then A as render target 0.
+      ID3D11UnorderedAccessView* ua = uavA.Get();
+      m_context->OMSetRenderTargetsAndUnorderedAccessViews(1, &x, nullptr, 1, 1, &ua, nullptr);
+      m_context->OMSetRenderTargetsAndUnorderedAccessViews(1, &a, nullptr, D3D11_KEEP_UNORDERED_ACCESS_VIEWS, D3D11_KEEP_UNORDERED_ACCESS_VIEWS, nullptr, nullptr);
+      observed += state() + " ";
+      // 6: A as render target 0 kept, the UAV of A at slot 1.
+      m_context->ClearState();
+      m_context->OMSetRenderTargets(1, &a, nullptr);
+      m_context->OMSetRenderTargetsAndUnorderedAccessViews(D3D11_KEEP_RENDER_TARGETS_AND_DEPTH_STENCIL, nullptr, nullptr, 1, 1, &ua, nullptr);
+      observed += state();
+      m_context->ClearState();
+      const char* expected = "X-|-bc- X-|-b-- X-|---- X-|---- A-|---- --|-a--";
+      if (observed != expected) {
+        error = "output-merger bindings " + observed + ", expected " + expected;
+        return false;
+      }
+      // Feature level 11.1: the output merger has 64 UAV slots.
+      if (m_device->GetFeatureLevel() >= D3D_FEATURE_LEVEL_11_1) {
+        m_context->OMSetRenderTargetsAndUnorderedAccessViews(1, &x, nullptr, 40, 1, bc, nullptr);
+        ID3D11UnorderedAccessView* high[64] = {};
+        m_context->OMGetRenderTargetsAndUnorderedAccessViews(0, nullptr, nullptr, 0, 64, high);
+        const bool bound = high[40] == uavB.Get();
+        for (auto* v : high)
+          if (v) v->Release();
+        m_context->ClearState();
+        if (!bound) {
+          error = "a UAV at output-merger slot 40 was not bound";
+          return false;
+        }
+      }
+      return true;
     }
 
     bool testDepthAndScissor(std::string& error) {

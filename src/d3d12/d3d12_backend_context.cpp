@@ -7721,9 +7721,21 @@ namespace dxup::d3d12 {
   }
 
   void D3D12BackendContext::clearUnorderedAccessViewFloat(IBackendBufferView* view, const float values[4]) {
+    clearBufferView(view, values, 0, nullptr);
+  }
+
+  void D3D12BackendContext::clearBufferView(IBackendBufferView* view, const float values[4], uint32_t rectCount,
+                                            const Rect* rects) {
 #ifdef _WIN32
     ContextLock ctxLock(*this);
     if (!view) return;
+    // Element ranges; empty ones clear nothing.
+    std::vector<D3D12_RECT> clearRects;
+    for (uint32_t i = 0; i < rectCount; i++)
+      if (rects[i].right > rects[i].left)
+        clearRects.push_back({ rects[i].left, 0, rects[i].right, 1 });
+    if (rectCount && clearRects.empty())
+      return;
     auto* d3d12View = static_cast<D3D12BackendBufferView*>(view);
     auto* d3d12Buffer = static_cast<D3D12BackendBuffer*>(d3d12View->getBuffer());
 
@@ -7747,7 +7759,8 @@ namespace dxup::d3d12 {
     D3D12_GPU_DESCRIPTOR_HANDLE gpuHandle;
     gpuHandle.ptr = m_shaderVisibleCbvSrvUavHeap->GetGPUDescriptorHandleForHeapStart().ptr + heapOffset * m_cbvSrvUavDescSize;
 
-    m_cmdList->ClearUnorderedAccessViewFloat(gpuHandle, d3d12View->getUavHandle(), d3d12Buffer->getResource(), values, 0, nullptr);
+    m_cmdList->ClearUnorderedAccessViewFloat(gpuHandle, d3d12View->getUavHandle(), d3d12Buffer->getResource(), values,
+      UINT(clearRects.size()), clearRects.empty() ? nullptr : clearRects.data());
 #endif
   }
 
