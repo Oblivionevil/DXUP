@@ -41,38 +41,47 @@ namespace dxup::d3d9 {
 
   // ---- Reference counting ----
 
-  // Objects alive while the application or the device holds them.
+  // Objects alive while the application or the device holds them. Both
+  // counts are one atomic (public in the low half, private in the high
+  // one), so the last release of either destroys the object once.
   class RefCounted {
   public:
     virtual ~RefCounted() = default;
-    virtual void addRefPrivate() { ++m_private; }
-    virtual void releasePrivate() {
-      if (--m_private == 0 && m_public == 0)
-        destroy();
-    }
+    virtual void addRefPrivate() { m_refs.fetch_add(kPrivateOne); }
+    virtual void releasePrivate() { releaseHold(); }
   protected:
+    static constexpr uint64_t kPrivateOne = uint64_t(1) << 32;
     ULONG addRefPublic() {
-      const ULONG count = ++m_public;
+      const ULONG count = ULONG(m_refs.fetch_add(1) & 0xffffffffu) + 1;
       if (count == 1)
         onRevived();
       return count;
     }
     ULONG releasePublic() {
-      const ULONG count = --m_public;
+      // The last public reference turns into a private one: held while
+      // letting go of what it holds, which may release it.
+      uint64_t refs = m_refs.load();
+      uint64_t next;
+      do {
+        next = (refs & 0xffffffffu) == 1 ? refs - 1 + kPrivateOne : refs - 1;
+      } while (!m_refs.compare_exchange_weak(refs, next));
+      const ULONG count = ULONG(refs & 0xffffffffu) - 1;
       if (count == 0) {
-        // Held while letting go of what it holds, which may release it.
-        ++m_private;
         onPublicReleased();
-        if (--m_private == 0 && m_public == 0)
-          destroy();
+        releaseHold();
       }
       return count;
     }
+    ULONG publicRefs() const { return ULONG(m_refs.load() & 0xffffffffu); }
     virtual void onRevived() {}
     virtual void onPublicReleased() {}
     virtual void destroy() { delete this; }
-    std::atomic<ULONG> m_public{0};
-    std::atomic<ULONG> m_private{0};
+  private:
+    void releaseHold() {
+      if (m_refs.fetch_sub(kPrivateOne) == kPrivateOne)
+        destroy();
+    }
+    std::atomic<uint64_t> m_refs{0};
   };
 
   // Holds a device-side reference to an object (bindings).
@@ -178,6 +187,8 @@ namespace dxup::d3d9 {
     bool isContained() const { return m_container != nullptr; }
     // The container's surfaces live as long as it does.
     void destroyContained() { delete this; }
+    // References of the application (also those counted on the container).
+    bool heldByApplication() const { return m_container ? m_containedRefs.load() > 0 : publicRefs() > 0; }
 
   private:
     // The device's own surfaces (its depth buffer) are deleted by it.
@@ -186,6 +197,7 @@ namespace dxup::d3d9 {
     uint32_t            m_subresource;
     IUnknown*           m_container;
     RefCounted*         m_containerRef;
+    std::atomic<LONG>   m_containedRefs{0};
     DWORD               m_usage;
     D3DMULTISAMPLE_TYPE m_multisample;
     DWORD               m_quality;
@@ -475,6 +487,14 @@ namespace dxup::d3d9 {
     HRESULT STDMETHODCALLTYPE GetDisplayModeEx(D3DDISPLAYMODEEX* mode, D3DDISPLAYROTATION* rotation) override;
 
     Surface* backBuffer(UINT index = 0) const { return index < m_backBuffers.size() ? m_backBuffers[index] : nullptr; }
+    // The application holds a back buffer, or the swap chain itself.
+    bool buffersHeld() const {
+      for (Surface* surface : m_backBuffers)
+        if (surface->heldByApplication())
+          return true;
+      return false;
+    }
+    bool heldByApplication() const { return (m_implicit ? m_appRefs.load() > 0 : publicRefs() > 0) || buffersHeld(); }
     const D3DPRESENT_PARAMETERS& params() const { return m_params; }
     HWND window() const { return m_params.hDeviceWindow; }
     void setGammaRamp(const D3DGAMMARAMP& ramp) { m_gamma = ramp; }
@@ -488,6 +508,7 @@ namespace dxup::d3d9 {
     std::shared_ptr<legacy::Texture> m_resolved;   // multisampled back buffers before presenting
     D3DGAMMARAMP m_gamma = {};
     UINT m_presentCount = 0;
+    std::atomic<LONG> m_appRefs{0};   // the implicit swap chain's, counted on the device
   };
 
   // ---- The device ----
@@ -689,6 +710,10 @@ namespace dxup::d3d9 {
     std::unique_ptr<legacy::Device> m_core;
     SwapChain*                      m_swapChain = nullptr;   // implicit
     Surface*                        m_autoDepthStencil = nullptr;
+    // Swap chains and depth buffers replaced by Reset that the application
+    // still held (Direct3D 9Ex).
+    std::vector<SwapChain*>         m_retiredSwapChains;
+    std::vector<Surface*>           m_retiredSurfaces;
 
     // Bindings
     std::array<Bound<Surface>, legacy::kMaxRenderTargets> m_renderTargets;

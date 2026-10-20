@@ -43,6 +43,14 @@ namespace dxup::d3d8 {
       return count;
     }
     Iface9* d3d9() const { return m_object; }
+    // A reference unless the last one is gone (the wrapper is going away).
+    bool tryAddRef() {
+      ULONG count = m_ref.load();
+      while (count)
+        if (m_ref.compare_exchange_weak(count, count + 1))
+          return true;
+      return false;
+    }
   protected:
     std::atomic<ULONG> m_ref{1};
     Device8* m_device;
@@ -201,7 +209,7 @@ namespace dxup::d3d8 {
     // reference (the object's is taken over or released).
     template<typename W, typename Iface9>
     W* wrap(Iface9* object);
-    void forget(IUnknown* object);
+    void forget(IUnknown* object, IUnknown* wrapper);
     IDirect3DDevice9* d3d9() const { return m_device; }
     void addRefInternal() { ++m_internal; }
     void releaseInternal();

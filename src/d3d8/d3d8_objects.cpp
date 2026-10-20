@@ -70,7 +70,7 @@ namespace dxup::d3d8 {
 
   template<typename Iface8, typename Iface9>
   Wrapper<Iface8, Iface9>::~Wrapper() {
-    m_device->forget(m_object);
+    m_device->forget(m_object, reinterpret_cast<IUnknown*>(this));
     m_object->Release();
     m_device->releaseInternal();
   }
@@ -91,19 +91,24 @@ namespace dxup::d3d8 {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
     auto it = m_wrappers.find(object);
     if (it != m_wrappers.end()) {
-      object->Release();
+      // A wrapper released to 0 on another thread is going away: a new one.
       auto* wrapper = static_cast<W*>(reinterpret_cast<typename W::Wrapper*>(it->second));
-      wrapper->AddRef();
-      return wrapper;
+      if (wrapper->tryAddRef()) {
+        object->Release();
+        return wrapper;
+      }
+      m_wrappers.erase(it);
     }
     auto* wrapper = new W(this, object);
     m_wrappers[object] = reinterpret_cast<IUnknown*>(static_cast<typename W::Wrapper*>(wrapper));
     return wrapper;
   }
 
-  void Device8::forget(IUnknown* object) {
+  void Device8::forget(IUnknown* object, IUnknown* wrapper) {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
-    m_wrappers.erase(object);
+    auto it = m_wrappers.find(object);
+    if (it != m_wrappers.end() && it->second == wrapper)
+      m_wrappers.erase(it);
   }
 
   namespace {
@@ -524,8 +529,10 @@ namespace dxup::d3d8 {
     if (!count)
       return m_device->UpdateSurface(src, nullptr, dst, nullptr);
     for (UINT i = 0; i < count; i++) {
+      // Without points the rectangles keep their places.
+      const POINT samePlace = sourceRects ? POINT{ sourceRects[i].left, sourceRects[i].top } : POINT{ 0, 0 };
       const HRESULT hr = m_device->UpdateSurface(src, sourceRects ? &sourceRects[i] : nullptr, dst,
-                                                 destPoints ? &destPoints[i] : nullptr);
+                                                 destPoints ? &destPoints[i] : &samePlace);
       if (FAILED(hr))
         return hr;
     }
@@ -607,6 +614,7 @@ namespace dxup::d3d8 {
   }
 
   HRESULT Device8::EndStateBlock(DWORD* token) {
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
     if (!token)
       return D3DERR_INVALIDCALL;
     IDirect3DStateBlock9* block = nullptr;
@@ -619,18 +627,21 @@ namespace dxup::d3d8 {
   }
 
   HRESULT Device8::ApplyStateBlock(DWORD token) {
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
     if (!token || token > m_stateBlocks.size() || !m_stateBlocks[token - 1])
       return D3DERR_INVALIDCALL;
     return m_stateBlocks[token - 1]->Apply();
   }
 
   HRESULT Device8::CaptureStateBlock(DWORD token) {
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
     if (!token || token > m_stateBlocks.size() || !m_stateBlocks[token - 1])
       return D3DERR_INVALIDCALL;
     return m_stateBlocks[token - 1]->Capture();
   }
 
   HRESULT Device8::DeleteStateBlock(DWORD token) {
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
     if (!token || token > m_stateBlocks.size() || !m_stateBlocks[token - 1])
       return D3DERR_INVALIDCALL;
     m_stateBlocks[token - 1]->Release();
@@ -639,6 +650,7 @@ namespace dxup::d3d8 {
   }
 
   HRESULT Device8::CreateStateBlock(D3DSTATEBLOCKTYPE type, DWORD* token) {
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
     if (!token)
       return D3DERR_INVALIDCALL;
     IDirect3DStateBlock9* block = nullptr;
@@ -848,6 +860,7 @@ namespace dxup::d3d8 {
   }
 
   HRESULT Device8::SetVertexShader(DWORD handle) {
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
     if (!(handle & 1)) {
       m_vertexShaderHandle = handle;
       m_device->SetVertexShader(nullptr);
@@ -873,6 +886,7 @@ namespace dxup::d3d8 {
   }
 
   HRESULT Device8::DeleteVertexShader(DWORD handle) {
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
     const DWORD index = (handle >> 1) - 1;
     if (!(handle & 1) || index >= m_vertexShaders.size() || !m_vertexShaders[index])
       return D3DERR_INVALIDCALL;
@@ -889,6 +903,7 @@ namespace dxup::d3d8 {
   }
 
   HRESULT Device8::GetVertexShaderDeclaration(DWORD handle, void* data, DWORD* size) {
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
     const DWORD index = (handle >> 1) - 1;
     if (!size || !(handle & 1) || index >= m_vertexShaders.size() || !m_vertexShaders[index])
       return D3DERR_INVALIDCALL;
@@ -903,6 +918,7 @@ namespace dxup::d3d8 {
   }
 
   HRESULT Device8::GetVertexShaderFunction(DWORD handle, void* data, DWORD* size) {
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
     const DWORD index = (handle >> 1) - 1;
     if (!size || !(handle & 1) || index >= m_vertexShaders.size() || !m_vertexShaders[index])
       return D3DERR_INVALIDCALL;
@@ -972,6 +988,7 @@ namespace dxup::d3d8 {
   }
 
   HRESULT Device8::SetPixelShader(DWORD handle) {
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
     if (!handle) {
       m_pixelShaderHandle = 0;
       return m_device->SetPixelShader(nullptr);
@@ -990,6 +1007,7 @@ namespace dxup::d3d8 {
   }
 
   HRESULT Device8::DeletePixelShader(DWORD handle) {
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
     if (!handle || handle > m_pixelShaders.size() || !m_pixelShaders[handle - 1])
       return D3DERR_INVALIDCALL;
     if (m_pixelShaderHandle == handle) {
@@ -1003,6 +1021,7 @@ namespace dxup::d3d8 {
   }
 
   HRESULT Device8::GetPixelShaderFunction(DWORD handle, void* data, DWORD* size) {
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
     if (!size || !handle || handle > m_pixelShaders.size() || !m_pixelShaders[handle - 1])
       return D3DERR_INVALIDCALL;
     const auto& tokens = m_pixelShaders[handle - 1]->function;

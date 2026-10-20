@@ -784,7 +784,7 @@ float4 main(float4 a : TEXCOORD0, float4 b : TEXCOORD1, float2 v : VPOS) : COLOR
   // malformed or unusual flow control. A bar per shader shows whether the
   // runtime took it; the two valid ones also draw.
   bool sceneShaderTokens(IDirect3DDevice9* d) {
-    d->Clear(0, nullptr, D3DCLEAR_TARGET, 0xff000000u, 1.0f, 0);
+    d->Clear(0, nullptr, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, 0xff000000u, 1.0f, 0);
     constexpr DWORD kPs20 = 0xffff0200u, kPs30 = 0xffff0300u, kEnd = 0x0000ffffu;
     constexpr DWORD kOC0 = 0x800f0800u, kC0 = 0xa0e40000u, kB0 = 0xe0e40800u, kL0 = 0xa0e41000u, kL1 = 0xa0e41001u;
     constexpr DWORD kDefC0 = 0xa00f0000u, kDefC1 = 0xa00f0001u;
@@ -826,6 +826,40 @@ float4 main(float4 a : TEXCOORD0, float4 b : TEXCOORD1, float2 v : VPOS) : COLOR
         d->SetPixelShader(nullptr);
       }
       if (ps) ps->Release();
+    }
+    return true;
+  }
+
+  // Reset while the application holds the back buffer or the automatic
+  // depth buffer fails; holding the swap chain does not stop it. Bars:
+  // white where Reset succeeded.
+  bool sceneResetHeld(IDirect3DDevice9* d) {
+    d->EndScene();
+    IDirect3DSwapChain9* chain = nullptr;
+    D3DPRESENT_PARAMETERS params = {};
+    if (FAILED(d->GetSwapChain(0, &chain)) || FAILED(chain->GetPresentParameters(&params)))
+      return false;
+    HRESULT results[4] = {};
+    IDirect3DSurface9* back = nullptr;
+    d->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &back);
+    D3DPRESENT_PARAMETERS p = params;
+    results[0] = d->Reset(&p);              // back buffer and swap chain held
+    if (back) back->Release();
+    p = params;
+    results[1] = d->Reset(&p);              // swap chain held
+    chain->Release();
+    IDirect3DSurface9* depth = nullptr;
+    d->GetDepthStencilSurface(&depth);
+    p = params;
+    results[2] = d->Reset(&p);              // automatic depth buffer held
+    if (depth) depth->Release();
+    p = params;
+    results[3] = d->Reset(&p);              // nothing held
+    d->BeginScene();
+    d->Clear(0, nullptr, D3DCLEAR_TARGET, 0xff000000u, 1.0f, 0);
+    for (int i = 0; i < 4; i++) {
+      const D3DRECT bar = { 2, 2 + i * 4, 20, 5 + i * 4 };
+      d->Clear(1, &bar, D3DCLEAR_TARGET, SUCCEEDED(results[i]) ? 0xffffffffu : 0xff404040u, 1.0f, 0);
     }
     return true;
   }
@@ -1863,6 +1897,7 @@ float4 main(float2 t : TEXCOORD0) : COLOR {
     { "aliased_elements", sceneAliasedElements },
     { "occlusion_boxes", sceneOcclusionBoxes },
     { "shader_tokens", sceneShaderTokens },
+    { "reset_held", sceneResetHeld },
     { "state_block", sceneStateBlock },
     { "sm3_loops", sceneSm3Loops },
     { "ps_1_4", scenePs14 },
@@ -2326,7 +2361,7 @@ int main(int argc, char** argv) {
   const char* filter = nullptr;
   int benchFrames = 0, benchDraws = 0;
   bool childForcedMsaa = false, identifier = false, childDpi = false, childFloatStrict = false, childDropped = false;
-  bool childSelfTest = false;
+  bool childSelfTest = false, dxupOnly = false;
   unsigned variantNonce = 0;
   for (int i = 1; i < argc; i++) {
     if (std::strcmp(argv[i], "--dump") == 0) dumpImages = true;
@@ -2338,6 +2373,7 @@ int main(int argc, char** argv) {
     else if (std::strcmp(argv[i], "--float-strict-child") == 0) childFloatStrict = true;
     else if (std::strcmp(argv[i], "--dropped-child") == 0) childDropped = true;
     else if (std::strcmp(argv[i], "--selftest-child") == 0) childSelfTest = true;
+    else if (std::strcmp(argv[i], "--dxup-only") == 0) dxupOnly = true;
     else if (std::strcmp(argv[i], "--variant-child") == 0 && i + 1 < argc) variantNonce = unsigned(std::strtoul(argv[++i], nullptr, 10));
     else if (std::strcmp(argv[i], "--bench") == 0 && i + 2 < argc) { benchFrames = std::atoi(argv[i + 1]); benchDraws = std::atoi(argv[i + 2]); i += 2; }
     else filter = argv[i];
@@ -2440,6 +2476,15 @@ int main(int argc, char** argv) {
       continue;
     std::vector<DWORD> reference, result;
     std::string error;
+    // Without Windows' D3D9 (no display): DXUP's picture only, to look at.
+    if (dxupOnly) {
+      const bool ran = run(dxup, scene, result, error);
+      std::printf("%s %-20s DXUP only%s%s\n", ran ? "ran " : "FAIL", scene.name, ran ? "" : ": ", ran ? "" : error.c_str());
+      if (ran)
+        writeImage((std::string(scene.name) + "_dxup.ppm").c_str(), result);
+      ran ? passed++ : failed++;
+      continue;
+    }
     if (!run(windows, scene, reference, error)) {
       std::printf("FAIL %-20s Windows: %s\n", scene.name, error.c_str());
       failed++;

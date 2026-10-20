@@ -195,14 +195,18 @@ namespace dxup::d3d9 {
   }
 
   ULONG Surface::AddRef() {
-    if (m_container)
+    if (m_container) {
+      ++m_containedRefs;
       return m_container->AddRef();
+    }
     return addRefPublic();
   }
 
   ULONG Surface::Release() {
-    if (m_container)
+    if (m_container) {
+      --m_containedRefs;
       return m_container->Release();
+    }
     return releasePublic();
   }
 
@@ -373,6 +377,8 @@ namespace dxup::d3d9 {
   HRESULT Volume::LockBox(D3DLOCKED_BOX* locked, const D3DBOX* box, DWORD flags) {
     if (!locked)
       return D3DERR_INVALIDCALL;
+    std::unique_lock<std::recursive_mutex> guard(m_device->mutex(), std::defer_lock);
+    if (m_device->multithreaded()) guard.lock();
     legacy::Box b = {};
     if (box)
       b = { box->Left, box->Top, box->Front, box->Right, box->Bottom, box->Back };
@@ -388,6 +394,8 @@ namespace dxup::d3d9 {
   }
 
   HRESULT Volume::UnlockBox() {
+    std::unique_lock<std::recursive_mutex> guard(m_device->mutex(), std::defer_lock);
+    if (m_device->multithreaded()) guard.lock();
     m_texture->unlock(m_level);
     return D3D_OK;
   }
@@ -622,12 +630,15 @@ namespace dxup::d3d9 {
   HRESULT BufferCommon<Base, Desc>::Lock(UINT offset, UINT size, void** data, DWORD flags) {
     if (!data)
       return D3DERR_INVALIDCALL;
+    // Draws read the buffer's clean ranges on other threads.
+    std::unique_lock<std::recursive_mutex> guard(this->m_device->mutex(), std::defer_lock);
+    if (this->m_device->multithreaded()) guard.lock();
     const UINT total = m_buffer->size();
     if (offset > total) {
       *data = nullptr;
       return D3DERR_INVALIDCALL;
     }
-    if (!size || offset + size > total)
+    if (!size || uint64_t(offset) + size > total)
       size = total - offset;
     if (flags & D3DLOCK_DISCARD)
       m_buffer->invalidate(0, 0);

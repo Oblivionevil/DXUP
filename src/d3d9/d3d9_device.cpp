@@ -140,14 +140,18 @@ namespace dxup::d3d9 {
   }
 
   ULONG SwapChain::AddRef() {
-    if (m_implicit)
+    if (m_implicit) {
+      ++m_appRefs;
       return m_device->addRefInternal();
+    }
     return addRefPublic();
   }
 
   ULONG SwapChain::Release() {
-    if (m_implicit)
+    if (m_implicit) {
+      --m_appRefs;
       return m_device->releaseInternal();
+    }
     return releasePublic();
   }
 
@@ -275,6 +279,10 @@ namespace dxup::d3d9 {
     if (m_autoDepthStencil)
       delete m_autoDepthStencil;
     delete m_swapChain;
+    for (Surface* surface : m_retiredSurfaces)
+      delete surface;
+    for (SwapChain* chain : m_retiredSwapChains)
+      delete chain;
     if (m_cursor)
       DestroyCursor(m_cursor);
     m_core.reset();
@@ -348,11 +356,19 @@ namespace dxup::d3d9 {
     m_core->setDepthStencil(nullptr);
     for (uint32_t i = 0; i < legacy::kMaxRenderTargets; i++)
       m_core->setRenderTarget(i, nullptr, 0);
+    // What the application still holds (Direct3D 9Ex) lives on until the
+    // device goes.
     if (m_autoDepthStencil) {
-      delete m_autoDepthStencil;
+      if (m_autoDepthStencil->heldByApplication())
+        m_retiredSurfaces.push_back(m_autoDepthStencil);
+      else
+        delete m_autoDepthStencil;
       m_autoDepthStencil = nullptr;
     }
-    delete m_swapChain;
+    if (m_swapChain && m_swapChain->heldByApplication())
+      m_retiredSwapChains.push_back(m_swapChain);
+    else
+      delete m_swapChain;
     m_swapChain = nullptr;
 
     D3DPRESENT_PARAMETERS p = *params;
@@ -561,6 +577,13 @@ namespace dxup::d3d9 {
     if (!params)
       return D3DERR_INVALIDCALL;
     DeviceLock lock(this);
+    // Direct3D 9 refuses while the application holds the back buffers or
+    // the automatic depth buffer (default pool resources).
+    if (!m_ex && ((m_autoDepthStencil && m_autoDepthStencil->heldByApplication())
+                  || (m_swapChain && m_swapChain->buffersHeld()))) {
+      logFailedCall(D3DERR_INVALIDCALL, "Reset while the application holds a back buffer or the automatic depth buffer");
+      return D3DERR_INVALIDCALL;
+    }
     if (m_recording) {
       m_recording->Release();
       m_recording = nullptr;
@@ -1149,8 +1172,7 @@ namespace dxup::d3d9 {
     static_assert(sizeof(legacy::Light) == sizeof(D3DLIGHT9), "light layouts");
     legacy::Light l;
     std::memcpy(&l, light, sizeof(l));
-    m_core->setLight(index, l);
-    return D3D_OK;
+    return m_core->setLight(index, l) ? D3D_OK : E_OUTOFMEMORY;
   }
 
   HRESULT Device::GetLight(DWORD index, D3DLIGHT9* light) {
@@ -1169,8 +1191,7 @@ namespace dxup::d3d9 {
       rec->lightEnables[index] = enable;
       return D3D_OK;
     }
-    m_core->lightEnable(index, enable != FALSE);
-    return D3D_OK;
+    return m_core->lightEnable(index, enable != FALSE) ? D3D_OK : E_OUTOFMEMORY;
   }
 
   HRESULT Device::GetLightEnable(DWORD index, BOOL* enable) {

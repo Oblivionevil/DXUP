@@ -324,9 +324,14 @@ namespace dxup::legacy {
     void     getTransform(uint32_t state, float* matrix) const;
     void     setMaterial(const Material& material);
     const Material& material() const { return m_material; }
-    void     setLight(uint32_t index, const Light& light);
+    // Light indices up to kMaxLights (Direct3D grows its light array to the
+    // index; larger ones fail as it runs out of memory).
+    static constexpr uint32_t kMaxLights = 1u << 16;
+    // The largest vertex index of the device caps.
+    static constexpr uint32_t kMaxVertexIndex = 0xffffff;
+    bool     setLight(uint32_t index, const Light& light);
     bool     getLight(uint32_t index, Light* light) const;
-    void     lightEnable(uint32_t index, bool enable);
+    bool     lightEnable(uint32_t index, bool enable);
     bool     lightEnabled(uint32_t index) const;
     void     setViewport(const Viewport& viewport);
     const Viewport& viewport() const { return m_viewport; }
@@ -385,6 +390,7 @@ namespace dxup::legacy {
               const Rect* srcRect, bool linear, bool colorKey, uint32_t keyColor);
     // Fills a rectangle of a surface with a color in its own format.
     void fill(Texture* dst, uint32_t dstSubresource, const Rect* dstRect, uint32_t color);
+    void fillTexel(Texture* dst, uint32_t dstSubresource, const Rect* dstRect, const uint8_t* texel);
     // Fills with a color given as ARGB (Direct3D 9 ColorFill).
     void fillArgb(Texture* dst, uint32_t dstSubresource, const Rect* dstRect, uint32_t argb);
 

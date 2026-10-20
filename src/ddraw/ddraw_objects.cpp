@@ -1,6 +1,7 @@
 #include "ddraw_objects.h"
 
 #include "../legacy/legacy_formats.h"
+#include "../util/com_ptr.h"
 #include "../util/util_gpu_spoof.h"
 #include "../util/util_types.h"
 
@@ -654,7 +655,7 @@ namespace dxup::ddraw {
     uint32_t pitch = 0;
     const legacy::Rect* lockRect = reinterpret_cast<const legacy::Rect*>(rect);
     if (!m_texture->lock(m_subresource, lockRect, (flags & DDLOCK_READONLY) != 0, &data, &pitch))
-      return DDERR_GENERIC;
+      return lockRect ? DDERR_INVALIDPARAMS : DDERR_GENERIC;   // rectangles outside the surface
     const DWORD size = desc->dwSize ? desc->dwSize : sizeof(DDSURFACEDESC2);
     std::memcpy(desc, &m_desc, (std::min)(size_t(size), sizeof(DDSURFACEDESC2)));
     desc->dwSize = size;
@@ -1055,7 +1056,7 @@ namespace dxup::ddraw {
   struct Device7::StateBlock {
     std::unordered_map<uint32_t, uint32_t> renderStates;
     std::unordered_map<uint32_t, uint32_t> stageStates;       // stage << 16 | type
-    std::unordered_map<uint32_t, Surface*> textures;
+    std::unordered_map<uint32_t, ComPtr<Surface>> textures;   // held: the application may release them
     std::unordered_map<uint32_t, D3DMATRIX> transforms;
     bool hasViewport = false;
     D3DVIEWPORT7 viewport = {};
@@ -1152,6 +1153,8 @@ namespace dxup::ddraw {
   }
 
   HRESULT Device7::Clear(DWORD count, LPD3DRECT rects, DWORD flags, D3DCOLOR color, D3DVALUE z, DWORD stencil) {
+    if (count && !rects)
+      return DDERR_INVALIDPARAMS;
     bindTargets();
     m_device->clear(count, reinterpret_cast<const legacy::Rect*>(rects), flags, color, z, stencil);
     return D3D_OK;
@@ -1228,8 +1231,7 @@ namespace dxup::ddraw {
     static_assert(sizeof(D3DLIGHT7) == sizeof(legacy::Light), "light layouts differ");
     if (!light) return DDERR_INVALIDPARAMS;
     if (m_recording) { m_recording->lights[index] = *light; return D3D_OK; }
-    m_device->setLight(index, *reinterpret_cast<const legacy::Light*>(light));
-    return D3D_OK;
+    return m_device->setLight(index, *reinterpret_cast<const legacy::Light*>(light)) ? D3D_OK : DDERR_OUTOFMEMORY;
   }
 
   HRESULT Device7::GetLight(DWORD index, LPD3DLIGHT7 light) {
@@ -1239,8 +1241,7 @@ namespace dxup::ddraw {
 
   HRESULT Device7::LightEnable(DWORD index, BOOL enable) {
     if (m_recording) { m_recording->lightEnables[index] = enable; return D3D_OK; }
-    m_device->lightEnable(index, enable != FALSE);
-    return D3D_OK;
+    return m_device->lightEnable(index, enable != FALSE) ? D3D_OK : DDERR_OUTOFMEMORY;
   }
 
   HRESULT Device7::GetLightEnable(DWORD index, BOOL* enable) {
@@ -1510,7 +1511,7 @@ namespace dxup::ddraw {
   void Device7::apply(const StateBlock& block) {
     for (const auto& [state, value] : block.renderStates) SetRenderState(D3DRENDERSTATETYPE(state), value);
     for (const auto& [key, value] : block.stageStates) SetTextureStageState(key >> 16, D3DTEXTURESTAGESTATETYPE(key & 0xffff), value);
-    for (const auto& [stage, texture] : block.textures) SetTexture(stage, texture);
+    for (const auto& [stage, texture] : block.textures) SetTexture(stage, texture.Get());
     for (const auto& [state, matrix] : block.transforms) { D3DMATRIX m = matrix; SetTransform(D3DTRANSFORMSTATETYPE(state), &m); }
     if (block.hasViewport) { D3DVIEWPORT7 v = block.viewport; SetViewport(&v); }
     if (block.hasMaterial) { D3DMATERIAL7 m = block.material; SetMaterial(&m); }

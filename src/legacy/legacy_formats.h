@@ -250,10 +250,38 @@ namespace dxup::legacy {
   }
 
   // And back (render targets read back in a converted format).
+  // Half floats of values 0 to 1 (colors), rounded to nearest.
+  inline uint16_t unitToHalf(float value) {
+    uint32_t bits;
+    std::memcpy(&bits, &value, 4);
+    const int32_t exponent = int32_t((bits >> 23) & 255) - 112;
+    if (exponent <= 0)
+      return 0;
+    const uint32_t half = (uint32_t(exponent) << 10) | ((bits >> 13) & 1023);
+    return uint16_t(half + ((bits >> 12) & 1));
+  }
+
+  // A color in a format's texel (up to 16 bytes); formats it has no
+  // conversion for are left alone.
   inline void fromArgb(Format format, uint32_t argb, uint8_t* dst) {
     const uint32_t a = argb >> 24, r = (argb >> 16) & 255, g = (argb >> 8) & 255, b = argb & 255;
+    const float fr = float(r) / 255.0f, fg = float(g) / 255.0f, fb = float(b) / 255.0f, fa = float(a) / 255.0f;
     uint16_t v16 = 0;
     switch (format) {
+      case FormatA2R10G10B10: { const uint32_t v = ((a >> 6) << 30) | ((r * 1023 + 127) / 255 << 20) | ((g * 1023 + 127) / 255 << 10)
+                                  | ((b * 1023 + 127) / 255); std::memcpy(dst, &v, 4); return; }
+      case FormatA2B10G10R10: { const uint32_t v = ((a >> 6) << 30) | ((b * 1023 + 127) / 255 << 20) | ((g * 1023 + 127) / 255 << 10)
+                                  | ((r * 1023 + 127) / 255); std::memcpy(dst, &v, 4); return; }
+      case FormatG16R16: { const uint16_t v[2] = { uint16_t(r * 257), uint16_t(g * 257) }; std::memcpy(dst, v, 4); return; }
+      case FormatA16B16G16R16: { const uint16_t v[4] = { uint16_t(r * 257), uint16_t(g * 257), uint16_t(b * 257), uint16_t(a * 257) };
+                                 std::memcpy(dst, v, 8); return; }
+      case FormatR16F: { const uint16_t v = unitToHalf(fr); std::memcpy(dst, &v, 2); return; }
+      case FormatG16R16F: { const uint16_t v[2] = { unitToHalf(fr), unitToHalf(fg) }; std::memcpy(dst, v, 4); return; }
+      case FormatA16B16G16R16F: { const uint16_t v[4] = { unitToHalf(fr), unitToHalf(fg), unitToHalf(fb), unitToHalf(fa) };
+                                  std::memcpy(dst, v, 8); return; }
+      case FormatR32F: std::memcpy(dst, &fr, 4); return;
+      case FormatG32R32F: { const float v[2] = { fr, fg }; std::memcpy(dst, v, 8); return; }
+      case FormatA32B32G32R32F: { const float v[4] = { fr, fg, fb, fa }; std::memcpy(dst, v, 16); return; }
       case FormatA8R8G8B8:
       case FormatX8R8G8B8: std::memcpy(dst, &argb, 4); return;
       case FormatA8B8G8R8:

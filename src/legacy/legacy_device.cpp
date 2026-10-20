@@ -526,6 +526,15 @@ namespace dxup::legacy {
                         uint32_t* slicePitchOut, bool discard) {
     if (subresource >= m_levels.size() || !data || m_desc.format == FormatNULL)
       return false;
+    if (box) {
+      // Boxes inside the level only (block formats: up to whole blocks).
+      const uint32_t block = formatInfo(m_desc.format).block ? 4u : 1u;
+      const uint32_t w = (width(subresource) + block - 1) / block * block;
+      const uint32_t h = (height(subresource) + block - 1) / block * block;
+      if (box->left > box->right || box->top > box->bottom || box->front > box->back
+       || box->right > w || box->bottom > h || box->back > depth(subresource))
+        return false;
+    }
     Level& level = m_levels[subresource];
     if (level.data.empty())
       level.data.resize(levelSize(subresource));
@@ -829,7 +838,7 @@ namespace dxup::legacy {
       return;
     const uint32_t total = uint32_t(m_data.size());
     uint32_t begin = (std::min)(offset, total);
-    const uint32_t end = (std::min)(size ? offset + size : total, total);
+    const uint32_t end = uint32_t((std::min)(size ? uint64_t(offset) + size : uint64_t(total), uint64_t(total)));
     if (begin >= end)
       return;
     // Already clean (the usual draw): nothing to upload or merge.
@@ -2109,13 +2118,16 @@ namespace dxup::legacy {
     m_vertexConstantsDirty = true;
   }
 
-  void Device::setLight(uint32_t index, const Light& light) {
+  bool Device::setLight(uint32_t index, const Light& light) {
+    if (index >= kMaxLights)
+      return false;
     if (index >= m_lights.size()) {
       m_lights.resize(index + 1);
       m_lightEnabled.resize(index + 1, false);
     }
     m_lights[index] = light;
     m_vertexConstantsDirty = true;
+    return true;
   }
 
   bool Device::getLight(uint32_t index, Light* light) const {
@@ -2125,7 +2137,9 @@ namespace dxup::legacy {
     return true;
   }
 
-  void Device::lightEnable(uint32_t index, bool enable) {
+  bool Device::lightEnable(uint32_t index, bool enable) {
+    if (index >= kMaxLights)
+      return false;
     if (index >= m_lights.size()) {
       // As Direct3D: enabling an unset light sets the default one.
       Light defaults = {};
@@ -2136,6 +2150,7 @@ namespace dxup::legacy {
     }
     m_lightEnabled[index] = enable;
     m_vertexConstantsDirty = true;
+    return true;
   }
 
   bool Device::lightEnabled(uint32_t index) const {
@@ -3846,6 +3861,11 @@ namespace dxup::legacy {
       }
     }
 
+    // Byte ranges past 4 GB are cut to what a buffer can hold.
+    uint32_t clampBytes(uint64_t bytes) {
+      return uint32_t((std::min)(bytes, uint64_t(UINT32_MAX)));
+    }
+
     // Triangle fans as lists: (0, i, i + 1).
     template<typename T>
     std::vector<uint32_t> fanToList(const T* indices, uint32_t count) {
@@ -3889,7 +3909,8 @@ namespace dxup::legacy {
       return;
     }
     const uint32_t end = a.minIndex + a.vertexCount;
-    if (lo >= a.minIndex && hi < end)
+    // Indices past the largest vertex index (caps) do not widen the range.
+    if ((lo >= a.minIndex && hi < end) || hi > kMaxVertexIndex)
       return;
     if (m_rangeReports < 8) {
       m_rangeReports++;
@@ -3982,10 +4003,11 @@ namespace dxup::legacy {
             offset = UINT(begin);
           }
         } else if (a.indexed) {
-          s.buffer->prepare(s.offset + uint32_t((std::max<int64_t>)(0, firstVertex) * stride), a.vertexCount * stride);
+          s.buffer->prepare(clampBytes(s.offset + uint64_t((std::max<int64_t>)(0, firstVertex)) * stride),
+                            clampBytes(uint64_t(a.vertexCount) * stride));
           if (rebase) offset = UINT(s.offset + uint64_t(firstVertex) * stride);
         } else {
-          s.buffer->prepare(s.offset + a.startVertex * stride, a.vertexCount * stride);
+          s.buffer->prepare(clampBytes(s.offset + uint64_t(a.startVertex) * stride), clampBytes(uint64_t(a.vertexCount) * stride));
           if (rebase) offset = UINT(s.offset + uint64_t(firstVertex) * stride);
         }
       }
@@ -4017,7 +4039,8 @@ namespace dxup::legacy {
       if (a.indexed) {
         const void* source = a.userIndices;
         bool index32 = a.userIndex32;
-        if (!source && m_indices) {
+        if (!source && m_indices
+         && (uint64_t(a.startIndex) + a.indexCount) * (m_index32 ? 4 : 2) <= m_indices->size()) {
           index32 = m_index32;
           source = m_indices->data() + size_t(a.startIndex) * (index32 ? 4 : 2);
         }
@@ -4052,7 +4075,7 @@ namespace dxup::legacy {
     UINT startIndex = a.startIndex;
     const uint32_t indexSize = m_index32 ? 4 : 2;
     if (!a.userIndices && m_indices && m_indices->dynamic()
-     && uint64_t(a.startIndex + a.indexCount) * indexSize <= m_indices->size()) {
+     && (uint64_t(a.startIndex) + a.indexCount) * indexSize <= m_indices->size()) {
       // Dynamic indices: the range drawn through the index ring.
       m_indices->noteStreamedDraw();
       const uint32_t indexOffset = uploadIndices(m_indices->data() + size_t(a.startIndex) * indexSize, a.indexCount * indexSize);
@@ -4075,7 +4098,7 @@ namespace dxup::legacy {
     } else {
       if (!m_indices)
         return dropDraw(DropIndices);
-      m_indices->prepare(a.startIndex * (m_index32 ? 4 : 2), a.indexCount * (m_index32 ? 4 : 2));
+      m_indices->prepare(clampBytes(uint64_t(a.startIndex) * indexSize), clampBytes(uint64_t(a.indexCount) * indexSize));
       m_context->IASetIndexBuffer(m_indices->resource(), m_index32 ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R16_UINT, 0);
     }
     if (instances > 1)
@@ -4525,19 +4548,29 @@ namespace dxup::legacy {
   }
 
   void Device::fill(Texture* dst, uint32_t dstSubresource, const Rect* dstRect, uint32_t color) {
+    uint8_t texel[16] = {};
+    std::memcpy(texel, &color, 4);
+    fillTexel(dst, dstSubresource, dstRect, texel);
+  }
+
+  // texel: the bytes of one texel in the texture's format (up to 16).
+  void Device::fillTexel(Texture* dst, uint32_t dstSubresource, const Rect* dstRect, const uint8_t* texel) {
     if (!dst)
       return;
+    uint32_t color = 0;
+    std::memcpy(&color, texel, 4);
     const Rect r = dstRect ? *dstRect : Rect{ 0, 0, int32_t(dst->width(dstSubresource)), int32_t(dst->height(dstSubresource)) };
     if (dst->desc().systemMemory || !dst->rtv(dstSubresource)) {
+      const FormatInfo info = formatInfo(dst->desc().format);
       void* data = nullptr;
       uint32_t pitch = 0;
-      if (!dst->lock(dstSubresource, nullptr, false, &data, &pitch))
+      if (info.block || info.bytesPerBlock > 16 || !dst->lock(dstSubresource, nullptr, false, &data, &pitch))
         return;
-      const uint32_t bpp = formatInfo(dst->desc().format).bytesPerBlock;
+      const uint32_t bpp = info.bytesPerBlock;
       const int32_t w = int32_t(dst->width(dstSubresource)), h = int32_t(dst->height(dstSubresource));
       for (int32_t y = (std::max)(0, r.top); y < (std::min)(h, r.bottom); y++)
         for (int32_t x = (std::max)(0, r.left); x < (std::min)(w, r.right); x++)
-          std::memcpy(static_cast<uint8_t*>(data) + size_t(y) * pitch + size_t(x) * bpp, &color, bpp);
+          std::memcpy(static_cast<uint8_t*>(data) + size_t(y) * pitch + size_t(x) * bpp, texel, bpp);
       dst->unlock(dstSubresource);
       return;
     }
@@ -4726,10 +4759,8 @@ namespace dxup::legacy {
       return;
     uint8_t raw[16] = {};
     fromArgb(dst->desc().format, argb, raw);
-    uint32_t color = 0;
-    std::memcpy(&color, raw, 4);
     if (dst->desc().systemMemory || !dst->rtv(dstSubresource)) {
-      fill(dst, dstSubresource, dstRect, color);
+      fillTexel(dst, dstSubresource, dstRect, raw);
       return;
     }
     const Rect r = dstRect ? *dstRect : Rect{ 0, 0, int32_t(dst->width(dstSubresource)), int32_t(dst->height(dstSubresource)) };
