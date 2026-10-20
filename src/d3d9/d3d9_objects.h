@@ -709,6 +709,9 @@ namespace dxup::d3d9 {
     bool                            m_ex;
     std::recursive_mutex            m_mutex;
     std::unique_ptr<legacy::Device> m_core;
+    // StretchRect's resolve target for multisampled sources it cannot
+    // resolve into the destination, kept for the next of that size.
+    std::shared_ptr<legacy::Texture> m_resolveTarget;
     SwapChain*                      m_swapChain = nullptr;   // implicit
     Surface*                        m_autoDepthStencil = nullptr;
     // Swap chains and depth buffers replaced by Reset that the application

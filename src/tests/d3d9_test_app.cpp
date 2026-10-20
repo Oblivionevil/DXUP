@@ -1825,6 +1825,65 @@ VO main(float3 p : POSITION, float4 c : COLOR0) { VO o; o.p = float4(p.xy * 0.8 
     return true;
   }
 
+  // A render target generating its mipmaps, drawn into (a clear, a triangle
+  // fan, a clear in another viewport) and then sampled at levels 0 to 4; a
+  // multisampled target resolved into two parts of the back buffer.
+  bool sceneAutogenTarget(IDirect3DDevice9* d) {
+    IDirect3DTexture9* texture = nullptr;
+    if (FAILED(d->CreateTexture(32, 32, 0, D3DUSAGE_RENDERTARGET | D3DUSAGE_AUTOGENMIPMAP, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT,
+                                &texture, nullptr)))
+      return false;
+    IDirect3DSurface9 *level = nullptr, *back = nullptr, *depth = nullptr;
+    texture->GetSurfaceLevel(0, &level);
+    d->GetRenderTarget(0, &back);
+    d->GetDepthStencilSurface(&depth);
+    d->SetRenderTarget(0, level);
+    d->SetDepthStencilSurface(nullptr);
+    d->SetRenderState(D3DRS_LIGHTING, FALSE);
+    d->SetRenderState(D3DRS_ZENABLE, FALSE);
+    d->Clear(0, nullptr, D3DCLEAR_TARGET, 0xffff0000u, 1.0f, 0);
+    const TLVertex fan[4] = {
+      { -0.5f, -0.5f, 0.5f, 1.0f, 0xff00ff00u }, { 15.5f, -0.5f, 0.5f, 1.0f, 0xff00ff00u },
+      { 15.5f, 31.5f, 0.5f, 1.0f, 0xff00ff00u }, { -0.5f, 31.5f, 0.5f, 1.0f, 0xff00ff00u },
+    };
+    d->SetFVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE);
+    d->DrawPrimitiveUP(D3DPT_TRIANGLEFAN, 2, fan, sizeof(TLVertex));
+    D3DVIEWPORT9 quarter = { 16, 16, 16, 16, 0.0f, 1.0f };
+    d->SetViewport(&quarter);
+    d->Clear(0, nullptr, D3DCLEAR_TARGET, 0xff0000ffu, 1.0f, 0);
+    d->SetRenderTarget(0, back);
+    d->SetDepthStencilSurface(depth);
+    d->Clear(0, nullptr, D3DCLEAR_TARGET, 0xff202020u, 1.0f, 0);
+    d->SetTexture(0, texture);
+    d->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_POINT);
+    d->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
+    d->SetSamplerState(0, D3DSAMP_MIPFILTER, D3DTEXF_POINT);
+    d->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
+    d->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
+    d->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1);
+    d->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE);
+    texturedRect(d, 0.0f, 0.0f, 32.0f, 32.0f);
+    texturedRect(d, 36.0f, 0.0f, 44.0f, 8.0f);
+    texturedRect(d, 48.0f, 0.0f, 52.0f, 4.0f);
+    texturedRect(d, 56.0f, 0.0f, 58.0f, 2.0f);
+    d->SetTexture(0, nullptr);
+    IDirect3DSurface9* msaa = nullptr;
+    if (SUCCEEDED(d->CreateRenderTarget(12, 12, D3DFMT_A8R8G8B8, D3DMULTISAMPLE_4_SAMPLES, 0, FALSE, &msaa, nullptr))) {
+      d->SetRenderTarget(0, msaa);
+      d->Clear(0, nullptr, D3DCLEAR_TARGET, 0xffffff00u, 1.0f, 0);
+      d->SetRenderTarget(0, back);
+      const RECT a = { 36, 34, 48, 46 }, b = { 50, 34, 62, 46 };
+      d->StretchRect(msaa, nullptr, back, &a, D3DTEXF_NONE);
+      d->StretchRect(msaa, nullptr, back, &b, D3DTEXF_NONE);
+      msaa->Release();
+    }
+    if (depth) depth->Release();
+    back->Release();
+    level->Release();
+    texture->Release();
+    return true;
+  }
+
   // Textures of the formats that convert or compress, sampled side by side.
   bool sceneFormats(IDirect3DDevice9* d) {
     d->Clear(0, nullptr, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, 0xff000000u, 1.0f, 0);
@@ -2086,6 +2145,7 @@ float4 main(float2 t : TEXCOORD0) : COLOR {
     { "ps_1_4", scenePs14 },
     { "mip_filter", sceneMipFilter, 6 },
     { "sampler_filters", sceneSamplerFilters, 6 },
+    { "autogen_target", sceneAutogenTarget },
   };
 
   // ---- Running ----

@@ -1563,7 +1563,16 @@ namespace dxup {
     bool                         m_glitchAsideValid[2] = {};
     uint32_t                     m_glitchLastSeen = 0;     // the last glitch frame any candidate had
     uint32_t                     m_glitchSuppressed = 0;
-    uint32_t                     m_traceGoPresents = 0;
+    uint64_t                     m_traceGoLastCheck = 0;   // GetTickCount64
+
+    bool traceGoDue() {
+      const uint64_t now = GetTickCount64();
+      if (now - m_traceGoLastCheck < 2000)
+        return false;
+      m_traceGoLastCheck = now;
+      static const std::string path = dxupSiblingPath("dxup_trace_go.txt");
+      return GetFileAttributesA(path.c_str()) != INVALID_FILE_ATTRIBUTES;
+    }
     uint32_t                     m_traceGoFrames = 0;
     bool                         m_traceGoDone = false;
     uint32_t                     m_windowSizePresents = 0;
@@ -1759,8 +1768,8 @@ namespace dxup {
       // and the driver's pacing see the application thread as they would
       // with a native device.
       IBackendContext* ctx = backendContext();
-      // With dxup_trace_go.txt next to the DLL (looked for every 64
-      // presents), the calls of the two frames after it appears go into
+      // With dxup_trace_go.txt next to the DLL (looked for every two
+      // seconds), the calls of the two frames after it appears go into
       // the log.
       if (!m_traceGoDone && !(flags & DXGI_PRESENT_TEST)) {
         if (m_traceGoFrames) {
@@ -1768,8 +1777,7 @@ namespace dxup {
             m_d3d11Device->diagTraceDraws.store(false, std::memory_order_relaxed);
             m_traceGoDone = true;
           }
-        } else if (!(m_traceGoPresents++ & 63)
-                && GetFileAttributesA(dxupSiblingPath("dxup_trace_go.txt").c_str()) != INVALID_FILE_ATTRIBUTES) {
+        } else if (traceGoDue()) {
           m_traceGoFrames = 2;
           m_d3d11Device->diagTraceDraws.store(true, std::memory_order_relaxed);
           m_d3d11Device->diagTraceIndex.store(0, std::memory_order_relaxed);

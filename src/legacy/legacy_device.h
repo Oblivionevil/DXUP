@@ -88,8 +88,9 @@ namespace dxup::legacy {
                  bool discard = false);
     void unlock(uint32_t subresource);
     // Uploads changed subresources (unlocked since the last draw), and
-    // generates mips the texture generates.
-    void flush();
+    // generates mips the texture generates when mips (it is sampled, not
+    // drawn into).
+    void flush(bool mips = true);
 
     void setPalette(const uint32_t* entries);
     // Texels of the key color become transparent (color-keyed textures).
@@ -187,8 +188,9 @@ namespace dxup::legacy {
     // until the buffer is written again; false past the buffer's end.
     bool indexRange(uint32_t start, uint32_t count, bool index32, uint32_t& lo, uint32_t& hi);
   private:
-    struct IndexRange { uint32_t version, lo, hi; };
-    std::unordered_map<uint64_t, IndexRange> m_indexRanges;
+    struct IndexRange { uint32_t lo, hi; };
+    std::unordered_map<uint64_t, IndexRange> m_indexRanges;   // of m_indexRangesVersion
+    uint32_t           m_indexRangesVersion = 0;
     uint32_t           m_version = 0;   // counts writes
     Device*            m_device;
     std::vector<uint8_t> m_data;
@@ -443,6 +445,7 @@ namespace dxup::legacy {
     void updateTransformConstants();
     void updatePixelConstants();
     void updateShaderConstants(bool pixel);
+    void bindShaderConstants(bool pixel);
     void updateShaderInts(bool pixel);
     void updateShaderFixedConstants();
     ID3D11BlendState*        blendState();
@@ -451,6 +454,7 @@ namespace dxup::legacy {
     ID3D11RasterizerState*   rasterizerState();
     ID3D11SamplerState*      d3dSampler(uint32_t sampler, bool compare);
     void bindTargets();
+    void bindViewport();
     void bindTextures();
     void drawWith(const DrawArgs& args);
     void widenVertexRange(DrawArgs& a);
@@ -479,10 +483,15 @@ namespace dxup::legacy {
     struct SwapChain {
       HWND window = nullptr;
       Ref<IDXGISwapChain1> swapChain;
+      // Buffer 0's view (flip model: always the buffer drawn next), and the
+      // buffers' size; both until a resize.
+      Ref<ID3D11RenderTargetView> rtv;
+      UINT bufferWidth = 0, bufferHeight = 0;
       UINT width = 0, height = 0;
       UINT flags = 0;
     };
     int m_tearing = -1;   // whether presents without VSync may tear (unknown: -1)
+    std::vector<uint32_t> m_fanIndices;   // triangle fans drawn as lists
     std::vector<std::unique_ptr<SwapChain>> m_swapChains;
     Ref<ID3D11VertexShader>         m_ffpVs;
     Ref<ID3D11PixelShader>          m_ffpPs;
@@ -505,6 +514,10 @@ namespace dxup::legacy {
     Ref<ID3D11DeviceContext1>       m_context1;
     Ref<ID3D11Buffer>               m_constantRings[2];
     uint32_t                        m_constantRingOffsets[2] = { kConstantRingSize, kConstantRingSize };
+    // The window last written per stage: bound again for another shader
+    // that reads no more (the ring has not been discarded since).
+    struct ConstantWindow { UINT first = 0, count = 0, floats = 0; bool valid = false; };
+    ConstantWindow                  m_constantWindows[2];
     Ref<ID3D11Buffer>               m_shaderIntConstants[2];
     Ref<ID3D11Buffer>               m_shaderFixedConstants;
     Ref<ID3D11Buffer>               m_clipPlaneConstants;   // shader vertex stage, b3
@@ -570,7 +583,8 @@ namespace dxup::legacy {
       uint32_t limits[4];   // the last float constant, vertex input modes (dxup_inputModes, dxup_inputWOne)
     };
     ConstantStore m_constants[2] = {};      // vertex, pixel
-    bool m_shaderConstantsDirty[2] = { true, true };
+    bool m_shaderConstantsDirty[2] = { true, true };   // the floats changed
+    bool m_shaderConstantsUnbound[2] = { true, true };  // b0 lost its window
     bool m_shaderIntsDirty[2] = { true, true };
 
     // The pipeline the bound state selects.
@@ -613,7 +627,8 @@ namespace dxup::legacy {
     // their shaders, declaration, streams (and first vertices), indices and
     // constants (checked every 64 presents, once per file).
     bool m_trace9 = false, m_trace9Done = false;
-    uint32_t m_trace9Draw = 0, m_trace9Presents = 0;
+    uint32_t m_trace9Draw = 0;
+    uint64_t m_trace9LastCheck = 0;   // GetTickCount64
     int32_t m_trace9X = -1, m_trace9Y = -1;   // probe pixel of target 0 after each draw
     Ref<ID3D11Texture2D> m_trace9Staging;
     DXGI_FORMAT m_trace9Format = DXGI_FORMAT_UNKNOWN;
@@ -647,6 +662,7 @@ namespace dxup::legacy {
     bool m_shaderFixedDirty = true;
     bool m_clipPlanesDirty = true;
     bool m_targetsDirty = true;
+    bool m_viewportDirty = true;   // viewport and scissor only
     ID3D11ShaderResourceView* m_boundViews[24] = {};
     ID3D11ShaderResourceView* m_boundVertexViews[4] = {};
     ID3D11SamplerState*       m_boundSamplers[kSamplerCount] = {};

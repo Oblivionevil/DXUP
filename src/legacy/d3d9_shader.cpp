@@ -258,6 +258,7 @@ namespace dxup::legacy {
       std::string* out = &body;
       int indent = 1;
       std::map<uint32_t, std::string> floatDefs, intDefs, boolDefs;
+      std::map<uint32_t, std::array<uint32_t, 4>> floatDefBits;   // c0-c255
       uint32_t maxTemp = 0, maxConst = 0;
       uint32_t colorInputs = 0;       // pixel shaders before 3.0: v0/v1 read
       uint32_t texCoordInputs = 0;    // pixel shaders before 3.0: texture coordinates read
@@ -335,13 +336,10 @@ namespace dxup::legacy {
               : op.type == RegConst4 ? 6144 : 0);
             if (op.relative) {
               info.relativeConstants = true;
-              // The shader's own def constants read as their values
-              // (Direct3D 9; Unreal Engine 3's landscape selects rows of a
-              // defined identity matrix).
-              if (!floatDefs.empty())
-                return "dxup_c(uint(" + relativeOffset(op) + str(index) + "))";
-              // The last index from the buffer: a bound the compiler can
-              // prove makes it much slower; negative indices wrap to it.
+              // The shader's own def constants are in the buffer too
+              // (ShaderInfo9::relativeDefs). The last index from the buffer:
+              // a bound the compiler can prove makes it much slower;
+              // negative indices wrap to it.
               return "c[min(uint(" + relativeOffset(op) + str(index) + "), dxup_lastConstant)]";
             }
             auto def = floatDefs.find(index);
@@ -920,6 +918,8 @@ namespace dxup::legacy {
         const uint32_t index = d.index + (d.type == RegConst2 ? 2048 : d.type == RegConst3 ? 4096 : d.type == RegConst4 ? 6144 : 0);
         w.floatDefs[index] = "float4(" + floatLiteral(i.literal[0]) + ", " + floatLiteral(i.literal[1]) + ", "
           + floatLiteral(i.literal[2]) + ", " + floatLiteral(i.literal[3]) + ")";
+        if (index < 256)
+          w.floatDefBits[index] = { i.literal[0], i.literal[1], i.literal[2], i.literal[3] };
         if (layout)
           layout->floatDefs[index] = { i.literal[0], i.literal[1], i.literal[2], i.literal[3] };
       } else if (i.opcode == OpDefI) {
@@ -1002,13 +1002,6 @@ namespace dxup::legacy {
     s += "float4 dxup_lit(float4 s) { float p = clamp(s.w, -127.9961f, 127.9961f); "
          "return float4(1.0f, max(s.x, 0.0f), s.x > 0.0f && s.y > 0.0f ? dxup_pow(s.y, p) : 0.0f, 1.0f); }\n";
     s += "float3 dxup_reflect(float3 n, float3 e) { return 2.0f * dot(n, e) / dot(n, n) * n - e; }\n";
-    if (info.relativeConstants && !w.floatDefs.empty()) {
-      // Relative reads: the defined constants first, then the buffer.
-      s += "float4 dxup_c(uint i) {\n  i = min(i, dxup_lastConstant);\n  return ";
-      for (const auto& def : w.floatDefs)
-        s += "i == " + std::to_string(def.first) + "u ? " + def.second + " : ";
-      s += "c[i];\n}\n";
-    }
     if (vertex && info.major == 1) {
       s += "float4 dxup_expp(float x) { float f = floor(x); return float4(exp2(f), x - f, exp2(x), 1.0f); }\n";
       s += "float4 dxup_logp(float x) { float a = abs(x); if (a == 0.0f) return float4(-3.402823466e38f, 1.0f, -3.402823466e38f, 1.0f);\n"
@@ -1266,6 +1259,8 @@ namespace dxup::legacy {
     s += "  return output;\n}\n";
 
     info.floatConstantCount = info.relativeConstants ? 256 : (std::min)(w.maxConst, 256u);
+    if (info.relativeConstants)
+      info.relativeDefs.assign(w.floatDefBits.begin(), w.floatDefBits.end());
     hlsl = std::move(s);
     if (layout) {
       layout->instructions = std::move(instructions);

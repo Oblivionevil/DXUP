@@ -595,7 +595,7 @@ namespace dxup::legacy {
     }
   }
 
-  void Texture::flush() {
+  void Texture::flush(bool mips) {
     if (m_anyDirty) {
       m_anyDirty = false;
       for (uint32_t i = 0; i < m_levels.size(); i++) {
@@ -607,7 +607,7 @@ namespace dxup::legacy {
         }
       }
     }
-    if (m_mipsDirty) {
+    if (m_mipsDirty && mips) {
       m_mipsDirty = false;
       if (m_srv && m_desc.levels > 1)
         m_device->context()->GenerateMips(m_srv.get());
@@ -787,11 +787,15 @@ namespace dxup::legacy {
     if (!count || (uint64_t(start) + count) * size > m_data.size())
       return false;
     const uint64_t key = (uint64_t(start) << 33) ^ (uint64_t(count) << 1) ^ (index32 ? 1u : 0u);
-    auto it = m_indexRanges.find(key);
-    if (it != m_indexRanges.end() && it->second.version == m_version) {
-      lo = it->second.lo;
-      hi = it->second.hi;
-      return true;
+    // Ranges of dynamic buffers are drawn once each: not kept.
+    const bool keep = !m_dynamic;
+    if (keep && m_indexRangesVersion == m_version) {
+      auto it = m_indexRanges.find(key);
+      if (it != m_indexRanges.end()) {
+        lo = it->second.lo;
+        hi = it->second.hi;
+        return true;
+      }
     }
     lo = UINT32_MAX;
     hi = 0;
@@ -808,9 +812,14 @@ namespace dxup::legacy {
         hi = (std::max)(hi, uint32_t(indices[i]));
       }
     }
-    if (m_indexRanges.size() >= 4096)
+    if (!keep)
+      return true;
+    // Those of earlier contents go at once.
+    if (m_indexRangesVersion != m_version || m_indexRanges.size() >= 4096) {
       m_indexRanges.clear();
-    m_indexRanges[key] = { m_version, lo, hi };
+      m_indexRangesVersion = m_version;
+    }
+    m_indexRanges[key] = { lo, hi };
     return true;
   }
 
@@ -1131,7 +1140,7 @@ namespace dxup::legacy {
 
     // Changes whenever the translator's output changes (the HLSL path's;
     // DXUP's compiler is not cached, it is faster than reading the cache).
-    constexpr uint64_t kTranslatorVersion = 8;
+    constexpr uint64_t kTranslatorVersion = 9;
 
     // The shaders draws used in this and earlier runs, their code and the
     // variants they were drawn with: compiled at the start of a later run,
@@ -1154,8 +1163,8 @@ namespace dxup::legacy {
       static_assert(sizeof(Record) == 40, "record layout");
 
       static VariantRecords& instance() {
-        static VariantRecords records;
-        return records;
+        static VariantRecords* records = new VariantRecords();   // lives until the process ends (its writer)
+        return *records;
       }
 
       // A variant a draw used (options as Shader::variant keys them).
@@ -1228,22 +1237,49 @@ namespace dxup::legacy {
         return hash;
       }
 
-      // One write per entry (other processes of the game may append too).
+      // Under m_mutex. A thread of its own writes the entries: opening the
+      // file took the drawing thread up to milliseconds per new variant.
+      // One write per batch of whole entries (other processes of the game
+      // may append too).
       void append(uint32_t type, const void* data, size_t size) {
         if (m_path.empty() || m_size + size > kMaxBytes)
           return;
-        std::vector<uint8_t> entry;
+        std::vector<uint8_t>& entry = m_pending;
         if (m_size == 0)
           entry.insert(entry.end(), reinterpret_cast<const uint8_t*>(kHeader), reinterpret_cast<const uint8_t*>(kHeader) + sizeof(kHeader));
         const uint32_t head[2] = { type, uint32_t(size) };
         entry.insert(entry.end(), reinterpret_cast<const uint8_t*>(head), reinterpret_cast<const uint8_t*>(head) + sizeof(head));
         entry.insert(entry.end(), static_cast<const uint8_t*>(data), static_cast<const uint8_t*>(data) + size);
-        FILE* file = nullptr;
-        if (_wfopen_s(&file, m_path.c_str(), L"ab") != 0 || !file)
-          return;
-        fwrite(entry.data(), 1, entry.size(), file);
-        fclose(file);
-        m_size += entry.size();
+        m_size += (m_size == 0 ? sizeof(kHeader) : 0) + sizeof(head) + size;
+        if (!m_writerStarted) {
+          try {
+            Thread([this] { write(); }).detach();
+            m_writerStarted = true;
+          } catch (const std::system_error&) {
+            m_pending.clear();
+            m_path.clear();
+            return;
+          }
+        }
+        m_wake.notify_one();
+      }
+
+      void write() {
+        SetThreadDescription(GetCurrentThread(), L"dxup-d3d9-records");
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+        for (;;) {
+          std::vector<uint8_t> batch;
+          {
+            std::unique_lock<std::mutex> lock(m_mutex);
+            m_wake.wait(lock, [this] { return !m_pending.empty(); });
+            batch.swap(m_pending);
+          }
+          FILE* file = nullptr;
+          if (_wfopen_s(&file, m_path.c_str(), L"ab") != 0 || !file)
+            continue;
+          fwrite(batch.data(), 1, batch.size(), file);
+          fclose(file);
+        }
       }
 
       VariantRecords() {
@@ -1288,7 +1324,10 @@ namespace dxup::legacy {
       }
 
       std::mutex m_mutex;
-      std::wstring m_path;
+      std::condition_variable m_wake;
+      std::vector<uint8_t> m_pending;   // entries the writer has not written
+      bool m_writerStarted = false;
+      std::wstring m_path;              // fixed once made
       size_t m_size = 0;
       std::unordered_set<uint64_t> m_known;
       std::unordered_multimap<uint64_t, Record> m_records;
@@ -2053,7 +2092,7 @@ namespace dxup::legacy {
 
   void Device::invalidateBindings() {
     m_dirty = DirtyAll;
-    m_targetsDirty = true;
+    m_targetsDirty = m_viewportDirty = true;
     m_textureDirtyMask = m_samplerDirtyMask = (1u << kSamplerCount) - 1;
     std::memset(m_boundViews, 0, sizeof(m_boundViews));
     std::memset(m_boundVertexViews, 0, sizeof(m_boundVertexViews));
@@ -2182,13 +2221,13 @@ namespace dxup::legacy {
 
   void Device::setViewport(const Viewport& viewport) {
     m_viewport = viewport;
-    m_targetsDirty = true;
+    m_viewportDirty = true;
     m_vertexConstantsDirty = true;
   }
 
   void Device::setScissor(const Rect& rect) {
     m_scissor = rect;
-    m_targetsDirty = true;
+    m_viewportDirty = true;
   }
 
   void Device::setRenderTarget(uint32_t index, Texture* target, uint32_t subresource) {
@@ -2216,7 +2255,7 @@ namespace dxup::legacy {
     m_viewport = { 0, 0, target->width(subresource), target->height(subresource), 0.0f, 1.0f };
     m_scissor = { 0, 0, int32_t(m_viewport.width), int32_t(m_viewport.height) };
     m_vertexConstantsDirty = true;
-    m_targetsDirty = true;
+    m_viewportDirty = true;
   }
 
   void Device::setDepthStencil(Texture* depth) {
@@ -2234,8 +2273,7 @@ namespace dxup::legacy {
     if (m_vertexShader == shader)
       return;
     m_vertexShader = shader;
-    m_dirty |= DirtyShaders | DirtyLayout;
-    m_shaderConstantsDirty[0] = true;
+    m_dirty |= DirtyShaders | DirtyLayout;   // binds the floats again (bindShaderConstants)
   }
 
   void Device::setPixelShader(Shader* shader) {
@@ -2246,7 +2284,6 @@ namespace dxup::legacy {
       m_textureDirtyMask = m_samplerDirtyMask = (1u << kSamplerCount) - 1;
     m_pixelShader = shader;
     m_dirty |= DirtyShaders | DirtyLayout;
-    m_shaderConstantsDirty[1] = true;
   }
 
   void Device::setShaderConstantF(bool pixel, uint32_t start, const float* data, uint32_t count) {
@@ -3485,13 +3522,14 @@ namespace dxup::legacy {
     // The floats the shader reads, in a window of 16-constant steps of the
     // stage's ring: appended without waiting, discarded when it wraps.
     const uint32_t floats = (std::min)(variant->info.floatConstantCount, 256u);
-    const uint32_t window = (std::max)(16u, (floats + 15) & ~15u);
-    const uint32_t bytes = window * 16;
+    const uint32_t windowSize = (std::max)(16u, (floats + 15) & ~15u);
+    const uint32_t bytes = windowSize * 16;
     uint32_t& offset = m_constantRingOffsets[pixel];
     D3D11_MAP mode = D3D11_MAP_WRITE_NO_OVERWRITE;
     if (offset + bytes > kConstantRingSize) {
       mode = D3D11_MAP_WRITE_DISCARD;
       offset = 0;
+      m_constantWindows[pixel].valid = false;
     }
     ID3D11Buffer* ring = m_constantRings[pixel].get();
     D3D11_MAPPED_SUBRESOURCE mapped = {};
@@ -3502,15 +3540,44 @@ namespace dxup::legacy {
     const uint32_t copied = (std::min)((floats + 3) & ~3u, 256u);
     if (glitchReportsEnabled())
       checkConstants(pixel, floats);
-    std::memcpy(static_cast<uint8_t*>(mapped.pData) + offset, m_constants[pixel].f, size_t(copied) * 16);
+    uint8_t* window = static_cast<uint8_t*>(mapped.pData) + offset;
+    std::memcpy(window, m_constants[pixel].f, size_t(copied) * 16);
+    for (const auto& def : variant->info.relativeDefs)
+      if (def.first < copied)
+        std::memcpy(window + size_t(def.first) * 16, def.second.data(), 16);
     m_context->Unmap(ring, 0);
-    const UINT first = offset / 16, count = window;
+    const UINT first = offset / 16, count = windowSize;
     if (pixel)
       m_context1->PSSetConstantBuffers1(0, 1, &ring, &first, &count);
     else
       m_context1->VSSetConstantBuffers1(0, 1, &ring, &first, &count);
     offset += bytes;
-    m_shaderConstantsDirty[pixel] = false;
+    // Another shader's def constants are not the application's floats.
+    m_constantWindows[pixel] = { first, count, copied, variant->info.relativeDefs.empty() };
+    m_shaderConstantsDirty[pixel] = m_shaderConstantsUnbound[pixel] = false;
+  }
+
+  // b0 again after the stage's constant buffers were set: the window last
+  // written when the floats did not change and the shader reads no more
+  // (nor def constants of its own from it).
+  void Device::bindShaderConstants(bool pixel) {
+    const Shader::Variant* variant = pixel ? m_psVariant : m_vsVariant;
+    if (!variant)
+      return;
+    const ConstantWindow& last = m_constantWindows[pixel];
+    const uint32_t floats = (std::min)(variant->info.floatConstantCount, 256u);
+    const uint32_t window = (std::max)(16u, (floats + 15) & ~15u);
+    if (!last.valid || floats > last.floats || window > last.count || !variant->info.relativeDefs.empty()
+     || glitchReportsEnabled()) {
+      updateShaderConstants(pixel);
+      return;
+    }
+    ID3D11Buffer* ring = m_constantRings[pixel].get();
+    if (pixel)
+      m_context1->PSSetConstantBuffers1(0, 1, &ring, &last.first, &last.count);
+    else
+      m_context1->VSSetConstantBuffers1(0, 1, &ring, &last.first, &last.count);
+    m_shaderConstantsUnbound[pixel] = false;
   }
 
   void Device::updateShaderInts(bool pixel) {
@@ -3581,6 +3648,10 @@ namespace dxup::legacy {
     std::memset(m_boundVertexViews, 0, sizeof(m_boundVertexViews));
     m_textureDirtyMask = (1u << kSamplerCount) - 1;
     m_context->OMSetRenderTargets(count, rtvs, dsv);
+    m_targetsDirty = false;
+  }
+
+  void Device::bindViewport() {
     // Direct3D 9 samples pixel centers at integer coordinates, D3D11 at
     // half: the viewport moves half a pixel.
     D3D11_VIEWPORT vp = { float(m_viewport.x) + 0.5f, float(m_viewport.y) + 0.5f, float(m_viewport.width),
@@ -3588,7 +3659,7 @@ namespace dxup::legacy {
     m_context->RSSetViewports(1, &vp);
     D3D11_RECT scissor = { m_scissor.left, m_scissor.top, m_scissor.right, m_scissor.bottom };
     m_context->RSSetScissorRects(1, &scissor);
-    m_targetsDirty = false;
+    m_viewportDirty = false;
   }
 
   void Device::selectShaders() {
@@ -3753,13 +3824,16 @@ namespace dxup::legacy {
       bindTargets();
       m_texturesPending = true;
     }
+    if (m_viewportDirty)
+      bindViewport();
     // Pixels the application wrote into the targets and textures come
     // before the draw (all bound ones: shaders may change before the next).
+    // Mipmaps of targets wait until they are sampled (not every draw).
     if (m_texturesPending) {
       m_texturesPending = false;
       for (Texture* target : m_renderTargets)
         if (target)
-          target->flush();
+          target->flush(false);
       for (Texture* texture : m_textures)
         if (texture)
           texture->flush();
@@ -3776,13 +3850,13 @@ namespace dxup::legacy {
         vsConstants[0] = nullptr;
         vsConstants[2] = m_shaderIntConstants[0].get();
         vsConstants[3] = m_clipPlaneConstants.get();
-        m_shaderConstantsDirty[0] = true;   // its window binds b0
+        m_shaderConstantsUnbound[0] = true;   // its window binds b0
       }
       ID3D11Buffer* psConstants[3] = { nullptr, m_pixelConstants.get(), nullptr };
       if (!ffpPixel) {
         psConstants[1] = m_shaderFixedConstants.get();
         psConstants[2] = m_shaderIntConstants[1].get();
-        m_shaderConstantsDirty[1] = true;
+        m_shaderConstantsUnbound[1] = true;
       }
       m_context->VSSetConstantBuffers(0, 4, vsConstants);
       m_context->PSSetConstantBuffers(0, 3, psConstants);
@@ -3795,6 +3869,8 @@ namespace dxup::legacy {
     } else {
       if (m_shaderConstantsDirty[0])
         updateShaderConstants(false);
+      else if (m_shaderConstantsUnbound[0])
+        bindShaderConstants(false);
       if (m_shaderIntsDirty[0])
         updateShaderInts(false);
       if (m_clipPlanesDirty && m_vsVariant && (m_renderStates[RsClipPlaneEnable] & 0x3f)) {
@@ -3812,6 +3888,8 @@ namespace dxup::legacy {
     } else {
       if (m_shaderConstantsDirty[1])
         updateShaderConstants(true);
+      else if (m_shaderConstantsUnbound[1])
+        bindShaderConstants(true);
       if (m_shaderIntsDirty[1])
         updateShaderInts(true);
       if (m_shaderFixedDirty)
@@ -3922,19 +4000,18 @@ namespace dxup::legacy {
       return uint32_t((std::min)(bytes, uint64_t(UINT32_MAX)));
     }
 
-    // Triangle fans as lists: (0, i, i + 1).
+    // Triangle fans as lists: (0, i, i + 1), into list (its memory reused).
     template<typename T>
-    std::vector<uint32_t> fanToList(const T* indices, uint32_t count) {
-      std::vector<uint32_t> list;
+    void fanToList(const T* indices, uint32_t count, std::vector<uint32_t>& list) {
+      list.clear();
       if (count < 3)
-        return list;
+        return;
       list.reserve(size_t(count - 2) * 3);
       for (uint32_t i = 1; i + 1 < count; i++) {
         list.push_back(indices ? uint32_t(indices[0]) : 0u);
         list.push_back(indices ? uint32_t(indices[i]) : i);
         list.push_back(indices ? uint32_t(indices[i + 1]) : i + 1);
       }
-      return list;
     }
   }
 
@@ -4090,7 +4167,7 @@ namespace dxup::legacy {
     }
 
     if (a.type == PrimitiveTriangleFan) {
-      std::vector<uint32_t> list;
+      std::vector<uint32_t>& list = m_fanIndices;
       int32_t base = 0;
       if (a.indexed) {
         const void* source = a.userIndices;
@@ -4102,11 +4179,13 @@ namespace dxup::legacy {
         }
         if (!source)
           return dropDraw(DropIndices);
-        list = index32 ? fanToList(static_cast<const uint32_t*>(source), a.indexCount)
-                       : fanToList(static_cast<const uint16_t*>(source), a.indexCount);
+        if (index32)
+          fanToList(static_cast<const uint32_t*>(source), a.indexCount, list);
+        else
+          fanToList(static_cast<const uint16_t*>(source), a.indexCount, list);
         base = rebase ? int32_t(int64_t(a.baseVertex) - firstVertex) : a.baseVertex;
       } else {
-        list = fanToList(static_cast<const uint32_t*>(nullptr), a.vertexCount);
+        fanToList(static_cast<const uint32_t*>(nullptr), a.vertexCount, list);
         base = rebase ? 0 : int32_t(a.startVertex);
       }
       if (list.empty())
@@ -4399,7 +4478,7 @@ namespace dxup::legacy {
       Texture* target = m_renderTargets[i];
       if (!target || target->nullTarget() || !(flags & ClearTarget))
         continue;
-      target->flush();
+      target->flush(false);
       rtvs[i] = target->rtv(m_renderTargetSubresources[i], srgb);
     }
     ID3D11DepthStencilView* dsv = (flags & (ClearZBuffer | ClearStencil)) && m_depthStencil ? m_depthStencil->dsv() : nullptr;
@@ -4680,28 +4759,33 @@ namespace dxup::legacy {
       m_trace9 = false;
       logMessage(LogLevel::Warn, "trace9: end of frame, %u draws", m_trace9Draw);
     }
-    if (!m_trace9Done && !(m_trace9Presents++ & 63)) {
-      wchar_t path[MAX_PATH] = {};
-      HMODULE self = nullptr;
-      GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-        reinterpret_cast<LPCWSTR>(&glitchReportsEnabled), &self);
-      if (self && GetModuleFileNameW(self, path, MAX_PATH)) {
-        if (wchar_t* name = wcsrchr(path, L'\\')) {
-          wcscpy_s(name + 1, MAX_PATH - (name + 1 - path), L"dxup_trace9_go.txt");
-          if (GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES) {
-            m_trace9 = m_trace9Done = true;
-            m_trace9DepthDone = false;
-            m_trace9Draw = 0;
-            // "x y": the probe pixel.
-            FILE* f = nullptr;
-            if (_wfopen_s(&f, path, L"r") == 0 && f) {
-              if (fscanf_s(f, "%d %d", &m_trace9X, &m_trace9Y) != 2)
-                m_trace9X = m_trace9Y = -1;
-              std::fclose(f);
-            }
-            logMessage(LogLevel::Warn, "trace9: next frame, probe %d, %d", m_trace9X, m_trace9Y);
-          }
+    // dxup_trace9_go.txt next to the DLL, looked for every two seconds.
+    const uint64_t now = GetTickCount64();
+    if (!m_trace9Done && now - m_trace9LastCheck >= 2000) {
+      m_trace9LastCheck = now;
+      static const std::wstring goPath = [] {
+        wchar_t path[MAX_PATH] = {};
+        HMODULE self = nullptr;
+        GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+          reinterpret_cast<LPCWSTR>(&glitchReportsEnabled), &self);
+        wchar_t* name = self && GetModuleFileNameW(self, path, MAX_PATH) ? wcsrchr(path, L'\\') : nullptr;
+        if (!name)
+          return std::wstring();
+        wcscpy_s(name + 1, MAX_PATH - (name + 1 - path), L"dxup_trace9_go.txt");
+        return std::wstring(path);
+      }();
+      if (!goPath.empty() && GetFileAttributesW(goPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
+        m_trace9 = m_trace9Done = true;
+        m_trace9DepthDone = false;
+        m_trace9Draw = 0;
+        // "x y": the probe pixel.
+        FILE* f = nullptr;
+        if (_wfopen_s(&f, goPath.c_str(), L"r") == 0 && f) {
+          if (fscanf_s(f, "%d %d", &m_trace9X, &m_trace9Y) != 2)
+            m_trace9X = m_trace9Y = -1;
+          std::fclose(f);
         }
+        logMessage(LogLevel::Warn, "trace9: next frame, probe %d, %d", m_trace9X, m_trace9Y);
       }
     }
     if (glitchReportsEnabled()) {
@@ -4795,6 +4879,7 @@ namespace dxup::legacy {
       m_swapChains.push_back(std::move(created));
     } else if (chain->width != width || chain->height != height) {
       m_context->OMSetRenderTargets(0, nullptr, nullptr);
+      chain->rtv.reset();
       // A failed resize keeps the buffers as they are (tried again next time).
       if (SUCCEEDED(chain->swapChain->ResizeBuffers(0, width, height, DXGI_FORMAT_UNKNOWN, chain->flags))) {
         chain->width = width;
@@ -4802,18 +4887,21 @@ namespace dxup::legacy {
       }
     }
 
-    Ref<ID3D11Texture2D> backBuffer;
-    if (FAILED(chain->swapChain->GetBuffer(0, __uuidof(ID3D11Texture2D), reinterpret_cast<void**>(backBuffer.put()))))
-      return E_FAIL;
-    D3D11_TEXTURE2D_DESC bufferDesc = {};
-    backBuffer->GetDesc(&bufferDesc);
-    width = bufferDesc.Width;
-    height = bufferDesc.Height;
-    Ref<ID3D11RenderTargetView> rtv;
-    if (FAILED(m_device->CreateRenderTargetView(backBuffer.get(), nullptr, rtv.put())))
-      return E_FAIL;
+    if (!chain->rtv) {
+      Ref<ID3D11Texture2D> backBuffer;
+      if (FAILED(chain->swapChain->GetBuffer(0, __uuidof(ID3D11Texture2D), reinterpret_cast<void**>(backBuffer.put()))))
+        return E_FAIL;
+      D3D11_TEXTURE2D_DESC bufferDesc = {};
+      backBuffer->GetDesc(&bufferDesc);
+      if (FAILED(m_device->CreateRenderTargetView(backBuffer.get(), nullptr, chain->rtv.put())))
+        return E_FAIL;
+      chain->bufferWidth = bufferDesc.Width;
+      chain->bufferHeight = bufferDesc.Height;
+    }
+    width = chain->bufferWidth;
+    height = chain->bufferHeight;
     source->flush();
-    ID3D11RenderTargetView* target = rtv.get();
+    ID3D11RenderTargetView* target = chain->rtv.get();
     ID3D11ShaderResourceView* nulls[24] = {};
     m_context->PSSetShaderResources(0, 24, nulls);
     m_context->OMSetRenderTargets(1, &target, nullptr);

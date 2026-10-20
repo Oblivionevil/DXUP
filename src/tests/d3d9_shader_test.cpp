@@ -563,9 +563,17 @@ float4 main(float4 t0 : TEXCOORD0, float4 t1 : TEXCOORD1, float4 t2 : TEXCOORD2)
     IDirect3DCubeTexture9* cube = nullptr;
     IDirect3DVolumeTexture9* volume = nullptr;
 
-    bool init(HWND hwnd, const Constants& k) {
+    // dxupReference: DXUP's Direct3D 9 (dxup_d3d9.dll beside the test) in
+    // place of Windows' (another build of DXUP as the reference).
+    bool init(HWND hwnd, const Constants& k, bool dxupReference = false) {
       window = hwnd;
-      d3d = Direct3DCreate9(D3D_SDK_VERSION);
+      if (dxupReference) {
+        HMODULE dxup = LoadLibraryW(L"dxup_d3d9.dll");
+        auto create = dxup ? reinterpret_cast<IDirect3D9* (WINAPI*)(UINT)>(GetProcAddress(dxup, "Direct3DCreate9")) : nullptr;
+        d3d = create ? create(D3D_SDK_VERSION) : nullptr;
+      } else {
+        d3d = Direct3DCreate9(D3D_SDK_VERSION);
+      }
       if (!d3d) return false;
       D3DPRESENT_PARAMETERS pp = {};
       pp.Windowed = TRUE;
@@ -710,7 +718,9 @@ float4 main(float4 t0 : TEXCOORD0, float4 t1 : TEXCOORD1, float4 t2 : TEXCOORD2)
     ID3D11RenderTargetView* rtv = nullptr;
     ID3D11Texture2D* readback = nullptr;
     ID3D11Buffer* vertices = nullptr;
-    ID3D11Buffer* constants = nullptr;
+    ID3D11Buffer* constants = nullptr;     // pixel stage
+    ID3D11Buffer* vsConstants = nullptr;
+    std::vector<uint8_t> floatData;        // c[256]
     ID3D11Buffer* intConstants = nullptr;
     std::vector<uint8_t> intData;   // ci[16], cb[4], last constant, vertex input modes
     ID3D11Buffer* fixed = nullptr;
@@ -745,8 +755,9 @@ float4 main(float4 t0 : TEXCOORD0, float4 t1 : TEXCOORD1, float4 t2 : TEXCOORD2)
       bd.ByteWidth = 4096;
       bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
       init.pSysMem = k.c;
-      if (FAILED(device->CreateBuffer(&bd, &init, &constants)))
+      if (FAILED(device->CreateBuffer(&bd, &init, &constants)) || FAILED(device->CreateBuffer(&bd, &init, &vsConstants)))
         return false;
+      floatData.assign(reinterpret_cast<const uint8_t*>(k.c), reinterpret_cast<const uint8_t*>(k.c) + sizeof(k.c));
       intData.assign(256 + 64 + 16, 0);
       std::memcpy(intData.data(), k.i, 256);
       std::memcpy(intData.data() + 256, k.b, 64);
@@ -892,8 +903,19 @@ float4 main(float4 t0 : TEXCOORD0, float4 t1 : TEXCOORD1, float4 t2 : TEXCOORD2)
         if (in.usage == UsageBlendIndices) inputModes |= 2u << (in.reg * 2);
       std::memcpy(intData.data() + 324, &inputModes, 4);
       context->UpdateSubresource(intConstants, 0, nullptr, intData.data(), 0, 0);
+      // The floats, with each stage's def constants it reads relatively
+      // (as the legacy device uploads them).
+      auto uploadFloats = [&](ID3D11Buffer* buffer, const ShaderInfo9& info) {
+        std::vector<uint8_t> data = floatData;
+        for (const auto& def : info.relativeDefs)
+          if (def.first < 256)
+            std::memcpy(data.data() + size_t(def.first) * 16, def.second.data(), 16);
+        context->UpdateSubresource(buffer, 0, nullptr, data.data(), 0, 0);
+      };
+      uploadFloats(vsConstants, vsInfo);
+      uploadFloats(constants, psInfo);
       ID3D11Buffer* buffers[3] = { constants, fixed, intConstants };
-      ID3D11Buffer* vsBuffers[3] = { constants, nullptr, intConstants };
+      ID3D11Buffer* vsBuffers[3] = { vsConstants, nullptr, intConstants };
       context->VSSetConstantBuffers(0, 3, vsBuffers);
       context->PSSetConstantBuffers(0, 3, buffers);
       ID3D11ShaderResourceView* srvs[4];
@@ -1357,7 +1379,7 @@ namespace {
   int compareShaders(const std::vector<CorpusShader>& shaders, bool verbose, bool floatEmulation) {
     DiffRunner runner;
     if (!runner.init()) { std::printf("FAIL: Direct3D 11 setup\n"); return 1; }
-    double fxcMs = 0.0, dxbcMs = 0.0, fxcWorst = 0.0, dxbcWorst = 0.0;
+    double fxcMs = 0.0, dxbcMs = 0.0, fxcWorst = 0.0, dxbcWorst = 0.0, translateMs = 0.0;
     int compared = 0, differing = 0, refused = 0, fallback = 0;
     for (size_t n = 0; n < shaders.size(); n++) {
       for (TranslateOptions9 options : shaders[n].variants) {
@@ -1367,7 +1389,9 @@ namespace {
         std::string hlsl, error;
         ShaderInfo9 info, info2;
         auto t0 = std::chrono::steady_clock::now();
-        if (!translateShader9(tokens.data(), tokens.size(), options, hlsl, info, error)) {
+        const bool translated = translateShader9(tokens.data(), tokens.size(), options, hlsl, info, error);
+        translateMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        if (!translated) {
           if (verbose) std::printf("skip %zu: %s\n", n, error.c_str());
           continue;
         }
@@ -1440,6 +1464,7 @@ namespace {
     }
     std::printf("compared %d, differing %d, refused %d, fallback %d; fxc %.0f ms (slowest %.1f), emitter %.1f ms (slowest %.2f)\n",
                 compared, differing, refused, fallback, fxcMs, fxcWorst, dxbcMs, dxbcWorst);
+    std::printf("translating to HLSL: %.1f ms (in both)\n", translateMs);
     return differing || refused ? 1 : 0;
   }
 
@@ -2161,7 +2186,7 @@ static int compileRecords(const char* path) {
 }
 
 int main(int argc, char** argv) {
-  bool dumpAll = false, compileBench = false, floatEmulation = false, dxbcBackend = false;
+  bool dumpAll = false, compileBench = false, floatEmulation = false, dxbcBackend = false, dxupReference = false;
   for (int i = 1; i + 1 < argc; i++) {
     if (std::strcmp(argv[i], "--compile-records") == 0) return compileRecords(argv[i + 1]);
     if (std::strcmp(argv[i], "--dump-record") == 0 && i + 2 < argc) return dumpRecord(argv[i + 1], argv[i + 2]);
@@ -2184,6 +2209,7 @@ int main(int argc, char** argv) {
     else if (std::strcmp(argv[i], "--compile-bench") == 0) compileBench = true;
     else if (std::strcmp(argv[i], "--float-emulation") == 0) floatEmulation = true;
     else if (std::strcmp(argv[i], "--dxbc") == 0) dxbcBackend = true;
+    else if (std::strcmp(argv[i], "--dxup-reference") == 0) dxupReference = true;
     else filter = argv[i];
   }
   CompileTimes times;
@@ -2198,7 +2224,7 @@ int main(int argc, char** argv) {
   const Constants k = makeConstants();
   D3D9Runner d3d9;
   D3D11Runner d3d11;
-  if (!d3d9.init(window, k)) { std::printf("FAIL: Direct3D 9 setup\n"); return 1; }
+  if (!d3d9.init(window, k, dxupReference)) { std::printf("FAIL: Direct3D 9 setup\n"); return 1; }
   if (!d3d11.init(k)) { std::printf("FAIL: Direct3D 11 setup\n"); return 1; }
 
   int passed = 0, failed = 0;

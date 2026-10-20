@@ -13,8 +13,10 @@
 // links by register, so a pixel shader needs a vertex shader with at least
 // its count: the vertex shader is translated again with minVaryings then.
 
+#include <array>
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace dxup::legacy {
@@ -48,6 +50,11 @@ namespace dxup::legacy {
     uint32_t varyingCount = 0;         // varying slots written (vertex) or declared (pixel)
     bool     writesPointSize = false;  // vertex: point size in slot 0's z (w = 1)
     bool     relativeConstants = false;
+    // Shaders reading c# relatively: their def constants (register, bits),
+    // written over the uploaded constants so that relative reads find them
+    // (Direct3D 9; Unreal Engine 3's landscape selects rows of a defined
+    // identity matrix). Direct reads take the values as literals.
+    std::vector<std::pair<uint32_t, std::array<uint32_t, 4>>> relativeDefs;
     bool     writesDepth = false;
     uint32_t colorOutputs = 0;         // bitmask of oC0-3
   };

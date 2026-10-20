@@ -1410,7 +1410,8 @@ namespace dxup::d3d12 {
     std::vector<Thread> m_compileThreads;
     std::deque<std::shared_ptr<CompileJob>> m_compileJobs;
     std::mutex m_compileMutex;
-    std::condition_variable m_compileCv;
+    std::condition_variable m_compileCv;   // the regular threads
+    std::condition_variable m_burstCv;     // the burst threads (a backlog)
     bool m_stopCompileThreads = false;
     // Draws skip pipelines that still compile (d3d11.asyncShaders).
     bool m_asyncDraws = false;

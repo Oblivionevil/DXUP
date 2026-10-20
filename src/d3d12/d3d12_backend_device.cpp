@@ -5069,7 +5069,7 @@ namespace dxup::d3d12 {
       std::shared_ptr<CompileJob> job;
       {
         std::unique_lock<std::mutex> lock(m_compileMutex);
-        m_compileCv.wait(lock, [this, burst] {
+        (burst ? m_burstCv : m_compileCv).wait(lock, [this, burst] {
           return m_stopCompileThreads || (!m_compileJobs.empty() && (!burst || m_compileJobs.size() > kBurstBacklog));
         });
         if (m_stopCompileThreads)
@@ -5083,6 +5083,7 @@ namespace dxup::d3d12 {
   }
 
   bool D3D12BackendDevice::enqueueCompile(std::shared_ptr<CompileJob> job, bool urgent) {
+    bool backlog = false;
     {
       std::lock_guard<std::mutex> lock(m_compileMutex);
       if (m_compileThreads.empty() || m_stopCompileThreads)
@@ -5091,10 +5092,11 @@ namespace dxup::d3d12 {
         m_compileJobs.push_front(std::move(job));
       else
         m_compileJobs.push_back(std::move(job));
+      backlog = m_compileJobs.size() > kBurstBacklog;
     }
-    // All waiting threads: burst ones go back to sleep while few jobs wait,
-    // and the one notify_one picks could be such a thread.
-    m_compileCv.notify_all();
+    m_compileCv.notify_one();
+    if (backlog)
+      m_burstCv.notify_one();
     return true;
   }
 
@@ -5105,6 +5107,7 @@ namespace dxup::d3d12 {
       m_compileJobs.clear();
     }
     m_compileCv.notify_all();
+    m_burstCv.notify_all();
     for (auto& thread : m_compileThreads) {
       if (thread.joinable())
         thread.join();

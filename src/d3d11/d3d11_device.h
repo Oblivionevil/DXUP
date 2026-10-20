@@ -4031,8 +4031,10 @@ namespace dxup {
       }
 
       uint64_t shaderHash = hashShaderBytecode(pShaderBytecode, BytecodeLength);
-      std::string bindingSummary = summarizeShaderBindings(pShaderBytecode, BytecodeLength);
-      std::string inputSummary = summarizeVertexShaderInputs(pShaderBytecode, BytecodeLength);
+      // For the final-pass trace only: reflection loads d3dcompiler per shader.
+      const bool traced = d3d11FinalPassTraceEnabled();
+      std::string bindingSummary = traced ? summarizeShaderBindings(pShaderBytecode, BytecodeLength) : std::string();
+      std::string inputSummary = traced ? summarizeVertexShaderInputs(pShaderBytecode, BytecodeLength) : std::string();
 
       *ppVertexShader = new D3D11VertexShader(this, std::move(shader), shaderHash, std::move(bindingSummary), std::move(inputSummary));
       return S_OK;
@@ -4056,7 +4058,8 @@ namespace dxup {
       }
 
       uint64_t shaderHash = hashShaderBytecode(pShaderBytecode, BytecodeLength);
-      std::string bindingSummary = summarizeShaderBindings(pShaderBytecode, BytecodeLength);
+      std::string bindingSummary = d3d11FinalPassTraceEnabled()
+        ? summarizeShaderBindings(pShaderBytecode, BytecodeLength) : std::string();
 
       *ppPixelShader = new D3D11PixelShader(this, std::move(shader), shaderHash, std::move(bindingSummary));
       return S_OK;

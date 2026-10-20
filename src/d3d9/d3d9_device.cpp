@@ -325,6 +325,7 @@ namespace dxup::d3d9 {
       delete chain;
     if (m_cursor)
       DestroyCursor(m_cursor);
+    m_resolveTarget.reset();
     m_core.reset();
     m_parent->Release();
   }
@@ -1026,12 +1027,20 @@ namespace dxup::d3d9 {
       }
       legacy::TextureDesc desc = s->desc();
       desc.samples = 1;
-      auto resolved = std::make_shared<legacy::Texture>(m_core.get(), desc);
-      if (!resolved->valid())
-        return D3DERR_INVALIDCALL;
+      const legacy::TextureDesc* kept = m_resolveTarget ? &m_resolveTarget->desc() : nullptr;
+      if (!kept || kept->width != desc.width || kept->height != desc.height || kept->format != desc.format
+       || kept->levels != desc.levels || kept->cube != desc.cube || kept->srgb != desc.srgb
+       || kept->renderTarget != desc.renderTarget) {
+        m_resolveTarget = std::make_shared<legacy::Texture>(m_core.get(), desc);
+        if (!m_resolveTarget->valid()) {
+          m_resolveTarget.reset();
+          return D3DERR_INVALIDCALL;
+        }
+      }
+      legacy::Texture* resolved = m_resolveTarget.get();
       context->ResolveSubresource(resolved->resource(), 0, s->resource(), src->subresource(), s->dxgiFormat());
       const legacy::Rect a = toRect(sr), b = toRect(dr);
-      m_core->blit(d, dst->subresource(), &b, resolved.get(), 0, &a, filter != D3DTEXF_POINT, false, 0);
+      m_core->blit(d, dst->subresource(), &b, resolved, 0, &a, filter != D3DTEXF_POINT, false, 0);
       return D3D_OK;
     }
     if (sameSize && s->dxgiFormat() == d->dxgiFormat() && s->desc().samples == d->desc().samples && s->d3dResource()

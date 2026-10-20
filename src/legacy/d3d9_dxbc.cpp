@@ -368,22 +368,14 @@ namespace dxup::legacy {
               const Op r = relativeIndex(op);
               emit(DxIAdd, { tempDst(s, 1), scalar(temp(r.relReg), r.relComp), immU(index) });
               emit(DxUMin, { tempDst(s, 1), scalar(temp(s)), scalar(cbuf(2, 20), 0) });
+              // The shader's own def constants are in the buffer too
+              // (ShaderInfo9::relativeDefs).
               Op o = cbuf(0, 0);
               o.relDim = 1;
               o.relImm = false;
               o.relReg = s;
               o.relComp = 0;
-              if (L.floatDefs.empty())
-                return o;
-              // The shader's own def constants read as their values, then
-              // the buffer (as the HLSL dxup_c).
-              const uint32_t value = scratch(), match = scratch();
-              emit(DxMov, { tempDst(value), o });
-              for (const auto& def : L.floatDefs) {
-                emit(DxIEq, { tempDst(match, 1), scalar(temp(s)), immU(def.first) });
-                emit(DxMovC, { tempDst(value), scalar(temp(match)), defLiteral(def.second), temp(value) });
-              }
-              return temp(value);
+              return o;
             }
             auto def = L.floatDefs.find(index);
             if (def != L.floatDefs.end())
