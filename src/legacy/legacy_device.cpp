@@ -4,6 +4,7 @@
 #include "../util/util_types.h"
 #include "../util/util_config.h"
 #include "../util/util_thread.h"
+#include "../d3d12/d3d12_dxbc.h"
 
 #include "ffp_vs.h"
 #include "ffp_ps.h"
@@ -25,6 +26,7 @@
 #include <cstring>
 #include <condition_variable>
 #include <deque>
+#include <io.h>
 #include <functional>
 #include <mutex>
 #include <thread>
@@ -1044,17 +1046,15 @@ namespace dxup::legacy {
   // Shaders
   // ============================================================
 
-  namespace {
-    using CompileFunction = HRESULT (WINAPI*)(const void*, SIZE_T, const char*, const D3D_SHADER_MACRO*, ID3DInclude*,
-      const char*, const char*, UINT, UINT, ID3DBlob**, ID3DBlob**);
+  CompileFunction compiler() {
+    static CompileFunction function = [] {
+      HMODULE module = LoadLibraryW(L"d3dcompiler_47.dll");
+      return module ? reinterpret_cast<CompileFunction>(GetProcAddress(module, "D3DCompile")) : nullptr;
+    }();
+    return function;
+  }
 
-    CompileFunction compiler() {
-      static CompileFunction function = [] {
-        HMODULE module = LoadLibraryW(L"d3dcompiler_47.dll");
-        return module ? reinterpret_cast<CompileFunction>(GetProcAddress(module, "D3DCompile")) : nullptr;
-      }();
-      return function;
-    }
+  namespace {
 
     // dxup_pso_cache next to the DLL (created), empty when unknown.
     std::wstring cacheDirectory() {
@@ -1076,6 +1076,14 @@ namespace dxup::legacy {
     // Translated and compiled shaders of this and earlier runs, by the hash
     // of bytecode and variant: dxup_pso_cache\d3d9_shaders.bin next to the
     // DLL, records of hash, size and DXBC appended as they compile.
+    // Changes whenever the translator's output changes (the HLSL path's;
+    // DXUP's compiler is not cached, it is faster than reading the cache).
+    constexpr uint64_t kTranslatorVersion = 9;
+
+    // dxup_pso_cache\d3d9_shaders.bin: fxc's code of translated variants. A
+    // header with the translator version (another one: started anew), then
+    // entries of key, size and DXBC appended; read up to the last whole
+    // valid entry (later ones are appended after it), at most kMaxBytes.
     class ShaderDiskCache {
     public:
       static ShaderDiskCache& instance() {
@@ -1097,50 +1105,67 @@ namespace dxup::legacy {
         if (m_entries.count(key))
           return;
         m_entries[key].assign(static_cast<const uint8_t*>(data), static_cast<const uint8_t*>(data) + size);
-        if (m_path.empty())
+        const uint64_t entryHeader[2] = { key, uint64_t(size) };
+        const size_t bytes = (m_size ? 0 : sizeof(kHeader)) + sizeof(entryHeader) + size;
+        if (m_path.empty() || m_size + bytes > kMaxBytes)
           return;
         FILE* file = nullptr;
         if (_wfopen_s(&file, m_path.c_str(), L"ab") != 0)
           file = nullptr;
         if (!file)
           return;
-        const uint64_t header[2] = { key, uint64_t(size) };
-        fwrite(header, sizeof(header), 1, file);
-        fwrite(data, 1, size, file);
+        bool written = !m_size ? fwrite(kHeader, sizeof(kHeader), 1, file) == 1 : true;
+        written = written && fwrite(entryHeader, sizeof(entryHeader), 1, file) == 1 && fwrite(data, 1, size, file) == size;
         fclose(file);
+        // A part written: no more appends after it (it is cut at the next start).
+        if (written)
+          m_size += bytes;
+        else
+          m_path.clear();
       }
 
     private:
+      static constexpr uint64_t kHeader[2] = { 0x39535844ull /* "DXS9" */, kTranslatorVersion };
+      static constexpr size_t kMaxBytes = 64u << 20;
+
       ShaderDiskCache() {
         const std::wstring dir = cacheDirectory();
         if (dir.empty())
           return;
         m_path = dir + L"\\d3d9_shaders.bin";
         FILE* file = nullptr;
-        if (_wfopen_s(&file, m_path.c_str(), L"rb") != 0)
+        if (_wfopen_s(&file, m_path.c_str(), L"r+b") != 0)
           file = nullptr;
         if (!file)
           return;
-        uint64_t header[2];
-        while (fread(header, sizeof(header), 1, file) == 1) {
-          if (header[1] > (16u << 20))
-            break;
-          std::vector<uint8_t> data(static_cast<size_t>(header[1]));
-          if (fread(data.data(), 1, data.size(), file) != data.size())
-            break;
-          m_entries[header[0]] = std::move(data);
+        uint64_t header[2] = {};
+        size_t good = 0;
+        if (fread(header, sizeof(header), 1, file) == 1 && header[0] == kHeader[0] && header[1] == kHeader[1]) {
+          good = sizeof(header);
+          uint64_t entry[2];
+          while (fread(entry, sizeof(entry), 1, file) == 1) {
+            if (entry[1] > (16u << 20) || good + sizeof(entry) + entry[1] > kMaxBytes)
+              break;
+            std::vector<uint8_t> data(static_cast<size_t>(entry[1]));
+            if (fread(data.data(), 1, data.size(), file) != data.size()
+             || !d3d12::dxbc::checksumMatches(data.data(), data.size()))
+              break;
+            good += sizeof(entry) + data.size();
+            m_entries[entry[0]] = std::move(data);
+          }
         }
+        // Another version, or a part entry at the end: cut after the last
+        // whole one (all of it for another version).
+        _chsize_s(_fileno(file), static_cast<__int64>(good));
         fclose(file);
+        m_size = good;
       }
 
       std::mutex m_mutex;
       std::wstring m_path;
+      size_t m_size = 0;   // the file's
       std::unordered_map<uint64_t, std::vector<uint8_t>> m_entries;
     };
-
-    // Changes whenever the translator's output changes (the HLSL path's;
-    // DXUP's compiler is not cached, it is faster than reading the cache).
-    constexpr uint64_t kTranslatorVersion = 9;
 
     // The shaders draws used in this and earlier runs, their code and the
     // variants they were drawn with: compiled at the start of a later run,
@@ -1233,7 +1258,7 @@ namespace dxup::legacy {
         uint64_t hash = 14695981039346656037ull;
         const uint8_t* bytes = reinterpret_cast<const uint8_t*>(&record);
         for (size_t i = 0; i < sizeof(record); i++)
-          hash = (hash ^ bytes[i]) * 1099511628211ull;
+          hash = fnv64Multiply(hash ^ bytes[i]);
         return hash;
       }
 
@@ -3154,13 +3179,11 @@ namespace dxup::legacy {
     m_nonFinite.presents++;
     if (!m_nonFinite.uploads)
       return;
-    // Every frame with any for the first 20, then every 100th.
-    m_nonFinite.frames++;
-    if (m_nonFinite.frames <= 20 || m_nonFinite.frames % 100 == 0)
+    if (m_nonFinite.frames.next())
       logMessage(LogLevel::Warn, "glitch: present %u: %u draws read NaN or infinite constants (first: %s shader %016llX c%u.%c = %g)%s",
         m_nonFinite.presents, m_nonFinite.uploads, m_nonFinite.pixel ? "pixel" : "vertex",
         static_cast<unsigned long long>(m_nonFinite.shader), m_nonFinite.reg, "xyzw"[m_nonFinite.component],
-        m_nonFinite.value, m_nonFinite.frames == 20 ? "; from now on every 100th such frame" : "");
+        m_nonFinite.value, m_nonFinite.frames.suffix());
     m_nonFinite.uploads = 0;
   }
 
@@ -3267,81 +3290,87 @@ namespace dxup::legacy {
       target->height(sub), uint32_t(target->desc().format));
   }
 
-  // The bound depth buffer's mean and nearest value (24-bit formats).
-  void Device::traceDepthMean9() {
+  double Device::DepthReadback::at(uint32_t x, uint32_t y) const {
+    const uint8_t* row = data + size_t(y) * pitch;
+    if (format == DXGI_FORMAT_D16_UNORM || format == DXGI_FORMAT_R16_TYPELESS) {
+      uint16_t v;
+      std::memcpy(&v, row + x * 2, 2);
+      return v / 65535.0;
+    }
+    uint32_t v;
+    std::memcpy(&v, row + x * 4, 4);
+    if (format == DXGI_FORMAT_D32_FLOAT || format == DXGI_FORMAT_R32_TYPELESS) {
+      float f;
+      std::memcpy(&f, &v, 4);
+      return double(f);
+    }
+    // 24-bit depth in the low bits (D24S8, X8 variants).
+    return (v & 0xffffffu) / 16777215.0;
+  }
+
+  bool Device::readDepth9(DepthReadback& depth) {
     if (!m_depthStencil || !m_depthStencil->resource())
-      return;
+      return false;
     D3D11_TEXTURE2D_DESC td;
     m_depthStencil->resource()->GetDesc(&td);
-    if (td.SampleDesc.Count > 1 || td.ArraySize > 1 || td.MipLevels > 1
-     || (td.Format != DXGI_FORMAT_R24G8_TYPELESS && td.Format != DXGI_FORMAT_D24_UNORM_S8_UINT))
-      return;
+    if (td.SampleDesc.Count > 1 || td.ArraySize > 1 || td.MipLevels > 1)
+      return false;
     D3D11_TEXTURE2D_DESC sd = {};
     if (m_trace9DepthStaging)
       m_trace9DepthStaging->GetDesc(&sd);
-    if (!m_trace9DepthStaging || sd.Width != td.Width || sd.Height != td.Height) {
+    if (!m_trace9DepthStaging || sd.Width != td.Width || sd.Height != td.Height || sd.Format != td.Format) {
       sd = td;
       sd.Usage = D3D11_USAGE_STAGING;
       sd.BindFlags = 0;
       sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
       sd.MiscFlags = 0;
       if (FAILED(m_device->CreateTexture2D(&sd, nullptr, m_trace9DepthStaging.put())))
-        return;
+        return false;
     }
     m_context->CopyResource(m_trace9DepthStaging.get(), m_depthStencil->resource());
     D3D11_MAPPED_SUBRESOURCE mapped = {};
     if (FAILED(m_context->Map(m_trace9DepthStaging.get(), 0, D3D11_MAP_READ, 0, &mapped)))
+      return false;
+    depth.data = static_cast<const uint8_t*>(mapped.pData);
+    depth.pitch = mapped.RowPitch;
+    depth.width = td.Width;
+    depth.height = td.Height;
+    depth.format = td.Format;
+    return true;
+  }
+
+  // The bound depth buffer's mean and nearest value (every 4th pixel).
+  void Device::traceDepthMean9() {
+    DepthReadback depth;
+    if (!readDepth9(depth))
       return;
-    uint64_t sum = 0;
-    uint32_t nearest = 0xffffff;
-    for (uint32_t y = 0; y < td.Height; y += 4) {
-      const uint32_t* row = reinterpret_cast<const uint32_t*>(static_cast<const uint8_t*>(mapped.pData) + size_t(y) * mapped.RowPitch);
-      for (uint32_t x = 0; x < td.Width; x += 4) {
-        const uint32_t d = row[x] & 0xffffffu;
+    double sum = 0.0, nearest = 2.0;
+    for (uint32_t y = 0; y < depth.height; y += 4) {
+      for (uint32_t x = 0; x < depth.width; x += 4) {
+        const double d = depth.at(x, y);
         sum += d;
         nearest = (std::min)(nearest, d);
       }
     }
     m_context->Unmap(m_trace9DepthStaging.get(), 0);
-    const double samples = double((td.Width + 3) / 4) * ((td.Height + 3) / 4);
-    logMessage(LogLevel::Warn, "trace9   depth mean %.6f nearest %.6f", sum / samples / 16777215.0, nearest / 16777215.0);
+    const double samples = double((depth.width + 3) / 4) * ((depth.height + 3) / 4);
+    logMessage(LogLevel::Warn, "trace9   depth mean %.6f nearest %.6f", sum / samples, nearest);
   }
 
   void Device::traceDepth9(const char* when) {
-    if (!m_trace9 || m_trace9DepthDone || !m_depthStencil || !m_depthStencil->resource())
+    if (!m_trace9 || m_trace9DepthDone)
       return;
     m_trace9DepthDone = true;
-    D3D11_TEXTURE2D_DESC td;
-    m_depthStencil->resource()->GetDesc(&td);
-    if (td.SampleDesc.Count > 1 || td.ArraySize > 1 || td.MipLevels > 1)
+    DepthReadback depth;
+    if (!readDepth9(depth))
       return;
-    D3D11_TEXTURE2D_DESC sd = td;
-    sd.Usage = D3D11_USAGE_STAGING;
-    sd.BindFlags = 0;
-    sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-    sd.MiscFlags = 0;
-    Ref<ID3D11Texture2D> staging;
-    if (FAILED(m_device->CreateTexture2D(&sd, nullptr, staging.put())))
-      return;
-    m_context->CopyResource(staging.get(), m_depthStencil->resource());
-    D3D11_MAPPED_SUBRESOURCE mapped = {};
-    if (FAILED(m_context->Map(staging.get(), 0, D3D11_MAP_READ, 0, &mapped)))
-      return;
-    // 24-bit depth in the low bits (D24S8, X8 variants); others as 16 or 32.
-    const bool d16 = td.Format == DXGI_FORMAT_D16_UNORM || td.Format == DXGI_FORMAT_R16_TYPELESS;
-    const bool f32 = td.Format == DXGI_FORMAT_D32_FLOAT || td.Format == DXGI_FORMAT_R32_TYPELESS;
-    auto depthAt = [&](uint32_t x, uint32_t y) {
-      const uint8_t* row = static_cast<const uint8_t*>(mapped.pData) + size_t(y) * mapped.RowPitch;
-      if (d16) { uint16_t v; std::memcpy(&v, row + x * 2, 2); return v / 65535.0; }
-      uint32_t v; std::memcpy(&v, row + x * 4, 4);
-      if (f32) { float f; std::memcpy(&f, &v, 4); return double(f); }
-      return (v & 0xffffffu) / 16777215.0;
-    };
+    const uint32_t width = depth.width, height = depth.height;
+    auto depthAt = [&depth](uint32_t x, uint32_t y) { return depth.at(x, y); };
     double minimum = 2.0, maximum = -1.0, sum = 0.0;
     uint64_t zeros = 0, ones = 0;
-    std::vector<uint8_t> image(size_t(td.Width) * td.Height * 2);
-    for (uint32_t y = 0; y < td.Height; y++) {
-      for (uint32_t x = 0; x < td.Width; x++) {
+    std::vector<uint8_t> image(size_t(width) * height * 2);
+    for (uint32_t y = 0; y < height; y++) {
+      for (uint32_t x = 0; x < width; x++) {
         const double d = depthAt(x, y);
         minimum = (std::min)(minimum, d);
         maximum = (std::max)(maximum, d);
@@ -3350,15 +3379,15 @@ namespace dxup::legacy {
         ones += d == 1.0;
         // 16 bits, big endian (PGM).
         const uint16_t v = uint16_t((std::max)(0.0, (std::min)(1.0, d)) * 65535.0 + 0.5);
-        image[(size_t(y) * td.Width + x) * 2] = uint8_t(v >> 8);
-        image[(size_t(y) * td.Width + x) * 2 + 1] = uint8_t(v);
+        image[(size_t(y) * width + x) * 2] = uint8_t(v >> 8);
+        image[(size_t(y) * width + x) * 2 + 1] = uint8_t(v);
       }
     }
-    const double probe = m_trace9X >= 0 && uint32_t(m_trace9X) < td.Width && uint32_t(m_trace9Y) < td.Height
+    const double probe = m_trace9X >= 0 && uint32_t(m_trace9X) < width && uint32_t(m_trace9Y) < height
       ? depthAt(m_trace9X, m_trace9Y) : -1.0;
-    m_context->Unmap(staging.get(), 0);
+    m_context->Unmap(m_trace9DepthStaging.get(), 0);
     logMessage(LogLevel::Warn, "trace9   depth %s: %ux%u format %u min %.7f max %.7f mean %.7f, %llu at 0, %llu at 1, probe %.7f",
-      when, td.Width, td.Height, unsigned(td.Format), minimum, maximum, sum / (double(td.Width) * td.Height),
+      when, width, height, unsigned(depth.format), minimum, maximum, sum / (double(width) * height),
       static_cast<unsigned long long>(zeros), static_cast<unsigned long long>(ones), probe);
     wchar_t path[MAX_PATH] = {};
     HMODULE self = nullptr;
@@ -3369,7 +3398,7 @@ namespace dxup::legacy {
         wcscpy_s(name + 1, MAX_PATH - (name + 1 - path), L"dxup_trace9_depth.pgm");
         FILE* f = nullptr;
         if (_wfopen_s(&f, path, L"wb") == 0 && f) {
-          std::fprintf(f, "P5 %u %u 65535 ", td.Width, td.Height);
+          std::fprintf(f, "P5 %u %u 65535 ", width, height);
           std::fwrite(image.data(), 1, image.size(), f);
           std::fclose(f);
         }
@@ -3496,9 +3525,7 @@ namespace dxup::legacy {
       total += count;
     if (!total)
       return;
-    // Every frame with any for the first 20, then every 100th.
-    m_dropped.frames++;
-    if (m_dropped.frames <= 20 || m_dropped.frames % 100 == 0) {
+    if (m_dropped.frames.next()) {
       static const char* const kReasons[DropReasons] = { "without declaration", "vertex shader not compiled",
         "pixel shader not compiled", "no input layout", "data too large", "without index buffer" };
       std::string reasons;
@@ -3510,7 +3537,7 @@ namespace dxup::legacy {
         reasons += text;
       }
       logMessage(LogLevel::Warn, "glitch: present %u: %u draws not drawn (%s)%s", m_nonFinite.presents, total,
-        reasons.c_str(), m_dropped.frames == 20 ? "; from now on every 100th such frame" : "");
+        reasons.c_str(), m_dropped.frames.suffix());
     }
     std::memset(m_dropped.counts, 0, sizeof(m_dropped.counts));
   }

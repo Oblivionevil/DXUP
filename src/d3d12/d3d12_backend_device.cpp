@@ -4,6 +4,7 @@
 #include "d3d12_dxbc.h"
 #include "../util/util_config.h"
 #include "../util/util_types.h"
+#include "../util/util_paths.h"
 
 #include <algorithm>
 #include <cctype>
@@ -61,51 +62,12 @@ namespace dxup::d3d12 {
       return enabled;
     }
 
-    bool getDeviceDllSiblingPath(char* path, size_t pathSize, const char* fileName) {
-      if (!path || pathSize == 0 || !fileName)
-        return false;
-
-      path[0] = '\0';
-      HMODULE hModule = nullptr;
-      GetModuleHandleExA(
-        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-        reinterpret_cast<LPCSTR>(&getDeviceDllSiblingPath),
-        &hModule);
-
-      if (hModule)
-        GetModuleFileNameA(hModule, path, static_cast<DWORD>(pathSize));
-
-      char* lastSlash = strrchr(path, '\\');
-      if (lastSlash) {
-        *(lastSlash + 1) = '\0';
-        strcat_s(path, pathSize, fileName);
-      } else {
-        strcpy_s(path, pathSize, fileName);
-      }
-
-      return path[0] != '\0';
-    }
-
     bool markerFileEnabled(const char* fileName) {
-      char markerPath[MAX_PATH] = {};
-      if (!getDeviceDllSiblingPath(markerPath, MAX_PATH, fileName))
-        strcpy_s(markerPath, MAX_PATH, fileName);
-
-      FILE* marker = fopen(markerPath, "r");
-      if (marker) {
-        fclose(marker);
-        return true;
-      }
-      return false;
+      return dxupSiblingExists(fileName);
     }
 
     bool shaderDescriptorLimitsEnabled() {
       static bool enabled = !markerFileEnabled("dxup_disable_shader_descriptor_limits.txt");
-      return enabled;
-    }
-
-    bool commonPromotionEnabled() {
-      static bool enabled = markerFileEnabled("dxup_common_promotion.txt");
       return enabled;
     }
 
@@ -313,35 +275,9 @@ namespace dxup::d3d12 {
       if (isPlanarVideoFormat(resFormat))
         return viewFormat;
 
-      // If resource format is typeless, any compatible typed format is valid
-      // (This is a simplified check using known typeless format ranges)
-      switch (resFormat) {
-        case DXGI_FORMAT_R32G32B32A32_TYPELESS:
-        case DXGI_FORMAT_R32G32B32_TYPELESS:
-        case DXGI_FORMAT_R16G16B16A16_TYPELESS:
-        case DXGI_FORMAT_R32G32_TYPELESS:
-        case DXGI_FORMAT_R32G8X24_TYPELESS:
-        case DXGI_FORMAT_R10G10B10A2_TYPELESS:
-        case DXGI_FORMAT_R8G8B8A8_TYPELESS:
-        case DXGI_FORMAT_R16G16_TYPELESS:
-        case DXGI_FORMAT_R32_TYPELESS:
-        case DXGI_FORMAT_R24G8_TYPELESS:
-        case DXGI_FORMAT_R8G8_TYPELESS:
-        case DXGI_FORMAT_R16_TYPELESS:
-        case DXGI_FORMAT_R8_TYPELESS:
-        case DXGI_FORMAT_BC1_TYPELESS:
-        case DXGI_FORMAT_BC2_TYPELESS:
-        case DXGI_FORMAT_BC3_TYPELESS:
-        case DXGI_FORMAT_BC4_TYPELESS:
-        case DXGI_FORMAT_BC5_TYPELESS:
-        case DXGI_FORMAT_B8G8R8A8_TYPELESS:
-        case DXGI_FORMAT_B8G8R8X8_TYPELESS:
-        case DXGI_FORMAT_BC6H_TYPELESS:
-        case DXGI_FORMAT_BC7_TYPELESS:
-          return viewFormat; // Typeless resource allows typed views
-        default:
-          break;
-      }
+      // Typeless resources take typed views of their family.
+      if (isTypelessFormat(resFormat))
+        return viewFormat;
 
       // Non-typeless resource: view format must match resource format
       if (viewFormat != resFormat) {
@@ -3548,9 +3484,9 @@ namespace dxup::d3d12 {
       snprintf(name, sizeof(name), "dxup_shaders\\%s_%016llx.dxbc", stage < 6 ? stages[stage] : "xs",
         static_cast<unsigned long long>(shader->getBytecodeHash()));
       char path[MAX_PATH] = {};
-      if (getDeviceDllSiblingPath(path, MAX_PATH, "dxup_shaders")) {
+      if (dxupSiblingPathTo(path, MAX_PATH, "dxup_shaders")) {
         CreateDirectoryA(path, nullptr);
-        getDeviceDllSiblingPath(path, MAX_PATH, name);
+        dxupSiblingPathTo(path, MAX_PATH, name);
         if (GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES) {
           if (FILE* file = fopen(path, "wb")) {
             fwrite(desc.bytecode, 1, desc.bytecodeSize, file);
@@ -4916,9 +4852,9 @@ namespace dxup::d3d12 {
       char name[64];
       snprintf(name, sizeof(name), "dxup_shaders\\cs_%016llx.dxbc", static_cast<unsigned long long>(cacheKey.csHash));
       char path[MAX_PATH] = {};
-      if (getDeviceDllSiblingPath(path, MAX_PATH, "dxup_shaders")) {
+      if (dxupSiblingPathTo(path, MAX_PATH, "dxup_shaders")) {
         CreateDirectoryA(path, nullptr);
-        getDeviceDllSiblingPath(path, MAX_PATH, name);
+        dxupSiblingPathTo(path, MAX_PATH, name);
         if (FILE* file = fopen(path, "wb")) {
           fwrite(desc.csBytecode, 1, desc.csBytecodeSize, file);
           fclose(file);

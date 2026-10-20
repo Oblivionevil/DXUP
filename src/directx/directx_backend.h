@@ -25,6 +25,26 @@ typedef int DXGI_FORMAT;
 
 namespace dxup {
 
+  // The typeless formats (a family's name; views give the type).
+  inline bool isTypelessFormat(DXGI_FORMAT format) {
+    switch (format) {
+      case DXGI_FORMAT_R32G32B32A32_TYPELESS: case DXGI_FORMAT_R32G32B32_TYPELESS:
+      case DXGI_FORMAT_R16G16B16A16_TYPELESS: case DXGI_FORMAT_R32G32_TYPELESS:
+      case DXGI_FORMAT_R32G8X24_TYPELESS:     case DXGI_FORMAT_R10G10B10A2_TYPELESS:
+      case DXGI_FORMAT_R8G8B8A8_TYPELESS:     case DXGI_FORMAT_R16G16_TYPELESS:
+      case DXGI_FORMAT_R32_TYPELESS:          case DXGI_FORMAT_R24G8_TYPELESS:
+      case DXGI_FORMAT_R8G8_TYPELESS:         case DXGI_FORMAT_R16_TYPELESS:
+      case DXGI_FORMAT_R8_TYPELESS:           case DXGI_FORMAT_BC1_TYPELESS:
+      case DXGI_FORMAT_BC2_TYPELESS:          case DXGI_FORMAT_BC3_TYPELESS:
+      case DXGI_FORMAT_BC4_TYPELESS:          case DXGI_FORMAT_BC5_TYPELESS:
+      case DXGI_FORMAT_B8G8R8A8_TYPELESS:     case DXGI_FORMAT_B8G8R8X8_TYPELESS:
+      case DXGI_FORMAT_BC6H_TYPELESS:         case DXGI_FORMAT_BC7_TYPELESS:
+        return true;
+      default:
+        return false;
+    }
+  }
+
   // Reference-counted pointer (simplified)
   template<typename T>
   using Rc = std::shared_ptr<T>;

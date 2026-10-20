@@ -212,19 +212,6 @@ namespace dxup::d3d12 {
         default:                                return format;
       }
     }
-
-    bool isTypeless(DXGI_FORMAT format) {
-      switch (format) {
-        case DXGI_FORMAT_R32G32B32A32_TYPELESS: case DXGI_FORMAT_R32G32B32_TYPELESS:
-        case DXGI_FORMAT_R16G16B16A16_TYPELESS: case DXGI_FORMAT_R32G32_TYPELESS:
-        case DXGI_FORMAT_R10G10B10A2_TYPELESS:  case DXGI_FORMAT_R8G8B8A8_TYPELESS:
-        case DXGI_FORMAT_R16G16_TYPELESS:       case DXGI_FORMAT_R32_TYPELESS:
-        case DXGI_FORMAT_B8G8R8A8_TYPELESS:     case DXGI_FORMAT_B8G8R8X8_TYPELESS:
-          return true;
-        default:
-          return false;
-      }
-    }
 #endif
 
   }
@@ -977,7 +964,7 @@ namespace dxup::d3d12 {
       m_upscalerKind = request.kind;
       std::copy(sizes, sizes + 4, m_upscalerSize);
       m_upscalerFailed = false;
-      if (isTypeless(colorDesc.format) || isTypeless(outputDesc.format)) {
+      if (isTypelessFormat(colorDesc.format) || isTypelessFormat(outputDesc.format)) {
         logMessage(LogLevel::Warn, "upscaler: typeless color (%u) or output (%u), the game's pass runs",
           static_cast<unsigned>(colorDesc.format), static_cast<unsigned>(outputDesc.format));
         m_upscalerFailed = true;

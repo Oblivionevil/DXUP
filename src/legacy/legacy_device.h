@@ -8,6 +8,7 @@
 #include "legacy_types.h"
 #include <atomic>
 #include "d3d9_shader.h"
+#include "../util/util_types.h"
 
 #include <windows.h>
 #include <d3d11_1.h>
@@ -25,6 +26,11 @@ namespace dxup::legacy {
   // The device's self-test draws (legacy_selftest.cpp): not recorded as the
   // game's shader variants.
   extern std::atomic<bool> g_selfTesting;
+
+  // D3DCompile of d3dcompiler_47.dll (loaded once), null without it.
+  using CompileFunction = HRESULT (WINAPI*)(const void*, SIZE_T, const char*, const D3D_SHADER_MACRO*, ID3DInclude*,
+    const char*, const char*, UINT, UINT, ID3DBlob**, ID3DBlob**);
+  CompileFunction compiler();
 
   class Device;
 
@@ -475,7 +481,7 @@ namespace dxup::legacy {
     HMODULE                         m_d3d11Module = nullptr;
     void (WINAPI* m_noteBackBufferSize)(IUnknown*, UINT, UINT) = nullptr;   // DXUP's d3d11.dll only
     HRESULT (WINAPI* m_createMappedView)(IUnknown*, ID3D11Resource*, const D3D11_SHADER_RESOURCE_VIEW_DESC*, UINT,
-                                         ID3D11ShaderResourceView**) = nullptr;   // DXUP's d3d11.dll only
+                                         ID3D11ShaderResourceView**) = nullptr;   // DXUP's d3d11.dll only
     HRESULT (WINAPI* m_createSampler)(IUnknown*, const D3D11_SAMPLER_DESC*, ID3D11SamplerState**) = nullptr;
     Ref<ID3D11Device>               m_device;
     Ref<ID3D11DeviceContext>        m_context;
@@ -594,7 +600,7 @@ namespace dxup::legacy {
     // infinite turn what a shader draws black (checkConstants).
     struct NonFiniteConstants {
       uint32_t uploads = 0;        // this frame
-      uint32_t frames = 0;         // frames with any, logged so far
+      ReportThrottle frames;
       uint32_t presents = 0;
       bool     pixel = false;      // the first of this frame
       uint32_t reg = 0, component = 0;
@@ -611,7 +617,7 @@ namespace dxup::legacy {
                                  DropIndices, DropReasons };
     struct DroppedDraws {
       uint32_t counts[DropReasons] = {};   // this frame
-      uint32_t frames = 0;                 // frames with any, logged so far
+      ReportThrottle frames;
       std::vector<uint64_t> causes;        // logged once
     };
     DroppedDraws m_dropped;
@@ -636,6 +642,15 @@ namespace dxup::legacy {
     void traceProbe9();
     bool m_trace9DepthDone = false;
     void traceDepthMean9();
+    // The bound depth buffer copied to m_trace9DepthStaging and mapped (the
+    // caller unmaps it): depth 0-1 of any single-sampled format.
+    struct DepthReadback {
+      const uint8_t* data = nullptr;
+      uint32_t pitch = 0, width = 0, height = 0;
+      DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+      double at(uint32_t x, uint32_t y) const;
+    };
+    bool readDepth9(DepthReadback& depth);
     Ref<ID3D11Texture2D> m_trace9DepthStaging;
     bool growRing(Ref<ID3D11Buffer>& ring, uint32_t& ringSize, uint32_t& ringOffset, uint32_t size, UINT bind);
     uint32_t m_rangeReports = 0;

@@ -1662,29 +1662,12 @@ namespace dxup::legacy {
         signatures(in, out);
         const std::vector<uint8_t> isgn = d3d12::dxbc::writeSignature(in);
         const std::vector<uint8_t> osgn = d3d12::dxbc::writeSignature(out);
-        struct Chunk { uint32_t type; const uint8_t* data; size_t size; };
-        const Chunk chunks[3] = {
+        const d3d12::dxbc::ContainerChunk chunks[3] = {
           { d3d12::dxbc::kISGN, isgn.data(), isgn.size() },
           { d3d12::dxbc::kOSGN, osgn.data(), osgn.size() },
           { d3d12::dxbc::fourcc('S', 'H', 'E', 'X'), reinterpret_cast<const uint8_t*>(shex.data()), shex.size() * 4 },
         };
-        std::vector<uint8_t> blob(32 + 3 * 4, 0);
-        d3d12::dxbc::writeU32(blob.data(), d3d12::dxbc::fourcc('D', 'X', 'B', 'C'));
-        d3d12::dxbc::writeU32(blob.data() + 20, 1);
-        d3d12::dxbc::writeU32(blob.data() + 28, 3);
-        for (uint32_t i = 0; i < 3; i++) {
-          d3d12::dxbc::writeU32(blob.data() + 32 + i * 4, uint32_t(blob.size()));
-          uint8_t header[8];
-          d3d12::dxbc::writeU32(header, chunks[i].type);
-          d3d12::dxbc::writeU32(header + 4, uint32_t(chunks[i].size));
-          blob.insert(blob.end(), header, header + 8);
-          blob.insert(blob.end(), chunks[i].data, chunks[i].data + chunks[i].size);
-        }
-        d3d12::dxbc::writeU32(blob.data() + 24, uint32_t(blob.size()));
-        uint32_t digest[4];
-        d3d12::dxbc::computeChecksum(blob.data() + 20, uint32_t(blob.size() - 20), digest);
-        std::memcpy(blob.data() + 4, digest, 16);
-        return blob;
+        return d3d12::dxbc::writeContainer(chunks, 3);
       }
     };
 

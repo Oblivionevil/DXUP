@@ -137,27 +137,7 @@ namespace dxup {
 
   // Formats that only name a family and are no view format.
   inline bool isFamilyOnlyFormat(DXGI_FORMAT format) {
-    return format != DXGI_FORMAT_UNKNOWN && getFormatFamily(format) == format
-      && format != DXGI_FORMAT_R11G11B10_FLOAT && UINT(format) >= 1
-      && (UINT(format) <= 99 || format == DXGI_FORMAT_B8G8R8A8_TYPELESS || format == DXGI_FORMAT_B8G8R8X8_TYPELESS)
-      && [&] {
-        switch (format) {
-          case DXGI_FORMAT_R32G32B32A32_TYPELESS: case DXGI_FORMAT_R32G32B32_TYPELESS:
-          case DXGI_FORMAT_R16G16B16A16_TYPELESS: case DXGI_FORMAT_R32G32_TYPELESS:
-          case DXGI_FORMAT_R32G8X24_TYPELESS: case DXGI_FORMAT_R10G10B10A2_TYPELESS:
-          case DXGI_FORMAT_R8G8B8A8_TYPELESS: case DXGI_FORMAT_R16G16_TYPELESS:
-          case DXGI_FORMAT_R32_TYPELESS: case DXGI_FORMAT_R24G8_TYPELESS:
-          case DXGI_FORMAT_R8G8_TYPELESS: case DXGI_FORMAT_R16_TYPELESS:
-          case DXGI_FORMAT_R8_TYPELESS: case DXGI_FORMAT_BC1_TYPELESS:
-          case DXGI_FORMAT_BC2_TYPELESS: case DXGI_FORMAT_BC3_TYPELESS:
-          case DXGI_FORMAT_BC4_TYPELESS: case DXGI_FORMAT_BC5_TYPELESS:
-          case DXGI_FORMAT_BC6H_TYPELESS: case DXGI_FORMAT_BC7_TYPELESS:
-          case DXGI_FORMAT_B8G8R8A8_TYPELESS: case DXGI_FORMAT_B8G8R8X8_TYPELESS:
-            return true;
-          default:
-            return false;
-        }
-      }();
+    return isTypelessFormat(format);
   }
 
   // The format a texture view has: its own, or the resource's for UNKNOWN.

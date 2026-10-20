@@ -50,6 +50,18 @@ namespace dxup {
 #endif
   }
 
+  // Glitch reports of one kind: every frame with any for the first 20, then
+  // every 100th.
+  struct ReportThrottle {
+    uint32_t frames = 0;   // frames with any so far
+    // Counts a frame with any; whether it is logged.
+    bool next() {
+      frames++;
+      return frames <= 20 || frames % 100 == 0;
+    }
+    const char* suffix() const { return frames == 20 ? "; from now on every 100th such frame" : ""; }
+  };
+
   // Logging levels
   enum class LogLevel {
     Trace,

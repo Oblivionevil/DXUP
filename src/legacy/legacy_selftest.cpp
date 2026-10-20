@@ -319,10 +319,7 @@ namespace dxup::legacy {
   // the declaration, the input layout, DXUP's shader compiler, the
   // pipeline - one point per type into a float target, read back.
   void Device::selfTestVertexTypes() {
-    using Compile = HRESULT (WINAPI*)(const void*, SIZE_T, const char*, const D3D_SHADER_MACRO*, ID3DInclude*,
-      const char*, const char*, UINT, UINT, ID3DBlob**, ID3DBlob**);
-    HMODULE module = LoadLibraryW(L"d3dcompiler_47.dll");
-    auto compile = module ? reinterpret_cast<Compile>(GetProcAddress(module, "D3DCompile")) : nullptr;
+    const CompileFunction compile = compiler();
     if (!compile)
       return;
     static const char kVs[] =
@@ -434,10 +431,7 @@ namespace dxup::legacy {
   }
 
   void Device::selfTestFormats() {
-    using Compile = HRESULT (WINAPI*)(const void*, SIZE_T, const char*, const D3D_SHADER_MACRO*, ID3DInclude*,
-      const char*, const char*, UINT, UINT, ID3DBlob**, ID3DBlob**);
-    HMODULE module = LoadLibraryW(L"d3dcompiler_47.dll");
-    auto compile = module ? reinterpret_cast<Compile>(GetProcAddress(module, "D3DCompile")) : nullptr;
+    const CompileFunction compile = compiler();
     if (!compile)
       return;
     static const char kVs[] =

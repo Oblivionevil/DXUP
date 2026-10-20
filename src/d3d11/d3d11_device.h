@@ -257,36 +257,6 @@ namespace dxup {
         || (format >= DXGI_FORMAT_BC6H_TYPELESS && format <= DXGI_FORMAT_BC7_UNORM_SRGB);
   }
 
-  inline bool isTypelessImageFormat(DXGI_FORMAT format) {
-    switch (format) {
-      case DXGI_FORMAT_R32G32B32A32_TYPELESS:
-      case DXGI_FORMAT_R32G32B32_TYPELESS:
-      case DXGI_FORMAT_R16G16B16A16_TYPELESS:
-      case DXGI_FORMAT_R32G32_TYPELESS:
-      case DXGI_FORMAT_R32G8X24_TYPELESS:
-      case DXGI_FORMAT_R10G10B10A2_TYPELESS:
-      case DXGI_FORMAT_R8G8B8A8_TYPELESS:
-      case DXGI_FORMAT_R16G16_TYPELESS:
-      case DXGI_FORMAT_R32_TYPELESS:
-      case DXGI_FORMAT_R24G8_TYPELESS:
-      case DXGI_FORMAT_R8G8_TYPELESS:
-      case DXGI_FORMAT_R16_TYPELESS:
-      case DXGI_FORMAT_R8_TYPELESS:
-      case DXGI_FORMAT_BC1_TYPELESS:
-      case DXGI_FORMAT_BC2_TYPELESS:
-      case DXGI_FORMAT_BC3_TYPELESS:
-      case DXGI_FORMAT_BC4_TYPELESS:
-      case DXGI_FORMAT_BC5_TYPELESS:
-      case DXGI_FORMAT_B8G8R8A8_TYPELESS:
-      case DXGI_FORMAT_B8G8R8X8_TYPELESS:
-      case DXGI_FORMAT_BC6H_TYPELESS:
-      case DXGI_FORMAT_BC7_TYPELESS:
-        return true;
-      default:
-        return false;
-    }
-  }
-
   // Formats of a texture DXUP multisamples although the application does not
   // (dxup.conf d3d11.msaaForce): the typed format the multisampled copy is
   // resolved and refilled in, and for depth the format a shader reads depth
@@ -418,7 +388,7 @@ namespace dxup {
   inline DXGI_FORMAT validateImageViewFormat(DXGI_FORMAT viewFormat, DXGI_FORMAT resourceFormat, bool castable = false) {
     DXGI_FORMAT resolvedFormat = resolveImageViewFormat(viewFormat, resourceFormat);
 
-    if (castable || resourceFormat == DXGI_FORMAT_UNKNOWN || isTypelessImageFormat(resourceFormat))
+    if (castable || resourceFormat == DXGI_FORMAT_UNKNOWN || isTypelessFormat(resourceFormat))
       return resolvedFormat;
 
     return resolvedFormat == resourceFormat ? resolvedFormat : resourceFormat;
@@ -3471,7 +3441,7 @@ namespace dxup {
         : is3D ? D3D11_FORMAT_SUPPORT_TEXTURE3D : D3D11_FORMAT_SUPPORT_TEXTURE2D;
       if (!(formatSupport & dimensionSupport))
         return E_INVALIDARG;
-      if (!isTypelessImageFormat(format)) {
+      if (!isTypelessFormat(format)) {
         if (((bindFlags & D3D11_BIND_RENDER_TARGET) && !(formatSupport & D3D11_FORMAT_SUPPORT_RENDER_TARGET))
          || ((bindFlags & D3D11_BIND_DEPTH_STENCIL) && !(formatSupport & D3D11_FORMAT_SUPPORT_DEPTH_STENCIL))
          || ((bindFlags & D3D11_BIND_SHADER_RESOURCE) && !(formatSupport & D3D11_FORMAT_SUPPORT_SHADER_LOAD)))

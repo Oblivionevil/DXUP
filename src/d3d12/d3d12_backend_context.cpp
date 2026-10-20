@@ -2,6 +2,7 @@
 #include "d3d12_dxbc.h"
 #include "d3d12_cs_thread.h"
 #include "../util/util_types.h"
+#include "../util/util_paths.h"
 #include <algorithm>
 #include <cstdarg>
 #include <cstdio>
@@ -32,67 +33,18 @@ namespace dxup::d3d12 {
 #ifdef _WIN32
   namespace {
 
-    bool getDllSiblingPath(char* path, size_t pathSize, const char* fileName) {
-      if (!path || pathSize == 0 || !fileName)
-        return false;
-
-      path[0] = '\0';
-      HMODULE hModule = nullptr;
-      GetModuleHandleExA(
-        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-        reinterpret_cast<LPCSTR>(&getDllSiblingPath),
-        &hModule);
-
-      if (hModule)
-        GetModuleFileNameA(hModule, path, static_cast<DWORD>(pathSize));
-
-      char* lastSlash = strrchr(path, '\\');
-      if (lastSlash) {
-        *(lastSlash + 1) = '\0';
-        strcat_s(path, pathSize, fileName);
-      } else {
-        strcpy_s(path, pathSize, fileName);
-      }
-
-      return path[0] != '\0';
-    }
-
     bool dredEnabled() {
-      static bool enabled = [] {
-        char markerPath[MAX_PATH] = {};
-        if (!getDllSiblingPath(markerPath, MAX_PATH, "dxup_dred.txt"))
-          return false;
-        return GetFileAttributesA(markerPath) != INVALID_FILE_ATTRIBUTES;
-      }();
+      static bool enabled = dxupSiblingExists("dxup_dred.txt");
       return enabled;
     }
 
     bool perfStatsEnabled() {
-      static bool enabled = [] {
-        char markerPath[MAX_PATH] = {};
-        if (!getDllSiblingPath(markerPath, MAX_PATH, "dxup_perf_stats.txt"))
-          strcpy_s(markerPath, MAX_PATH, "dxup_perf_stats.txt");
-
-        FILE* marker = fopen(markerPath, "r");
-        if (marker) {
-          fclose(marker);
-          return true;
-        }
-        return false;
-      }();
+      static bool enabled = dxupSiblingExists("dxup_perf_stats.txt");
       return enabled;
     }
 
     bool infoDiagnosticsEnabled() {
-      static bool enabled = [] {
-        char markerPath[MAX_PATH] = {};
-        if (!getDllSiblingPath(markerPath, MAX_PATH, "dxup_info_log.txt"))
-          strcpy_s(markerPath, MAX_PATH, "dxup_info_log.txt");
-
-        DWORD attributes = GetFileAttributesA(markerPath);
-        return attributes != INVALID_FILE_ATTRIBUTES
-          && !(attributes & FILE_ATTRIBUTE_DIRECTORY);
-      }();
+      static bool enabled = dxupSiblingExists("dxup_info_log.txt");
       return enabled;
     }
 
@@ -112,66 +64,22 @@ namespace dxup::d3d12 {
     }
 
     bool asyncResetEnabled() {
-      static bool enabled = [] {
-        char markerPath[MAX_PATH] = {};
-        if (!getDllSiblingPath(markerPath, MAX_PATH, "dxup_disable_async_reset.txt"))
-          strcpy_s(markerPath, MAX_PATH, "dxup_disable_async_reset.txt");
-
-        FILE* marker = fopen(markerPath, "r");
-        if (marker) {
-          fclose(marker);
-          return false;
-        }
-        return true;
-      }();
+      static bool enabled = !dxupSiblingExists("dxup_disable_async_reset.txt");
       return enabled;
     }
 
     bool immediateSmallUpdatesEnabled() {
-      static bool enabled = [] {
-        char markerPath[MAX_PATH] = {};
-        if (!getDllSiblingPath(markerPath, MAX_PATH, "dxup_immediate_small_updates.txt"))
-          strcpy_s(markerPath, MAX_PATH, "dxup_immediate_small_updates.txt");
-
-        FILE* marker = fopen(markerPath, "r");
-        if (marker) {
-          fclose(marker);
-          return true;
-        }
-        return false;
-      }();
+      static bool enabled = dxupSiblingExists("dxup_immediate_small_updates.txt");
       return enabled;
     }
 
     bool barrierStatsEnabled() {
-      static bool enabled = [] {
-        char markerPath[MAX_PATH] = {};
-        if (!getDllSiblingPath(markerPath, MAX_PATH, "dxup_barrier_stats.txt"))
-          strcpy_s(markerPath, MAX_PATH, "dxup_barrier_stats.txt");
-
-        FILE* marker = fopen(markerPath, "r");
-        if (marker) {
-          fclose(marker);
-          return true;
-        }
-        return false;
-      }();
+      static bool enabled = dxupSiblingExists("dxup_barrier_stats.txt");
       return enabled;
     }
 
     bool perfTimingEnabled() {
-      static bool enabled = [] {
-        char markerPath[MAX_PATH] = {};
-        if (!getDllSiblingPath(markerPath, MAX_PATH, "dxup_perf_timing.txt"))
-          strcpy_s(markerPath, MAX_PATH, "dxup_perf_timing.txt");
-
-        FILE* marker = fopen(markerPath, "r");
-        if (marker) {
-          fclose(marker);
-          return true;
-        }
-        return false;
-      }();
+      static bool enabled = dxupSiblingExists("dxup_perf_timing.txt");
       return enabled;
     }
 
@@ -182,18 +90,7 @@ namespace dxup::d3d12 {
     }
 
     bool commonPromotionEnabled() {
-      static bool enabled = [] {
-        char markerPath[MAX_PATH] = {};
-        if (!getDllSiblingPath(markerPath, MAX_PATH, "dxup_common_promotion.txt"))
-          strcpy_s(markerPath, MAX_PATH, "dxup_common_promotion.txt");
-
-        FILE* marker = fopen(markerPath, "r");
-        if (marker) {
-          fclose(marker);
-          return true;
-        }
-        return false;
-      }();
+      static bool enabled = dxupSiblingExists("dxup_common_promotion.txt");
       return enabled;
     }
 
@@ -1005,8 +902,8 @@ namespace dxup::d3d12 {
       d3d12Device->CreateQueryHeap(&queryHeapDesc, IID_PPV_ARGS(&m_streamOutputQueryHeap));
 
       char profileMarker[MAX_PATH] = {}, profileOut[MAX_PATH] = {};
-      if (getDllSiblingPath(profileMarker, MAX_PATH, "dxup_gpu_profile.txt")
-       && getDllSiblingPath(profileOut, MAX_PATH, "dxup_gpu_profile_out.txt"))
+      if (dxupSiblingPathTo(profileMarker, MAX_PATH, "dxup_gpu_profile.txt")
+       && dxupSiblingPathTo(profileOut, MAX_PATH, "dxup_gpu_profile_out.txt"))
         m_gpuProfiler.init(d3d12Device, device->getCommandQueue(), profileMarker, profileOut);
 
     }
@@ -4320,8 +4217,7 @@ namespace dxup::d3d12 {
   uint64_t D3D12BackendContext::barrierBatchSignature() const {
     uint64_t hash = 1469598103934665603ull;
     auto mix = [&](uint64_t value) {
-      hash ^= value;
-      hash *= 1099511628211ull;
+      hash = fnv64Multiply(hash ^ value);
     };
     for (const auto& b : m_pendingBarriers) {
       if (b.Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION) {

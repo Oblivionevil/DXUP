@@ -21,6 +21,7 @@
 #include <string>
 #include <new>
 
+#include "../util/util_paths.h"
 #include "d3d11_device.h"
 #include "d3d11_context.h"
 #include "../d3d12/d3d12_backend_device.h"
@@ -34,51 +35,10 @@ namespace dxup {
   // D3D11Device and D3D11Texture2D available via d3d11_device.h
 
   inline bool dxupFpsOverlayEnabled() {
-    static bool enabled = [] {
-      char dllPath[MAX_PATH] = {};
-      HMODULE hModule = nullptr;
-      GetModuleHandleExA(
-        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-        reinterpret_cast<LPCSTR>(&dxupFpsOverlayEnabled),
-        &hModule);
-
-      if (hModule)
-        GetModuleFileNameA(hModule, dllPath, MAX_PATH);
-
-      char* lastSlash = strrchr(dllPath, '\\');
-      if (lastSlash) {
-        *(lastSlash + 1) = '\0';
-        strncat_s(dllPath, MAX_PATH, "dxup_show_fps_overlay.txt", _TRUNCATE);
-      } else {
-        strcpy_s(dllPath, MAX_PATH, "dxup_show_fps_overlay.txt");
-      }
-
-      FILE* marker = fopen(dllPath, "r");
-      if (marker) {
-        fclose(marker);
-        return true;
-      }
-      return false;
-    }();
+    static bool enabled = dxupSiblingExists("dxup_show_fps_overlay.txt");
     return enabled;
   }
 
-  // Path of a file next to the DLL this code is in.
-  inline std::string dxupSiblingPath(const char* name) {
-    char path[MAX_PATH] = {};
-    HMODULE module = nullptr;
-    GetModuleHandleExA(
-      GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-      reinterpret_cast<LPCSTR>(&dxupSiblingPath), &module);
-    if (module)
-      GetModuleFileNameA(module, path, MAX_PATH);
-    char* lastSlash = strrchr(path, '\\');
-    if (lastSlash)
-      *(lastSlash + 1) = '\0';
-    else
-      path[0] = '\0';
-    return std::string(path) + name;
-  }
 
   // Diagnostics: with dxup_frame_dump.txt next to the DLL, the back buffer
   // the application rendered is saved as dxup_frame_<n>.bmp at a few

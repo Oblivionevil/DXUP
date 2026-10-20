@@ -14,6 +14,7 @@
 
 #include "../directx/directx_backend.h"
 #include "../util/util_types.h"
+#include "../util/util_paths.h"
 #include "../util/com_private_data.h"
 #include "d3d11_d3d12_bridge.h"
 #include "../d3d12/d3d12_backend_context.h"
@@ -61,60 +62,13 @@ namespace dxup {
   static constexpr uint32_t D3D11_PS_CS_UAV_REGISTER_COUNT_MAX = 8;
   static constexpr uint32_t SHADER_STAGE_COUNT = 6;
 
-  inline bool getD3D11DllSiblingPath(char* path, size_t pathSize, const char* fileName) {
-    if (!path || pathSize == 0 || !fileName)
-      return false;
-
-    path[0] = '\0';
-    HMODULE hModule = nullptr;
-    GetModuleHandleExA(
-      GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-      reinterpret_cast<LPCSTR>(&getD3D11DllSiblingPath),
-      &hModule);
-
-    if (hModule)
-      GetModuleFileNameA(hModule, path, static_cast<DWORD>(pathSize));
-
-    char* lastSlash = strrchr(path, '\\');
-    if (lastSlash) {
-      *(lastSlash + 1) = '\0';
-      strcat_s(path, pathSize, fileName);
-    } else {
-      strcpy_s(path, pathSize, fileName);
-    }
-
-    return path[0] != '\0';
-  }
-
   inline bool renameSrvUavUpdatesEnabled() {
-    static bool enabled = [] {
-      char markerPath[MAX_PATH] = {};
-      if (!getD3D11DllSiblingPath(markerPath, MAX_PATH, "dxup_rename_srv_uav_updates.txt"))
-        strcpy_s(markerPath, MAX_PATH, "dxup_rename_srv_uav_updates.txt");
-
-      FILE* marker = fopen(markerPath, "r");
-      if (marker) {
-        fclose(marker);
-        return true;
-      }
-      return false;
-    }();
+    static bool enabled = dxupSiblingExists("dxup_rename_srv_uav_updates.txt");
     return enabled;
   }
 
   inline bool batchSrvUavUpdatesEnabled() {
-    static bool enabled = [] {
-      char markerPath[MAX_PATH] = {};
-      if (!getD3D11DllSiblingPath(markerPath, MAX_PATH, "dxup_batch_srv_uav_updates.txt"))
-        strcpy_s(markerPath, MAX_PATH, "dxup_batch_srv_uav_updates.txt");
-
-      FILE* marker = fopen(markerPath, "r");
-      if (marker) {
-        fclose(marker);
-        return true;
-      }
-      return false;
-    }();
+    static bool enabled = dxupSiblingExists("dxup_batch_srv_uav_updates.txt");
     return enabled;
   }
 
@@ -1852,13 +1806,14 @@ namespace dxup {
     enum DropReason : uint32_t { DropNone, DropNoVertexShader, DropPipelineFailed, DropPipelinePending, DropReasons };
     DropReason m_dropReason = DropNone;
     uint32_t   m_droppedDraws[DropReasons] = {};
-    uint32_t   m_droppedFrames = 0;
+    ReportThrottle m_droppedFrames;
 
     // NaN and infinity the game puts into constant buffers, and NaN in GPU
     // results it reads back (glitch reports): either shows as black or
     // missing pixels, and spreads through the game's own math (exposure,
     // LOD biases) into later frames.
-    uint32_t m_nonFiniteUploads = 0, m_nonFiniteFrames = 0, m_nanReadbacks = 0;
+    uint32_t m_nonFiniteUploads = 0, m_nanReadbacks = 0;
+    ReportThrottle m_nonFiniteFrames;
     std::unordered_set<ID3D11Resource*> m_nonFiniteLogged;
 
     void checkConstants(ID3D11Resource* buffer, const float* values, UINT count) {
@@ -1932,10 +1887,9 @@ namespace dxup {
       if (auto* backend = m_device->GetBackend())
         m_droppedDraws[DropPipelineFailed] += backend->takeFailedPipelineDraws();
       if (m_nonFiniteUploads) {
-        m_nonFiniteFrames++;
-        if (m_nonFiniteFrames <= 20 || m_nonFiniteFrames % 100 == 0)
+        if (m_nonFiniteFrames.next())
           logMessage(LogLevel::Warn, "glitch: present %u: %u constant buffer writes with NaN or infinity%s", m_historyFrame,
-            m_nonFiniteUploads, m_nonFiniteFrames == 20 ? "; from now on every 100th such frame" : "");
+            m_nonFiniteUploads, m_nonFiniteFrames.suffix());
         m_nonFiniteUploads = 0;
       }
       uint32_t total = 0;
@@ -1944,9 +1898,7 @@ namespace dxup {
       total += m_droppedDraws[DropNone];   // dropped for another reason
       if (!total)
         return;
-      // Every frame with any for the first 20, then every 100th.
-      m_droppedFrames++;
-      if (m_droppedFrames <= 20 || m_droppedFrames % 100 == 0) {
+      if (m_droppedFrames.next()) {
         static const char* const kReasons[DropReasons] = { "other", "without vertex shader",
           "pipeline failed to compile (see the error above)", "pipeline still compiling (d3d11.asyncShaders)" };
         std::string reasons;
@@ -1958,7 +1910,7 @@ namespace dxup {
           reasons += text;
         }
         logMessage(LogLevel::Warn, "glitch: present %u: %u draws not drawn (%s)%s", m_historyFrame, total, reasons.c_str(),
-          m_droppedFrames == 20 ? "; from now on every 100th such frame" : "");
+          m_droppedFrames.suffix());
       }
       std::memset(m_droppedDraws, 0, sizeof(m_droppedDraws));
     }

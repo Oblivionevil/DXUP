@@ -241,6 +241,47 @@ namespace dxup::d3d12::dxbc {
     return std::memcmp(digest, bytes + 4, 16) == 0;
   }
 
+  // Size and checksum of a container whose chunks are in place.
+  inline void finishContainer(std::vector<uint8_t>& blob) {
+    writeU32(blob.data() + 24, uint32_t(blob.size()));
+    uint32_t digest[4];
+    computeChecksum(blob.data() + 20, uint32_t(blob.size() - 20), digest);
+    std::memcpy(blob.data() + 4, digest, 16);
+  }
+
+  struct ContainerChunk {
+    uint32_t       type;
+    const uint8_t* data;
+    size_t         size;
+  };
+
+  // A container of the chunks, in their order.
+  inline std::vector<uint8_t> writeContainer(const ContainerChunk* chunks, uint32_t count) {
+    std::vector<uint8_t> blob(32 + size_t(count) * 4, 0);
+    writeU32(blob.data(), fourcc('D', 'X', 'B', 'C'));
+    writeU32(blob.data() + 20, 1);
+    writeU32(blob.data() + 28, count);
+    for (uint32_t i = 0; i < count; i++) {
+      writeU32(blob.data() + 32 + i * 4, uint32_t(blob.size()));
+      uint8_t header[8];
+      writeU32(header, chunks[i].type);
+      writeU32(header + 4, uint32_t(chunks[i].size));
+      blob.insert(blob.end(), header, header + 8);
+      blob.insert(blob.end(), chunks[i].data, chunks[i].data + chunks[i].size);
+    }
+    finishContainer(blob);
+    return blob;
+  }
+
+  // Tokens of the instruction at `at` (custom data gives its length in the
+  // next token); 0 when malformed or past the end.
+  inline uint32_t instructionLength(const std::vector<uint32_t>& tokens, size_t at) {
+    uint32_t length = (tokens[at] >> 24) & 0x7f;
+    if ((tokens[at] & 0x7ff) == 0x35)
+      length = at + 1 < tokens.size() ? tokens[at + 1] : 0;
+    return length <= tokens.size() - at ? length : 0;
+  }
+
   inline bool isDeclaration(uint32_t opcode) {
     // dcl_resource .. dcl_global_flags, the D3D11 declarations, and
     // dcl_gs_instance_count; custom data holds immediate constant buffers.
@@ -260,10 +301,8 @@ namespace dxup::d3d12::dxbc {
     size_t insert = 2;
     while (insert < tokens.size()) {
       const uint32_t opcode = tokens[insert] & 0x7ff;
-      uint32_t length = (tokens[insert] >> 24) & 0x7f;
-      if (opcode == 0x35)
-        length = insert + 1 < tokens.size() ? tokens[insert + 1] : 0;
-      if (!length || length > tokens.size() - insert)
+      const uint32_t length = instructionLength(tokens, insert);
+      if (!length)
         return false;
       if (!isDeclaration(opcode))
         break;
@@ -305,10 +344,8 @@ namespace dxup::d3d12::dxbc {
     size_t at = 2;
     while (at < tokens.size()) {
       const uint32_t opcode = tokens[at] & 0x7ff;
-      uint32_t length = (tokens[at] >> 24) & 0x7f;
-      if (opcode == 0x35)
-        length = at + 1 < tokens.size() ? tokens[at + 1] : 0;
-      if (!length || length > tokens.size() - at)
+      const uint32_t length = instructionLength(tokens, at);
+      if (!length)
         return false;
       if (!isDeclaration(opcode))
         break;
@@ -372,10 +409,7 @@ namespace dxup::d3d12::dxbc {
     }
     if (!replaced)
       return false;
-    writeU32(out.data() + 24, uint32_t(out.size()));
-    uint32_t digest[4];
-    computeChecksum(out.data() + 20, uint32_t(out.size() - 20), digest);
-    std::memcpy(out.data() + 4, digest, 16);
+    finishContainer(out);
     return true;
   }
 
@@ -393,10 +427,8 @@ namespace dxup::d3d12::dxbc {
     size_t at = 2;
     while (at < tokens.size()) {
       const uint32_t opcode = tokens[at] & 0x7ff;
-      uint32_t length = (tokens[at] >> 24) & 0x7f;
-      if (opcode == 0x35)
-        length = at + 1 < tokens.size() ? tokens[at + 1] : 0;
-      if (!length || length > tokens.size() - at)
+      const uint32_t length = instructionLength(tokens, at);
+      if (!length)
         return traits;
       const uint32_t mode = (tokens[at] >> 11) & 0xf;
       const bool interpolated = mode >= 2 && mode <= 5;
@@ -429,10 +461,8 @@ namespace dxup::d3d12::dxbc {
     size_t at = 2;
     while (at < tokens.size()) {
       const uint32_t opcode = tokens[at] & 0x7ff;
-      uint32_t length = (tokens[at] >> 24) & 0x7f;
-      if (opcode == 0x35)
-        length = at + 1 < tokens.size() ? tokens[at + 1] : 0;
-      if (!length || length > tokens.size() - at)
+      const uint32_t length = instructionLength(tokens, at);
+      if (!length)
         return false;
       if (!isDeclaration(opcode))
         break;
@@ -471,10 +501,8 @@ namespace dxup::d3d12::dxbc {
     size_t at = 2;
     while (at < tokens.size()) {
       const uint32_t opcode = tokens[at] & 0x7ff;
-      uint32_t length = (tokens[at] >> 24) & 0x7f;
-      if (opcode == 0x35)
-        length = at + 1 < tokens.size() ? tokens[at + 1] : 0;
-      if (!length || length > tokens.size() - at)
+      const uint32_t length = instructionLength(tokens, at);
+      if (!length)
         return false;
       if (!isDeclaration(opcode))
         break;
@@ -604,10 +632,8 @@ namespace dxup::d3d12::dxbc {
     size_t at = 2;
     while (at < tokens.size()) {
       const uint32_t opcode = tokens[at] & 0x7ff;
-      uint32_t length = (tokens[at] >> 24) & 0x7f;
-      if (opcode == 0x35)
-        length = at + 1 < tokens.size() ? tokens[at + 1] : 0;
-      if (!length || length > tokens.size() - at)
+      const uint32_t length = instructionLength(tokens, at);
+      if (!length)
         return false;
       // fcall carries a function table index before its operand.
       if (opcode == 0x78)
@@ -667,10 +693,8 @@ namespace dxup::d3d12::dxbc {
     size_t at = 2;
     while (at < tokens.size()) {
       const uint32_t opcode = tokens[at] & 0x7ff;
-      uint32_t length = (tokens[at] >> 24) & 0x7f;
-      if (opcode == 0x35)
-        length = at + 1 < tokens.size() ? tokens[at + 1] : 0;
-      if (!length || length > tokens.size() - at)
+      const uint32_t length = instructionLength(tokens, at);
+      if (!length)
         return false;
       // dcl_resource(_raw, _structured), dcl_constantbuffer, dcl_sampler,
       // dcl_uav_typed(_raw, _structured): the register's slot is the first
@@ -763,10 +787,8 @@ namespace dxup::d3d12::dxbc {
     size_t at = 2;
     while (at < tokens.size()) {
       const uint32_t opcode = tokens[at] & 0x7ff;
-      uint32_t length = (tokens[at] >> 24) & 0x7f;
-      if (opcode == 0x35)
-        length = at + 1 < tokens.size() ? tokens[at + 1] : 0;
-      if (!length || length > tokens.size() - at)
+      const uint32_t length = instructionLength(tokens, at);
+      if (!length)
         return false;
       // fcall carries a function table index before its operand.
       if (opcode == 0x78)
@@ -1021,10 +1043,8 @@ namespace dxup::d3d12::dxbc {
     size_t at = 2;
     while (at < tokens.size()) {
       const uint32_t opcode = tokens[at] & 0x7ff;
-      uint32_t length = (tokens[at] >> 24) & 0x7f;
-      if (opcode == 0x35)
-        length = at + 1 < tokens.size() ? tokens[at + 1] : 0;
-      if (!length || length > tokens.size() - at)
+      const uint32_t length = instructionLength(tokens, at);
+      if (!length)
         return false;
       if (opcode == 0x78)   // fcall: interfaces
         return false;
@@ -1077,9 +1097,9 @@ namespace dxup::d3d12::dxbc {
     at = 2;
     while (at < tokens.size()) {
       const uint32_t opcode = tokens[at] & 0x7ff;
-      uint32_t length = (tokens[at] >> 24) & 0x7f;
-      if (opcode == 0x35)
-        length = tokens[at + 1];
+      const uint32_t length = instructionLength(tokens, at);
+      if (!length)
+        return false;
       if (opcode == 0x68) {
         rewritten.push_back(tokens[at]);
         rewritten.push_back(newCount);
@@ -1200,10 +1220,8 @@ namespace dxup::d3d12::dxbc {
     size_t at = 2;
     while (at < tokens.size()) {
       const uint32_t opcode = tokens[at] & 0x7ff;
-      uint32_t length = (tokens[at] >> 24) & 0x7f;
-      if (opcode == 0x35)
-        length = at + 1 < tokens.size() ? tokens[at + 1] : 0;
-      if (!length || length > tokens.size() - at)
+      const uint32_t length = instructionLength(tokens, at);
+      if (!length)
         return false;
       if (opcode == 0x78)   // fcall: interfaces
         return false;
@@ -1237,9 +1255,9 @@ namespace dxup::d3d12::dxbc {
     at = 2;
     while (at < tokens.size()) {
       const uint32_t opcode = tokens[at] & 0x7ff;
-      uint32_t length = (tokens[at] >> 24) & 0x7f;
-      if (opcode == 0x35)
-        length = tokens[at + 1];
+      const uint32_t length = instructionLength(tokens, at);
+      if (!length)
+        return false;
       if (at == icbAt) {
         // dcl_constantbuffer cb<slot>[vectors], dynamicIndexed
         rewritten.insert(rewritten.end(), { 0x59u | (1u << 11) | (4u << 24), 0x208e46u, slot, vectors });

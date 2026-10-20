@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../directx/directx_backend.h"
+#include "../util/util_paths.h"
 #include <cstring>
 
 #ifdef _WIN32
@@ -19,25 +20,7 @@ namespace dxup {
   // For developers only: copying each mapped constant buffer back costs a
   // D3D9 game 98 % of its frame rate, so the detailed log does not do it.
   inline bool d3d11FinalPassTraceEnabled() {
-    static bool enabled = [] {
-      char markerPath[MAX_PATH] = {};
-      HMODULE module = nullptr;
-      GetModuleHandleExA(
-        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-        reinterpret_cast<LPCSTR>(&d3d11FinalPassTraceEnabled),
-        &module);
-      if (module)
-        GetModuleFileNameA(module, markerPath, MAX_PATH);
-      char* lastSlash = strrchr(markerPath, '\\');
-      if (lastSlash)
-        *(lastSlash + 1) = '\0';
-      else
-        markerPath[0] = '\0';
-      strcat_s(markerPath, MAX_PATH, "dxup_final_pass_trace.txt");
-      DWORD attributes = GetFileAttributesA(markerPath);
-      return attributes != INVALID_FILE_ATTRIBUTES
-          && !(attributes & FILE_ATTRIBUTE_DIRECTORY);
-    }();
+    static bool enabled = dxupSiblingExists("dxup_final_pass_trace.txt");
     return enabled;
   }
 
@@ -45,52 +28,12 @@ namespace dxup {
   // Manager's "Record a problem"): also the draw history and flicker
   // detection of glitch reports.
   inline bool d3d11GlitchReportsEnabled() {
-    static bool enabled = [] {
-      char markerPath[MAX_PATH] = {};
-      HMODULE module = nullptr;
-      GetModuleHandleExA(
-        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-        reinterpret_cast<LPCSTR>(&d3d11GlitchReportsEnabled),
-        &module);
-      if (module)
-        GetModuleFileNameA(module, markerPath, MAX_PATH);
-      char* lastSlash = strrchr(markerPath, '\\');
-      if (lastSlash)
-        *(lastSlash + 1) = '\0';
-      else
-        markerPath[0] = '\0';
-      strcat_s(markerPath, MAX_PATH, "dxup_frame_dump.txt");
-      DWORD attributes = GetFileAttributesA(markerPath);
-      return attributes != INVALID_FILE_ATTRIBUTES
-          && !(attributes & FILE_ATTRIBUTE_DIRECTORY);
-    }();
+    static bool enabled = dxupSiblingExists("dxup_frame_dump.txt");
     return enabled;
   }
 
   inline bool d3d11InfoLoggingEnabled() {
-    static bool enabled = [] {
-      char markerPath[MAX_PATH] = {};
-      HMODULE module = nullptr;
-      GetModuleHandleExA(
-        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-        reinterpret_cast<LPCSTR>(&d3d11InfoLoggingEnabled),
-        &module);
-
-      if (module)
-        GetModuleFileNameA(module, markerPath, MAX_PATH);
-
-      char* lastSlash = strrchr(markerPath, '\\');
-      if (lastSlash) {
-        *(lastSlash + 1) = '\0';
-        strcat_s(markerPath, MAX_PATH, "dxup_info_log.txt");
-      } else {
-        strcpy_s(markerPath, MAX_PATH, "dxup_info_log.txt");
-      }
-
-      DWORD attributes = GetFileAttributesA(markerPath);
-      return attributes != INVALID_FILE_ATTRIBUTES
-          && !(attributes & FILE_ATTRIBUTE_DIRECTORY);
-    }();
+    static bool enabled = dxupSiblingExists("dxup_info_log.txt");
     return enabled;
   }
 #endif
