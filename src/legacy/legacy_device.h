@@ -106,6 +106,9 @@ namespace dxup::legacy {
     ID3D11Resource*           d3dResource() const;
     ID3D11ShaderResourceView* srv() const { return m_srv.get(); }
     ID3D11ShaderResourceView* srv(bool srgb);
+    // A view of a copy of the texture as it is now: shaders reading a
+    // texture they also draw into (null when no copy can be made).
+    ID3D11ShaderResourceView* copySrv(bool srgb);
     ID3D11RenderTargetView*   rtv(uint32_t subresource, bool srgb = false);
     ID3D11DepthStencilView*   dsv() const { return m_dsv.get(); }
     DXGI_FORMAT dxgiFormat() const { return m_dxgiFormat; }
@@ -149,6 +152,8 @@ namespace dxup::legacy {
     Ref<ID3D11Texture2D>   m_texture;
     Ref<ID3D11Texture3D>   m_volume;
     Ref<ID3D11Texture2D>   m_resolved;      // multisampled targets read back
+    std::unique_ptr<Texture> m_copy;        // copySrv
+    bool                   m_copyFailed = false;
     Ref<ID3D11ShaderResourceView> m_srv;
     Ref<ID3D11ShaderResourceView> m_srvSrgb;
     Ref<ID3D11DepthStencilView>   m_dsv;
@@ -671,6 +676,9 @@ namespace dxup::legacy {
     uint32_t m_dirty = DirtyAll;
     uint32_t m_textureDirtyMask = 0xfffff;
     uint32_t m_samplerDirtyMask = 0xfffff;
+    // Samplers whose texture is a bound target: bound again each draw
+    // (bindTextures copies the targets the shaders read).
+    uint32_t m_feedbackMask = 0;
     bool m_vertexConstantsDirty = true;
     bool m_transformConstantsDirty = true;
     bool m_pixelConstantsDirty = true;

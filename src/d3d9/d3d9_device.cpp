@@ -1051,8 +1051,11 @@ namespace dxup::d3d9 {
       d->markGpuWritten();
       return D3D_OK;
     }
+    // Video surfaces stretch filtered whatever the filter (Windows' Direct3D
+    // 9 converts them through the video processor).
+    const bool video = src->format() == D3DFMT_YUY2 || src->format() == D3DFMT_UYVY;
     const legacy::Rect a = toRect(sr), b = toRect(dr);
-    m_core->blit(d, dst->subresource(), &b, s, src->subresource(), &a, filter != D3DTEXF_POINT, false, 0);
+    m_core->blit(d, dst->subresource(), &b, s, src->subresource(), &a, filter != D3DTEXF_POINT || video, false, 0);
     return D3D_OK;
   }
 

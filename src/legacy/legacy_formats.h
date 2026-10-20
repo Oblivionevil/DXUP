@@ -252,18 +252,19 @@ namespace dxup::legacy {
   }
 
   // And back (render targets read back in a converted format).
-  // Pixel x of a YUY2/UYVY row (two pixels share U and V), BT.601 video range.
+  // Pixel x of a YUY2/UYVY row (two pixels share U and V), BT.601 full
+  // range (Windows' Direct3D 9 StretchRect: Y 0-255, not 16-235).
   inline uint32_t yuvToArgb(Format format, const uint8_t* row, uint32_t x) {
     const uint8_t* pair = row + size_t(x & ~1u) * 2;
     const bool yuy2 = format == FormatYUY2;
     const int y = yuy2 ? pair[(x & 1) ? 2 : 0] : pair[(x & 1) ? 3 : 1];
     const int u = yuy2 ? pair[1] : pair[0];
     const int v = yuy2 ? pair[3] : pair[2];
-    const int c = y - 16, d = u - 128, e = v - 128;
+    const int c = y * 256, d = u - 128, e = v - 128;
     auto clamp = [](int value) { return uint32_t(value < 0 ? 0 : value > 255 ? 255 : value); };
-    const uint32_t r = clamp((298 * c + 409 * e + 128) >> 8);
-    const uint32_t g = clamp((298 * c - 100 * d - 208 * e + 128) >> 8);
-    const uint32_t b = clamp((298 * c + 516 * d + 128) >> 8);
+    const uint32_t r = clamp((c + 359 * e + 128) >> 8);
+    const uint32_t g = clamp((c - 88 * d - 183 * e + 128) >> 8);
+    const uint32_t b = clamp((c + 454 * d + 128) >> 8);
     return 0xff000000u | (r << 16) | (g << 8) | b;
   }
 

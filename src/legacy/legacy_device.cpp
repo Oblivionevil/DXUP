@@ -426,6 +426,25 @@ namespace dxup::legacy {
     return view.get();
   }
 
+  ID3D11ShaderResourceView* Texture::copySrv(bool srgb) {
+    if (!m_texture || m_desc.samples > 1 || m_copyFailed)
+      return nullptr;
+    if (!m_copy) {
+      // The same description picks the same formats.
+      TextureDesc desc = m_desc;
+      desc.backBuffer = false;
+      desc.autoMips = false;
+      m_copy = std::make_unique<Texture>(m_device, desc);
+      if (!m_copy->valid() || !m_copy->resource()) {
+        m_copy.reset();
+        m_copyFailed = true;
+        return nullptr;
+      }
+    }
+    m_device->context()->CopyResource(m_copy->resource(), m_texture.get());
+    return m_copy->srv(srgb);
+  }
+
   ID3D11Texture2D* Texture::staging(uint32_t subresource) {
     const uint32_t mip = subresource % m_desc.levels;
     if (m_staging.size() < m_desc.levels)
@@ -2084,6 +2103,14 @@ namespace dxup::legacy {
     uint32_t textureTypeOf(Texture* texture) {
       return texture ? texture->type() : 0u;
     }
+
+    // Whether a stage's colour operation takes D3DTA_TEXTURE: arguments a
+    // select of the other one or a two-argument operation leaves unread do
+    // not count (2 SELECTARG1, 3 SELECTARG2, 25 MULTIPLYADD, 26 LERP).
+    bool colorOpReadsTexture(uint32_t op, uint32_t arg1, uint32_t arg2, uint32_t arg0) {
+      const auto texture = [](uint32_t arg) { return (arg & 0xf) == 2; };
+      return (texture(arg1) && op != 3) || (texture(arg2) && op != 2) || (texture(arg0) && (op == 25 || op == 26));
+    }
   }
 
   void Device::setRenderState(uint32_t state, uint32_t value) {
@@ -3064,8 +3091,13 @@ namespace dxup::legacy {
       const auto& tss = m_stageStates[stage];
       if (tss[TssColorOp] == 1)
         break;
-      stageCount = stage + 1;
       uint32_t type = textureTypeOf(m_textures[stage]);
+      // A colour operation taking the texture of a stage without one ends
+      // the stages there, as D3DTOP_DISABLE does (Windows' Direct3D 9);
+      // alpha operations read a missing texture as white.
+      if (!type && colorOpReadsTexture(tss[TssColorOp], tss[TssColorArg1], tss[TssColorArg2], tss[TssColorArg0]))
+        break;
+      stageCount = stage + 1;
       if (type == 1 && ((m_shadowMask >> stage) & 1))
         type = 4;   // a depth texture, compared
       const uint32_t flags = tss[TssTextureTransformFlags];
@@ -3695,16 +3727,13 @@ namespace dxup::legacy {
           shadow |= uint16_t(1u << i);
       options.shadowSamplers = shadow;
       // Pixel shaders 1.1 to 1.3 project t# as the stage's D3DTTFF_PROJECTED
-      // says, by the last of D3DTTFF_COUNTn components.
+      // says, by w whatever D3DTTFF_COUNTn says (Windows' NVIDIA Direct3D 9;
+      // w is 1 for fewer coordinates).
       const ShaderInfo9& psInfo = m_pixelShader->info();
       if (psInfo.major == 1 && psInfo.minor < 4) {
-        for (uint32_t stage = 0; stage < 4; stage++) {
-          const uint32_t flags = m_stageStates[stage][TssTextureTransformFlags];
-          if (flags & 256) {
-            const uint32_t count = flags & 0xff;
-            options.projected |= uint16_t((count >= 2 && count <= 4 ? count - 1 : 3) << (stage * 2));
-          }
-        }
+        for (uint32_t stage = 0; stage < 4; stage++)
+          if (m_stageStates[stage][TssTextureTransformFlags] & 256)
+            options.projected |= uint16_t(3u << (stage * 2));
       }
       m_psVariant = m_pixelShader->variant(options);
       if (m_psVariant)
@@ -3750,27 +3779,41 @@ namespace dxup::legacy {
 
   void Device::bindTextures() {
     const bool ffpPixel = !m_psVariant;
-    auto usable = [&](Texture* texture) {
+    // Direct3D 9 drivers let a shader read a texture it draws into
+    // (StarCraft II's depth of field blurs the scene in place): reads see
+    // the texture as before the draw. Direct3D 11 does not bind a target's
+    // views, so such draws read a copy made right before each of them
+    // (m_feedbackMask binds them again every draw).
+    m_textureDirtyMask |= m_feedbackMask;
+    auto view = [&](uint32_t sampler, Texture* texture, bool read) -> ID3D11ShaderResourceView* {
       if (!texture || texture == m_depthStencil)
-        return false;
-      for (Texture* target : m_renderTargets)
-        if (target == texture) return false;
-      return true;
+        return nullptr;
+      const bool srgb = m_samplerStatesValues[sampler][SampSrgbTexture] != 0;
+      for (Texture* target : m_renderTargets) {
+        if (target != texture)
+          continue;
+        m_feedbackMask |= 1u << sampler;
+        return read ? texture->copySrv(srgb) : nullptr;
+      }
+      return texture->srv(srgb);
     };
     if (m_textureDirtyMask & ((1u << kPixelSamplers) - 1)) {
+      m_feedbackMask &= ~((1u << kPixelSamplers) - 1);
       ID3D11ShaderResourceView* views[24] = {};
       if (ffpPixel) {
+        bool enabled = true;
         for (uint32_t stage = 0; stage < kFixedStages; stage++) {
+          enabled = enabled && m_stageStates[stage][TssColorOp] != 1;   // stages after a disabled one are off
           Texture* texture = m_textures[stage];
           const uint32_t type = textureTypeOf(texture);
-          if (type && usable(texture))
-            views[(type - 1) * 8 + stage] = texture->srv(m_samplerStatesValues[stage][SampSrgbTexture] != 0);
+          if (type)
+            views[(type - 1) * 8 + stage] = view(stage, texture, enabled);
         }
       } else {
         for (uint32_t sampler = 0; sampler < kPixelSamplers; sampler++) {
           Texture* texture = m_textures[sampler];
-          if (textureTypeOf(texture) && usable(texture))
-            views[sampler] = texture->srv(m_samplerStatesValues[sampler][SampSrgbTexture] != 0);
+          if (textureTypeOf(texture))
+            views[sampler] = view(sampler, texture, m_psVariant->info.samplerTypes[sampler] != 0);
         }
       }
       // Runs of changed slots in one call each.
@@ -3789,11 +3832,12 @@ namespace dxup::legacy {
       }
     }
     if (m_textureDirtyMask >> kVertexSamplerBase) {
+      m_feedbackMask &= (1u << kVertexSamplerBase) - 1;
       ID3D11ShaderResourceView* views[4] = {};
       for (uint32_t i = 0; i < 4; i++) {
         Texture* texture = m_textures[kVertexSamplerBase + i];
-        if (textureTypeOf(texture) && usable(texture))
-          views[i] = texture->srv(m_samplerStatesValues[kVertexSamplerBase + i][SampSrgbTexture] != 0);
+        if (textureTypeOf(texture))
+          views[i] = view(kVertexSamplerBase + i, texture, m_vsVariant && m_vsVariant->info.samplerTypes[i] != 0);
       }
       if (std::memcmp(views, m_boundVertexViews, sizeof(views)) != 0) {
         m_context->VSSetShaderResources(0, 4, views);

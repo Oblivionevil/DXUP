@@ -878,7 +878,9 @@ float4 main(float4 a : TEXCOORD0, float4 b : TEXCOORD1, float2 v : VPOS) : COLOR
   }
 
   // ps_1_1 tex t# with D3DTTFF_PROJECTED: the coordinates divided by w
-  // (COUNT4) or z (COUNT3). Left: projected, right: not.
+  // whatever the count (Windows' NVIDIA Direct3D 9), w 1 for three
+  // coordinates. Top: projected, not; middle: four, three coordinates;
+  // bottom: three coordinates, COUNT4 and COUNT2.
   bool scenePs1Projected(IDirect3DDevice9* d) {
     d->Clear(0, nullptr, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, 0xff000000u, 1.0f, 0);
     const auto psCode = assemble("ps_1_1\n tex t0\n mov r0, t0\n");
@@ -904,6 +906,7 @@ float4 main(float4 a : TEXCOORD0, float4 b : TEXCOORD1, float2 v : VPOS) : COLOR
     struct V { float x, y, z, rhw, u, v, s, q; };
     // (0.25, 0.75) * 4 in x, y; z 2, w 4: projected by w -> texel (0, 1) blue,
     // by z -> (0.5, 1.5) clamped -> white; not projected -> (1, 3) -> white.
+    // Three coordinates (1, 3, 4): by w -> white, by z -> blue.
     auto quad = [&](float x0, float x1, DWORD flags, float row) {
       d->SetTextureStageState(0, D3DTSS_TEXTURETRANSFORMFLAGS, flags);
       const V v[4] = { { x0, row, 0.5f, 1, 1, 3, 2, 4 }, { x1, row, 0.5f, 1, 1, 3, 2, 4 },
@@ -913,6 +916,17 @@ float4 main(float4 a : TEXCOORD0, float4 b : TEXCOORD1, float2 v : VPOS) : COLOR
     quad(2, 30, D3DTTFF_COUNT4 | D3DTTFF_PROJECTED, 2);
     quad(34, 62, D3DTTFF_COUNT4, 2);
     quad(2, 30, D3DTTFF_COUNT3 | D3DTTFF_PROJECTED, 20);
+    d->SetFVF(D3DFVF_XYZRHW | D3DFVF_TEX1 | D3DFVF_TEXCOORDSIZE3(0));
+    struct V3 { float x, y, z, rhw, u, v, s; };
+    auto quad3 = [&](float x0, float x1, DWORD flags, float row) {
+      d->SetTextureStageState(0, D3DTSS_TEXTURETRANSFORMFLAGS, flags);
+      const V3 v[4] = { { x0, row, 0.5f, 1, 1, 3, 4 }, { x1, row, 0.5f, 1, 1, 3, 4 },
+                        { x0, row + 10, 0.5f, 1, 1, 3, 4 }, { x1, row + 10, 0.5f, 1, 1, 3, 4 } };
+      d->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, v, sizeof(V3));
+    };
+    quad3(34, 62, D3DTTFF_COUNT3 | D3DTTFF_PROJECTED, 20);
+    quad3(2, 30, D3DTTFF_COUNT4 | D3DTTFF_PROJECTED, 34);
+    quad3(34, 62, D3DTTFF_COUNT2 | D3DTTFF_PROJECTED, 34);
     d->SetTextureStageState(0, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_DISABLE);
     d->SetPixelShader(nullptr);
     d->SetTexture(0, nullptr);
@@ -921,9 +935,11 @@ float4 main(float4 a : TEXCOORD0, float4 b : TEXCOORD1, float2 v : VPOS) : COLOR
     return true;
   }
 
-  // YUY2 and UYVY surfaces (video) stretched onto the back buffer: two
-  // pixels share U and V. Top half YUY2, bottom half UYVY.
-  bool sceneYuvSurfaces(IDirect3DDevice9* d) {
+  // YUY2 and UYVY surfaces (video) copied onto the back buffer: two pixels
+  // share U and V; Y, U and V vary apart (BT.601 full range on Windows).
+  // Top YUY2, bottom UYVY; 1:1, or stretched 3 times as wide (filtered
+  // whatever the filter).
+  bool yuvSurfaces(IDirect3DDevice9* d, bool stretch) {
     d->Clear(0, nullptr, D3DCLEAR_TARGET, 0xff000000u, 1.0f, 0);
     IDirect3DSurface9* back = nullptr;
     if (FAILED(d->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &back)))
@@ -940,7 +956,8 @@ float4 main(float4 a : TEXCOORD0, float4 b : TEXCOORD1, float2 v : VPOS) : COLOR
         for (UINT y = 0; y < 8; y++) {
           BYTE* row = static_cast<BYTE*>(locked.pBits) + y * locked.Pitch;
           for (UINT pair = 0; pair < 8; pair++) {
-            const BYTE y0 = BYTE(32 + pair * 24), y1 = BYTE(40 + pair * 24), u = BYTE(64 + y * 16), v = BYTE(200 - pair * 12);
+            const BYTE y0 = BYTE(16 + pair * 28 + y * 3), y1 = BYTE(y0 + 9);
+            const BYTE u = BYTE(40 + y * 22), v = BYTE(60 + ((y * 3) % 8) * 21);
             BYTE* p = row + pair * 4;
             if (format == D3DFMT_YUY2) { p[0] = y0; p[1] = u; p[2] = y1; p[3] = v; }
             else { p[0] = u; p[1] = y0; p[2] = v; p[3] = y1; }
@@ -948,7 +965,7 @@ float4 main(float4 a : TEXCOORD0, float4 b : TEXCOORD1, float2 v : VPOS) : COLOR
         }
         surface->UnlockRect();
       }
-      const RECT dest = { 0, LONG(half * 24), 64, LONG(half * 24 + 24) };
+      const RECT dest = { 0, LONG(half * 24), stretch ? 48 : 16, LONG(half * 24 + 8) };
       d->StretchRect(surface, nullptr, back, &dest, D3DTEXF_POINT);
       surface->Release();
       half++;
@@ -956,6 +973,9 @@ float4 main(float4 a : TEXCOORD0, float4 b : TEXCOORD1, float2 v : VPOS) : COLOR
     back->Release();
     return true;
   }
+
+  bool sceneYuvSurfaces(IDirect3DDevice9* d) { return yuvSurfaces(d, false); }
+  bool sceneYuvStretch(IDirect3DDevice9* d) { return yuvSurfaces(d, true); }
 
   // Clear inside the scissor rectangle when the scissor test is on, and
   // rectangles with a count of 0 clear nothing.
@@ -1884,6 +1904,182 @@ VO main(float3 p : POSITION, float4 c : COLOR0) { VO o; o.p = float4(p.xy * 0.8 
     return true;
   }
 
+  // Draws reading the texture they draw into, each pixel its own texel
+  // (StarCraft II's depth of field blurs the scene in place): a float target
+  // through a pixel shader, an 8-bit one through the fixed stages; both
+  // then shown in the back buffer.
+  bool sceneTargetFeedback(IDirect3DDevice9* d) {
+    const char* psSource = R"(
+sampler2D scene : register(s0);
+float4 size : register(c0);
+float4 main(float2 pos : VPOS) : COLOR {
+  float4 c = tex2Dlod(scene, float4((pos + 0.5) * size.zw, 0, 0));
+  return c * float4(0.5, 0.25, 2.0, 1.0) + float4(0.125, 0.25, 0.0625, -0.25);
+})";
+    const auto psCode = compile(psSource, "ps_3_0");
+    IDirect3DPixelShader9* ps = nullptr;
+    if (psCode.empty() || FAILED(d->CreatePixelShader(psCode.data(), &ps)))
+      return false;
+    IDirect3DTexture9 *hdr = nullptr, *ldr = nullptr;
+    if (FAILED(d->CreateTexture(32, 32, 1, D3DUSAGE_RENDERTARGET, D3DFMT_A16B16G16R16F, D3DPOOL_DEFAULT, &hdr, nullptr))
+     || FAILED(d->CreateTexture(32, 32, 1, D3DUSAGE_RENDERTARGET, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, &ldr, nullptr)))
+      return false;
+    IDirect3DSurface9 *hdrLevel = nullptr, *ldrLevel = nullptr, *back = nullptr, *depth = nullptr;
+    hdr->GetSurfaceLevel(0, &hdrLevel);
+    ldr->GetSurfaceLevel(0, &ldrLevel);
+    d->GetRenderTarget(0, &back);
+    d->GetDepthStencilSurface(&depth);
+    d->SetDepthStencilSurface(nullptr);
+    d->SetRenderState(D3DRS_LIGHTING, FALSE);
+    d->SetRenderState(D3DRS_ZENABLE, FALSE);
+    d->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_POINT);
+    d->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
+    d->SetSamplerState(0, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
+    const TLVertex tri[3] = {
+      { 2.0f, 1.0f, 0.5f, 1.0f, 0xffffffffu }, { 30.0f, 6.0f, 0.5f, 1.0f, 0xffff4000u }, { 9.0f, 29.0f, 0.5f, 1.0f, 0x8000c0ffu },
+    };
+    const TLVertex full[4] = {
+      { -0.5f, -0.5f, 0.5f, 1.0f, 0xffffffffu }, { 31.5f, -0.5f, 0.5f, 1.0f, 0xffffffffu },
+      { -0.5f, 31.5f, 0.5f, 1.0f, 0xffffffffu }, { 31.5f, 31.5f, 0.5f, 1.0f, 0xffffffffu },
+    };
+    d->SetFVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE);
+    for (IDirect3DSurface9* level : { hdrLevel, ldrLevel }) {
+      d->SetRenderTarget(0, level);
+      d->Clear(0, nullptr, D3DCLEAR_TARGET, 0xff306090u, 1.0f, 0);
+      d->DrawPrimitiveUP(D3DPT_TRIANGLELIST, 1, tri, sizeof(TLVertex));
+    }
+    // The float target reads itself through the shader. (A second such
+    // draw reads what the first drew or not: Windows' NVIDIA driver gives
+    // the texture before the first.)
+    d->SetRenderTarget(0, hdrLevel);
+    d->SetTexture(0, hdr);
+    const float size[4] = { 32.0f, 32.0f, 1.0f / 32.0f, 1.0f / 32.0f };
+    d->SetPixelShaderConstantF(0, size, 1);
+    d->SetPixelShader(ps);
+    d->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, full, sizeof(TLVertex));
+    d->SetPixelShader(nullptr);
+    // The 8-bit target reads itself through the fixed stages (texture
+    // times the texture factor).
+    d->SetRenderTarget(0, ldrLevel);
+    d->SetTexture(0, ldr);
+    d->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_MODULATE);
+    d->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
+    d->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1);
+    d->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE);
+    const TLTex1 ffpQuad[4] = {
+      { -0.5f, -0.5f, 0.5f, 1.0f, 0.0f, 0.0f }, { 31.5f, -0.5f, 0.5f, 1.0f, 1.0f, 0.0f },
+      { -0.5f, 31.5f, 0.5f, 1.0f, 0.0f, 1.0f }, { 31.5f, 31.5f, 0.5f, 1.0f, 1.0f, 1.0f },
+    };
+    d->SetRenderState(D3DRS_TEXTUREFACTOR, 0xff80c040u);
+    d->SetTextureStageState(0, D3DTSS_COLORARG2, D3DTA_TFACTOR);
+    d->SetFVF(D3DFVF_XYZRHW | D3DFVF_TEX1);
+    d->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, ffpQuad, sizeof(TLTex1));
+    d->SetTextureStageState(0, D3DTSS_COLORARG2, D3DTA_CURRENT);
+    // Both in the back buffer.
+    d->SetRenderTarget(0, back);
+    d->SetDepthStencilSurface(depth);
+    d->Clear(0, nullptr, D3DCLEAR_TARGET, 0xff000000u, 1.0f, 0);
+    d->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
+    d->SetTexture(0, hdr);
+    texturedRect(d, 0.0f, 0.0f, 32.0f, 32.0f);
+    d->SetTexture(0, ldr);
+    texturedRect(d, 32.0f, 0.0f, 64.0f, 32.0f);
+    d->SetTexture(0, nullptr);
+    if (depth) depth->Release();
+    back->Release();
+    ldrLevel->Release();
+    hdrLevel->Release();
+    ldr->Release();
+    hdr->Release();
+    ps->Release();
+    return true;
+  }
+
+  // Fixed-function stages whose operation takes a texture none is bound
+  // to: one 8x16 cell per operation (stage 0, then stage 1 after a stage 0
+  // adding the texture factor), blended by the result's alpha; a third row
+  // of such stages 0 before a stage 1 adding the factor.
+  bool sceneFfpNoTexture(IDirect3DDevice9* d) {
+    d->Clear(0, nullptr, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, 0xff204060u, 1.0f, 0);
+    d->SetRenderState(D3DRS_LIGHTING, FALSE);
+    d->SetRenderState(D3DRS_ZENABLE, FALSE);
+    d->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
+    d->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_SRCALPHA);
+    d->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
+    d->SetRenderState(D3DRS_TEXTUREFACTOR, 0x60402010u);
+    d->SetTexture(0, nullptr);
+    d->SetTexture(1, nullptr);
+    d->SetFVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE);
+    struct Op { D3DTEXTUREOP color; DWORD arg1, arg2; D3DTEXTUREOP alpha; DWORD alphaArg1, alphaArg2; };
+    const Op ops[8] = {
+      { D3DTOP_MODULATE, D3DTA_TEXTURE, D3DTA_DIFFUSE, D3DTOP_SELECTARG1, D3DTA_TEXTURE, D3DTA_DIFFUSE },   // the defaults
+      { D3DTOP_ADD, D3DTA_TEXTURE, D3DTA_DIFFUSE, D3DTOP_MODULATE, D3DTA_TEXTURE, D3DTA_DIFFUSE },
+      { D3DTOP_SELECTARG2, D3DTA_TEXTURE, D3DTA_TFACTOR, D3DTOP_SELECTARG2, D3DTA_TEXTURE, D3DTA_TFACTOR },
+      { D3DTOP_SELECTARG1, D3DTA_TEXTURE | D3DTA_COMPLEMENT, D3DTA_DIFFUSE, D3DTOP_ADD, D3DTA_DIFFUSE, D3DTA_TEXTURE },
+      { D3DTOP_SUBTRACT, D3DTA_DIFFUSE, D3DTA_TEXTURE, D3DTOP_SELECTARG1, D3DTA_TFACTOR, D3DTA_TEXTURE },
+      { D3DTOP_BLENDTEXTUREALPHA, D3DTA_TFACTOR, D3DTA_DIFFUSE, D3DTOP_SELECTARG1, D3DTA_DIFFUSE, D3DTA_DIFFUSE },
+      { D3DTOP_MODULATE2X, D3DTA_DIFFUSE, D3DTA_TFACTOR, D3DTOP_MODULATE, D3DTA_TEXTURE | D3DTA_ALPHAREPLICATE, D3DTA_DIFFUSE },
+      { D3DTOP_ADDSIGNED, D3DTA_TEXTURE, D3DTA_DIFFUSE, D3DTOP_SUBTRACT, D3DTA_DIFFUSE, D3DTA_TEXTURE },
+    };
+    for (int row = 0; row < 2; row++) {
+      const DWORD stage = DWORD(row);
+      if (row == 1) {
+        d->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_ADD);
+        d->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_DIFFUSE);
+        d->SetTextureStageState(0, D3DTSS_COLORARG2, D3DTA_TFACTOR);
+        d->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1);
+        d->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_DIFFUSE);
+      }
+      for (int i = 0; i < 8; i++) {
+        const Op& op = ops[i];
+        d->SetTextureStageState(stage, D3DTSS_COLOROP, op.color);
+        d->SetTextureStageState(stage, D3DTSS_COLORARG1, op.arg1);
+        d->SetTextureStageState(stage, D3DTSS_COLORARG2, row == 1 && op.arg2 == D3DTA_DIFFUSE ? D3DTA_CURRENT : op.arg2);
+        d->SetTextureStageState(stage, D3DTSS_ALPHAOP, op.alpha);
+        d->SetTextureStageState(stage, D3DTSS_ALPHAARG1, op.alphaArg1);
+        d->SetTextureStageState(stage, D3DTSS_ALPHAARG2, op.alphaArg2);
+        const float x0 = float(i * 8), x1 = x0 + 8.0f, y0 = float(row * 16), y1 = y0 + 16.0f;
+        const TLVertex quad[4] = {
+          { x0 - 0.5f, y0 - 0.5f, 0.5f, 1.0f, 0x80ff8040u }, { x1 - 0.5f, y0 - 0.5f, 0.5f, 1.0f, 0x80ff8040u },
+          { x0 - 0.5f, y1 - 0.5f, 0.5f, 1.0f, 0xc040c0ffu }, { x1 - 0.5f, y1 - 0.5f, 0.5f, 1.0f, 0xc040c0ffu },
+        };
+        d->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, quad, sizeof(TLVertex));
+      }
+      d->SetTextureStageState(stage, D3DTSS_COLOROP, row ? D3DTOP_DISABLE : D3DTOP_MODULATE);
+    }
+    // Third row: stage 0 without its texture, stage 1 adding the factor.
+    struct Pair { D3DTEXTUREOP color; DWORD arg1, arg2; D3DTEXTUREOP alpha; DWORD alphaArg1, alphaArg2; bool second; };
+    const Pair pairs[4] = {
+      { D3DTOP_SUBTRACT, D3DTA_DIFFUSE, D3DTA_TEXTURE, D3DTOP_SELECTARG1, D3DTA_TFACTOR, D3DTA_DIFFUSE, true },
+      { D3DTOP_ADD, D3DTA_DIFFUSE, D3DTA_TFACTOR, D3DTOP_SELECTARG1, D3DTA_TEXTURE, D3DTA_DIFFUSE, false },
+      { D3DTOP_SELECTARG1, D3DTA_DIFFUSE, D3DTA_TEXTURE, D3DTOP_MODULATE, D3DTA_TEXTURE, D3DTA_TFACTOR, true },
+      { D3DTOP_MODULATE, D3DTA_TEXTURE, D3DTA_DIFFUSE, D3DTOP_SELECTARG1, D3DTA_DIFFUSE, D3DTA_TEXTURE, true },
+    };
+    for (int i = 0; i < 4; i++) {
+      const Pair& op = pairs[i];
+      d->SetTextureStageState(0, D3DTSS_COLOROP, op.color);
+      d->SetTextureStageState(0, D3DTSS_COLORARG1, op.arg1);
+      d->SetTextureStageState(0, D3DTSS_COLORARG2, op.arg2);
+      d->SetTextureStageState(0, D3DTSS_ALPHAOP, op.alpha);
+      d->SetTextureStageState(0, D3DTSS_ALPHAARG1, op.alphaArg1);
+      d->SetTextureStageState(0, D3DTSS_ALPHAARG2, op.alphaArg2);
+      d->SetTextureStageState(1, D3DTSS_COLOROP, op.second ? D3DTOP_ADD : D3DTOP_DISABLE);
+      d->SetTextureStageState(1, D3DTSS_COLORARG1, D3DTA_CURRENT);
+      d->SetTextureStageState(1, D3DTSS_COLORARG2, D3DTA_TFACTOR);
+      d->SetTextureStageState(1, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1);
+      d->SetTextureStageState(1, D3DTSS_ALPHAARG1, D3DTA_CURRENT);
+      const float x0 = float(i * 16), x1 = x0 + 16.0f, y0 = 32.0f, y1 = 48.0f;
+      const TLVertex quad[4] = {
+        { x0 - 0.5f, y0 - 0.5f, 0.5f, 1.0f, 0x80ff8040u }, { x1 - 0.5f, y0 - 0.5f, 0.5f, 1.0f, 0x80ff8040u },
+        { x0 - 0.5f, y1 - 0.5f, 0.5f, 1.0f, 0xc040c0ffu }, { x1 - 0.5f, y1 - 0.5f, 0.5f, 1.0f, 0xc040c0ffu },
+      };
+      d->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, quad, sizeof(TLVertex));
+    }
+    d->SetTextureStageState(1, D3DTSS_COLOROP, D3DTOP_DISABLE);
+    d->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+    return true;
+  }
+
   // Textures of the formats that convert or compress, sampled side by side.
   bool sceneFormats(IDirect3DDevice9* d) {
     d->Clear(0, nullptr, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, 0xff000000u, 1.0f, 0);
@@ -2137,6 +2333,7 @@ float4 main(float2 t : TEXCOORD0) : COLOR {
     { "multiply_transform", sceneMultiplyTransform },
     { "clear_rules", sceneClearRules },
     { "yuv_surfaces", sceneYuvSurfaces },
+    { "yuv_stretch", sceneYuvStretch, 20 },   // Windows' video processor maps the source a little narrower
     { "ps1_projected", scenePs1Projected },
     { "point_sizes", scenePointSizes },
     { "ffp_shadow", sceneFfpShadow },
@@ -2146,6 +2343,8 @@ float4 main(float2 t : TEXCOORD0) : COLOR {
     { "mip_filter", sceneMipFilter, 6 },
     { "sampler_filters", sceneSamplerFilters, 6 },
     { "autogen_target", sceneAutogenTarget },
+    { "target_feedback", sceneTargetFeedback },
+    { "ffp_no_texture", sceneFfpNoTexture },
   };
 
   // ---- Running ----
