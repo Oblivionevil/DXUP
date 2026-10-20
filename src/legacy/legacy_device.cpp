@@ -1147,7 +1147,7 @@ namespace dxup::legacy {
       struct Record {
         uint64_t shader;
         uint32_t minVaryings;
-        uint16_t reserved0, reserved1, shadowSamplers, reserved2;
+        uint16_t projected, reserved1, shadowSamplers, reserved2;
         uint8_t  clipPlanes, typed, reserved[2];
         uint8_t  types[16];
       };
@@ -1164,6 +1164,7 @@ namespace dxup::legacy {
         record.shader = shader;
         record.minVaryings = options.minVaryings;
         record.shadowSamplers = options.shadowSamplers;
+        record.projected = options.projected;
         record.clipPlanes = options.clipPlanes;
         if (options.boundSamplerTypes) {
           record.typed = 1;
@@ -1208,6 +1209,7 @@ namespace dxup::legacy {
       static void apply(const Record& record, TranslateOptions9& options) {
         options.minVaryings = record.minVaryings;
         options.shadowSamplers = record.shadowSamplers;
+        options.projected = record.projected;
         options.clipPlanes = record.clipPlanes;
         options.boundSamplerTypes = record.typed ? record.types : nullptr;
       }
@@ -1575,8 +1577,11 @@ namespace dxup::legacy {
     }
     uint64_t key = kTranslatorVersion;
     key = fnv64Multiply(key ^ options.minVaryings);
+    if (vertex() || m_info.major != 1 || m_info.minor >= 4)
+      options.projected = 0;
     key = fnv64Multiply(key ^ options.shadowSamplers);
     key = fnv64Multiply(key ^ (uint32_t(options.clipPlanes) << 16));
+    key = fnv64Multiply(key ^ (uint64_t(options.projected) << 40));
     key = fnv64Multiply(key ^ ((options.floatEmulation ? 0x1000000u : 0u) | (options.dotEmulation ? 0x2000000u : 0u)
       | (options.nanDepthZero ? 0x4000000u : 0u)));
     if (options.boundSamplerTypes)
@@ -1737,8 +1742,16 @@ namespace dxup::legacy {
 
   HRESULT Device::createShaderResourceView(ID3D11Resource* resource, const D3D11_SHADER_RESOURCE_VIEW_DESC* desc, UINT mapping,
                                            ID3D11ShaderResourceView** view) {
-    if (mapping && m_createMappedView)
-      return m_createMappedView(m_device.get(), resource, desc, mapping, view);
+    if (mapping && m_createMappedView) {
+      const HRESULT hr = m_createMappedView(m_device.get(), resource, desc, mapping, view);
+      if (SUCCEEDED(hr))
+        return hr;
+      // Windows' own D3D11 (DXUP's fallback) has no component mappings: the
+      // view as it is (missing channels read 0, not 1).
+      static std::atomic<bool> s_logged{false};
+      if (!s_logged.exchange(true))
+        logMessage(LogLevel::Warn, "D3D9: no component mapping on this device (hr 0x%08lx): views without", hr);
+    }
     return m_device->CreateShaderResourceView(resource, desc, view);
   }
 
@@ -2032,6 +2045,8 @@ namespace dxup::legacy {
     m_pixelConstantsDirty = m_shaderFixedDirty = true;
     if (type == TssTexCoordIndex || type == TssTextureTransformFlags)
       m_vertexConstantsDirty = true;
+    if (type == TssTextureTransformFlags && m_pixelShader)   // ps_1_1-1_3 projection
+      m_dirty |= DirtyShaders;
     if (type == TssTexCoordIndex)
       m_transformConstantsDirty = true;
   }
@@ -2085,6 +2100,8 @@ namespace dxup::legacy {
       m_shadowMask = newShadow ? (m_shadowMask | (1u << stage)) : (m_shadowMask & ~(1u << stage));
       if (m_pixelShader)
         m_dirty |= DirtyShaders;
+      if (stage < kFixedStages)
+        m_pixelConstantsDirty = true;
       m_samplerDirtyMask |= 1u << stage;
     }
     m_textures[stage] = texture;
@@ -2617,6 +2634,7 @@ namespace dxup::legacy {
     add("COLOR", 1, find(UseColor, 1), DXGI_FORMAT_B8G8R8A8_UNORM, 36);
     for (uint8_t i = 0; i < 8; i++)
       add("TEXCOORD", i, find(UseTexCoord, i), DXGI_FORMAT_R32G32B32A32_FLOAT, 48);
+    add("PSIZE", 0, find(UsePSize, 0), DXGI_FORMAT_R32_FLOAT, kDefaultZeroOffset);
     if (FAILED(m_device->CreateInputLayout(elements.data(), UINT(elements.size()), g_ffp_vs, sizeof(g_ffp_vs), &layout)))
       layout = nullptr;
     return layout;
@@ -2982,7 +3000,9 @@ namespace dxup::legacy {
       if (tss[TssColorOp] == 1)
         break;
       stageCount = stage + 1;
-      const uint32_t type = textureTypeOf(m_textures[stage]);
+      uint32_t type = textureTypeOf(m_textures[stage]);
+      if (type == 1 && ((m_shadowMask >> stage) & 1))
+        type = 4;   // a depth texture, compared
       const uint32_t flags = tss[TssTextureTransformFlags];
       const uint32_t projected = (flags & 256) ? 1u : 0u;
       c->stageOps[stage][0] = tss[TssColorOp];
@@ -3590,6 +3610,18 @@ namespace dxup::legacy {
         if ((m_shadowMask >> i) & 1 && (m_pixelShader->info().samplerTypes[i] == Sampler2D || m_pixelShader->info().major == 1))
           shadow |= uint16_t(1u << i);
       options.shadowSamplers = shadow;
+      // Pixel shaders 1.1 to 1.3 project t# as the stage's D3DTTFF_PROJECTED
+      // says, by the last of D3DTTFF_COUNTn components.
+      const ShaderInfo9& psInfo = m_pixelShader->info();
+      if (psInfo.major == 1 && psInfo.minor < 4) {
+        for (uint32_t stage = 0; stage < 4; stage++) {
+          const uint32_t flags = m_stageStates[stage][TssTextureTransformFlags];
+          if (flags & 256) {
+            const uint32_t count = flags & 0xff;
+            options.projected |= uint16_t((count >= 2 && count <= 4 ? count - 1 : 3) << (stage * 2));
+          }
+        }
+      }
       m_psVariant = m_pixelShader->variant(options);
       if (m_psVariant)
         pixelVaryings = m_psVariant->info.varyingCount;
@@ -3695,6 +3727,14 @@ namespace dxup::legacy {
         if (!vertexSampler && sampler >= pixelSamplers)
           continue;
         const bool compare = !ffpPixel && !vertexSampler && ((m_shadowMask >> sampler) & 1);
+        // The fixed-function stage's depth textures: comparison samplers at 8-15.
+        if (ffpPixel && !vertexSampler && ((m_shadowMask >> sampler) & 1)) {
+          ID3D11SamplerState* comparing = d3dSampler(sampler, true);
+          if (comparing != m_boundSamplers[kFixedStages + sampler]) {
+            m_boundSamplers[kFixedStages + sampler] = comparing;
+            m_context->PSSetSamplers(kFixedStages + sampler, 1, &comparing);
+          }
+        }
         ID3D11SamplerState* state = d3dSampler(sampler, compare);
         if (state == m_boundSamplers[sampler])
           continue;
@@ -4126,7 +4166,17 @@ namespace dxup::legacy {
   bool Device::expandPoints() const {
     const auto& rs = m_renderStates;
     return rs[RsPointSpriteEnable] || rs[RsPointScaleEnable] || asFloat(rs[RsPointSize]) != 1.0f
-        || (m_vsVariant && m_vsVariant->info.writesPointSize);
+        || (m_vsVariant && m_vsVariant->info.writesPointSize) || (!m_vertexShader && fixedPointSizes());
+  }
+
+  // Fixed-function vertices with their own point size (D3DFVF_PSIZE).
+  bool Device::fixedPointSizes() const {
+    if (!m_decl)
+      return false;
+    for (const auto& e : m_decl->elements())
+      if (e.usage == UsePSize && e.usageIndex == 0)
+        return true;
+    return false;
   }
 
   ID3D11GeometryShader* Device::pointShader(uint32_t slots, bool clip) {
@@ -4155,9 +4205,11 @@ namespace dxup::legacy {
          "  float size = sizes.x;\n";
     if (slots)
       s += "  if (flags.x != 0u) {\n"
+           "    if (flags.y != 0u)\n"
+           "      size = v.s0.w;\n"
            "    if (scale.w != 0.0f) {\n"
            "      float d = v.s0.z;\n"
-           "      size = viewport.y * sizes.x * sqrt(1.0f / max(scale.x + scale.y * d + scale.z * d * d, 1e-20f));\n"
+           "      size = viewport.y * size * sqrt(1.0f / max(scale.x + scale.y * d + scale.z * d * d, 1e-20f));\n"
            "    }\n"
            "  } else if (v.s0.w == 1.0f) {\n"
            "    size = v.s0.z;\n"
@@ -4204,6 +4256,7 @@ namespace dxup::legacy {
     uint32_t words[16];
     std::memcpy(words, c, sizeof(words));
     words[12] = m_vsVariant ? 0u : 1u;
+    words[13] = !m_vsVariant && fixedPointSizes() ? 1u : 0u;
     D3D11_MAPPED_SUBRESOURCE mapped = {};
     if (SUCCEEDED(m_context->Map(m_pointConstants.get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
       writeLines(static_cast<uint8_t*>(mapped.pData), words, sizeof(words));

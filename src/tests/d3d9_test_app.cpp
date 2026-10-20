@@ -830,6 +830,97 @@ float4 main(float4 a : TEXCOORD0, float4 b : TEXCOORD1, float2 v : VPOS) : COLOR
     return true;
   }
 
+  // A depth texture in a fixed-function stage compares with the third
+  // coordinate (shadow map): left 0.3 against 0.5, right 0.7.
+  bool sceneFfpShadow(IDirect3DDevice9* d) {
+    IDirect3DTexture9* depth = nullptr;
+    IDirect3DSurface9 *depthSurface = nullptr, *target = nullptr, *back = nullptr, *backDepth = nullptr;
+    if (FAILED(d->CreateTexture(32, 32, 1, D3DUSAGE_DEPTHSTENCIL, D3DFMT_D24S8, D3DPOOL_DEFAULT, &depth, nullptr))
+     || FAILED(depth->GetSurfaceLevel(0, &depthSurface))
+     || FAILED(d->CreateRenderTarget(32, 32, D3DFMT_A8R8G8B8, D3DMULTISAMPLE_NONE, 0, FALSE, &target, nullptr)))
+      return false;
+    d->GetRenderTarget(0, &back);
+    d->GetDepthStencilSurface(&backDepth);
+    d->SetRenderTarget(0, target);
+    d->SetDepthStencilSurface(depthSurface);
+    d->Clear(0, nullptr, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, 0xff000000u, 0.5f, 0);
+    d->SetRenderTarget(0, back);
+    d->SetDepthStencilSurface(backDepth);
+    d->Clear(0, nullptr, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, 0xff404040u, 1.0f, 0);
+    d->SetTexture(0, depth);
+    d->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
+    d->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
+    d->SetRenderState(D3DRS_LIGHTING, FALSE);
+    d->SetFVF(D3DFVF_XYZRHW | D3DFVF_TEX1 | D3DFVF_TEXCOORDSIZE3(0));
+    struct V { float x, y, z, rhw, u, v, w; };
+    for (int i = 0; i < 2; i++) {
+      const float x0 = i ? 34.0f : 2.0f, x1 = x0 + 28.0f, ref = i ? 0.7f : 0.3f;
+      const V v[4] = { { x0, 8, 0.5f, 1, 0, 0, ref }, { x1, 8, 0.5f, 1, 1, 0, ref },
+                       { x0, 40, 0.5f, 1, 0, 1, ref }, { x1, 40, 0.5f, 1, 1, 1, ref } };
+      d->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, v, sizeof(V));
+    }
+    d->SetTexture(0, nullptr);
+    d->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_MODULATE);
+    back->Release(); backDepth->Release(); target->Release(); depthSurface->Release(); depth->Release();
+    return true;
+  }
+
+  // Fixed-function points with their own size (D3DFVF_PSIZE).
+  bool scenePointSizes(IDirect3DDevice9* d) {
+    d->Clear(0, nullptr, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, 0xff000000u, 1.0f, 0);
+    struct V { float x, y, z, rhw, size; DWORD color; };
+    const V points[3] = { { 10, 24, 0.5f, 1, 2, 0xffff0000u }, { 30, 24, 0.5f, 1, 8, 0xff00ff00u },
+                          { 50, 24, 0.5f, 1, 14, 0xff0000ffu } };
+    d->SetRenderState(D3DRS_LIGHTING, FALSE);
+    d->SetFVF(D3DFVF_XYZRHW | D3DFVF_PSIZE | D3DFVF_DIFFUSE);
+    d->DrawPrimitiveUP(D3DPT_POINTLIST, 3, points, sizeof(V));
+    return true;
+  }
+
+  // ps_1_1 tex t# with D3DTTFF_PROJECTED: the coordinates divided by w
+  // (COUNT4) or z (COUNT3). Left: projected, right: not.
+  bool scenePs1Projected(IDirect3DDevice9* d) {
+    d->Clear(0, nullptr, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, 0xff000000u, 1.0f, 0);
+    const auto psCode = assemble("ps_1_1\n tex t0\n mov r0, t0\n");
+    IDirect3DPixelShader9* ps = nullptr;
+    IDirect3DTexture9* texture = nullptr;
+    if (psCode.empty() || FAILED(d->CreatePixelShader(psCode.data(), &ps))
+     || FAILED(d->CreateTexture(2, 2, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, &texture, nullptr)))
+      return false;
+    D3DLOCKED_RECT locked = {};
+    if (SUCCEEDED(texture->LockRect(0, &locked, nullptr, 0))) {
+      const DWORD texels[4] = { 0xffff0000u, 0xff00ff00u, 0xff0000ffu, 0xffffffffu };
+      for (int y = 0; y < 2; y++)
+        std::memcpy(static_cast<BYTE*>(locked.pBits) + y * locked.Pitch, texels + y * 2, 8);
+      texture->UnlockRect(0);
+    }
+    d->SetTexture(0, texture);
+    d->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_POINT);
+    d->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
+    d->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
+    d->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
+    d->SetPixelShader(ps);
+    d->SetFVF(D3DFVF_XYZRHW | D3DFVF_TEX1 | D3DFVF_TEXCOORDSIZE4(0));
+    struct V { float x, y, z, rhw, u, v, s, q; };
+    // (0.25, 0.75) * 4 in x, y; z 2, w 4: projected by w -> texel (0, 1) blue,
+    // by z -> (0.5, 1.5) clamped -> white; not projected -> (1, 3) -> white.
+    auto quad = [&](float x0, float x1, DWORD flags, float row) {
+      d->SetTextureStageState(0, D3DTSS_TEXTURETRANSFORMFLAGS, flags);
+      const V v[4] = { { x0, row, 0.5f, 1, 1, 3, 2, 4 }, { x1, row, 0.5f, 1, 1, 3, 2, 4 },
+                       { x0, row + 10, 0.5f, 1, 1, 3, 2, 4 }, { x1, row + 10, 0.5f, 1, 1, 3, 2, 4 } };
+      d->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, v, sizeof(V));
+    };
+    quad(2, 30, D3DTTFF_COUNT4 | D3DTTFF_PROJECTED, 2);
+    quad(34, 62, D3DTTFF_COUNT4, 2);
+    quad(2, 30, D3DTTFF_COUNT3 | D3DTTFF_PROJECTED, 20);
+    d->SetTextureStageState(0, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_DISABLE);
+    d->SetPixelShader(nullptr);
+    d->SetTexture(0, nullptr);
+    ps->Release();
+    texture->Release();
+    return true;
+  }
+
   // YUY2 and UYVY surfaces (video) stretched onto the back buffer: two
   // pixels share U and V. Top half YUY2, bottom half UYVY.
   bool sceneYuvSurfaces(IDirect3DDevice9* d) {
@@ -1987,6 +2078,9 @@ float4 main(float2 t : TEXCOORD0) : COLOR {
     { "multiply_transform", sceneMultiplyTransform },
     { "clear_rules", sceneClearRules },
     { "yuv_surfaces", sceneYuvSurfaces },
+    { "ps1_projected", scenePs1Projected },
+    { "point_sizes", scenePointSizes },
+    { "ffp_shadow", sceneFfpShadow },
     { "state_block", sceneStateBlock },
     { "sm3_loops", sceneSm3Loops },
     { "ps_1_4", scenePs14 },

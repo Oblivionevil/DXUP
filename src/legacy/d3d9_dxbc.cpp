@@ -943,7 +943,15 @@ namespace dxup::legacy {
           // ---- Textures ----
           case OpTex:
             if (ps1() && minor < 4) {
-              write(ins, sample(reg, temp(texCoordTemp(reg))));
+              const uint32_t projected = (options.projected >> ((reg & 7) * 2)) & 3;
+              if (projected) {
+                const uint32_t t = scratch();
+                const Op coord = temp(texCoordTemp(reg));
+                emit(DxDiv, { tempDst(t), coord, comp(coord, projected) });
+                write(ins, sample(reg, temp(t)));
+              } else {
+                write(ins, sample(reg, temp(texCoordTemp(reg))));
+              }
             } else if (ps1()) {
               write(ins, sample(reg, src(ins, 0)));
             } else {

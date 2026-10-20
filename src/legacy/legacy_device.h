@@ -463,6 +463,7 @@ namespace dxup::legacy {
     // Points drawn as quads (point sprites, sizes above one pixel): a
     // geometry shader per vertex output layout.
     bool expandPoints() const;
+    bool fixedPointSizes() const;
     ID3D11GeometryShader* pointShader(uint32_t slots, bool clip);
     void updatePointConstants();
 

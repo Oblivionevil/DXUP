@@ -618,8 +618,12 @@ namespace dxup::legacy {
           // ---- Textures ----
           case OpTex:
             if (ps1() && minor < 4) {
-              // tex t#: sample with texture coordinate #.
-              write(ins, sampleFor(reg, tc(reg), "", ""));
+              // tex t#: sample with texture coordinate #, projected by the
+              // stage's D3DTTFF_PROJECTED.
+              const uint32_t projected = (options.projected >> ((reg & 7) * 2)) & 3;
+              const std::string coord = tc(reg);
+              write(ins, sampleFor(reg, projected ? "(" + coord + ") / (" + coord + ")." + std::string(4, kComponents[projected])
+                                                  : coord, "", ""));
             } else if (ps1()) {
               // texld r#, t#/r#: the sampler is the destination's number.
               write(ins, sampleFor(reg, src(0), "", ""));

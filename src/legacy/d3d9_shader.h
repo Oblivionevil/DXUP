@@ -63,6 +63,9 @@ namespace dxup::legacy {
     uint16_t shadowSamplers = 0;
     // Vertex shaders: user clip planes enabled (clip space, cbuffer b3).
     uint8_t clipPlanes = 0;
+    // Pixel shaders 1.1 to 1.3: tex t# divides its coordinates by a component
+    // (D3DTTFF_PROJECTED of the stage), 2 bits per t#: 0 none, else 1-3 (y-w).
+    uint16_t projected = 0;
     // 0 times infinity or NaN gives 0 (as Direct3D 9 drivers do) in mul and
     // mad (floatEmulation), and in dp2add, dp3, dp4 and the matrix products
     // (dotEmulation); IEEE gives NaN.

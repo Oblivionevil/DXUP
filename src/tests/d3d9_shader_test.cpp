@@ -1923,6 +1923,7 @@ namespace {
           o.nanDepthZero = rng.chance(50);
         } else {
           o.shadowSamplers = uint16_t(rng.chance(50) ? 1 : 0);
+          o.projected = uint16_t(rng.chance(50) ? rng.below(256) : 0);   // ps_1_1-1_3 tex t#
         }
         o.floatEmulation = rng.chance(30);
         s.variants.push_back(o);

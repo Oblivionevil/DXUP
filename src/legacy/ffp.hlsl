@@ -55,6 +55,7 @@ struct VSInput {
   float4 color0   : COLOR0;
   float4 color1   : COLOR1;
   float4 tex[8]   : TEXCOORD0;
+  float  psize    : PSIZE;      // per-vertex point size (0 without one)
 };
 
 // The varying slots of Direct3D 9 shaders (d3d9_shader.h), so translated
@@ -198,7 +199,7 @@ VSOutput vs_main(VSInput input) {
     fog = saturate(exp(-(fogDistance * fogVertex.w) * (fogDistance * fogVertex.w)));
   // The factor, and the distances the pixel stage computes fog from (as
   // NVIDIA's Direct3D 9 does for vertex fog too).
-  output.fog = float4(fog, abs(viewPosition.z), length(viewPosition), 0.0f);
+  output.fog = float4(fog, abs(viewPosition.z), length(viewPosition), input.psize);
 
   // Texture coordinates per stage: generated or from a set, transformed.
   [unroll]
@@ -241,6 +242,9 @@ Texture2D    textures2d[MAX_STAGES]   : register(t0);
 TextureCube  texturesCube[MAX_STAGES] : register(t8);
 Texture3D    textures3d[MAX_STAGES]   : register(t16);
 SamplerState samplers[MAX_STAGES]     : register(s0);
+// Depth textures (shadow maps) compare with the third coordinate, as NVIDIA's
+// Direct3D 9 does: texture type 4.
+SamplerComparisonState compareSamplers[MAX_STAGES] : register(s8);
 
 cbuffer FfpPixel : register(b1) {
   uint4  stageOps[MAX_STAGES];   // color op, alpha op, result (0 current, 1 temp), texture type | projected << 4 | count << 8
@@ -337,6 +341,8 @@ float4 ps_main(PSInput input) : SV_Target {
     float4 texel = 1.0f;
     if (textureType == 1)
       texel = textures2d[stage].Sample(samplers[stage], tc.xy);
+    else if (textureType == 4)
+      texel = textures2d[stage].SampleCmpLevelZero(compareSamplers[stage], tc.xy, tc.z).xxxx;
     else if (textureType == 2)
       texel = texturesCube[stage].Sample(samplers[stage], tc.xyz);
     else if (textureType == 3)
