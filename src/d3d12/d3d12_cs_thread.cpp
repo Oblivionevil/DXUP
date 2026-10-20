@@ -34,7 +34,7 @@ namespace dxup {
         *(lastSlash + 1) = '\0';
       else
         path[0] = '\0';
-      strcat_s(path, MAX_PATH, "dxup_disable_cs_thread.txt");
+      strncat_s(path, MAX_PATH, "dxup_disable_cs_thread.txt", _TRUNCATE);
 
       FILE* marker = fopen(path, "r");
       if (marker) {

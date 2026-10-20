@@ -5863,6 +5863,7 @@ namespace dxup {
     DWORD                    m_removedEventCookie = 0;
     std::vector<std::pair<DWORD, ComPtr<ID3D12Fence>>> m_removedEventFences;
     D3D11ImmediateContext*   m_immediateContext = nullptr;
+    std::mutex               m_immediateContextMutex;   // its creation on first use
     DXGIDevice*              m_dxgiDevice = nullptr;
     std::mutex               m_dxgiDeviceMutex;
     std::mutex               m_wrappedResourceMutex;

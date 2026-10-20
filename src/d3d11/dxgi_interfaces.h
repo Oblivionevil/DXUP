@@ -48,7 +48,7 @@ namespace dxup {
       char* lastSlash = strrchr(dllPath, '\\');
       if (lastSlash) {
         *(lastSlash + 1) = '\0';
-        strcat_s(dllPath, MAX_PATH, "dxup_show_fps_overlay.txt");
+        strncat_s(dllPath, MAX_PATH, "dxup_show_fps_overlay.txt", _TRUNCATE);
       } else {
         strcpy_s(dllPath, MAX_PATH, "dxup_show_fps_overlay.txt");
       }
@@ -193,8 +193,27 @@ namespace dxup {
 
     HRESULT STDMETHODCALLTYPE EnumAdapters(UINT Adapter, IDXGIAdapter** ppAdapter) override;
 
+    // DXUP's swap chains belong to the factory of its D3D12 device: the
+    // association goes there too (Alt+Enter turned off by the application).
     HRESULT STDMETHODCALLTYPE MakeWindowAssociation(HWND WindowHandle, UINT Flags) override {
-      return m_realFactory->MakeWindowAssociation(WindowHandle, Flags);
+      const HRESULT hr = m_realFactory->MakeWindowAssociation(WindowHandle, Flags);
+      m_associatedWindow = WindowHandle;
+      m_associationFlags = Flags;
+      if (SUCCEEDED(hr) && m_backendFactory && m_backendFactory.Get() != m_realFactory.Get())
+        m_backendFactory->MakeWindowAssociation(WindowHandle, Flags | (m_backendWindowed ? DXGI_MWA_NO_ALT_ENTER : 0u));
+      return hr;
+    }
+
+    void associateBackendFactory(IDXGIFactory4* factory, HWND window, bool windowed) {
+      if (!factory)
+        return;
+      m_backendFactory = factory;
+      m_backendWindowed = windowed;
+      UINT flags = windowed ? DXGI_MWA_NO_ALT_ENTER : 0u;
+      if (m_associatedWindow == window)
+        flags |= m_associationFlags;
+      if (flags)
+        factory->MakeWindowAssociation(window, flags);
     }
 
     HRESULT STDMETHODCALLTYPE GetWindowAssociation(HWND* pWindowHandle) override {
@@ -376,6 +395,10 @@ namespace dxup {
   private:
     std::atomic<ULONG>    m_refCount;
     ComPtr<IDXGIFactory4> m_realFactory;
+    ComPtr<IDXGIFactory4> m_backendFactory;   // of the last swap chain created
+    bool                  m_backendWindowed = false;
+    HWND                  m_associatedWindow = nullptr;
+    UINT                  m_associationFlags = 0;
   };
 
 
@@ -573,13 +596,15 @@ namespace dxup {
   static constexpr GUID kDxupOutputIid =
     { 0x8f3d2a61, 0x1c4e, 0x4b7a, { 0xa5, 0x92, 0x6e, 0x0d, 0x31, 0xc8, 0x4f, 0x27 } };
 
-  class DXGIOutput : public IDXGIOutput {
+  class DXGIOutput : public IDXGIOutput1 {
   public:
     DXGIOutput(ComPtr<IDXGIOutput> realOutput, DXGIAdapter* adapter)
     : m_refCount(1)
     , m_realOutput(std::move(realOutput))
     , m_adapter(adapter) {
       if (m_adapter) m_adapter->AddRef();
+      if (m_realOutput)
+        m_realOutput.As(&m_realOutput1);
     }
 
     ~DXGIOutput() {
@@ -594,8 +619,9 @@ namespace dxup {
       if (riid == __uuidof(IUnknown)
        || riid == __uuidof(IDXGIObject)
        || riid == __uuidof(IDXGIOutput)
+       || (riid == __uuidof(IDXGIOutput1) && m_realOutput1)
        || riid == kDxupOutputIid) {
-        *ppvObject = static_cast<IDXGIOutput*>(this);
+        *ppvObject = static_cast<IDXGIOutput1*>(this);
         AddRef();
         return S_OK;
       }
@@ -706,14 +732,41 @@ namespace dxup {
       return m_realOutput->GetFrameStatistics(pStats);
     }
 
+    // ---- IDXGIOutput1 ----
+
+    HRESULT STDMETHODCALLTYPE GetDisplayModeList1(DXGI_FORMAT EnumFormat, UINT Flags, UINT* pNumModes,
+                                                  DXGI_MODE_DESC1* pDesc) override {
+      return m_realOutput1->GetDisplayModeList1(EnumFormat, Flags, pNumModes, pDesc);
+    }
+
+    // As FindClosestMatchingMode: DXGI refuses DXUP's device.
+    HRESULT STDMETHODCALLTYPE FindClosestMatchingMode1(const DXGI_MODE_DESC1* pModeToMatch, DXGI_MODE_DESC1* pClosestMatch,
+                                                       IUnknown* pConcernedDevice) override {
+      if (!pConcernedDevice || !pModeToMatch)
+        return m_realOutput1->FindClosestMatchingMode1(pModeToMatch, pClosestMatch, pConcernedDevice);
+      DXGI_MODE_DESC1 mode = *pModeToMatch;
+      if (mode.Format == DXGI_FORMAT_UNKNOWN)
+        mode.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+      return m_realOutput1->FindClosestMatchingMode1(&mode, pClosestMatch, nullptr);
+    }
+
+    HRESULT STDMETHODCALLTYPE GetDisplaySurfaceData1(IDXGIResource* pDestination) override {
+      return m_realOutput1->GetDisplaySurfaceData1(pDestination);
+    }
+
+    HRESULT STDMETHODCALLTYPE DuplicateOutput(IUnknown* pDevice, IDXGIOutputDuplication** ppOutputDuplication) override {
+      return m_realOutput1->DuplicateOutput(pDevice, ppOutputDuplication);
+    }
+
     // ---- Accessors ----
 
     IDXGIOutput* getRealOutput() const { return m_realOutput.Get(); }
 
   private:
-    std::atomic<ULONG>  m_refCount;
-    ComPtr<IDXGIOutput> m_realOutput;
-    DXGIAdapter*        m_adapter;
+    std::atomic<ULONG>   m_refCount;
+    ComPtr<IDXGIOutput>  m_realOutput;
+    ComPtr<IDXGIOutput1> m_realOutput1;
+    DXGIAdapter*         m_adapter;
   };
 
   // The real output behind an output the application passes in. Real DXGI
@@ -981,6 +1034,14 @@ namespace dxup {
 
     HRESULT STDMETHODCALLTYPE GetBuffer(UINT Buffer, REFIID riid, void** ppSurface) override {
       if (!ppSurface) return E_POINTER;
+      // Buffers the application does not have (the DISCARD effects give
+      // the first only, as Windows' D3D11).
+      DXGI_SWAP_CHAIN_DESC realDesc = {};
+      if ((m_appDiscard && Buffer > 0)
+       || (SUCCEEDED(m_realSwapChain->GetDesc(&realDesc)) && Buffer >= realDesc.BufferCount)) {
+        *ppSurface = nullptr;
+        return DXGI_ERROR_INVALID_CALL;
+      }
 
       // Lazily create back buffer textures + proxy
       if (m_backBufferTextures.empty()) {
@@ -1150,6 +1211,8 @@ namespace dxup {
       UINT        Height,
       DXGI_FORMAT NewFormat,
       UINT        SwapChainFlags) override {
+      // Presents queued on the worker still use the buffers.
+      waitForPresents();
       detachDirectBackBuffer();
       m_backBufferTextures.clear();
       m_backBufferBackendImages.clear();
@@ -1234,6 +1297,7 @@ namespace dxup {
     // The swap effect and buffer usage the application asked for.
     void setApplicationSwapModel(DXGI_SWAP_EFFECT effect, DXGI_USAGE usage) {
       m_appFlipModel = effect == DXGI_SWAP_EFFECT_FLIP_DISCARD || effect == DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
+      m_appDiscard = effect == DXGI_SWAP_EFFECT_DISCARD || effect == DXGI_SWAP_EFFECT_FLIP_DISCARD;
       m_appUnorderedAccess = (usage & DXGI_USAGE_UNORDERED_ACCESS) != 0;
     }
 
@@ -1394,6 +1458,7 @@ namespace dxup {
       UINT              SwapChainFlags,
       const UINT*       pCreationNodeMask,
       IUnknown* const*  ppPresentQueue) override {
+      waitForPresents();
       detachDirectBackBuffer();
       m_backBufferTextures.clear();
       m_backBufferBackendImages.clear();
@@ -1510,8 +1575,12 @@ namespace dxup {
     std::vector<ComPtr<ID3D12Resource>> m_directBuffers;
     // Textures of their own for direct buffers the application kept past
     // ResizeBuffers.
-    std::vector<Rc<IBackendImage>> m_detachedImages;
+    // Stand-ins for direct back buffers the application still held when they
+    // were detached: kept as long as its texture (the owner) lives.
+    struct DetachedImage { std::weak_ptr<d3d12::D3D12BackendImage> owner; Rc<IBackendImage> copy; };
+    std::vector<DetachedImage> m_detachedImages;
     bool                         m_appFlipModel = false;
+    bool                         m_appDiscard = false;
     bool                         m_appUnorderedAccess = false;
     DXGI_FORMAT                  m_appFormat = DXGI_FORMAT_UNKNOWN;
     DXGI_SAMPLE_DESC             m_appSampleDesc = { 1, 0 };
@@ -1754,7 +1823,10 @@ namespace dxup {
       if (ctx && !(flags & DXGI_PRESENT_TEST) && presentOnWorker()) {
         auto parameters = std::make_shared<PresentParameters>(params);
         const bool hasParameters = params != nullptr;
-        ctx->executeOnBackend([this, syncInterval, flags, present1, parameters, hasParameters](IBackendContext* backend) {
+        // The worker may wait for the display (the application does not):
+        // DO_NOT_WAIT there would drop the frame queued as presented.
+        const UINT workerFlags = flags & ~UINT(DXGI_PRESENT_DO_NOT_WAIT);
+        ctx->executeOnBackend([this, syncInterval, flags = workerFlags, present1, parameters, hasParameters](IBackendContext* backend) {
           preparePresent(backend);
           DXGI_PRESENT_PARAMETERS copy = parameters->get();
           const int64_t start = hitchTraceEnabled() ? hitchTimestamp() : 0;
@@ -1838,12 +1910,14 @@ namespace dxup {
       waitForPresents();
       m_direct = false;
       IBackendImage* image = m_proxyBackendImage;
+      m_detachedImages.erase(std::remove_if(m_detachedImages.begin(), m_detachedImages.end(),
+        [](const DetachedImage& detached) { return detached.owner.expired(); }), m_detachedImages.end());
       ComPtr<IUnknown> standIn;
       if (image && m_proxyRenderTarget && m_d3d11Device
        && (m_proxyRenderTarget.Get()->AddRef(), m_proxyRenderTarget.Get()->Release()) > 1) {
         if (Rc<IBackendImage> copy = m_d3d11Device->GetBackend()->createImage(image->getDesc())) {
           standIn = static_cast<d3d12::D3D12BackendImage*>(copy.get())->getResource();
-          m_detachedImages.push_back(std::move(copy));
+          m_detachedImages.push_back({ static_cast<d3d12::D3D12BackendImage*>(image)->weak_from_this(), std::move(copy) });
         }
       }
       retargetNow(image, standIn.Get());
@@ -3061,12 +3135,14 @@ namespace dxup {
       nullptr,   // restrict to output
       swapChain1.ReleaseAndGetAddressOf());
 
-    if (FAILED(hr))
+    if (FAILED(hr)) {
+      ourDevice->Release();
       return hr;
+    }
 
-    // Disable Alt+Enter handling if windowed
-    if (pDesc->Windowed)
-      factoryForSwapChain->MakeWindowAssociation(pDesc->OutputWindow, DXGI_MWA_NO_ALT_ENTER);
+    // Alt+Enter off in a window; what the application associated through
+    // this factory goes to the one of the swap chain too.
+    associateBackendFactory(factoryForSwapChain, pDesc->OutputWindow, pDesc->Windowed != FALSE);
 
     hr = wrapDxgiSwapChain(this, ourDevice, swapChain1, commandQueue, reinterpret_cast<void**>(ppSwapChain), __uuidof(IDXGISwapChain),
       pDesc->BufferDesc.Format, pDesc->SampleDesc, pDesc->Flags, pDesc->SwapEffect, pDesc->BufferUsage,
@@ -3142,6 +3218,8 @@ namespace dxup {
       ourDevice->Release();
       return hr;
     }
+    // (No Alt+Enter default here: DXGI keeps handling it, as before.)
+    associateBackendFactory(factoryForSwapChain, hWnd, false);
 
     logMessage(LogLevel::Info, "DXGIFactory::CreateSwapChainForHwnd: swap chain created successfully");
 

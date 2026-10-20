@@ -216,6 +216,16 @@ namespace dxup {
         AddRef();
         return S_OK;
       }
+      // Engines mark GPU events through it (UE4); without a profiler
+      // nothing records them.
+      if (riid == __uuidof(ID3DUserDefinedAnnotation)) {
+        *ppvObject = static_cast<ID3DUserDefinedAnnotation*>(&m_annotation);
+        AddRef();
+        return S_OK;
+      }
+      // The immediate context's lock (ID3D11Multithread) is the device's.
+      if (!m_isDeferred && (riid == __uuidof(ID3D11Multithread) || riid == __uuidof(ID3D10Multithread)))
+        return reinterpret_cast<IUnknown*>(m_device)->QueryInterface(riid, ppvObject);
 
       logMessage(LogLevel::Debug, "D3D11ImmediateContext::QueryInterface unsupported riid=%s",
         formatGuid(riid).c_str());
@@ -2458,21 +2468,34 @@ namespace dxup {
         }
         return static_cast<d3d12::D3D12BackendImage*>(getBackendImage(resource.Get()));
       };
+      // Constants inside the buffer bound there only.
       auto constant = [this](UINT slot, UINT offset) {
         d3d12::UpscaleRequest::Constant result;
-        if (ID3D11Buffer* buffer = m_state.cs.constantBuffers[slot]) {
-          result.buffer = static_cast<d3d12::D3D12BackendBuffer*>(getBackendBuffer(buffer));
-          result.offset = m_state.cs.constantBufferFirst[slot] * 16 + offset;
+        ID3D11Buffer* buffer = slot < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT ? m_state.cs.constantBuffers[slot] : nullptr;
+        if (buffer) {
+          D3D11_BUFFER_DESC desc = {};
+          buffer->GetDesc(&desc);
+          const uint64_t at = uint64_t(m_state.cs.constantBufferFirst[slot]) * 16 + offset;
+          if (at + 16 <= desc.ByteWidth) {
+            result.buffer = static_cast<d3d12::D3D12BackendBuffer*>(getBackendBuffer(buffer));
+            result.offset = UINT(at);
+          }
         }
         return result;
+      };
+      auto srv = [this](UINT slot) -> ID3D11View* {
+        return slot < D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT ? m_state.cs.srvs[slot] : nullptr;
+      };
+      auto uav = [this](UINT slot) -> ID3D11View* {
+        return slot < D3D11_1_UAV_SLOT_COUNT ? m_state.cs.uavs[slot] : nullptr;
       };
 
       d3d12::UpscaleRequest request;
       request.kind = static_cast<upscale::Kind>(m_overrides.upscaler);
-      request.color = image(m_state.cs.srvs[profile->colorSlot], nullptr);
-      request.depth = image(m_state.cs.srvs[profile->depthSlot], &request.depthFormat);
-      request.velocity = image(m_state.cs.srvs[profile->velocitySlot], &request.velocityFormat);
-      request.output = image(m_state.cs.uavs[profile->outputSlot], nullptr);
+      request.color = image(srv(profile->colorSlot), nullptr);
+      request.depth = image(srv(profile->depthSlot), &request.depthFormat);
+      request.velocity = image(srv(profile->velocitySlot), &request.velocityFormat);
+      request.output = image(uav(profile->outputSlot), nullptr);
       if (!profile->viewSizeFromTexture)
         request.viewSize = constant(profile->paramsBuffer, profile->viewSizeOffset);
       request.jitter = constant(profile->jitterBuffer != ~0u ? profile->jitterBuffer : profile->paramsBuffer,
@@ -2486,7 +2509,7 @@ namespace dxup {
       if (calibrating) {
         // The game's pass runs; its color and velocity are measured.
         DXGI_FORMAT colorFormat = DXGI_FORMAT_UNKNOWN;
-        image(m_state.cs.srvs[profile->colorSlot], &colorFormat);
+        image(srv(profile->colorSlot), &colorFormat);
         if (!request.color || !request.velocity || colorFormat == DXGI_FORMAT_UNKNOWN)
           return false;
         auto calibration = m_autoTaa->calibration();
@@ -4360,6 +4383,25 @@ namespace dxup {
     bool                 m_currentPipelineIsCompute = false;
     bool                 m_pipelineDirty = true;
     bool                 m_isDeferred = false;
+
+    // ID3DUserDefinedAnnotation, counted on the context. Without a profiler
+    // attached BeginEvent and EndEvent return -1, as Windows' D3D11's.
+    class Annotation final : public ID3DUserDefinedAnnotation {
+    public:
+      explicit Annotation(ID3D11DeviceContext* context) : m_context(context) {}
+      HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppvObject) override {
+        return m_context->QueryInterface(riid, ppvObject);
+      }
+      ULONG STDMETHODCALLTYPE AddRef() override { return m_context->AddRef(); }
+      ULONG STDMETHODCALLTYPE Release() override { return m_context->Release(); }
+      INT STDMETHODCALLTYPE BeginEvent(LPCWSTR) override { return -1; }
+      INT STDMETHODCALLTYPE EndEvent() override { return -1; }
+      void STDMETHODCALLTYPE SetMarker(LPCWSTR) override {}
+      BOOL STDMETHODCALLTYPE GetStatus() override { return FALSE; }
+    private:
+      ID3D11DeviceContext* m_context;
+    };
+    Annotation           m_annotation{this};
     // Whether the backend can ask for the output merger state again (see
     // IBackendContext::outputMergerStateNeedsRebind).
     bool                 m_outputMergerRebinds = true;
@@ -7741,6 +7783,11 @@ namespace dxup {
   }
 
   inline void D3D11Device::submitThen(std::function<void()> fn) {
+    // Without a context nothing is queued: at once.
+    if (!m_immediateContext) {
+      fn();
+      return;
+    }
     m_immediateContext->submitThen(std::move(fn));
   }
 

@@ -29,7 +29,7 @@ namespace dxup {
     if (!lastSlash)
       return false;
     *(lastSlash + 1) = '\0';
-    strcat_s(path, MAX_PATH, fileName);
+    strncat_s(path, MAX_PATH, fileName, _TRUNCATE);
     DWORD attributes = GetFileAttributesA(path);
     return attributes != INVALID_FILE_ATTRIBUTES && !(attributes & FILE_ATTRIBUTE_DIRECTORY);
 #else
@@ -54,7 +54,7 @@ namespace dxup {
       char* lastSlash = strrchr(markerPath, '\\');
       if (lastSlash) {
         *(lastSlash + 1) = '\0';
-        strcat_s(markerPath, MAX_PATH, "dxup_info_log.txt");
+        strncat_s(markerPath, MAX_PATH, "dxup_info_log.txt", _TRUNCATE);
         DWORD attributes = GetFileAttributesA(markerPath);
         if (attributes != INVALID_FILE_ATTRIBUTES && !(attributes & FILE_ATTRIBUTE_DIRECTORY))
           return LogLevel::Info;
@@ -96,12 +96,12 @@ namespace dxup {
     } else {
       dllPath[0] = '\0';
     }
-    strcat_s(dllPath, MAX_PATH, "logdxup");
+    strncat_s(dllPath, MAX_PATH, "logdxup", _TRUNCATE);
     if (!isD3D11) {
-      strcat_s(dllPath, MAX_PATH, "_");
-      strcat_s(dllPath, MAX_PATH, stem);
+      strncat_s(dllPath, MAX_PATH, "_", _TRUNCATE);
+      strncat_s(dllPath, MAX_PATH, stem, _TRUNCATE);
     }
-    strcat_s(dllPath, MAX_PATH, ".log");
+    strncat_s(dllPath, MAX_PATH, ".log", _TRUNCATE);
 
     g_logFile = fopen(dllPath, "w");
 #else
@@ -221,7 +221,7 @@ namespace dxup {
       int len = snprintf(debugBuf, sizeof(debugBuf), "DXUP %s", prefix);
       vsnprintf(debugBuf + len, sizeof(debugBuf) - len, fmt, args);
       va_end(args);
-      strncat_s(debugBuf, sizeof(debugBuf), "\n", 1);
+      strncat_s(debugBuf, sizeof(debugBuf), "\n", _TRUNCATE);   // a full buffer goes without
       OutputDebugStringA(debugBuf);
 #endif
     }
@@ -234,7 +234,10 @@ namespace dxup {
   }
 
   void logShutdown() {
-    std::lock_guard<std::mutex> lock(g_logMutex);
+    // At process exit a killed thread may hold the lock: the log stays open.
+    std::unique_lock<std::mutex> lock(g_logMutex, std::try_to_lock);
+    if (!lock.owns_lock())
+      return;
     if (g_logFile) {
       fprintf(g_logFile, "=== DXUP Log Ended ===\n");
       fclose(g_logFile);

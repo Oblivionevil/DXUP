@@ -401,6 +401,9 @@ void main(uint2 id : SV_DispatchThreadID) {
         {"stream_output_gap", &Dx11TestApp::testStreamOutputGap},
         {"planar_initial_data", &Dx11TestApp::testPlanarInitialData},
         {"dxgi_device_interfaces", &Dx11TestApp::testDxgiDeviceInterfaces},
+        {"swap_chain_buffer_index", &Dx11TestApp::testSwapChainBufferIndex},
+        {"context_interfaces", &Dx11TestApp::testContextInterfaces},
+        {"dxgi_object_identity", &Dx11TestApp::testDxgiObjectIdentity},
         {"geometry_stream_output_draw_auto", &Dx11TestApp::testGeometryStreamOutputDrawAuto},
         {"stream_output_per_buffer_size", &Dx11TestApp::testStreamOutputPerBufferSize},
         {"tessellation_pipeline", &Dx11TestApp::testTessellationPipeline},
@@ -4943,6 +4946,132 @@ float4 main(float4 position : SV_Position) : SV_Target { return float4(1.0f, 1.0
 
     // A stream-output declaration with a gap (a NULL semantic name skips
     // its components in the buffer).
+    // The device's adapter is one object (enumerating adapters and outputs
+    // gives new ones each time, as Windows' DXGI does).
+    bool testDxgiObjectIdentity(std::string& error) {
+      ComPtr<IDXGIDevice> dxgiDevice;
+      ComPtr<IDXGIAdapter> adapter, adapterAgain;
+      if (FAILED(m_device.As(&dxgiDevice)) || FAILED(dxgiDevice->GetAdapter(adapter.GetAddressOf()))
+       || FAILED(dxgiDevice->GetAdapter(adapterAgain.GetAddressOf()))) {
+        error = "getting the adapter failed";
+        return false;
+      }
+      if (adapter.Get() != adapterAgain.Get()) {
+        error = "GetAdapter gave two objects";
+        return false;
+      }
+      // An output's closest mode for the application's device (IDXGIOutput1).
+      ComPtr<IDXGIOutput> output;
+      ComPtr<IDXGIOutput1> output1;
+      if (SUCCEEDED(adapter->EnumOutputs(0, output.GetAddressOf())) && SUCCEEDED(output.As(&output1))) {
+        DXGI_MODE_DESC1 wanted = {};
+        wanted.Width = 1280;
+        wanted.Height = 720;
+        DXGI_MODE_DESC1 found = {};
+        const HRESULT hr = output1->FindClosestMatchingMode1(&wanted, &found, m_device.Get());
+        if (FAILED(hr) || !found.Width) {
+          error = "FindClosestMatchingMode1 with the device failed: " + formatHResult(hr);
+          return false;
+        }
+      }
+      return true;
+    }
+
+    // The immediate context answers ID3D11Multithread (the device's lock) and
+    // ID3DUserDefinedAnnotation (no profiler: -1 and FALSE).
+    bool testContextInterfaces(std::string& error) {
+      ComPtr<ID3D11Multithread> multithread;
+      ComPtr<ID3DUserDefinedAnnotation> annotation;
+      HRESULT hr = m_context.As(&multithread);
+      if (FAILED(hr)) {
+        error = "QueryInterface(ID3D11Multithread) failed: " + formatHResult(hr);
+        return false;
+      }
+      if (FAILED(hr = m_context.As(&annotation))) {
+        error = "QueryInterface(ID3DUserDefinedAnnotation) failed: " + formatHResult(hr);
+        return false;
+      }
+      const BOOL was = multithread->SetMultithreadProtected(TRUE);
+      const BOOL now = multithread->GetMultithreadProtected();
+      multithread->SetMultithreadProtected(was);
+      if (!now) {
+        error = "SetMultithreadProtected(TRUE) did not hold";
+        return false;
+      }
+      const INT begin = annotation->BeginEvent(L"dxup test");
+      const INT end = annotation->EndEvent();
+      annotation->SetMarker(L"marker");
+      if (annotation->GetStatus() || begin != -1 || end != -1) {
+        error = formatString("annotation without a profiler: status %d, begin %d, end %d", int(annotation->GetStatus()),
+          begin, end);
+        return false;
+      }
+      // A device of D3D11CreateDevice is no 11on12 device.
+      ComPtr<ID3D11On12Device> on12;
+      if (SUCCEEDED(m_device.As(&on12))) {
+        error = "the device answers ID3D11On12Device";
+        return false;
+      }
+      ComPtr<ID3D11DeviceContext> back;
+      if (FAILED(annotation.As(&back)) || back.Get() != m_context.Get()) {
+        error = "the annotation does not lead back to the context";
+        return false;
+      }
+      return true;
+    }
+
+    // GetBuffer of buffers a swap chain does not have fails; the DISCARD
+    // effects give the first only.
+    bool testSwapChainBufferIndex(std::string& error) {
+      ComPtr<IDXGIDevice> dxgiDevice;
+      ComPtr<IDXGIAdapter> adapter;
+      ComPtr<IDXGIFactory> factory;
+      if (FAILED(m_device.As(&dxgiDevice)) || FAILED(dxgiDevice->GetAdapter(adapter.GetAddressOf()))
+       || FAILED(adapter->GetParent(__uuidof(IDXGIFactory), reinterpret_cast<void**>(factory.GetAddressOf())))) {
+        error = "getting the DXGI factory failed";
+        return false;
+      }
+      HWND window = CreateWindowExA(0, kWindowClassName, "buffers", WS_OVERLAPPEDWINDOW,
+        CW_USEDEFAULT, CW_USEDEFAULT, 64, 64, nullptr, nullptr, GetModuleHandleA(nullptr), nullptr);
+      if (!window) {
+        error = "CreateWindowExA failed";
+        return false;
+      }
+      struct WindowGuard { HWND h; ~WindowGuard() { DestroyWindow(h); } } guard{ window };
+      for (const DXGI_SWAP_EFFECT effect : { DXGI_SWAP_EFFECT_DISCARD, DXGI_SWAP_EFFECT_SEQUENTIAL,
+                                             DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL, DXGI_SWAP_EFFECT_FLIP_DISCARD }) {
+        DXGI_SWAP_CHAIN_DESC desc = {};
+        desc.BufferDesc.Width = 64;
+        desc.BufferDesc.Height = 48;
+        desc.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        desc.SampleDesc.Count = 1;
+        desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+        desc.BufferCount = 2;
+        desc.OutputWindow = window;
+        desc.Windowed = TRUE;
+        desc.SwapEffect = effect;
+        ComPtr<IDXGISwapChain> swapChain;
+        HRESULT hr = factory->CreateSwapChain(m_device.Get(), &desc, swapChain.GetAddressOf());
+        if (FAILED(hr)) {
+          error = formatString("effect %d: CreateSwapChain failed: %s", int(effect), formatHResult(hr).c_str());
+          return false;
+        }
+        const bool sequential = effect == DXGI_SWAP_EFFECT_SEQUENTIAL || effect == DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
+        for (UINT index = 0; index < 4; index++) {
+          ComPtr<ID3D11Texture2D> buffer;
+          hr = swapChain->GetBuffer(index, __uuidof(ID3D11Texture2D), reinterpret_cast<void**>(buffer.GetAddressOf()));
+          const bool expected = index == 0 || (sequential && index < 2);
+          if (std::getenv("DXUP_PROBE_BUFFERS"))
+            std::printf("  effect %d buffer %u: %08lx\n", int(effect), index, static_cast<unsigned long>(hr));
+          else if (SUCCEEDED(hr) != expected) {
+            error = formatString("effect %d: GetBuffer(%u) returned %s", int(effect), index, formatHResult(hr).c_str());
+            return false;
+          }
+        }
+      }
+      return true;
+    }
+
     // IDXGIDevice3/4 on the device (same COM object); EnqueueSetEvent signals
     // once the GPU is done with the work so far.
     bool testDxgiDeviceInterfaces(std::string& error) {

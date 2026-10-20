@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <charconv>
 #include <cstdlib>
 #include <fstream>
 #include <iterator>
@@ -142,17 +143,19 @@ namespace dxup {
       std::vector<Block> blocks;
       std::istringstream lines(text);
       std::string line;
+      bool inGame = false;   // other [sections] end a game's block
       while (std::getline(lines, line)) {
         line = trim(line);
         if (line.empty() || line[0] == '#')
           continue;
         if (line[0] == '[') {
-          if (lower(line) == "[game]")
+          inGame = lower(line) == "[game]";
+          if (inGame)
             blocks.emplace_back();
           continue;
         }
         const size_t equals = line.find('=');
-        if (blocks.empty() || equals == std::string::npos)
+        if (!inGame || equals == std::string::npos)
           continue;
         const std::string key = lower(trim(line.substr(0, equals)));
         const std::string value = trim(line.substr(equals + 1));
@@ -291,9 +294,14 @@ namespace dxup {
     const std::string* value = find(key);
     if (!value)
       return fallback;
-    char* end = nullptr;
-    const float parsed = std::strtof(value->c_str(), &end);
-    if (end == value->c_str() || *end)
+    // '.' whatever locale the application set (strtof would take ',').
+    float parsed = 0.0f;
+    const char* begin = value->c_str();
+    const char* last = begin + value->size();
+    if (begin != last && *begin == '+')
+      begin++;
+    const auto result = std::from_chars(begin, last, parsed);
+    if (result.ec != std::errc() || result.ptr != last)
       return fallback;
     return parsed;
   }

@@ -190,11 +190,8 @@ HRESULT STDMETHODCALLTYPE D3D11Device::QueryInterface(REFIID riid, void** ppvObj
     return S_OK;
   }
 
-  if (riid == __uuidof(ID3D11On12Device)) {
-    *ppvObject = static_cast<ID3D11On12Device*>(this);
-    AddRef();
-    return S_OK;
-  }
+  // ID3D11On12Device: not on devices of D3D11CreateDevice (Windows' only
+  // answers it on devices of D3D11On12CreateDevice, which go to Windows).
 
   if (riid == __uuidof(IDXGIObject)
    || riid == __uuidof(IDXGIDevice)
@@ -249,6 +246,8 @@ D3D11Device::~D3D11Device() {
 void D3D11Device::GetImmediateContext(ID3D11DeviceContext** ppImmediateContext) {
   if (!ppImmediateContext)
     return;
+  // Threads asking at once get the same context.
+  std::lock_guard<std::mutex> lock(m_immediateContextMutex);
   if (!m_immediateContext) {
     logMessage(LogLevel::Info, "Creating immediate context...");
     try {
@@ -305,7 +304,7 @@ static bool dxupExceptionTraceEnabled() {
     if (!lastSlash)
       return false;
     *(lastSlash + 1) = '\0';
-    strcat_s(path, MAX_PATH, "dxup_exception_trace.txt");
+    strncat_s(path, MAX_PATH, "dxup_exception_trace.txt", _TRUNCATE);
     const DWORD attributes = GetFileAttributesA(path);
     return attributes != INVALID_FILE_ATTRIBUTES && !(attributes & FILE_ATTRIBUTE_DIRECTORY);
   }();
@@ -418,6 +417,8 @@ static LONG WINAPI dxupVectoredExceptionHandler(PEXCEPTION_POINTERS pExInfo) {
   return EXCEPTION_CONTINUE_SEARCH;
 }
 
+static PVOID s_exceptionHandler = nullptr;
+
 BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
   (void)lpvReserved;
 
@@ -427,10 +428,15 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
       logMessage(LogLevel::Info, "DXUP d3d11.dll loaded (DLL_PROCESS_ATTACH)");
       d3d12::setUpscalerFactory(&createUpscaler);
       s_exceptionTrace = dxupExceptionTraceEnabled();
-      AddVectoredExceptionHandler(1, dxupVectoredExceptionHandler);
+      s_exceptionHandler = AddVectoredExceptionHandler(1, dxupVectoredExceptionHandler);
       break;
     case DLL_PROCESS_DETACH:
       logMessage(LogLevel::Info, "DXUP d3d11.dll unloading (DLL_PROCESS_DETACH)");
+      // Unloaded with FreeLibrary: the handler's code goes with the DLL.
+      if (s_exceptionHandler) {
+        RemoveVectoredExceptionHandler(s_exceptionHandler);
+        s_exceptionHandler = nullptr;
+      }
       logShutdown();
       break;
   }
@@ -502,7 +508,7 @@ static HRESULT createNativeDevice(
 static bool warpAdapterLuid(LUID& luid) {
   char path[MAX_PATH];
   GetSystemDirectoryA(path, MAX_PATH);
-  strcat_s(path, "\\dxgi.dll");
+  strncat_s(path, "\\dxgi.dll", _TRUNCATE);
   HMODULE dxgi = LoadLibraryA(path);
   using CreateFactory = HRESULT (WINAPI*)(REFIID, void**);
   auto create = dxgi ? reinterpret_cast<CreateFactory>(GetProcAddress(dxgi, "CreateDXGIFactory1")) : nullptr;

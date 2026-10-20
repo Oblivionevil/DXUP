@@ -685,7 +685,13 @@ namespace dxup {
         &p.jitterBuffer, &p.jitterOffset, &p.jitterScale[0], &p.jitterScale[1], &p.clipBuffer, &p.clipOffset,
         &p.velocityMode, &p.velocityCandidate);
       std::fclose(file);
-      if ((read != 14 && read != 16) || !hash || p.velocityMode > 1 || p.velocityCandidate > 5)
+      // Slots past the pipeline's (a damaged file) are not used.
+      constexpr UINT kSrvs = D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT;
+      constexpr UINT kBuffers = D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT;
+      if ((read != 14 && read != 16) || !hash || p.velocityMode > 1 || p.velocityCandidate > 5
+       || p.colorSlot >= kSrvs || p.depthSlot >= kSrvs || p.velocitySlot >= kSrvs || p.outputSlot >= D3D11_1_UAV_SLOT_COUNT
+       || p.viewSizeBuffer >= kBuffers || p.jitterBuffer >= kBuffers || p.clipBuffer >= kBuffers
+       || p.viewSizeOffset >= 65536 || p.jitterOffset >= 65536 || p.clipOffset >= 65536)
         return;
       p.shaderHash = hash;
       p.viewSizeFromTexture = fromTexture != 0;
