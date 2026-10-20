@@ -368,6 +368,12 @@ namespace dxup::ddraw {
     D3DCLIPSTATUS m_clipStatus = {};
     float m_clipPlanes[6][4] = {};
     bool m_colorKeyEnable = false;
+    // The alpha test DXUP turned on for colour-keyed textures, and the
+    // application's alpha states under it.
+    bool m_keyAlphaTest = false;
+    uint32_t m_keySavedFunc = 0, m_keySavedRef = 0;
+    void endKeyAlphaTest();
+    uint32_t appRenderState(uint32_t state) const;
     std::vector<std::unique_ptr<StateBlock>> m_stateBlocks;
     std::unique_ptr<StateBlock> m_recording;
     GUID m_type;

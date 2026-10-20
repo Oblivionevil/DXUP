@@ -305,6 +305,11 @@ namespace dxup::legacy {
       if (!(s_logged.fetch_or(bit) & bit))
         logMessage(LogLevel::Info, "D3D9: textures of format %u converted to B8G8R8A8", uint32_t(m_desc.format));
     }
+    // Colour keys need alpha: formats without it are converted.
+    if (m_desc.colorKeyed && (format == DXGI_FORMAT_B5G6R5_UNORM || format == DXGI_FORMAT_B8G8R8X8_UNORM)) {
+      format = DXGI_FORMAT_B8G8R8A8_UNORM;
+      m_convert = true;
+    }
     m_dxgiFormat = format;
     DXGI_FORMAT resourceFormat = format;
     DXGI_FORMAT dsvFormat = format;
@@ -662,8 +667,9 @@ namespace dxup::legacy {
     for (uint32_t z = 0; z < d; z++) {
       for (uint32_t y = 0; y < h; y++) {
         const uint8_t* row = level.data.data() + size_t(z) * srcSlice + size_t(y) * srcPitch;
+        const bool yuv = m_desc.format == FormatYUY2 || m_desc.format == FormatUYVY;
         for (uint32_t x = 0; x < w; x++) {
-          uint32_t argb = toArgb(m_desc.format, row + size_t(x) * bpp, m_palette.data());
+          uint32_t argb = yuv ? yuvToArgb(m_desc.format, row, x) : toArgb(m_desc.format, row + size_t(x) * bpp, m_palette.data());
           if (keyed && (argb & 0x00ffffffu) == (m_colorKey & 0x00ffffffu))
             argb = 0;
           converted[(size_t(z) * h + y) * w + x] = argb;
@@ -2171,24 +2177,29 @@ namespace dxup::legacy {
   void Device::setRenderTarget(uint32_t index, Texture* target, uint32_t subresource) {
     if (index >= kMaxRenderTargets)
       return;
-    if (target && index == 0) {
-      // As Direct3D 9: the first target sets viewport and scissor to itself,
-      // also when it is the target already bound (UE3 games set their scene
-      // target again after a smaller viewport: The Vanishing of Ethan Carter
-      // drew its world into a 512x512 corner).
-      m_viewport = { 0, 0, target->width(subresource), target->height(subresource), 0.0f, 1.0f };
-      m_scissor = { 0, 0, int32_t(m_viewport.width), int32_t(m_viewport.height) };
-      m_vertexConstantsDirty = true;
-      m_targetsDirty = true;
-    }
     if (m_renderTargets[index] == target && m_renderTargetSubresources[index] == subresource)
       return;
     m_renderTargets[index] = target;
     m_renderTargetSubresources[index] = subresource;
+    // A new first target sets viewport and scissor to itself (Direct3D 9
+    // also does for the target already bound: resetViewport).
+    if (target && index == 0)
+      resetViewport();
     m_targetsDirty = true;
     // A texture bound as the new target is unbound from its stage.
     m_textureDirtyMask = (1u << kSamplerCount) - 1;
     m_dirty |= DirtyBlend;
+  }
+
+  void Device::resetViewport() {
+    Texture* target = m_renderTargets[0];
+    if (!target)
+      return;
+    const uint32_t subresource = m_renderTargetSubresources[0];
+    m_viewport = { 0, 0, target->width(subresource), target->height(subresource), 0.0f, 1.0f };
+    m_scissor = { 0, 0, int32_t(m_viewport.width), int32_t(m_viewport.height) };
+    m_vertexConstantsDirty = true;
+    m_targetsDirty = true;
   }
 
   void Device::setDepthStencil(Texture* depth) {
@@ -2480,8 +2491,11 @@ namespace dxup::legacy {
     const float bias = asFloat(rs[RsDepthBias]);
     // Direct3D 9's bias is in depth units; D3D11's in steps of the format.
     const float steps = m_depthStencil && formatInfo(m_depthStencil->desc().format).bytesPerBlock == 2 ? 65535.0f : 16777215.0f;
-    desc.DepthBias = INT(bias * steps) - INT(rs[RsZBias]) * 1000;
-    desc.SlopeScaledDepthBias = asFloat(rs[RsSlopeScaleDepthBias]);
+    // NaN or values past INT do nothing / saturate (D3D11 refuses NaN).
+    const double depthBias = std::isfinite(bias) ? double(bias) * steps - double(INT(rs[RsZBias])) * 1000.0 : 0.0;
+    desc.DepthBias = INT((std::max)(-2147483648.0, (std::min)(2147483647.0, depthBias)));
+    const float slope = asFloat(rs[RsSlopeScaleDepthBias]);
+    desc.SlopeScaledDepthBias = std::isfinite(slope) ? slope : 0.0f;
     desc.DepthClipEnable = TRUE;
     desc.ScissorEnable = rs[RsScissorTestEnable] != 0;
     desc.MultisampleEnable = TRUE;
@@ -3500,7 +3514,9 @@ namespace dxup::legacy {
     c.fogParams[0] = asFloat(rs[RsFogStart]);
     c.fogParams[1] = asFloat(rs[RsFogEnd]);
     c.fogParams[2] = asFloat(rs[RsFogDensity]);
-    c.fogParams[3] = 1.0f / (std::max)(c.fogParams[1] - c.fogParams[0], 1e-6f);
+    // Inverted ranges (end before start) keep their sign, as ffp.hlsl's fogRange.
+    const float fogRange = c.fogParams[1] - c.fogParams[0];
+    c.fogParams[3] = 1.0f / (std::fabs(fogRange) < 1e-6f ? (fogRange < 0.0f ? -1e-6f : 1e-6f) : fogRange);
     c.flags[0] = rs[RsFogEnable] ? 1 : 0;
     c.flags[1] = rs[RsFogTableMode] <= 3 ? rs[RsFogTableMode] : 0;
     // D3DCMP_NEVER (1) to ALWAYS (8) minus one: less, equal, greater bits;
@@ -4336,8 +4352,17 @@ namespace dxup::legacy {
     ID3D11DepthStencilView* dsv = (flags & (ClearZBuffer | ClearStencil)) && m_depthStencil ? m_depthStencil->dsv() : nullptr;
     float rgba[4];
     colorToFloats(color, rgba);
-    const Rect full = { int32_t(m_viewport.x), int32_t(m_viewport.y), int32_t(m_viewport.x + m_viewport.width),
-                        int32_t(m_viewport.y + m_viewport.height) };
+    Rect full = { int32_t(m_viewport.x), int32_t(m_viewport.y), int32_t(m_viewport.x + m_viewport.width),
+                  int32_t(m_viewport.y + m_viewport.height) };
+    // The scissor rectangle limits clears too (Direct3D 9).
+    if (m_renderStates[RsScissorTestEnable]) {
+      full.left = (std::max)(full.left, m_scissor.left);
+      full.top = (std::max)(full.top, m_scissor.top);
+      full.right = (std::min)(full.right, m_scissor.right);
+      full.bottom = (std::min)(full.bottom, m_scissor.bottom);
+      if (full.left >= full.right || full.top >= full.bottom)
+        return;
+    }
     Texture* first = m_renderTargets[0] ? m_renderTargets[0] : m_depthStencil;
     const uint32_t targetWidth = first ? first->width(m_renderTargets[0] ? m_renderTargetSubresources[0] : 0) : full.right;
     const uint32_t targetHeight = first ? first->height(m_renderTargets[0] ? m_renderTargetSubresources[0] : 0) : full.bottom;
@@ -4463,6 +4488,9 @@ namespace dxup::legacy {
       const int32_t w = dr.right - dr.left, h = dr.bottom - dr.top;
       const int32_t sw = sr.right - sr.left, sh = sr.bottom - sr.top;
       if (si.block || di.block) {
+        // Block rows apart (a whole lock of ATI1/ATI2 reports a texel pitch).
+        srcPitch = src->pitch(srcSubresource);
+        dstPitch = dst->pitch(dstSubresource);
         if (sf == df && w == sw && h == sh) {
           const uint32_t rows = (uint32_t(h) + 3) / 4;
           const uint32_t bytes = ((uint32_t(w) + 3) / 4) * si.bytesPerBlock;
@@ -4674,8 +4702,8 @@ namespace dxup::legacy {
       return E_INVALIDARG;
     RECT client = {};
     GetClientRect(window, &client);
-    const UINT width = (std::max)(1L, client.right - client.left);
-    const UINT height = (std::max)(1L, client.bottom - client.top);
+    UINT width = (std::max)(1L, client.right - client.left);
+    UINT height = (std::max)(1L, client.bottom - client.top);
 
     SwapChain* chain = nullptr;
     for (auto& existing : m_swapChains)
@@ -4714,14 +4742,20 @@ namespace dxup::legacy {
       m_swapChains.push_back(std::move(created));
     } else if (chain->width != width || chain->height != height) {
       m_context->OMSetRenderTargets(0, nullptr, nullptr);
-      chain->swapChain->ResizeBuffers(0, width, height, DXGI_FORMAT_UNKNOWN, chain->flags);
-      chain->width = width;
-      chain->height = height;
+      // A failed resize keeps the buffers as they are (tried again next time).
+      if (SUCCEEDED(chain->swapChain->ResizeBuffers(0, width, height, DXGI_FORMAT_UNKNOWN, chain->flags))) {
+        chain->width = width;
+        chain->height = height;
+      }
     }
 
     Ref<ID3D11Texture2D> backBuffer;
     if (FAILED(chain->swapChain->GetBuffer(0, __uuidof(ID3D11Texture2D), reinterpret_cast<void**>(backBuffer.put()))))
       return E_FAIL;
+    D3D11_TEXTURE2D_DESC bufferDesc = {};
+    backBuffer->GetDesc(&bufferDesc);
+    width = bufferDesc.Width;
+    height = bufferDesc.Height;
     Ref<ID3D11RenderTargetView> rtv;
     if (FAILED(m_device->CreateRenderTargetView(backBuffer.get(), nullptr, rtv.put())))
       return E_FAIL;

@@ -92,6 +92,13 @@ float4 sourceColor(uint source, float4 material, float4 color0, float4 color1) {
   return material;
 }
 
+// Linear fog's end - start: inverted ranges (end before start) fog the
+// near side, as with Direct3D; an empty range is a step.
+float fogRange(float start, float end) {
+  const float range = end - start;
+  return abs(range) < 1e-6f ? (range < 0.0f ? -1e-6f : 1e-6f) : range;
+}
+
 VSOutput vs_main(VSInput input) {
   VSOutput output;
   const bool transformed = vertexFlags.x != 0;
@@ -184,7 +191,7 @@ VSOutput vs_main(VSInput input) {
   const float fogDistance = (vertexFlags2.w >> 4) != 0 ? length(viewPosition) : abs(viewPosition.z);
   float fog = input.color1.a;
   if (!transformed && fogMode == 3)
-    fog = saturate((fogVertex.z - fogDistance) / max(fogVertex.z - fogVertex.y, 1e-6f));
+    fog = saturate((fogVertex.z - fogDistance) / fogRange(fogVertex.y, fogVertex.z));
   else if (!transformed && fogMode == 1)
     fog = saturate(exp(-fogDistance * fogVertex.w));
   else if (!transformed && fogMode == 2)
@@ -379,7 +386,7 @@ float4 ps_main(PSInput input) : SV_Target {
     const uint tableMode = (uint)fogTable.w;
     const float depth = pixelFlags.z != 0 ? input.fog.z : input.fog.y;
     if (tableMode == 3)
-      fog = saturate((fogTable.y - depth) / max(fogTable.y - fogTable.x, 1e-6f));
+      fog = saturate((fogTable.y - depth) / fogRange(fogTable.x, fogTable.y));
     else if (tableMode == 1)
       fog = saturate(exp(-depth * fogTable.z));
     else if (tableMode == 2)

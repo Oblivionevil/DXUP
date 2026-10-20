@@ -42,7 +42,7 @@ namespace dxup::d3d8 {
     q.Windowed = p.Windowed;
     q.EnableAutoDepthStencil = p.EnableAutoDepthStencil;
     q.AutoDepthStencilFormat = p.AutoDepthStencilFormat;
-    q.Flags = p.Flags & ~D3DPRESENTFLAG_LOCKABLE_BACKBUFFER ? p.Flags : p.Flags;
+    q.Flags = p.Flags & D3DPRESENTFLAG_LOCKABLE_BACKBUFFER;   // the only Direct3D 8 flag
     q.FullScreen_RefreshRateInHz = p.Windowed ? 0 : p.FullScreen_RefreshRateInHz;
     // Windows of Direct3D 8 present at once, but for COPY_VSYNC.
     if (p.Windowed)
@@ -340,8 +340,8 @@ namespace dxup::d3d8 {
   }
 
   Device8::~Device8() {
-    for (auto* block : m_stateBlocks)
-      if (block) block->Release();
+    for (auto& entry : m_stateBlocks)
+      if (entry.block) entry.block->Release();
     for (auto& shader : m_vertexShaders) {
       if (!shader) continue;
       if (shader->decl) shader->decl->Release();
@@ -613,6 +613,14 @@ namespace dxup::d3d8 {
     return m_device->GetRenderState(state, value);
   }
 
+  HRESULT Device8::BeginStateBlock() {
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    const HRESULT hr = m_device->BeginStateBlock();
+    if (SUCCEEDED(hr))
+      m_recording = std::make_unique<StateBlock8>();
+    return hr;
+  }
+
   HRESULT Device8::EndStateBlock(DWORD* token) {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
     if (!token)
@@ -621,31 +629,43 @@ namespace dxup::d3d8 {
     const HRESULT hr = m_device->EndStateBlock(&block);
     if (FAILED(hr))
       return hr;
-    m_stateBlocks.push_back(block);
+    StateBlock8 entry = m_recording ? *m_recording : StateBlock8{};
+    m_recording.reset();
+    entry.block = block;
+    m_stateBlocks.push_back(entry);
     *token = DWORD(m_stateBlocks.size());
     return D3D_OK;
   }
 
   HRESULT Device8::ApplyStateBlock(DWORD token) {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
-    if (!token || token > m_stateBlocks.size() || !m_stateBlocks[token - 1])
+    if (!token || token > m_stateBlocks.size() || !m_stateBlocks[token - 1].block)
       return D3DERR_INVALIDCALL;
-    return m_stateBlocks[token - 1]->Apply();
+    const StateBlock8& entry = m_stateBlocks[token - 1];
+    const HRESULT hr = entry.block->Apply();
+    if (entry.hasIndices) m_baseVertexIndex = entry.baseVertexIndex;
+    if (entry.hasVertexShader) m_vertexShaderHandle = entry.vertexShader;
+    if (entry.hasPixelShader) m_pixelShaderHandle = entry.pixelShader;
+    return hr;
   }
 
   HRESULT Device8::CaptureStateBlock(DWORD token) {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
-    if (!token || token > m_stateBlocks.size() || !m_stateBlocks[token - 1])
+    if (!token || token > m_stateBlocks.size() || !m_stateBlocks[token - 1].block)
       return D3DERR_INVALIDCALL;
-    return m_stateBlocks[token - 1]->Capture();
+    StateBlock8& entry = m_stateBlocks[token - 1];
+    if (entry.hasIndices) entry.baseVertexIndex = m_baseVertexIndex;
+    if (entry.hasVertexShader) entry.vertexShader = m_vertexShaderHandle;
+    if (entry.hasPixelShader) entry.pixelShader = m_pixelShaderHandle;
+    return entry.block->Capture();
   }
 
   HRESULT Device8::DeleteStateBlock(DWORD token) {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
-    if (!token || token > m_stateBlocks.size() || !m_stateBlocks[token - 1])
+    if (!token || token > m_stateBlocks.size() || !m_stateBlocks[token - 1].block)
       return D3DERR_INVALIDCALL;
-    m_stateBlocks[token - 1]->Release();
-    m_stateBlocks[token - 1] = nullptr;
+    m_stateBlocks[token - 1].block->Release();
+    m_stateBlocks[token - 1] = StateBlock8{};
     return D3D_OK;
   }
 
@@ -657,7 +677,15 @@ namespace dxup::d3d8 {
     const HRESULT hr = m_device->CreateStateBlock(type, &block);
     if (FAILED(hr))
       return hr;
-    m_stateBlocks.push_back(block);
+    StateBlock8 entry;
+    entry.block = block;
+    entry.hasIndices = type == D3DSBT_ALL;
+    entry.hasVertexShader = type == D3DSBT_ALL || type == D3DSBT_VERTEXSTATE;
+    entry.hasPixelShader = type == D3DSBT_ALL || type == D3DSBT_PIXELSTATE;
+    entry.baseVertexIndex = m_baseVertexIndex;
+    entry.vertexShader = m_vertexShaderHandle;
+    entry.pixelShader = m_pixelShaderHandle;
+    m_stateBlocks.push_back(entry);
     *token = DWORD(m_stateBlocks.size());
     return D3D_OK;
   }
@@ -861,8 +889,12 @@ namespace dxup::d3d8 {
 
   HRESULT Device8::SetVertexShader(DWORD handle) {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    // While recording, the handle goes into the state block.
+    DWORD& current = m_recording ? m_recording->vertexShader : m_vertexShaderHandle;
+    if (m_recording)
+      m_recording->hasVertexShader = true;
     if (!(handle & 1)) {
-      m_vertexShaderHandle = handle;
+      current = handle;
       m_device->SetVertexShader(nullptr);
       return m_device->SetFVF(handle);
     }
@@ -870,7 +902,7 @@ namespace dxup::d3d8 {
     if (index >= m_vertexShaders.size() || !m_vertexShaders[index])
       return D3DERR_INVALIDCALL;
     VertexShader& shader = *m_vertexShaders[index];
-    m_vertexShaderHandle = handle;
+    current = handle;
     m_device->SetVertexDeclaration(shader.decl);
     m_device->SetVertexShader(shader.shader);
     for (const auto& constant : shader.constants)
@@ -950,7 +982,13 @@ namespace dxup::d3d8 {
   }
 
   HRESULT Device8::SetIndices(IDirect3DIndexBuffer8* indices, UINT baseVertexIndex) {
-    m_baseVertexIndex = baseVertexIndex;
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    if (m_recording) {
+      m_recording->hasIndices = true;
+      m_recording->baseVertexIndex = baseVertexIndex;
+    } else {
+      m_baseVertexIndex = baseVertexIndex;
+    }
     return m_device->SetIndices(indices ? static_cast<IndexBuffer8*>(indices)->d3d9() : nullptr);
   }
 
@@ -989,13 +1027,16 @@ namespace dxup::d3d8 {
 
   HRESULT Device8::SetPixelShader(DWORD handle) {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    DWORD& current = m_recording ? m_recording->pixelShader : m_pixelShaderHandle;
+    if (m_recording)
+      m_recording->hasPixelShader = true;
     if (!handle) {
-      m_pixelShaderHandle = 0;
+      current = 0;
       return m_device->SetPixelShader(nullptr);
     }
     if (handle > m_pixelShaders.size() || !m_pixelShaders[handle - 1])
       return D3DERR_INVALIDCALL;
-    m_pixelShaderHandle = handle;
+    current = handle;
     return m_device->SetPixelShader(m_pixelShaders[handle - 1]->shader);
   }
 

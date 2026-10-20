@@ -53,6 +53,8 @@ namespace dxup::legacy {
       case FormatDXT5:
       case FormatATI2:     return { 16, true, false, false };
       case FormatL16:
+      case FormatYUY2:
+      case FormatUYVY:
       case FormatR16F:     return { 2, false, false, false };
       case FormatDF16:     return { 2, false, true, false };
       case FormatD32FLockable:
@@ -250,6 +252,21 @@ namespace dxup::legacy {
   }
 
   // And back (render targets read back in a converted format).
+  // Pixel x of a YUY2/UYVY row (two pixels share U and V), BT.601 video range.
+  inline uint32_t yuvToArgb(Format format, const uint8_t* row, uint32_t x) {
+    const uint8_t* pair = row + size_t(x & ~1u) * 2;
+    const bool yuy2 = format == FormatYUY2;
+    const int y = yuy2 ? pair[(x & 1) ? 2 : 0] : pair[(x & 1) ? 3 : 1];
+    const int u = yuy2 ? pair[1] : pair[0];
+    const int v = yuy2 ? pair[3] : pair[2];
+    const int c = y - 16, d = u - 128, e = v - 128;
+    auto clamp = [](int value) { return uint32_t(value < 0 ? 0 : value > 255 ? 255 : value); };
+    const uint32_t r = clamp((298 * c + 409 * e + 128) >> 8);
+    const uint32_t g = clamp((298 * c - 100 * d - 208 * e + 128) >> 8);
+    const uint32_t b = clamp((298 * c + 516 * d + 128) >> 8);
+    return 0xff000000u | (r << 16) | (g << 8) | b;
+  }
+
   // Half floats of values 0 to 1 (colors), rounded to nearest.
   inline uint16_t unitToHalf(float value) {
     uint32_t bits;

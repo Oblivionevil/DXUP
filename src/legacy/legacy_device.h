@@ -60,6 +60,7 @@ namespace dxup::legacy {
     bool     autoMips = false;      // mips generated from level 0
     uint32_t samples = 1;           // multisampled targets
     bool     backBuffer = false;    // a swap chain's buffer (forced multisampling covers its size)
+    bool     colorKeyed = false;    // DirectDraw textures: alpha for colour-keyed texels
   };
 
   struct Box { uint32_t left, top, front, right, bottom, back; };
@@ -305,6 +306,8 @@ namespace dxup::legacy {
     // ---- Render targets ----
     void setRenderTarget(Texture* target, uint32_t subresource) { setRenderTarget(0, target, subresource); }
     void setRenderTarget(uint32_t index, Texture* target, uint32_t subresource);
+    // Viewport and scissor of the whole first target.
+    void resetViewport();
     void setDepthStencil(Texture* depth);
     Texture* renderTarget(uint32_t index = 0) const { return index < kMaxRenderTargets ? m_renderTargets[index] : nullptr; }
     uint32_t renderTargetSubresource(uint32_t index = 0) const { return index < kMaxRenderTargets ? m_renderTargetSubresources[index] : 0; }

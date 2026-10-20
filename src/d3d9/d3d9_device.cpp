@@ -192,10 +192,50 @@ namespace dxup::d3d9 {
     return D3D_OK;
   }
 
+  // The screen as shown, in an A8R8G8B8 surface (Windows' D3D9 copies the
+  // monitor's picture, also around a window): read through GDI.
   HRESULT SwapChain::GetFrontBufferData(IDirect3DSurface9* destination) {
-    if (!destination || m_backBuffers.empty())
+    D3DSURFACE_DESC desc = {};
+    if (!destination || FAILED(destination->GetDesc(&desc)) || desc.Format != D3DFMT_A8R8G8B8)
       return D3DERR_INVALIDCALL;
-    return m_device->GetRenderTargetData(m_backBuffers[0], destination);
+    MONITORINFO info = { sizeof(info) };
+    if (!GetMonitorInfoW(MonitorFromWindow(window(), MONITOR_DEFAULTTOPRIMARY), &info))
+      return D3DERR_INVALIDCALL;
+    const int width = (std::min)(int(desc.Width), int(info.rcMonitor.right - info.rcMonitor.left));
+    const int height = (std::min)(int(desc.Height), int(info.rcMonitor.bottom - info.rcMonitor.top));
+    HDC screen = GetDC(nullptr);
+    HDC memory = screen ? CreateCompatibleDC(screen) : nullptr;
+    BITMAPINFO bitmap = {};
+    bitmap.bmiHeader.biSize = sizeof(bitmap.bmiHeader);
+    bitmap.bmiHeader.biWidth = width;
+    bitmap.bmiHeader.biHeight = -height;
+    bitmap.bmiHeader.biPlanes = 1;
+    bitmap.bmiHeader.biBitCount = 32;
+    bitmap.bmiHeader.biCompression = BI_RGB;
+    void* bits = nullptr;
+    HBITMAP section = memory ? CreateDIBSection(screen, &bitmap, DIB_RGB_COLORS, &bits, nullptr, 0) : nullptr;
+    HRESULT hr = D3DERR_INVALIDCALL;
+    D3DLOCKED_RECT locked = {};
+    if (section && width > 0 && height > 0) {
+      HGDIOBJ old = SelectObject(memory, section);
+      BitBlt(memory, 0, 0, width, height, screen, info.rcMonitor.left, info.rcMonitor.top, SRCCOPY);
+      GdiFlush();
+      SelectObject(memory, old);
+      if (SUCCEEDED(destination->LockRect(&locked, nullptr, 0))) {
+        for (int y = 0; y < height; y++) {
+          const auto* from = static_cast<const uint32_t*>(bits) + size_t(y) * width;
+          auto* to = reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(locked.pBits) + size_t(y) * locked.Pitch);
+          for (int x = 0; x < width; x++)
+            to[x] = from[x] | 0xff000000u;
+        }
+        destination->UnlockRect();
+        hr = D3D_OK;
+      }
+    }
+    if (section) DeleteObject(section);
+    if (memory) DeleteDC(memory);
+    if (screen) ReleaseDC(nullptr, screen);
+    return hr;
   }
 
   HRESULT SwapChain::GetBackBuffer(UINT index, D3DBACKBUFFER_TYPE, IDirect3DSurface9** buffer) {
@@ -397,8 +437,10 @@ namespace dxup::d3d9 {
       auto texture = std::make_shared<legacy::Texture>(m_core.get(), desc);
       if (!texture->valid())
         return D3DERR_NOTAVAILABLE;
-      m_autoDepthStencil = new Surface(this, D3DPOOL_DEFAULT, texture, 0, nullptr, nullptr, D3DUSAGE_DEPTHSTENCIL,
-                                       p.MultiSampleType, p.MultiSampleQuality, true);
+      // Counted on the device (as the back buffers): the device lives as
+      // long as the application holds it.
+      m_autoDepthStencil = new Surface(this, D3DPOOL_DEFAULT, texture, 0, static_cast<IDirect3DDevice9Ex*>(this), this,
+                                       D3DUSAGE_DEPTHSTENCIL, p.MultiSampleType, p.MultiSampleQuality, true);
       m_depthStencil.set(m_autoDepthStencil);
       m_core->setDepthStencil(texture.get());
     }
@@ -1028,6 +1070,12 @@ namespace dxup::d3d9 {
       return D3DERR_INVALIDCALL;
     m_renderTargets[index].set(s);
     m_core->setRenderTarget(index, s ? s->texture() : nullptr, s ? s->subresource() : 0);
+    // Direct3D 9 sets viewport and scissor to the first target, also when it
+    // is bound already (UE3 games set their scene target again after a
+    // smaller viewport: The Vanishing of Ethan Carter drew its world into a
+    // 512x512 corner). Direct3D 7 keeps its viewport.
+    if (index == 0)
+      m_core->resetViewport();
     return D3D_OK;
   }
 
@@ -1074,6 +1122,9 @@ namespace dxup::d3d9 {
   }
 
   HRESULT Device::Clear(DWORD count, const D3DRECT* rects, DWORD flags, D3DCOLOR color, float z, DWORD stencil) {
+    // Rectangles without a count clear nothing (as Windows' D3D9, DXVK).
+    if (!count && rects)
+      return D3D_OK;
     DeviceLock lock(this);
     if (count && !rects)
       count = 0;
@@ -1108,12 +1159,13 @@ namespace dxup::d3d9 {
   HRESULT Device::MultiplyTransform(D3DTRANSFORMSTATETYPE state, const D3DMATRIX* matrix) {
     if (!matrix)
       return D3DERR_INVALIDCALL;
+    // The given matrix times the current one (as Direct3D 7 and Wine).
     D3DMATRIX current, result;
     GetTransform(state, &current);
     for (int r = 0; r < 4; r++)
       for (int c = 0; c < 4; c++)
-        result.m[r][c] = current.m[r][0] * matrix->m[0][c] + current.m[r][1] * matrix->m[1][c]
-                       + current.m[r][2] * matrix->m[2][c] + current.m[r][3] * matrix->m[3][c];
+        result.m[r][c] = matrix->m[r][0] * current.m[0][c] + matrix->m[r][1] * current.m[1][c]
+                       + matrix->m[r][2] * current.m[2][c] + matrix->m[r][3] * current.m[3][c];
     return SetTransform(state, &result);
   }
 
@@ -1964,9 +2016,34 @@ namespace dxup::d3d9 {
     return D3D_OK;
   }
 
-  HRESULT Device::ProcessVertices(UINT, UINT, UINT, IDirect3DVertexBuffer9*, IDirect3DVertexDeclaration9*, DWORD) {
-    logUnsupported("ProcessVertices");
-    return D3DERR_INVALIDCALL;
+  // Vertices of stream 0 through the fixed-function transform (and
+  // lighting) into the destination buffer's FVF, as Direct3D 7's.
+  HRESULT Device::ProcessVertices(UINT srcStart, UINT destIndex, UINT count, IDirect3DVertexBuffer9* destination,
+                                  IDirect3DVertexDeclaration9*, DWORD flags) {
+    if (!destination)
+      return D3DERR_INVALIDCALL;
+    DeviceLock lock(this);
+    auto* dst = static_cast<VertexBuffer*>(destination);
+    D3DVERTEXBUFFER_DESC desc = {};
+    dst->GetDesc(&desc);
+    const Stream& stream = m_streams[0];
+    if (!m_fvf || m_vertexShader || !stream.buffer || !desc.FVF
+     || (desc.FVF & legacy::FvfPositionMask) != legacy::FvfXyzRhw) {
+      logUnsupported("ProcessVertices without FVFs, or with a vertex shader");
+      return D3DERR_INVALIDCALL;
+    }
+    legacy::Buffer* from = stream.buffer->buffer();
+    legacy::Buffer* to = dst->buffer();
+    const uint32_t srcStride = stream.stride, dstStride = legacy::fvfStride(desc.FVF);
+    if (!from || !to || !srcStride
+     || stream.offset + (uint64_t(srcStart) + count) * srcStride > from->size()
+     || (uint64_t(destIndex) + count) * dstStride > to->size())
+      return D3DERR_INVALIDCALL;
+    m_core->processVertices(from->data() + stream.offset + size_t(srcStart) * srcStride, m_fvf, srcStride,
+      to->data() + size_t(destIndex) * dstStride, desc.FVF, dstStride, count, m_core->renderState(D3DRS_LIGHTING) != 0,
+      !(flags & D3DPV_DONOTCOPYDATA));
+    to->invalidate(destIndex * dstStride, count * dstStride);
+    return D3D_OK;
   }
 
   HRESULT Device::DrawRectPatch(UINT, const float*, const D3DRECTPATCH_INFO*) {

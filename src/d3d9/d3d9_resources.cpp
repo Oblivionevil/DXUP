@@ -842,8 +842,10 @@ namespace dxup::d3d9 {
     const bool beginEnd = m_type == D3DQUERYTYPE_OCCLUSION || m_type == D3DQUERYTYPE_TIMESTAMPDISJOINT
       || m_type == D3DQUERYTYPE_TIMESTAMPFREQ;
     if (flags & D3DISSUE_BEGIN) {
-      if (beginEnd)
+      if (beginEnd) {
         context->Begin(m_query.get());
+        m_building = true;
+      }
     }
     if (m_device->core()->tracing9()) {
       logMessage(LogLevel::Warn, "trace9   query %p type %u issue%s%s", static_cast<void*>(this), unsigned(m_type),
@@ -852,10 +854,12 @@ namespace dxup::d3d9 {
         m_device->core()->traceDepth9("at the first occlusion query");
     }
     if (flags & D3DISSUE_END) {
-      if (beginEnd && m_type != D3DQUERYTYPE_OCCLUSION && !(flags & D3DISSUE_BEGIN) && !m_issued)
+      // An end without a begin: an empty query (occlusion: nothing drawn).
+      if (beginEnd && !m_building && (m_type == D3DQUERYTYPE_OCCLUSION || !m_issued))
         context->Begin(m_query.get());
       context->End(m_query.get());
       m_issued = true;
+      m_building = false;
       m_resultNoted = false;
     }
     return D3D_OK;
@@ -873,6 +877,9 @@ namespace dxup::d3d9 {
       return D3DERR_INVALIDCALL;
     std::unique_lock<std::recursive_mutex> guard(m_device->mutex(), std::defer_lock);
     if (m_device->multithreaded()) guard.lock();
+    // Begun and not ended: no result yet.
+    if (m_building)
+      return S_FALSE;
     if (!m_issued) {
       // Never issued: done, nothing counted.
       if (data && size) std::memset(data, 0, size);
@@ -927,8 +934,9 @@ namespace dxup::d3d9 {
       default:
         break;
     }
+    // A failing poll is a lost device only when the device is gone.
     if (FAILED(hr))
-      return D3DERR_DEVICELOST;
+      return FAILED(m_device->core()->d3d11()->GetDeviceRemovedReason()) ? D3DERR_DEVICELOST : D3DERR_INVALIDCALL;
     return hr == S_OK ? D3D_OK : S_FALSE;
   }
 

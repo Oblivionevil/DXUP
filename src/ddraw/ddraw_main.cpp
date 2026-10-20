@@ -4,6 +4,8 @@
 
 #include "../util/util_types.h"
 
+#include <atomic>
+
 using namespace dxup;
 
 BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID) {
@@ -27,6 +29,10 @@ namespace {
     }();
     return module ? GetProcAddress(module, name) : nullptr;
   }
+
+  // Which DirectDraw the application has: DXUP's (DirectDrawCreateEx) or
+  // Windows' (DirectDrawCreate), whose clippers must be Windows' too.
+  std::atomic<bool> g_dxupDirectDraw{false}, g_systemDirectDraw{false};
 }
 
 extern "C" {
@@ -36,6 +42,7 @@ HRESULT WINAPI DirectDrawCreateEx(GUID* guid, LPVOID* dd, REFIID riid, IUnknown*
   if (!dd) return DDERR_INVALIDPARAMS;
   *dd = nullptr;
   if (outer) return CLASS_E_NOAGGREGATION;
+  g_dxupDirectDraw = true;
   auto* object = new ddraw::DirectDraw();
   const HRESULT hr = object->QueryInterface(riid, dd);
   object->Release();
@@ -48,6 +55,7 @@ HRESULT WINAPI DirectDrawCreate(GUID* guid, LPDIRECTDRAW* dd, IUnknown* outer) {
   using Create = HRESULT(WINAPI*)(GUID*, LPDIRECTDRAW*, IUnknown*);
   if (auto create = reinterpret_cast<Create>(systemProc("DirectDrawCreate"))) {
     logMessage(LogLevel::Warn, "ddraw: DirectDrawCreate (DirectDraw 1-6) left to Windows' ddraw.dll");
+    g_systemDirectDraw = true;
     return create(guid, dd, outer);
   }
   if (dd) *dd = nullptr;
@@ -90,8 +98,14 @@ HRESULT WINAPI SetAppCompatData(DWORD type, DWORD value) {
   return DDERR_GENERIC;
 }
 
-HRESULT WINAPI DirectDrawCreateClipper(DWORD, LPDIRECTDRAWCLIPPER* clipper, IUnknown*) {
+HRESULT WINAPI DirectDrawCreateClipper(DWORD flags, LPDIRECTDRAWCLIPPER* clipper, IUnknown* outer) {
   if (!clipper) return DDERR_INVALIDPARAMS;
+  // Windows' DirectDraw objects take only Windows' clippers.
+  using Create = HRESULT(WINAPI*)(DWORD, LPDIRECTDRAWCLIPPER*, IUnknown*);
+  if (g_systemDirectDraw && !g_dxupDirectDraw) {
+    if (auto create = reinterpret_cast<Create>(systemProc("DirectDrawCreateClipper")))
+      return create(flags, clipper, outer);
+  }
   *clipper = new ddraw::Clipper();
   return DD_OK;
 }

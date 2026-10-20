@@ -288,7 +288,7 @@ namespace dxup::d3d8 {
     HRESULT STDMETHODCALLTYPE GetClipPlane(DWORD index, float* plane) override { return m_device->GetClipPlane(index, plane); }
     HRESULT STDMETHODCALLTYPE SetRenderState(D3DRENDERSTATETYPE state, DWORD value) override;
     HRESULT STDMETHODCALLTYPE GetRenderState(D3DRENDERSTATETYPE state, DWORD* value) override;
-    HRESULT STDMETHODCALLTYPE BeginStateBlock() override { return m_device->BeginStateBlock(); }
+    HRESULT STDMETHODCALLTYPE BeginStateBlock() override;
     HRESULT STDMETHODCALLTYPE EndStateBlock(DWORD* token) override;
     HRESULT STDMETHODCALLTYPE ApplyStateBlock(DWORD token) override;
     HRESULT STDMETHODCALLTYPE CaptureStateBlock(DWORD token) override;
@@ -377,7 +377,16 @@ namespace dxup::d3d8 {
     std::unordered_map<IUnknown*, IUnknown*> m_wrappers;   // Direct3D 9 object -> wrapper
     std::vector<std::unique_ptr<VertexShader>> m_vertexShaders;
     std::vector<std::unique_ptr<PixelShader>> m_pixelShaders;
-    std::vector<IDirect3DStateBlock9*> m_stateBlocks;
+    // Direct3D 8 state Direct3D 9's state blocks do not hold: the base
+    // vertex index of SetIndices and the shader handles.
+    struct StateBlock8 {
+      IDirect3DStateBlock9* block = nullptr;
+      bool hasIndices = false, hasVertexShader = false, hasPixelShader = false;
+      UINT baseVertexIndex = 0;
+      DWORD vertexShader = 0, pixelShader = 0;
+    };
+    std::vector<StateBlock8> m_stateBlocks;
+    std::unique_ptr<StateBlock8> m_recording;   // between BeginStateBlock and EndStateBlock
     DWORD m_vertexShaderHandle = 0;
     DWORD m_pixelShaderHandle = 0;
     UINT m_baseVertexIndex = 0;

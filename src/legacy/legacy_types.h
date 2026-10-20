@@ -67,6 +67,8 @@ namespace dxup::legacy {
     FormatNULL      = 0x4c4c554e,   // render target without memory
     FormatATI1      = 0x31495441,   // BC4
     FormatATI2      = 0x32495441,   // BC5
+    FormatYUY2      = 0x32595559,   // video: Y0 U Y1 V for two pixels
+    FormatUYVY      = 0x59565955,   // video: U Y0 V Y1
   };
 
   // D3DPRIMITIVETYPE

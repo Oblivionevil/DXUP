@@ -306,6 +306,11 @@ namespace dxup::ddraw {
       const WORD value = WORD(i * 257);
       m_gamma.red[i] = m_gamma.green[i] = m_gamma.blue[i] = value;
     }
+    // A source colour key given at creation.
+    if (desc.dwFlags & DDSD_CKSRCBLT) {
+      m_hasSrcBltKey = true;
+      m_srcBltKey = desc.ddckCKSrcBlt;
+    }
   }
 
   Surface::~Surface() {
@@ -765,8 +770,12 @@ namespace dxup::ddraw {
     }
     if (flags & DDBLT_DEPTHFILL) {
       if (!fx || !device || !m_texture || !m_texture->dsv()) return DDERR_INVALIDPARAMS;
+      // The depth bits' largest value (D24S8: 24 of 32 bits), from the mask.
+      DWORD mask = m_desc.ddpfPixelFormat.dwZBitMask;
+      while (mask && !(mask & 1))
+        mask >>= 1;
       const uint32_t bits = m_desc.ddpfPixelFormat.dwZBufferBitDepth;
-      const double maximum = bits >= 32 ? 4294967295.0 : double((1ull << bits) - 1);
+      const double maximum = mask ? double(mask) : bits >= 32 ? 4294967295.0 : double((1ull << bits) - 1);
       device->context()->ClearDepthStencilView(m_texture->dsv(), D3D11_CLEAR_DEPTH, float(double(fx->dwFillDepth) / maximum), 0);
       return DD_OK;
     }
@@ -1253,6 +1262,8 @@ namespace dxup::ddraw {
   HRESULT Device7::SetRenderState(D3DRENDERSTATETYPE state, DWORD value) {
     const uint32_t s = uint32_t(state);
     if (m_recording) { m_recording->renderStates[s] = value; return D3D_OK; }
+    if (s == D3DRENDERSTATE_ALPHATESTENABLE || s == D3DRENDERSTATE_ALPHAFUNC || s == D3DRENDERSTATE_ALPHAREF)
+      endKeyAlphaTest();
     switch (s) {
       case D3DRENDERSTATE_COLORKEYENABLE:
         m_colorKeyEnable = value != 0;
@@ -1281,14 +1292,24 @@ namespace dxup::ddraw {
 
   HRESULT Device7::GetRenderState(D3DRENDERSTATETYPE state, LPDWORD value) {
     if (!value) return DDERR_INVALIDPARAMS;
-    *value = uint32_t(state) == D3DRENDERSTATE_COLORKEYENABLE ? m_colorKeyEnable : m_device->renderState(uint32_t(state));
+    *value = uint32_t(state) == D3DRENDERSTATE_COLORKEYENABLE ? m_colorKeyEnable : appRenderState(uint32_t(state));
     return D3D_OK;
   }
 
   HRESULT Device7::SetTextureStageState(DWORD stage, D3DTEXTURESTAGESTATETYPE type, DWORD value) {
     if (stage >= 8) return DDERR_INVALIDPARAMS;
     const uint32_t t = uint32_t(type);
-    if (m_recording) { m_recording->stageStates[(stage << 16) | t] = value; return D3D_OK; }
+    if (m_recording) {
+      // ADDRESS sets both: recorded as them, so the order of applying
+      // cannot undo a later ADDRESSU/ADDRESSV.
+      if (t == D3DTSS_ADDRESS) {
+        m_recording->stageStates[(stage << 16) | D3DTSS_ADDRESSU] = value;
+        m_recording->stageStates[(stage << 16) | D3DTSS_ADDRESSV] = value;
+      } else {
+        m_recording->stageStates[(stage << 16) | t] = value;
+      }
+      return D3D_OK;
+    }
     switch (t) {
       case D3DTSS_ADDRESS:
         m_device->setSamplerState(stage, legacy::SampAddressU, value);
@@ -1366,11 +1387,36 @@ namespace dxup::ddraw {
       DDCOLORKEY key;
       keyed = keyed || (m_colorKeyEnable && SUCCEEDED(m_textures[stage]->GetColorKey(DDCKEY_SRCBLT, &key)));
     }
-    if (keyed && !m_device->renderState(legacy::RsAlphaTestEnable)) {
+    if (keyed && !m_keyAlphaTest && !m_device->renderState(legacy::RsAlphaTestEnable)) {
+      // The application's states come back once nothing is keyed.
+      m_keySavedFunc = m_device->renderState(legacy::RsAlphaFunc);
+      m_keySavedRef = m_device->renderState(legacy::RsAlphaRef);
       m_device->setRenderState(legacy::RsAlphaTestEnable, 1);
       m_device->setRenderState(legacy::RsAlphaFunc, 5);   // greater
       m_device->setRenderState(legacy::RsAlphaRef, 0);
+      m_keyAlphaTest = true;
+    } else if (!keyed) {
+      endKeyAlphaTest();
     }
+  }
+
+  // A render state as the application set it (not the colour-key alpha test).
+  uint32_t Device7::appRenderState(uint32_t state) const {
+    if (m_keyAlphaTest) {
+      if (state == D3DRENDERSTATE_ALPHATESTENABLE) return 0;
+      if (state == D3DRENDERSTATE_ALPHAFUNC) return m_keySavedFunc;
+      if (state == D3DRENDERSTATE_ALPHAREF) return m_keySavedRef;
+    }
+    return m_device->renderState(state);
+  }
+
+  void Device7::endKeyAlphaTest() {
+    if (!m_keyAlphaTest)
+      return;
+    m_keyAlphaTest = false;
+    m_device->setRenderState(legacy::RsAlphaTestEnable, 0);
+    m_device->setRenderState(legacy::RsAlphaFunc, m_keySavedFunc);
+    m_device->setRenderState(legacy::RsAlphaRef, m_keySavedRef);
   }
 
   namespace {
@@ -1479,10 +1525,12 @@ namespace dxup::ddraw {
   Device7::StateBlock Device7::capture() const {
     StateBlock block;
     for (uint32_t s = 1; s < legacy::RsCount; s++)
-      block.renderStates[s] = m_device->renderState(s);
+      block.renderStates[s] = appRenderState(s);
     block.renderStates[D3DRENDERSTATE_COLORKEYENABLE] = m_colorKeyEnable;
     for (uint32_t stage = 0; stage < 8; stage++) {
       for (uint32_t t = 1; t <= 24; t++) {
+        if (t == D3DTSS_ADDRESS)   // as ADDRESSU and ADDRESSV
+          continue;
         DWORD value = 0;
         const_cast<Device7*>(this)->GetTextureStageState(stage, D3DTEXTURESTAGESTATETYPE(t), &value);
         block.stageStates[(stage << 16) | t] = value;
@@ -1597,7 +1645,7 @@ namespace dxup::ddraw {
   HRESULT Device7::SetClipPlane(DWORD index, D3DVALUE* plane) {
     if (index >= 6 || !plane) return DDERR_INVALIDPARAMS;
     std::memcpy(m_clipPlanes[index], plane, 4 * sizeof(float));
-    logUnsupported("IDirect3DDevice7::SetClipPlane (kept, not applied)");
+    m_device->setClipPlane(index, plane);   // world space, as Direct3D 9's fixed function
     return D3D_OK;
   }
 
@@ -2012,6 +2060,7 @@ namespace dxup::ddraw {
       && (!texture || (caps & DDSCAPS_3DDEVICE));
     if (!td.systemMemory && !texture && !zbuffer)
       td.renderTarget = true;
+    td.colorKeyed = texture && !td.renderTarget;
     // The full screen primary and its back buffers are the swap chain; a
     // windowed application draws into surfaces of the window's size.
     td.backBuffer = primary && !td.systemMemory;

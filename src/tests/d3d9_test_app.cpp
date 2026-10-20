@@ -830,6 +830,92 @@ float4 main(float4 a : TEXCOORD0, float4 b : TEXCOORD1, float2 v : VPOS) : COLOR
     return true;
   }
 
+  // YUY2 and UYVY surfaces (video) stretched onto the back buffer: two
+  // pixels share U and V. Top half YUY2, bottom half UYVY.
+  bool sceneYuvSurfaces(IDirect3DDevice9* d) {
+    d->Clear(0, nullptr, D3DCLEAR_TARGET, 0xff000000u, 1.0f, 0);
+    IDirect3DSurface9* back = nullptr;
+    if (FAILED(d->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &back)))
+      return false;
+    int half = 0;
+    for (D3DFORMAT format : { D3DFMT_YUY2, D3DFMT_UYVY }) {
+      IDirect3DSurface9* surface = nullptr;
+      if (FAILED(d->CreateOffscreenPlainSurface(16, 8, format, D3DPOOL_DEFAULT, &surface, nullptr))) {
+        half++;
+        continue;
+      }
+      D3DLOCKED_RECT locked = {};
+      if (SUCCEEDED(surface->LockRect(&locked, nullptr, 0))) {
+        for (UINT y = 0; y < 8; y++) {
+          BYTE* row = static_cast<BYTE*>(locked.pBits) + y * locked.Pitch;
+          for (UINT pair = 0; pair < 8; pair++) {
+            const BYTE y0 = BYTE(32 + pair * 24), y1 = BYTE(40 + pair * 24), u = BYTE(64 + y * 16), v = BYTE(200 - pair * 12);
+            BYTE* p = row + pair * 4;
+            if (format == D3DFMT_YUY2) { p[0] = y0; p[1] = u; p[2] = y1; p[3] = v; }
+            else { p[0] = u; p[1] = y0; p[2] = v; p[3] = y1; }
+          }
+        }
+        surface->UnlockRect();
+      }
+      const RECT dest = { 0, LONG(half * 24), 64, LONG(half * 24 + 24) };
+      d->StretchRect(surface, nullptr, back, &dest, D3DTEXF_POINT);
+      surface->Release();
+      half++;
+    }
+    back->Release();
+    return true;
+  }
+
+  // Clear inside the scissor rectangle when the scissor test is on, and
+  // rectangles with a count of 0 clear nothing.
+  bool sceneClearRules(IDirect3DDevice9* d) {
+    d->Clear(0, nullptr, D3DCLEAR_TARGET, 0xff000000u, 1.0f, 0);
+    const RECT scissor = { 10, 8, 30, 24 };
+    d->SetScissorRect(&scissor);
+    d->SetRenderState(D3DRS_SCISSORTESTENABLE, TRUE);
+    d->Clear(0, nullptr, D3DCLEAR_TARGET, 0xff00ff00u, 1.0f, 0);
+    const D3DRECT partly = { 20, 16, 50, 40 };
+    d->Clear(1, &partly, D3DCLEAR_TARGET, 0xff0000ffu, 1.0f, 0);
+    d->SetRenderState(D3DRS_SCISSORTESTENABLE, FALSE);
+    const D3DRECT ignored = { 40, 4, 60, 14 };
+    d->Clear(0, &ignored, D3DCLEAR_TARGET, 0xffff0000u, 1.0f, 0);
+    return true;
+  }
+
+  // MultiplyTransform: the given matrix times the current one. Bars: white
+  // for that order, gray for the other, dark for neither.
+  bool sceneMultiplyTransform(IDirect3DDevice9* d) {
+    d->Clear(0, nullptr, D3DCLEAR_TARGET, 0xff000000u, 1.0f, 0);
+    D3DMATRIX a = {}, b = {};
+    for (int r = 0; r < 4; r++)
+      for (int c = 0; c < 4; c++) {
+        a.m[r][c] = float(r * 4 + c + 1);
+        b.m[r][c] = float((r + 2) * (c + 1) % 7) - 3.0f;
+      }
+    auto product = [](const D3DMATRIX& x, const D3DMATRIX& y) {
+      D3DMATRIX p = {};
+      for (int r = 0; r < 4; r++)
+        for (int c = 0; c < 4; c++)
+          for (int k = 0; k < 4; k++)
+            p.m[r][c] += x.m[r][k] * y.m[k][c];
+      return p;
+    };
+    const D3DMATRIX ba = product(b, a), ab = product(a, b);
+    int i = 0;
+    for (D3DTRANSFORMSTATETYPE state : { D3DTS_WORLD, D3DTS_VIEW, D3DTS_PROJECTION, D3DTS_TEXTURE0 }) {
+      D3DMATRIX result = {};
+      d->SetTransform(state, &a);
+      d->MultiplyTransform(state, &b);
+      d->GetTransform(state, &result);
+      const DWORD color = std::memcmp(&result, &ba, sizeof(result)) == 0 ? 0xffffffffu
+                        : std::memcmp(&result, &ab, sizeof(result)) == 0 ? 0xff808080u : 0xff202020u;
+      const D3DRECT bar = { 2, 2 + i * 4, 20, 5 + i * 4 };
+      d->Clear(1, &bar, D3DCLEAR_TARGET, color, 1.0f, 0);
+      i++;
+    }
+    return true;
+  }
+
   // Reset while the application holds the back buffer or the automatic
   // depth buffer fails; holding the swap chain does not stop it. Bars:
   // white where Reset succeeded.
@@ -1898,6 +1984,9 @@ float4 main(float2 t : TEXCOORD0) : COLOR {
     { "occlusion_boxes", sceneOcclusionBoxes },
     { "shader_tokens", sceneShaderTokens },
     { "reset_held", sceneResetHeld },
+    { "multiply_transform", sceneMultiplyTransform },
+    { "clear_rules", sceneClearRules },
+    { "yuv_surfaces", sceneYuvSurfaces },
     { "state_block", sceneStateBlock },
     { "sm3_loops", sceneSm3Loops },
     { "ps_1_4", scenePs14 },
