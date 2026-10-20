@@ -413,10 +413,12 @@ namespace dxup {
     return getForcedMsaaFormats(format, false, formats) && formats.typed == format;
   }
 
-  inline DXGI_FORMAT validateImageViewFormat(DXGI_FORMAT viewFormat, DXGI_FORMAT resourceFormat) {
+  // castable: a swap chain proxy, typeless underneath (sRGB views of UNORM
+  // back buffers).
+  inline DXGI_FORMAT validateImageViewFormat(DXGI_FORMAT viewFormat, DXGI_FORMAT resourceFormat, bool castable = false) {
     DXGI_FORMAT resolvedFormat = resolveImageViewFormat(viewFormat, resourceFormat);
 
-    if (resourceFormat == DXGI_FORMAT_UNKNOWN || isTypelessImageFormat(resourceFormat))
+    if (castable || resourceFormat == DXGI_FORMAT_UNKNOWN || isTypelessImageFormat(resourceFormat))
       return resolvedFormat;
 
     return resolvedFormat == resourceFormat ? resolvedFormat : resourceFormat;
@@ -2068,11 +2070,14 @@ namespace dxup {
       addResourcePrivateRef(m_resource);
       this->setBindData(m_resource, m_view.get());
       DXGI_FORMAT resourceFormat = DXGI_FORMAT_UNKNOWN;
+      bool castable = false;
       if (IBackendImage* image = m_view ? m_view->getImage() : nullptr) {
         resourceFormat = image->getDesc().format;
+        castable = (image->getDesc().miscFlags & kResourceMiscCastable) != 0;
         m_sampleCount = image->getDesc().sampleCount ? image->getDesc().sampleCount : 1u;
+        m_sampleQuality = image->getDesc().sampleQuality;
       }
-      m_pipelineFormat = validateImageViewFormat(m_desc.Format, resourceFormat);
+      m_pipelineFormat = validateImageViewFormat(m_desc.Format, resourceFormat, castable);
     }
 
     ~D3D11RenderTargetView() {
@@ -2138,6 +2143,7 @@ namespace dxup {
     // of its image (0 without one).
     DXGI_FORMAT GetPipelineFormat() const { return m_pipelineFormat; }
     uint32_t GetSampleCount() const { return m_sampleCount; }
+    uint32_t GetSampleQuality() const { return m_sampleQuality; }
 
     // The view of the multisampled copy of forced multisampling, which the
     // immediate context draws into, and its sample count.
@@ -2152,6 +2158,7 @@ namespace dxup {
     uint32_t                      m_shadowSampleCount = 0;
     DXGI_FORMAT                   m_pipelineFormat = DXGI_FORMAT_UNKNOWN;
     uint32_t                      m_sampleCount = 0;
+    uint32_t                      m_sampleQuality = 0;
 
     D3D10RenderTargetView m_d3d10{this};
   };
@@ -2180,6 +2187,7 @@ namespace dxup {
       if (IBackendImage* image = m_view ? m_view->getImage() : nullptr) {
         resourceFormat = image->getDesc().format;
         m_sampleCount = image->getDesc().sampleCount ? image->getDesc().sampleCount : 1u;
+        m_sampleQuality = image->getDesc().sampleQuality;
       }
       m_pipelineFormat = resolveDepthStencilFormat(validateImageViewFormat(m_desc.Format, resourceFormat));
     }
@@ -2227,6 +2235,7 @@ namespace dxup {
     // its image (0 without one).
     DXGI_FORMAT GetPipelineFormat() const { return m_pipelineFormat; }
     uint32_t GetSampleCount() const { return m_sampleCount; }
+    uint32_t GetSampleQuality() const { return m_sampleQuality; }
 
     // The view of the multisampled copy of forced multisampling, and its
     // sample count.
@@ -2251,6 +2260,7 @@ namespace dxup {
     uint32_t                      m_shadowSampleCount = 0;
     DXGI_FORMAT                   m_pipelineFormat = DXGI_FORMAT_UNKNOWN;
     uint32_t                      m_sampleCount = 0;
+    uint32_t                      m_sampleQuality = 0;
 
     D3D10DepthStencilView m_d3d10{this};
   };
@@ -2480,9 +2490,10 @@ namespace dxup {
           m_soEntries[i] = pSODeclaration[i];
           m_soSemanticNames[i] = pSODeclaration[i].SemanticName ? pSODeclaration[i].SemanticName : "";
         }
-        // Fix up pointers after all strings are stored (no more reallocations)
+        // Fix up pointers after all strings are stored (no more
+        // reallocations); a NULL name marks a gap and stays NULL.
         for (UINT i = 0; i < NumEntries; i++) {
-          m_soEntries[i].SemanticName = m_soSemanticNames[i].c_str();
+          m_soEntries[i].SemanticName = pSODeclaration[i].SemanticName ? m_soSemanticNames[i].c_str() : nullptr;
         }
       }
       if (pBufferStrides && NumStrides > 0) {
@@ -3492,11 +3503,15 @@ namespace dxup {
         || (miscFlags & D3D11_RESOURCE_MISC_TILED)))
         return E_INVALIDARG;
       if (sampleDesc.Count > 1) {
+        // Multisampled textures take no initial data (native runtime).
+        if (initialData)
+          return E_INVALIDARG;
         UINT qualityLevels = 0;
         if (dimension != D3D11_RESOURCE_DIMENSION_TEXTURE2D || mipLevels != 1
          || (bindFlags & D3D11_BIND_UNORDERED_ACCESS)
-         || FAILED(CheckMultisampleQualityLevels(format, sampleDesc.Count, &qualityLevels))
-         || sampleDesc.Quality >= qualityLevels)
+         || FAILED(CheckMultisampleQualityLevels(format, sampleDesc.Count, &qualityLevels)) || !qualityLevels
+         || (sampleDesc.Quality >= qualityLevels && sampleDesc.Quality != D3D11_STANDARD_MULTISAMPLE_PATTERN
+          && sampleDesc.Quality != D3D11_CENTER_MULTISAMPLE_PATTERN))
           return E_INVALIDARG;
       }
 
@@ -4170,14 +4185,15 @@ namespace dxup {
       return text;
     }
 
-    static HRESULT validateSamplerDesc(const D3D11_SAMPLER_DESC& desc) {
+    // pointMipAnisotropic: 0x54, D3D12's anisotropic filter with point mips,
+    // which only DXUP's Direct3D 9 layer may create (DXUPCreateSamplerState;
+    // native D3D11 refuses it).
+    static HRESULT validateSamplerDesc(const D3D11_SAMPLER_DESC& desc, bool pointMipAnisotropic = false) {
       const UINT filter = UINT(desc.Filter);
       const UINT reduction = filter & 0x180u;
       const UINT base = filter & ~0x180u;
-      // 0x54: D3D12's anisotropic filter with point mips, which DXUP's
-      // Direct3D 9 layer passes for D3D9's (native D3D11 refuses it).
       const bool validBase = base == 0x00 || base == 0x01 || base == 0x04 || base == 0x05 || base == 0x10
-        || base == 0x11 || base == 0x14 || base == 0x15 || base == 0x54 || base == 0x55;
+        || base == 0x11 || base == 0x14 || base == 0x15 || (base == 0x54 && pointMipAnisotropic) || base == 0x55;
       auto validAddress = [](D3D11_TEXTURE_ADDRESS_MODE mode) {
         return mode >= D3D11_TEXTURE_ADDRESS_WRAP && mode <= D3D11_TEXTURE_ADDRESS_MIRROR_ONCE;
       };
@@ -4278,8 +4294,14 @@ namespace dxup {
     HRESULT STDMETHODCALLTYPE CreateSamplerState(
         const D3D11_SAMPLER_DESC*  pSamplerDesc,
         ID3D11SamplerState**       ppSamplerState) override {
+      return createSamplerState(pSamplerDesc, ppSamplerState, false);
+    }
+
+    // DXUPCreateSamplerState: also the anisotropic filter with point mips.
+    HRESULT createSamplerState(const D3D11_SAMPLER_DESC* pSamplerDesc, ID3D11SamplerState** ppSamplerState,
+                               bool pointMipAnisotropic) {
       if (!pSamplerDesc) return E_INVALIDARG;
-      if (HRESULT hr = validateSamplerDesc(*pSamplerDesc); FAILED(hr))
+      if (HRESULT hr = validateSamplerDesc(*pSamplerDesc, pointMipAnisotropic); FAILED(hr))
         return rejectInvalidCall("validateSamplerDesc", hr, describeSamplerDesc(*pSamplerDesc));
       if (!ppSamplerState) return S_FALSE;
 
@@ -4445,7 +4467,9 @@ namespace dxup {
       if (HRESULT hr = validateBlendDesc(baseDesc); FAILED(hr)) return rejectInvalidCall("validateBlendDesc", hr);
       for (UINT i = 0; i < (pBlendStateDesc->IndependentBlendEnable ? 8u : 1u); i++) {
         const auto& rt = pBlendStateDesc->RenderTarget[i];
-        if (rt.LogicOpEnable && (rt.BlendEnable || rt.LogicOp > D3D11_LOGIC_OP_OR_INVERTED))
+        // Logic ops need IndependentBlendEnable off (native runtime).
+        if (rt.LogicOpEnable && (rt.BlendEnable || rt.LogicOp > D3D11_LOGIC_OP_OR_INVERTED
+         || pBlendStateDesc->IndependentBlendEnable))
           return E_INVALIDARG;
       }
       if (!ppBlendState) return S_FALSE;
@@ -5375,8 +5399,12 @@ namespace dxup {
     }
 
     UINT STDMETHODCALLTYPE GetCreationFlags() override {
-      return 0;
+      return m_creationFlags;
     }
+
+    // The flags D3D11CreateDevice got (GetCreationFlags gives them back).
+    void setCreationFlags(UINT flags) { m_creationFlags = flags; }
+    UINT m_creationFlags = 0;
 
     // Created for Direct3D 10 (d3d10.dll asks the device for ID3D10Device).
     void enableD3D10(UINT flags) {

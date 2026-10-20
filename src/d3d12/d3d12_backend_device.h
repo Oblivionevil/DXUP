@@ -389,6 +389,40 @@ namespace dxup::d3d12 {
     BufferDesc                m_desc;
   };
 
+  // Video formats with a luma and a chroma plane; their D3D11 data has the
+  // planes' rows after each other at the same pitch (D3D12 also counts
+  // depth/stencil formats as planar: their D3D11 data is interleaved).
+  inline bool isPlanarVideoFormat(DXGI_FORMAT format) {
+    switch (format) {
+      case DXGI_FORMAT_NV12:
+      case DXGI_FORMAT_P010:
+      case DXGI_FORMAT_P016:
+      case DXGI_FORMAT_420_OPAQUE:
+      case DXGI_FORMAT_NV11:
+        return true;
+      default:
+        return false;
+    }
+  }
+
+  // The plane a view reads: stencil views of depth/stencil images and
+  // chroma views of video images take the second one.
+  inline uint32_t getViewPlaneSlice(DXGI_FORMAT imageFormat, DXGI_FORMAT viewFormat) {
+    switch (viewFormat) {
+      case DXGI_FORMAT_X24_TYPELESS_G8_UINT:
+      case DXGI_FORMAT_X32_TYPELESS_G8X24_UINT:
+        return 1u;
+      case DXGI_FORMAT_R8G8_UNORM:
+      case DXGI_FORMAT_R8G8_UINT:
+        return imageFormat == DXGI_FORMAT_NV12 || imageFormat == DXGI_FORMAT_NV11 ? 1u : 0u;
+      case DXGI_FORMAT_R16G16_UNORM:
+      case DXGI_FORMAT_R16G16_UINT:
+        return imageFormat == DXGI_FORMAT_P010 || imageFormat == DXGI_FORMAT_P016 ? 1u : 0u;
+      default:
+        return 0u;
+    }
+  }
+
   // ============================================================
   // D3D12 Backend Image
   // ============================================================
@@ -1229,6 +1263,7 @@ namespace dxup::d3d12 {
       uint32_t sampleCount; uint32_t sampleMask;
       uint64_t soHash;
       uint32_t sampleShading;
+      uint32_t sampleQuality = 0;
       bool operator==(const PsoCacheKey& o) const {
         if (vsHash != o.vsHash || psHash != o.psHash || gsHash != o.gsHash
          || hsHash != o.hsHash || dsHash != o.dsHash
@@ -1239,7 +1274,7 @@ namespace dxup::d3d12 {
          || topology != o.topology || stripCutIndexType != o.stripCutIndexType
          || numRenderTargets != o.numRenderTargets || dsvFormat != o.dsvFormat
          || sampleCount != o.sampleCount || sampleMask != o.sampleMask || soHash != o.soHash
-         || sampleShading != o.sampleShading)
+         || sampleShading != o.sampleShading || sampleQuality != o.sampleQuality)
           return false;
 
         for (uint32_t i = 0; i < 8; i++) {
@@ -1268,6 +1303,7 @@ namespace dxup::d3d12 {
         mix(static_cast<uint64_t>(k.dsvFormat)); mix(k.sampleCount); mix(k.sampleMask);
         mix(k.soHash);
         mix(k.sampleShading);
+        mix(k.sampleQuality);
         return static_cast<size_t>(h);
       }
     };
@@ -1304,6 +1340,8 @@ namespace dxup::d3d12 {
         // Only then: cache files of other pipelines keep their names.
         if (k.sampleShading)
           append(&k.sampleShading, sizeof(k.sampleShading));
+        if (k.sampleQuality)
+          append(&k.sampleQuality, sizeof(k.sampleQuality));
         return h;
       }
     };

@@ -5050,16 +5050,20 @@ namespace dxup {
       for (UINT i = 0; i < activeRenderTargetCount; i++) {
         if (auto* view = static_cast<D3D11RenderTargetView*>(m_state.om.renderTargets[i])) {
           key.rtvFormats[i] = view->GetPipelineFormat();
-          if (!sampleCount)
+          if (!sampleCount) {
             sampleCount = m_omForcedMsaa ? view->GetShadowSampleCount() : view->GetSampleCount();
+            key.sampleQuality = m_omForcedMsaa ? 0u : view->GetSampleQuality();
+          }
         }
       }
       if (auto* view = static_cast<D3D11DepthStencilView*>(m_state.om.depthStencilView)) {
         key.hasDepthStencilView = 1;
         key.dsvFormat = view->GetPipelineFormat();
         const uint32_t viewSamples = m_omForcedMsaa ? view->GetShadowSampleCount() : view->GetSampleCount();
-        if (sampleCount <= 1 && viewSamples)
+        if (sampleCount <= 1 && viewSamples) {
           sampleCount = viewSamples;
+          key.sampleQuality = m_omForcedMsaa ? 0u : view->GetSampleQuality();
+        }
       }
       key.sampleCount = sampleCount ? sampleCount : 1u;
       key.sampleShading = pipelineSampleShading(key.sampleCount) ? 1u : 0u;
@@ -5289,11 +5293,14 @@ namespace dxup {
           D3D11_RENDER_TARGET_VIEW_DESC rtvDesc;
           m_state.om.renderTargets[i]->GetDesc(&rtvDesc);
           DXGI_FORMAT resourceFormat = DXGI_FORMAT_UNKNOWN;
+          bool castable = false;
           if (auto* backendRtv = boundRtv(m_state.om.renderTargets[i])) {
-            if (auto* backendImage = backendRtv->getImage())
+            if (auto* backendImage = backendRtv->getImage()) {
               resourceFormat = backendImage->getDesc().format;
+              castable = (backendImage->getDesc().miscFlags & kResourceMiscCastable) != 0;
+            }
           }
-          desc.rtvFormats[i] = validateImageViewFormat(rtvDesc.Format, resourceFormat);
+          desc.rtvFormats[i] = validateImageViewFormat(rtvDesc.Format, resourceFormat, castable);
         }
       }
 
@@ -5322,6 +5329,7 @@ namespace dxup {
           if (auto* backendImage = backendRtv->getImage()) {
             uint32_t sampleCount = backendImage->getDesc().sampleCount;
             desc.sampleCount = sampleCount ? sampleCount : 1u;
+            desc.sampleQuality = backendImage->getDesc().sampleQuality;
             break;
           }
         }
@@ -5332,6 +5340,7 @@ namespace dxup {
           if (auto* backendImage = backendDsv->getImage()) {
             uint32_t sampleCount = backendImage->getDesc().sampleCount;
             desc.sampleCount = sampleCount ? sampleCount : 1u;
+            desc.sampleQuality = backendImage->getDesc().sampleQuality;
           }
         }
       }

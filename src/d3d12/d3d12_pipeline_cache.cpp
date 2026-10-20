@@ -18,7 +18,7 @@ namespace dxup::d3d12 {
 #ifdef _WIN32
   namespace {
     constexpr char     kStateCacheMagic[8] = { 'D', 'X', 'U', 'P', 'P', 'S', 'C', '1' };
-    constexpr uint32_t kStateCacheVersion  = 1;
+    constexpr uint32_t kStateCacheVersion  = 2;   // 2: sample quality
     // A record larger than this is not a pipeline description: the file
     // is damaged from there on.
     constexpr uint32_t kMaxRecordSize      = 64u << 10;
@@ -168,6 +168,7 @@ namespace dxup::d3d12 {
       w.put(desc.sampleCount);
       w.put(desc.sampleMask);
       w.put(uint8_t(desc.sampleShading));
+      w.put(desc.sampleQuality);
 
       const uint32_t soEntries = desc.soEntries ? desc.numSOEntries : 0;
       w.put(soEntries);
@@ -298,6 +299,7 @@ namespace dxup::d3d12 {
       desc.sampleCount = r.get<uint32_t>();
       desc.sampleMask = r.get<uint32_t>();
       desc.sampleShading = r.get<uint8_t>() != 0;
+      desc.sampleQuality = r.get<uint32_t>();
 
       const uint32_t soCount = r.get<uint32_t>();
       if (soCount > 64)

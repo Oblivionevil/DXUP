@@ -779,6 +779,57 @@ float4 main(float4 a : TEXCOORD0, float4 b : TEXCOORD1, float2 v : VPOS) : COLOR
   // depth test against an FP16 target's own depth buffer, many queries in a
   // row, the results read after Present without a flush. Each result is
   // shown as a bar.
+  // Hand-made token streams: def literals that look like comment or end
+  // tokens (the shader's length is found instruction by instruction), and
+  // malformed or unusual flow control. A bar per shader shows whether the
+  // runtime took it; the two valid ones also draw.
+  bool sceneShaderTokens(IDirect3DDevice9* d) {
+    d->Clear(0, nullptr, D3DCLEAR_TARGET, 0xff000000u, 1.0f, 0);
+    constexpr DWORD kPs20 = 0xffff0200u, kPs30 = 0xffff0300u, kEnd = 0x0000ffffu;
+    constexpr DWORD kOC0 = 0x800f0800u, kC0 = 0xa0e40000u, kB0 = 0xe0e40800u, kL0 = 0xa0e41000u, kL1 = 0xa0e41001u;
+    constexpr DWORD kDefC0 = 0xa00f0000u, kDefC1 = 0xa00f0001u;
+    constexpr DWORD kMov = 0x02000001u, kDef = 0x05000051u, kIf = 0x01000028u, kEndIf = 0x0000002bu, kRet = 0x0000001cu;
+    constexpr DWORD kLabel = 0x0100001eu, kCall = 0x01000019u, kRep = 0x01000026u, kEndRep = 0x00000027u;
+    const std::vector<std::vector<DWORD>> shaders = {
+      // 0.99999988 is 0x3f7ffffe: a comment token's low half.
+      { kPs20, kDef, kDefC0, 0x3f7ffffeu, 0x3f000000u, 0x3e800000u, 0x3f800000u, kMov, kOC0, kC0, kEnd },
+      // A literal equal to the end token.
+      { kPs20, kDef, kDefC1, 0x0000ffffu, 0xfffffffeu, 0x0000fffeu, 0x3f800000u,
+        kDef, kDefC0, 0x3e800000u, 0x3f800000u, 0x3f000000u, 0x3f800000u, kMov, kOC0, kC0, kEnd },
+      // if without its operand.
+      { kPs30, kMov, kOC0, kC0, 0x00000028u, kEndIf, kEnd },
+      // endif without if.
+      { kPs30, kMov, kOC0, kC0, kEndIf, kEnd },
+      // rep closed by endif.
+      { kPs30, kMov, kOC0, kC0, kRep, 0xf0e40000u, kEndIf, kEnd },
+      // A subroutine with a conditional ret.
+      { kPs30, kMov, kOC0, kC0, kCall, kL0, kRet, kLabel, kL0, kIf, kB0, kRet, kEndIf, kRet, kEnd },
+      // A call of a missing label.
+      { kPs30, kMov, kOC0, kC0, kCall, kL1, kRet, kLabel, kL0, kRet, kEnd },
+      // A plain subroutine.
+      { kPs30, kMov, kOC0, kC0, kCall, kL0, kRet, kLabel, kL0, kRet, kEnd },
+    };
+    // The ps_2_0 constants: c0 drawn as it is.
+    d->SetFVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE);
+    for (size_t i = 0; i < shaders.size(); i++) {
+      IDirect3DPixelShader9* ps = nullptr;
+      const bool created = SUCCEEDED(d->CreatePixelShader(shaders[i].data(), &ps)) && ps;
+      const float y = 2.0f + float(i) * 4.0f;
+      const DWORD color = created ? 0xffffffffu : 0xff404040u;
+      const TLVertex bar[4] = { { 2, y, 0.5f, 1, color }, { 20, y, 0.5f, 1, color },
+                                { 2, y + 3, 0.5f, 1, color }, { 20, y + 3, 0.5f, 1, color } };
+      d->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, bar, sizeof(TLVertex));
+      if (created && i < 2) {
+        d->SetPixelShader(ps);
+        const TLVertex quad[4] = { { 24, y, 0.5f, 1, 0 }, { 60, y, 0.5f, 1, 0 }, { 24, y + 3, 0.5f, 1, 0 }, { 60, y + 3, 0.5f, 1, 0 } };
+        d->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, quad, sizeof(TLVertex));
+        d->SetPixelShader(nullptr);
+      }
+      if (ps) ps->Release();
+    }
+    return true;
+  }
+
   bool sceneOcclusionBoxes(IDirect3DDevice9* d) {
     IDirect3DSurface9 *back = nullptr, *backDepth = nullptr, *target = nullptr, *depth = nullptr;
     d->GetRenderTarget(0, &back);
@@ -1811,6 +1862,7 @@ float4 main(float2 t : TEXCOORD0) : COLOR {
     { "decl_types", sceneDeclTypes },
     { "aliased_elements", sceneAliasedElements },
     { "occlusion_boxes", sceneOcclusionBoxes },
+    { "shader_tokens", sceneShaderTokens },
     { "state_block", sceneStateBlock },
     { "sm3_loops", sceneSm3Loops },
     { "ps_1_4", scenePs14 },

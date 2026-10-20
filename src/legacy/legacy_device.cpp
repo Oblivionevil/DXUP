@@ -1345,14 +1345,11 @@ namespace dxup::legacy {
       return nullptr;
     }
     // The token stream ends with the end token.
-    size_t count = 1;
-    while (count < tokenCount && tokens[count] != 0x0000ffffu) {
-      const uint32_t token = tokens[count];
-      if ((token & 0xffff) == 0xfffe)
-        count += (token >> 16) & 0x7fff;
-      count++;
+    const size_t count = shaderTokenCount9(tokens, tokenCount);
+    if (!count) {
+      error = "no end token";
+      return nullptr;
     }
-    count = (std::min)(count + 1, tokenCount);
     uint64_t hash = 14695981039346656037ull;
     for (size_t i = 0; i < count; i++)
       hash = fnv64Multiply(hash ^ tokens[i]);
@@ -1755,6 +1752,8 @@ namespace dxup::legacy {
       GetProcAddress(m_d3d11Module, "DXUPNoteBackBufferSize"));
     m_createMappedView = reinterpret_cast<decltype(m_createMappedView)>(
       GetProcAddress(m_d3d11Module, "DXUPCreateShaderResourceView"));
+    m_createSampler = reinterpret_cast<decltype(m_createSampler)>(
+      GetProcAddress(m_d3d11Module, "DXUPCreateSamplerState"));
     // The GPU's maker, before the first shader is translated.
     using GetVendorId = UINT (WINAPI*)(IUnknown*);
     if (auto getVendorId = reinterpret_cast<GetVendorId>(GetProcAddress(m_d3d11Module, "DXUPGetVendorId")))
@@ -2512,10 +2511,15 @@ namespace dxup::legacy {
     desc.ComparisonFunc = compare ? D3D11_COMPARISON_LESS_EQUAL : D3D11_COMPARISON_NEVER;
     const uint64_t key = hashBytes(desc);
     auto& state = m_samplerStates[key];
-    if (!state && FAILED(m_device->CreateSamplerState(&desc, &state)) && desc.Filter == kAnisotropicPointMip) {
-      // Windows' own D3D11 (DXUP's fallback) has no point mips here.
-      desc.Filter = D3D11_FILTER_ANISOTROPIC;
-      m_device->CreateSamplerState(&desc, &state);
+    if (!state) {
+      // The point mip filter through DXUP's own entry (D3D11 has none);
+      // Windows' own D3D11 (DXUP's fallback) filters mips linearly.
+      HRESULT hr = desc.Filter == kAnisotropicPointMip && m_createSampler
+        ? m_createSampler(m_device.get(), &desc, &state) : m_device->CreateSamplerState(&desc, &state);
+      if (FAILED(hr) && desc.Filter == kAnisotropicPointMip) {
+        desc.Filter = D3D11_FILTER_ANISOTROPIC;
+        m_device->CreateSamplerState(&desc, &state);
+      }
     }
     return state;
   }

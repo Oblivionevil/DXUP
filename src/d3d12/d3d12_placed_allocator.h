@@ -146,8 +146,12 @@ namespace dxup::d3d12 {
         }
       }
       D3D12_RESOURCE_ALLOCATION_INFO info = device->GetResourceAllocationInfo(0, 1, &desc);
+      // Planar formats (video, depth/stencil) never take the small alignment.
+      D3D12_FEATURE_DATA_FORMAT_INFO formatInfo = { desc.Format, 0 };
       if (desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER
-       && info.SizeInBytes <= D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT) {
+       && info.SizeInBytes <= D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT
+       && SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_INFO, &formatInfo, sizeof(formatInfo)))
+       && formatInfo.PlaneCount <= 1) {
         D3D12_RESOURCE_DESC smallDesc = desc;
         smallDesc.Alignment = D3D12_SMALL_RESOURCE_PLACEMENT_ALIGNMENT;
         const D3D12_RESOURCE_ALLOCATION_INFO smallInfo = device->GetResourceAllocationInfo(0, 1, &smallDesc);

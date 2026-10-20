@@ -318,14 +318,7 @@ namespace dxup::d3d12 {
     }
 
     inline UINT getImageViewPlaneStartForTransition(const ImageViewDesc& viewDesc, const ImageDesc& imageDesc) {
-      switch (getImageViewFormatForTransition(viewDesc, imageDesc)) {
-        case DXGI_FORMAT_X24_TYPELESS_G8_UINT:
-        case DXGI_FORMAT_X32_TYPELESS_G8X24_UINT:
-          return 1u;
-
-        default:
-          return 0u;
-      }
+      return getViewPlaneSlice(imageDesc.format, getImageViewFormatForTransition(viewDesc, imageDesc));
     }
 
     inline UINT getImageViewPlaneCountForTransition(
@@ -4878,6 +4871,26 @@ namespace dxup::d3d12 {
         footprint.Footprint.Width, footprint.Footprint.Height);
     }
 
+    // Planar video images: the chroma rows follow the luma rows at the same
+    // pitch (getImageUploadLayout).
+    if (copyOk && !region && isPlanarVideoFormat(dstImageDesc.format) && d3d12Dst->getPlaneCount() == 2) {
+      const UINT chromaIdx = subresourceIdx + d3d12Dst->getMipLevelCount() * d3d12Dst->getArraySubresourceCount();
+      D3D12_PLACED_SUBRESOURCE_FOOTPRINT chroma = {};
+      UINT chromaRows = 0;
+      const D3D12_RESOURCE_DESC dstDesc = d3d12Dst->getTextureDesc();
+      m_device->getDevice()->GetCopyableFootprints(&dstDesc, chromaIdx, 1,
+        footprint.Offset + uint64_t(footprint.Footprint.RowPitch) * numRows, &chroma, &chromaRows, nullptr, nullptr);
+      if (chromaRows && chroma.Footprint.RowPitch == footprint.Footprint.RowPitch
+       && !(chroma.Offset % D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT)
+       && chroma.Offset + uint64_t(chroma.Footprint.RowPitch) * chromaRows <= d3d12Src->getOffset() + d3d12Src->getDesc().size) {
+        D3D12_TEXTURE_COPY_LOCATION chromaDst = dstLoc;
+        chromaDst.SubresourceIndex = chromaIdx;
+        D3D12_TEXTURE_COPY_LOCATION chromaSrc = srcLoc;
+        chromaSrc.PlacedFootprint = chroma;
+        m_cmdList->CopyTextureRegion(&chromaDst, 0, 0, 0, &chromaSrc, nullptr);
+      }
+    }
+
     m_copyOpsSinceFlush++;
 #endif
   }
@@ -5100,53 +5113,68 @@ namespace dxup::d3d12 {
 #ifdef _WIN32
     ContextLock ctxLock(*this);
     auto* image = static_cast<D3D12BackendImage*>(dst);
-    if (m_deviceRemoved || !image || !data || image->isStaging() || image->getPlaneCount() > 1 || !image->getResource())
+    if (m_deviceRemoved || !image || !data || image->isStaging() || !image->getResource())
+      return false;
+    // Planar video data: the planes' rows follow each other.
+    const UINT planes = isPlanarVideoFormat(image->getDesc().format) ? image->getPlaneCount() : 1u;
+    if (image->getPlaneCount() > planes || planes > 2)
       return false;
 
-    const UINT subresource = calcImageSubresourceIndex(image, dstSubres);
     const D3D12_RESOURCE_DESC desc = image->getTextureDesc();
-    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint = {};
-    UINT numRows = 0;
-    UINT64 rowSize = 0, totalSize = 0;
-    m_device->getDevice()->GetCopyableFootprints(&desc, subresource, 1, 0, &footprint, &numRows, &rowSize, &totalSize);
-    if (!totalSize || totalSize == UINT64_MAX || rowSize > rowPitch)
-      return false;
-
-    ID3D12Resource* upload = nullptr;
-    uint64_t uploadOffset = 0;
-    void* uploadPtr = nullptr;
-    if (!allocateUploadScratch(totalSize, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT, &upload, &uploadOffset, &uploadPtr))
-      return false;
-
-    const uint32_t depth = footprint.Footprint.Depth;
-    const uint64_t sourceSlicePitch = depthPitch ? depthPitch : uint64_t(rowPitch) * numRows;
-    auto* dstBytes = static_cast<uint8_t*>(uploadPtr);
-    const auto* srcBytes = static_cast<const uint8_t*>(data);
-    for (uint32_t z = 0; z < depth; z++) {
-      for (UINT row = 0; row < numRows; row++) {
-        std::memcpy(dstBytes + (uint64_t(z) * numRows + row) * footprint.Footprint.RowPitch,
-                    srcBytes + z * sourceSlicePitch + uint64_t(row) * rowPitch, size_t(rowSize));
-      }
+    UINT subresources[2] = {};
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprints[2] = {};
+    UINT numRows[2] = {};
+    UINT64 rowSizes[2] = {}, totalSizes[2] = {};
+    for (UINT plane = 0; plane < planes; plane++) {
+      subresources[plane] = image->calcSubresource(dstSubres.mipLevel, dstSubres.arrayLayer, plane);
+      m_device->getDevice()->GetCopyableFootprints(&desc, subresources[plane], 1, 0, &footprints[plane],
+        &numRows[plane], &rowSizes[plane], &totalSizes[plane]);
+      if (!totalSizes[plane] || totalSizes[plane] == UINT64_MAX || rowSizes[plane] > rowPitch)
+        return false;
     }
 
-    // New images get all their data: one barrier for the whole image.
-    if (image->hasUniformState())
+    ID3D12Resource* uploads[2] = {};
+    uint64_t uploadOffsets[2] = {};
+    const auto* srcBytes = static_cast<const uint8_t*>(data);
+    for (UINT plane = 0; plane < planes; plane++) {
+      void* uploadPtr = nullptr;
+      if (!allocateUploadScratch(totalSizes[plane], D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT, &uploads[plane],
+                                 &uploadOffsets[plane], &uploadPtr))
+        return false;
+      const D3D12_PLACED_SUBRESOURCE_FOOTPRINT& footprint = footprints[plane];
+      const uint32_t depth = footprint.Footprint.Depth;
+      const uint64_t sourceSlicePitch = depthPitch ? depthPitch : uint64_t(rowPitch) * numRows[plane];
+      auto* dstBytes = static_cast<uint8_t*>(uploadPtr);
+      for (uint32_t z = 0; z < depth; z++) {
+        for (UINT row = 0; row < numRows[plane]; row++) {
+          std::memcpy(dstBytes + (uint64_t(z) * numRows[plane] + row) * footprint.Footprint.RowPitch,
+                      srcBytes + z * sourceSlicePitch + uint64_t(row) * rowPitch, size_t(rowSizes[plane]));
+        }
+      }
+      srcBytes += uint64_t(rowPitch) * numRows[plane];
+    }
+
+    // New images get all their data: one barrier for the whole image (and
+    // for all planes).
+    if (image->hasUniformState() || planes > 1)
       transitionResource(image, D3D12_RESOURCE_STATE_COPY_DEST);
     else
       transitionResource(image, dstSubres, D3D12_RESOURCE_STATE_COPY_DEST);
     holdBatchResource(image->getResource());
     flushBarriers();
-    D3D12_TEXTURE_COPY_LOCATION dstLoc = {};
-    dstLoc.pResource = image->getResource();
-    dstLoc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-    dstLoc.SubresourceIndex = subresource;
-    D3D12_TEXTURE_COPY_LOCATION srcLoc = {};
-    srcLoc.pResource = upload;
-    srcLoc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-    srcLoc.PlacedFootprint = footprint;
-    srcLoc.PlacedFootprint.Offset = uploadOffset;
-    m_cmdList->CopyTextureRegion(&dstLoc, 0, 0, 0, &srcLoc, nullptr);
-    m_copyOpsSinceFlush++;
+    for (UINT plane = 0; plane < planes; plane++) {
+      D3D12_TEXTURE_COPY_LOCATION dstLoc = {};
+      dstLoc.pResource = image->getResource();
+      dstLoc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+      dstLoc.SubresourceIndex = subresources[plane];
+      D3D12_TEXTURE_COPY_LOCATION srcLoc = {};
+      srcLoc.pResource = uploads[plane];
+      srcLoc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+      srcLoc.PlacedFootprint = footprints[plane];
+      srcLoc.PlacedFootprint.Offset = uploadOffsets[plane];
+      m_cmdList->CopyTextureRegion(&dstLoc, 0, 0, 0, &srcLoc, nullptr);
+      m_copyOpsSinceFlush++;
+    }
     return true;
 #else
     (void)dst; (void)dstSubres; (void)data; (void)rowPitch; (void)depthPitch;

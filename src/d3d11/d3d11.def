@@ -6,3 +6,4 @@ EXPORTS
   DXUPNoteBackBufferSize
   DXUPGetVendorId
   DXUPCreateShaderResourceView
+  DXUPCreateSamplerState

@@ -248,6 +248,12 @@ namespace dxup {
 
   // Compute row pitch for a given width and format
   inline uint32_t computeRowPitch(uint32_t width, DXGI_FORMAT format) {
+    // Planar video formats: a luma row (the chroma rows are as long).
+    switch (format) {
+      case DXGI_FORMAT_NV12: case DXGI_FORMAT_NV11: case DXGI_FORMAT_420_OPAQUE: return width;
+      case DXGI_FORMAT_P010: case DXGI_FORMAT_P016: return width * 2;
+      default: break;
+    }
     uint32_t bpp = getFormatBpp(format);
     if (bpp > 0) {
       return width * bpp;
@@ -357,6 +363,20 @@ namespace dxup {
       layout.depth = footprint.Footprint.Depth;
     if (totalBytes)
       layout.totalSize = totalBytes;
+
+    // Planar video images: the chroma rows follow the luma rows at the same
+    // pitch, as in D3D11 data (copyBufferToImage copies both planes).
+    if (d3d12::isPlanarVideoFormat(d3d12Image->getDesc().format) && d3d12Image->getPlaneCount() == 2) {
+      const UINT chromaSubresource = subresourceIndex
+        + d3d12Image->getMipLevelCount() * d3d12Image->getArraySubresourceCount();
+      D3D12_PLACED_SUBRESOURCE_FOOTPRINT chroma = {};
+      UINT chromaRows = 0;
+      d3d12Device->GetCopyableFootprints(&resourceDesc, chromaSubresource, 1, 0, &chroma, &chromaRows, nullptr, nullptr);
+      if (chromaRows && chroma.Footprint.RowPitch == layout.rowPitch) {
+        layout.numRows += chromaRows;
+        layout.totalSize = uint64_t(layout.rowPitch) * layout.numRows;
+      }
+    }
 #endif
 
     return layout;

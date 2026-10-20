@@ -25,12 +25,13 @@ namespace dxup {
     uint32_t sampleCount;
     uint32_t rtvFormats[8];
     uint32_t dsvFormat;
+    uint32_t sampleQuality;
     uint8_t  topology;
     uint8_t  stripCutIndexType;
     uint8_t  renderTargetCount;
     uint8_t  hasDepthStencilView;
     uint8_t  sampleShading;
-    uint8_t  reserved[3];
+    uint8_t  reserved[7];
 
     // Keys are compared bytewise, so no padding may hold stray bytes.
     void clear() { std::memset(this, 0, sizeof(*this)); }
@@ -75,7 +76,7 @@ namespace dxup {
 
   static_assert(sizeof(GraphicsPipelineKey) % sizeof(uint64_t) == 0,
     "GraphicsPipelineKey is hashed as 64-bit words");
-  static_assert(sizeof(GraphicsPipelineKey) == 5 * 16 + 4 * 8 + 3 * 4 + 8 * 4 + 4 + 4 + 4,
+  static_assert(sizeof(GraphicsPipelineKey) == 5 * 16 + 4 * 8 + 3 * 4 + 8 * 4 + 4 + 4 + 12,
     "GraphicsPipelineKey must not have padding");
 
   // The pipelines one context bound, by key. The device keeps every

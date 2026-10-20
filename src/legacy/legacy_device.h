@@ -461,7 +461,8 @@ namespace dxup::legacy {
     HMODULE                         m_d3d11Module = nullptr;
     void (WINAPI* m_noteBackBufferSize)(IUnknown*, UINT, UINT) = nullptr;   // DXUP's d3d11.dll only
     HRESULT (WINAPI* m_createMappedView)(IUnknown*, ID3D11Resource*, const D3D11_SHADER_RESOURCE_VIEW_DESC*, UINT,
-                                         ID3D11ShaderResourceView**) = nullptr;   // DXUP's d3d11.dll only
+                                         ID3D11ShaderResourceView**) = nullptr;   // DXUP's d3d11.dll only
+    HRESULT (WINAPI* m_createSampler)(IUnknown*, const D3D11_SAMPLER_DESC*, ID3D11SamplerState**) = nullptr;
     Ref<ID3D11Device>               m_device;
     Ref<ID3D11DeviceContext>        m_context;
     Ref<IDXGIFactory2>              m_factory;

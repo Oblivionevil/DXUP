@@ -758,6 +758,9 @@ namespace dxup {
     DXGI_FORMAT       rtvFormats[8]    = {};
     DXGI_FORMAT       dsvFormat        = DXGI_FORMAT_UNKNOWN;
     uint32_t          sampleCount      = 1;
+    // The targets' quality (D3D11 and D3D12 share the standard and center
+    // pattern values).
+    uint32_t          sampleQuality    = 0;
     uint32_t          sampleMask       = 0xFFFFFFFF;
     // The pixel shader runs once per sample (supersampling).
     bool              sampleShading    = false;

@@ -199,7 +199,9 @@ HRESULT STDMETHODCALLTYPE D3D11Device::QueryInterface(REFIID riid, void** ppvObj
   if (riid == __uuidof(IDXGIObject)
    || riid == __uuidof(IDXGIDevice)
     || riid == __uuidof(IDXGIDevice1)
-    || riid == __uuidof(IDXGIDevice2)) {
+    || riid == __uuidof(IDXGIDevice2)
+    || riid == __uuidof(IDXGIDevice3)
+    || riid == __uuidof(IDXGIDevice4)) {
     DXGIDevice* dxgiDevice = nullptr;
     {
       std::lock_guard<std::mutex> lock(m_dxgiDeviceMutex);
@@ -620,6 +622,7 @@ HRESULT __stdcall D3D11CreateDevice(
   // Windows' d3d10.dll (0x40000000) and d3d10_1.dll (0x80000000) create
   // their devices with these flags and then ask for ID3D10Device(1).
   constexpr UINT kCreateForD3D10 = 0xC0000000u;
+  device->setCreationFlags(Flags & ~kCreateForD3D10);
   if (Flags & kCreateForD3D10)
     device->enableD3D10(Flags & ~kCreateForD3D10);
 
@@ -753,6 +756,17 @@ HRESULT WINAPI DXUPCreateShaderResourceView(IUnknown* pDevice, ID3D11Resource* p
    || FAILED(pDevice->QueryInterface(kDxupD3D11DeviceIid, reinterpret_cast<void**>(dxupDevice.GetAddressOf()))))
     return E_INVALIDARG;
   return static_cast<D3D11Device*>(dxupDevice.Get())->CreateMappedShaderResourceView(pResource, pDesc, ComponentMapping, ppView);
+}
+
+// A sampler of DXUP's device that may also use D3D12's anisotropic filter
+// with point mips (0x54), as Direct3D 9 filters: DXUP's Direct3D 9 layer.
+HRESULT WINAPI DXUPCreateSamplerState(IUnknown* pDevice, const D3D11_SAMPLER_DESC* pDesc,
+    ID3D11SamplerState** ppSampler) {
+  ComPtr<ID3D11Device5> dxupDevice;
+  if (!pDevice
+   || FAILED(pDevice->QueryInterface(kDxupD3D11DeviceIid, reinterpret_cast<void**>(dxupDevice.GetAddressOf()))))
+    return E_INVALIDARG;
+  return static_cast<D3D11Device*>(dxupDevice.Get())->createSamplerState(pDesc, ppSampler, true);
 }
 
 } // extern "C"

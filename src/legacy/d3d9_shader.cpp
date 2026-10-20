@@ -5,6 +5,7 @@
 #include <cstring>
 #include <deque>
 #include <map>
+#include <set>
 
 namespace dxup::legacy {
 
@@ -116,7 +117,7 @@ namespace dxup::legacy {
             if (pos < end) ins.dst.push_back(readDst(end));
             return;
           case OpDef: case OpDefI: case OpDefB:
-            ins.dst.push_back(readDst(end));
+            if (pos < end) ins.dst.push_back(readDst(end));
             for (int i = 0; i < (ins.opcode == OpDefB ? 1 : 4) && pos < end; i++)
               ins.literal[i] = tokens[pos++];
             return;
@@ -137,6 +138,83 @@ namespace dxup::legacy {
           ins.src.push_back(readSrc(end));
       }
     };
+
+    // Operand counts and flow control as Direct3D 9 validates them: the
+    // HLSL writer and the DXBC emitter index operands and nest blocks
+    // without further checks.
+    bool validateProgram(const std::vector<Instruction>& instructions, std::string& error) {
+      auto fail = [&](const char* what, uint32_t opcode) {
+        error = std::string(what) + " (instruction " + std::to_string(opcode) + ")";
+        return false;
+      };
+      auto minSources = [](uint32_t opcode) -> size_t {
+        switch (opcode) {
+          case OpCall: case OpLabel: case OpRep: case OpIf: case OpBreakP: return 1;
+          case OpCallNz: case OpLoop: case OpIfC: case OpBreakC: return 2;
+          case OpM4x4: case OpM4x3: case OpM3x4: case OpM3x3: case OpM3x2: return 2;
+          default: return 0;
+        }
+      };
+      auto takesDst = [](uint32_t opcode) {
+        switch (opcode) {
+          case OpNop: case OpPhase: case OpCall: case OpCallNz: case OpLoop: case OpRet: case OpEndLoop: case OpLabel:
+          case OpRep: case OpEndRep: case OpIf: case OpIfC: case OpElse: case OpEndIf: case OpBreak: case OpBreakC:
+          case OpBreakP:
+            return false;
+          default:
+            return true;
+        }
+      };
+      std::vector<char> blocks;   // i: if, e: else, r: rep, l: loop
+      std::set<uint32_t> labels, called;
+      auto inLoop = [&] { return std::find_if(blocks.begin(), blocks.end(), [](char b) { return b == 'r' || b == 'l'; }) != blocks.end(); };
+      for (const auto& ins : instructions) {
+        if ((takesDst(ins.opcode) && ins.dst.empty()) || ins.src.size() < minSources(ins.opcode))
+          return fail("missing operand", ins.opcode);
+        switch (ins.opcode) {
+          case OpIf: case OpIfC: blocks.push_back('i'); break;
+          case OpRep: blocks.push_back('r'); break;
+          case OpLoop: blocks.push_back('l'); break;
+          case OpElse:
+            if (blocks.empty() || blocks.back() != 'i') return fail("else without if", ins.opcode);
+            blocks.back() = 'e';
+            break;
+          case OpEndIf:
+            if (blocks.empty() || (blocks.back() != 'i' && blocks.back() != 'e')) return fail("endif without if", ins.opcode);
+            blocks.pop_back();
+            break;
+          case OpEndRep:
+            if (blocks.empty() || blocks.back() != 'r') return fail("endrep without rep", ins.opcode);
+            blocks.pop_back();
+            break;
+          case OpEndLoop:
+            if (blocks.empty() || blocks.back() != 'l') return fail("endloop without loop", ins.opcode);
+            blocks.pop_back();
+            break;
+          case OpBreak: case OpBreakC: case OpBreakP:
+            if (!inLoop()) return fail("break outside a loop", ins.opcode);
+            break;
+          case OpLabel:
+            if (!blocks.empty()) return fail("label inside a block", ins.opcode);
+            labels.insert(ins.src[0].index);
+            break;
+          case OpRet:
+            if (!blocks.empty()) return fail("ret inside a block", ins.opcode);
+            break;
+          case OpCall: case OpCallNz:
+            called.insert(ins.src[0].index);
+            break;
+          default:
+            break;
+        }
+      }
+      if (!blocks.empty())
+        return fail("unclosed block", 0);
+      for (uint32_t label : called)
+        if (!labels.count(label))
+          return fail("call of a missing label", OpCall);
+      return true;
+    }
 
     // ---- HLSL writing ----
 
@@ -760,6 +838,34 @@ namespace dxup::legacy {
     return sm9::translateShader9(tokens, tokenCount, options, hlsl, info, error, nullptr);
   }
 
+  size_t shaderTokenCount9(const uint32_t* tokens, size_t maxTokens) {
+    if (!tokens || maxTokens < 2)
+      return 0;
+    const uint32_t major = (tokens[0] >> 8) & 0xff;
+    size_t pos = 1;
+    while (pos < maxTokens) {
+      const uint32_t token = tokens[pos];
+      const uint32_t opcode = token & 0xffff;
+      if (opcode == sm9::OpEnd)
+        return pos + 1;
+      pos++;
+      if (opcode == sm9::OpComment) {
+        pos += (token >> 16) & 0x7fff;
+        continue;
+      }
+      // As the parser: shader model 2 and later give the length; before,
+      // def has four literals and other operands have bit 31 set.
+      if (major >= 2)
+        pos += (token >> 24) & 0xf;
+      else if (opcode == sm9::OpDef)
+        pos += 5;
+      else
+        while (pos < maxTokens && (tokens[pos] & 0x80000000u))
+          pos++;
+    }
+    return 0;
+  }
+
   bool sm9::translateShader9(const uint32_t* tokens, size_t tokenCount, const TranslateOptions9& options,
                              std::string& hlsl, ShaderInfo9& info, std::string& error, Layout9* layout) {
     if (!tokens || tokenCount < 2) {
@@ -791,6 +897,8 @@ namespace dxup::legacy {
       error = parser.error;
       return false;
     }
+    if (!validateProgram(instructions, error))
+      return false;
 
     Writer w{ info, options, vertex, info.major, info.minor };
     for (const auto& i : instructions) {

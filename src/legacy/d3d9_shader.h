@@ -90,6 +90,12 @@ namespace dxup::legacy {
   bool translateShader9(const uint32_t* tokens, size_t tokenCount, const TranslateOptions9& options,
                         std::string& hlsl, ShaderInfo9& info, std::string& error);
 
+  // The shader's length in tokens with its end token, found instruction by
+  // instruction as Direct3D 9 reads it (the literals of def, defi and defb
+  // can look like comment or end tokens), at most maxTokens; 0 without an
+  // end token within them.
+  size_t shaderTokenCount9(const uint32_t* tokens, size_t maxTokens);
+
   // The semantic Direct3D 11 stages and input layouts use for a usage.
   std::string semantic9(uint8_t usage, uint8_t usageIndex);
   // Its name alone (input layouts give the index apart).

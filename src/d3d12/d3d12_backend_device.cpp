@@ -251,7 +251,7 @@ namespace dxup::d3d12 {
           return 2u;
 
         default:
-          return 1u;
+          return isPlanarVideoFormat(format) ? 2u : 1u;
       }
     }
 
@@ -309,6 +309,10 @@ namespace dxup::d3d12 {
       if (viewFormat == resFormat)
         return viewFormat;
 
+      // Video formats are viewed per plane (luma and chroma formats).
+      if (isPlanarVideoFormat(resFormat))
+        return viewFormat;
+
       // If resource format is typeless, any compatible typed format is valid
       // (This is a simplified check using known typeless format ranges)
       switch (resFormat) {
@@ -349,6 +353,18 @@ namespace dxup::d3d12 {
       return viewFormat;
     }
 
+    // Null descriptors of chroma views: a resource in the view format has
+    // one plane only.
+    template<typename ViewDesc>
+    inline ViewDesc nullViewDesc(ViewDesc desc, DXGI_FORMAT imageFormat) {
+      // TEXTURE2D and TEXTURE2DARRAY: 4 and 5 for both view types.
+      if (isPlanarVideoFormat(imageFormat) && UINT(desc.ViewDimension) == 4)
+        desc.Texture2D.PlaneSlice = 0;
+      else if (isPlanarVideoFormat(imageFormat) && UINT(desc.ViewDimension) == 5)
+        desc.Texture2DArray.PlaneSlice = 0;
+      return desc;
+    }
+
     inline void fillShaderResourceViewDesc(
         const ImageViewDesc& desc,
         const ImageDesc& imageDesc,
@@ -356,10 +372,10 @@ namespace dxup::d3d12 {
       srvDesc = {};
       srvDesc.Format = getImageViewFormat(desc, imageDesc);
       srvDesc.Shader4ComponentMapping = desc.componentMapping ? desc.componentMapping : D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-      // Stencil views read the second plane of depth-stencil images; D3D12
-      // removes the device for a stencil format on the depth plane.
-      const UINT planeSlice = srvDesc.Format == DXGI_FORMAT_X24_TYPELESS_G8_UINT
-        || srvDesc.Format == DXGI_FORMAT_X32_TYPELESS_G8X24_UINT ? 1u : 0u;
+      // Stencil views read the second plane of depth-stencil images (D3D12
+      // removes the device for a stencil format on the depth plane), chroma
+      // views the second plane of video images.
+      const UINT planeSlice = getViewPlaneSlice(imageDesc.format, srvDesc.Format);
 
       switch (desc.type) {
         case ImageViewType::View1D:
@@ -449,6 +465,7 @@ namespace dxup::d3d12 {
         case ImageViewType::View2D:
           rtvDesc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
           rtvDesc.Texture2D.MipSlice = desc.baseMipLevel;
+          rtvDesc.Texture2D.PlaneSlice = getViewPlaneSlice(imageDesc.format, rtvDesc.Format);
           break;
 
         case ImageViewType::View2DArray:
@@ -456,6 +473,7 @@ namespace dxup::d3d12 {
           rtvDesc.Texture2DArray.MipSlice = desc.baseMipLevel;
           rtvDesc.Texture2DArray.FirstArraySlice = desc.baseArrayLayer;
           rtvDesc.Texture2DArray.ArraySize = getImageViewArrayCount(desc, imageDesc);
+          rtvDesc.Texture2DArray.PlaneSlice = getViewPlaneSlice(imageDesc.format, rtvDesc.Format);
           break;
 
         case ImageViewType::View2DMS:
@@ -558,6 +576,7 @@ namespace dxup::d3d12 {
         case ImageViewType::View2D:
           uavDesc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
           uavDesc.Texture2D.MipSlice = desc.baseMipLevel;
+          uavDesc.Texture2D.PlaneSlice = getViewPlaneSlice(imageDesc.format, uavDesc.Format);
           return true;
 
         case ImageViewType::View2DArray:
@@ -565,6 +584,7 @@ namespace dxup::d3d12 {
           uavDesc.Texture2DArray.MipSlice = desc.baseMipLevel;
           uavDesc.Texture2DArray.FirstArraySlice = desc.baseArrayLayer;
           uavDesc.Texture2DArray.ArraySize = getImageViewArrayCount(desc, imageDesc);
+          uavDesc.Texture2DArray.PlaneSlice = getViewPlaneSlice(imageDesc.format, uavDesc.Format);
           return true;
 
         case ImageViewType::View3D:
@@ -3400,7 +3420,8 @@ namespace dxup::d3d12 {
       setSrvMinLodClamp(srvDesc, image->minLod.load(std::memory_order_relaxed));
       m_device->CreateShaderResourceView(d3d12Image->getResource(), &srvDesc, srvHandle);
       nullSrvHandle = m_descriptorHeapManager.allocateCbvSrvUav();
-      m_device->CreateShaderResourceView(nullptr, &srvDesc, nullSrvHandle);
+      const D3D12_SHADER_RESOURCE_VIEW_DESC nullSrvDesc = nullViewDesc(srvDesc, imageDesc.format);
+      m_device->CreateShaderResourceView(nullptr, &nullSrvDesc, nullSrvHandle);
       {
         HRESULT chk = m_device->GetDeviceRemovedReason();
         if (FAILED(chk))
@@ -3465,7 +3486,8 @@ namespace dxup::d3d12 {
         } else {
           uavDesc.Format = getValidatedViewFormat(uavDesc.Format, d3d12Image->getResource());
           m_device->CreateUnorderedAccessView(d3d12Image->getResource(), nullptr, &uavDesc, uavHandle);
-          m_device->CreateUnorderedAccessView(nullptr, nullptr, &uavDesc, nullUavHandle);
+          const D3D12_UNORDERED_ACCESS_VIEW_DESC nullUavDesc = nullViewDesc(uavDesc, imageDesc.format);
+          m_device->CreateUnorderedAccessView(nullptr, nullptr, &nullUavDesc, nullUavHandle);
           view->setUavHandle(uavHandle);
           view->setNullUavHandle(nullUavHandle);
           {
@@ -3898,6 +3920,7 @@ namespace dxup::d3d12 {
     cacheKey.sampleMask = desc.sampleMask;
     cacheKey.soHash = soHash;
     cacheKey.sampleShading = desc.sampleShading ? 1u : 0u;
+    cacheKey.sampleQuality = desc.sampleCount > 1 ? desc.sampleQuality : 0u;
     return cacheKey;
   }
 
@@ -4158,7 +4181,18 @@ namespace dxup::d3d12 {
     return result;
   }
 
-  Rc<IBackendPipeline> D3D12BackendDevice::compileGraphicsPipeline(const GraphicsPipelineDesc& desc, const PsoCacheKey& key) {
+  Rc<IBackendPipeline> D3D12BackendDevice::compileGraphicsPipeline(const GraphicsPipelineDesc& source, const PsoCacheKey& key) {
+    // D3D11 streams out of the vertex shader through a "geometry shader"
+    // made of vertex shader code (CreateGeometryShaderWithStreamOutput);
+    // D3D12 takes the declaration without a geometry shader.
+    GraphicsPipelineDesc withoutGs;
+    const bool vertexStreamOut = source.gsBytecode && dxbc::programType(source.gsBytecode, source.gsBytecodeSize) == 1;
+    if (vertexStreamOut) {
+      withoutGs = source;
+      withoutGs.gsBytecode = nullptr;
+      withoutGs.gsBytecodeSize = 0;
+    }
+    const GraphicsPipelineDesc& desc = vertexStreamOut ? withoutGs : source;
     const int64_t start = hitchTraceEnabled() ? hitchTimestamp() : 0;
     Rc<IBackendPipeline> pipeline;
     try {
@@ -4450,7 +4484,7 @@ namespace dxup::d3d12 {
     psoDesc.DSVFormat = desc.dsvFormat;
 
     psoDesc.SampleDesc.Count   = desc.sampleCount;
-    psoDesc.SampleDesc.Quality = 0;
+    psoDesc.SampleDesc.Quality = desc.sampleCount > 1 ? desc.sampleQuality : 0u;
     psoDesc.SampleMask         = desc.sampleMask;
 
     // Stream output
@@ -4462,7 +4496,8 @@ namespace dxup::d3d12 {
       for (uint32_t i = 0; i < desc.numSOEntries; i++) {
         soSemanticNames[i] = desc.soEntries[i].semanticName ? desc.soEntries[i].semanticName : "";
         soDecl[i].Stream         = desc.soEntries[i].stream;
-        soDecl[i].SemanticName   = soSemanticNames[i].c_str();
+        // A NULL name is a gap of componentCount components.
+        soDecl[i].SemanticName   = desc.soEntries[i].semanticName ? soSemanticNames[i].c_str() : nullptr;
         soDecl[i].SemanticIndex  = desc.soEntries[i].semanticIndex;
         soDecl[i].StartComponent = desc.soEntries[i].startComponent;
         soDecl[i].ComponentCount = desc.soEntries[i].componentCount;

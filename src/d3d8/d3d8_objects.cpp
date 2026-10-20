@@ -2,6 +2,7 @@
 
 #include "d3d8_objects.h"
 
+#include "../legacy/d3d9_shader.h"
 #include "../legacy/legacy_formats.h"
 #include "../util/util_types.h"
 
@@ -11,6 +12,9 @@
 #include <string>
 
 namespace dxup::d3d8 {
+
+  // How far a shader's end token is looked for (as the Direct3D 9 layer).
+  constexpr size_t kMaxShaderTokens = size_t(1) << 20;
 
   void logUnsupported(const char* what) {
     static std::mutex mutex;
@@ -816,13 +820,9 @@ namespace dxup::d3d8 {
       return hr;
     if (function) {
       // vs_1_1 of Direct3D 9 declares its inputs: dcl for each register.
-      size_t length = 1;
-      while (function[length] != 0x0000ffffu) {
-        if ((function[length] & 0xffff) == 0xfffe)
-          length += (function[length] >> 16) & 0x7fff;
-        length++;
-      }
-      length++;
+      const size_t length = legacy::shaderTokenCount9(reinterpret_cast<const uint32_t*>(function), kMaxShaderTokens);
+      if (!length)
+        return D3DERR_INVALIDCALL;
       shader->function.assign(function, function + length);
       std::vector<DWORD> tokens;
       tokens.push_back(function[0]);
@@ -954,13 +954,9 @@ namespace dxup::d3d8 {
     if (!function || !handle)
       return D3DERR_INVALIDCALL;
     auto shader = std::make_unique<PixelShader>();
-    size_t length = 1;
-    while (function[length] != 0x0000ffffu) {
-      if ((function[length] & 0xffff) == 0xfffe)
-        length += (function[length] >> 16) & 0x7fff;
-      length++;
-    }
-    length++;
+    const size_t length = legacy::shaderTokenCount9(reinterpret_cast<const uint32_t*>(function), kMaxShaderTokens);
+    if (!length)
+      return D3DERR_INVALIDCALL;
     shader->function.assign(function, function + length);
     // ps.1.0 is ps_1_1 for Direct3D 9.
     std::vector<DWORD> tokens = shader->function;

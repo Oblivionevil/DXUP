@@ -1888,6 +1888,8 @@ namespace dxup {
       imageDesc.format    = format;
       imageDesc.bindFlags = (texDesc.BindFlags & D3D11_BIND_SHADER_RESOURCE)
         ? BindFlags::RenderTarget | BindFlags::ShaderResource : BindFlags::RenderTarget;
+      // Swap chain buffers take sRGB views of their UNORM format.
+      imageDesc.miscFlags = kResourceMiscCastable;
       const UINT current = m_realSwapChain->GetCurrentBackBufferIndex() % bufferCount;
       auto image = std::make_shared<d3d12::D3D12BackendImage>(m_directBuffers[current], imageDesc);
       image->setCurrentState(D3D12_RESOURCE_STATE_PRESENT);
@@ -2593,12 +2595,12 @@ namespace dxup {
 
 
   // ============================================================
-  // DXGIDevice : IDXGIDevice2
+  // DXGIDevice : IDXGIDevice4
   //
   // Wraps our D3D11Device as a DXGI device. Games use this to
   // navigate from ID3D11Device -> IDXGIDevice -> IDXGIAdapter.
   // ============================================================
-  class DXGIDevice : public IDXGIDevice2 {
+  class DXGIDevice : public IDXGIDevice4 {
   public:
     DXGIDevice(D3D11Device* d3d11Device, DXGIAdapter* adapter)
     : m_d3d11Device(d3d11Device)
@@ -2620,8 +2622,10 @@ namespace dxup {
       if (riid == __uuidof(IDXGIObject)
        || riid == __uuidof(IDXGIDevice)
        || riid == __uuidof(IDXGIDevice1)
-       || riid == __uuidof(IDXGIDevice2)) {
-        *ppvObject = static_cast<IDXGIDevice2*>(this);
+       || riid == __uuidof(IDXGIDevice2)
+       || riid == __uuidof(IDXGIDevice3)
+       || riid == __uuidof(IDXGIDevice4)) {
+        *ppvObject = static_cast<IDXGIDevice4*>(this);
         AddRef();
         return S_OK;
       }
@@ -2776,9 +2780,46 @@ namespace dxup {
       return S_OK;
     }
 
+    // Signalled once the GPU has finished all work submitted so far.
     HRESULT STDMETHODCALLTYPE EnqueueSetEvent(HANDLE hEvent) override {
       if (!hEvent) return E_INVALIDARG;
-      SetEvent(hEvent);
+      ComPtr<ID3D11DeviceContext> context;
+      ComPtr<ID3D11DeviceContext3> context3;
+      if (m_d3d11Device)
+        m_d3d11Device->GetImmediateContext(context.GetAddressOf());
+      if (context && SUCCEEDED(context.As(&context3)))
+        context3->Flush1(D3D11_CONTEXT_TYPE_ALL, hEvent);
+      else
+        SetEvent(hEvent);
+      return S_OK;
+    }
+
+    // ---- IDXGIDevice3 ----
+
+    // Driver-internal memory: nothing to give back.
+    void STDMETHODCALLTYPE Trim() override {}
+
+    // ---- IDXGIDevice4 ----
+
+    HRESULT STDMETHODCALLTYPE OfferResources1(
+        UINT                 NumResources,
+        IDXGIResource* const* ppResources,
+        DXGI_OFFER_RESOURCE_PRIORITY Priority,
+        UINT                 Flags) override {
+      (void)Flags;
+      return OfferResources(NumResources, ppResources, Priority);
+    }
+
+    // Offered resources keep their contents.
+    HRESULT STDMETHODCALLTYPE ReclaimResources1(
+        UINT                 NumResources,
+        IDXGIResource* const* ppResources,
+        DXGI_RECLAIM_RESOURCE_RESULTS* pResults) override {
+      (void)ppResources;
+      if (pResults) {
+        for (UINT i = 0; i < NumResources; i++)
+          pResults[i] = DXGI_RECLAIM_RESOURCE_RESULT_OK;
+      }
       return S_OK;
     }
 

@@ -77,6 +77,17 @@ namespace dxup::d3d12::dxbc {
     return false;
   }
 
+  // The program type of DXBC code (0 pixel, 1 vertex, 2 geometry, 3 hull,
+  // 4 domain, 5 compute); -1 without readable code.
+  inline int programType(const void* code, size_t size) {
+    const uint32_t types[] = { fourcc('S', 'H', 'E', 'X'), fourcc('S', 'H', 'D', 'R') };
+    uint32_t type = 0, dataSize = 0;
+    const uint8_t* data = nullptr;
+    if (!findChunk(code, size, types, 2, type, data, dataSize) || dataSize < 4)
+      return -1;
+    return int(readU32(data) >> 16);
+  }
+
   inline uint32_t elementSize(uint32_t chunk) {
     return chunk == kISG1 || chunk == kOSG1 ? 32u : chunk == kOSG5 ? 28u : 24u;
   }

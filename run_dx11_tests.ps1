@@ -103,7 +103,9 @@ function Assert-CleanRuntimeLog {
     'DEVICE (ALREADY )?REMOVED',
     'GPU fence wait TIMED OUT'
   )
-  $fatalLines = Select-String -LiteralPath $Path -Pattern $fatalPatterns
+  # native_fallback makes DXUP's device creation fail on purpose.
+  $fatalLines = Select-String -LiteralPath $Path -Pattern $fatalPatterns |
+    Where-Object { $_.Line -notmatch 'D3D11CreateDevice failed: DXUP_FAIL_D3D12' }
   if ($fatalLines) {
     $preview = ($fatalLines | Select-Object -First 8 | ForEach-Object { $_.Line }) -join [Environment]::NewLine
     throw "$Label emitted fatal runtime diagnostics despite a zero process exit code:`n$preview`nSee $Path"

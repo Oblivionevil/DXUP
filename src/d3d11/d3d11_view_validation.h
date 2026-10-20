@@ -170,6 +170,19 @@ namespace dxup {
       return E_INVALIDARG;
     if (format == info.format)
       return S_OK;
+    // Video textures are viewed per plane: luma and chroma formats.
+    switch (info.format) {
+      case DXGI_FORMAT_NV12:
+      case DXGI_FORMAT_NV11:
+        return format == DXGI_FORMAT_R8_UNORM || format == DXGI_FORMAT_R8_UINT
+          || format == DXGI_FORMAT_R8G8_UNORM || format == DXGI_FORMAT_R8G8_UINT ? S_OK : E_INVALIDARG;
+      case DXGI_FORMAT_P010:
+      case DXGI_FORMAT_P016:
+        return format == DXGI_FORMAT_R16_UNORM || format == DXGI_FORMAT_R16_UINT
+          || format == DXGI_FORMAT_R16G16_UNORM || format == DXGI_FORMAT_R16G16_UINT ? S_OK : E_INVALIDARG;
+      default:
+        break;
+    }
     if (info.swapChainBuffer)
       return getFormatFamily(format) == getFormatFamily(info.format) ? S_OK : E_INVALIDARG;
     return isFamilyOnlyFormat(info.format) && getFormatFamily(format) == info.format ? S_OK : E_INVALIDARG;
@@ -183,8 +196,19 @@ namespace dxup {
     return count && count <= total - first;
   }
 
-  inline bool checkArrayRange(UINT total, UINT first, UINT count) {
+  // A count of -1 is every slice from first on (as the SDK's CD3D11_*
+  // helpers pass by default).
+  inline bool checkArrayRange(UINT total, UINT first, UINT& count) {
+    if (count == UINT(-1) && first < total)
+      count = total - first;
     return count && first < total && count <= total - first;
+  }
+
+  // NumCubes of -1: every whole cube from the first face on.
+  inline bool resolveCubeCount(UINT arraySize, UINT firstFace, UINT& cubes) {
+    if (cubes == UINT(-1) && firstFace < arraySize)
+      cubes = (arraySize - firstFace) / 6;
+    return true;
   }
 
   using FormatSupportQuery = std::function<UINT(DXGI_FORMAT)>;
@@ -334,6 +358,7 @@ namespace dxup {
           case D3D11_SRV_DIMENSION_TEXTURECUBEARRAY:
             return cube && info.samples == 1
                 && checkMipRange(info.mipLevels, out.TextureCubeArray.MostDetailedMip, out.TextureCubeArray.MipLevels)
+                && resolveCubeCount(info.arraySize, out.TextureCubeArray.First2DArrayFace, out.TextureCubeArray.NumCubes)
                 && out.TextureCubeArray.NumCubes && out.TextureCubeArray.First2DArrayFace < info.arraySize
                 && UINT64(out.TextureCubeArray.NumCubes) * 6 <= info.arraySize - out.TextureCubeArray.First2DArrayFace
               ? S_OK : E_INVALIDARG;
