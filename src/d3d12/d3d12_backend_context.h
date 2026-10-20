@@ -245,6 +245,10 @@ namespace dxup::d3d12 {
     void setPredication(IBackendQuery* predicate, bool value) override;
     void executeCommandList(const Rc<IBackendCommandList>& list) override;
     void suspendPredication(bool suspended) override;
+    // DXUP's own copies and clears run whatever the application's predicate
+    // says: pausePredication returns whether to resume it after them.
+    bool pausePredication();
+    void resumePredication(bool paused);
     void setImageMinLod(IBackendImage* image, float minLod) override;
     void retargetImage(IBackendImage* image, IUnknown* resource) override;
     void trackSwapChainBuffer(IUnknown* resource) override;
@@ -380,7 +384,8 @@ namespace dxup::d3d12 {
     };
 
     // Set once device is removed — all operations become no-ops
-    bool m_deviceRemoved = false;
+    // Read by mapBuffer on the application thread while the CS thread records.
+    std::atomic<bool> m_deviceRemoved{false};
 
     // Copy-only contexts skip ring allocator (always sync after each flush)
     bool m_copyOnly = false;
@@ -532,7 +537,8 @@ namespace dxup::d3d12 {
 
     // Fence value covering each recent frame's work, indexed by present
     // count, for the D3D11 maximum frame latency (at most 16 frames).
-    static constexpr uint32_t         kPresentFenceHistory = 16;
+    // More than the 16 frames DXGI lets queue: frame n - 1 - 16 must still be there.
+    static constexpr uint32_t         kPresentFenceHistory = 32;
     std::array<uint64_t, kPresentFenceHistory> m_presentFenceValues = {};
     uint64_t                          m_presentCount = 0;
     HANDLE                            m_frameLatencyEvent = nullptr;
@@ -1060,11 +1066,13 @@ namespace dxup::d3d12 {
     std::unique_ptr<upscale::Upscaler> m_upscaler;
     // Created on a thread of its own (FSR and XeSS compile their pipelines
     // for hundreds of milliseconds): the game's pass runs until it is there.
+    // Not std::async: its threads take the game's default stack size.
     struct PendingUpscaler {
       std::unique_ptr<upscale::Upscaler> upscaler;
       std::string error;
     };
     std::future<PendingUpscaler> m_upscalerPending;
+    Thread                      m_upscalerThread;
     upscale::Kind               m_upscalerKind = upscale::Kind::Off;
     uint32_t                    m_upscalerSize[4] = {};   // render and output width, height
     bool                        m_upscalerFailed = false;
@@ -1116,6 +1124,7 @@ namespace dxup::d3d12 {
     // Reused for every mip: render target views are read when bound.
     D3D12_CPU_DESCRIPTOR_HANDLE m_mipGenRtv = {};
     D3D12_CPU_DESCRIPTOR_HANDLE m_lazyClearRtv = {};
+    D3D12_CPU_DESCRIPTOR_HANDLE m_nullRtv = {};   // holes between render targets
     void initMipGenResources();
 
     // Forced multisampling passes: a fullscreen triangle reads one image and
@@ -1239,9 +1248,6 @@ namespace dxup::d3d12 {
     void transitionStreamOutputCounter(D3D12BackendBuffer* buffer, D3D12_RESOURCE_STATES state);
 
     // Overlay upload buffer (persistent, mapped once)
-    ComPtr<ID3D12Resource> m_overlayUploadBuffer;
-    void* m_overlayUploadMapped = nullptr;
-    uint32_t m_overlayUploadCapacity = 0;
 
     // Per-command-allocator upload scratch buffers for frequent
     // UpdateSubresource buffer updates. A slot is reset only after the matching

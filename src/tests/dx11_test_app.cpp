@@ -403,6 +403,10 @@ void main(uint2 id : SV_DispatchThreadID) {
         {"dxgi_device_interfaces", &Dx11TestApp::testDxgiDeviceInterfaces},
         {"swap_chain_buffer_index", &Dx11TestApp::testSwapChainBufferIndex},
         {"context_interfaces", &Dx11TestApp::testContextInterfaces},
+        {"render_target_hole", &Dx11TestApp::testRenderTargetHole},
+        {"large_constant_buffer", &Dx11TestApp::testLargeConstantBuffer},
+        {"tbuffer_read", &Dx11TestApp::testTbufferRead},
+        {"query_released_while_active", &Dx11TestApp::testQueryReleasedWhileActive},
         {"dxgi_object_identity", &Dx11TestApp::testDxgiObjectIdentity},
         {"geometry_stream_output_draw_auto", &Dx11TestApp::testGeometryStreamOutputDrawAuto},
         {"stream_output_per_buffer_size", &Dx11TestApp::testStreamOutputPerBufferSize},
@@ -4972,6 +4976,209 @@ float4 main(float4 position : SV_Position) : SV_Target { return float4(1.0f, 1.0
         if (FAILED(hr) || !found.Width) {
           error = "FindClosestMatchingMode1 with the device failed: " + formatHResult(hr);
           return false;
+        }
+      }
+      return true;
+    }
+
+    // Occlusion queries released between Begin and End; the next ones work.
+    bool testQueryReleasedWhileActive(std::string& error) {
+      D3D11_QUERY_DESC desc = { D3D11_QUERY_OCCLUSION, 0 };
+      for (int i = 0; i < 8; i++) {
+        ComPtr<ID3D11Query> dropped;
+        if (FAILED(m_device->CreateQuery(&desc, dropped.GetAddressOf()))) {
+          error = "CreateQuery failed";
+          return false;
+        }
+        m_context->Begin(dropped.Get());
+      }
+      m_context->Flush();
+      ComPtr<ID3D11Query> query;
+      if (FAILED(m_device->CreateQuery(&desc, query.GetAddressOf()))) {
+        error = "CreateQuery failed";
+        return false;
+      }
+      m_context->Begin(query.Get());
+      m_context->End(query.Get());
+      UINT64 samples = ~0ull;
+      HRESULT hr = S_FALSE;
+      for (int tries = 0; tries < 2000 && hr == S_FALSE; tries++) {
+        hr = m_context->GetData(query.Get(), &samples, sizeof(samples), 0);
+        if (hr == S_FALSE)
+          Sleep(1);
+      }
+      if (hr != S_OK || samples != 0) {
+        error = formatString("the next query: hr %s, %llu samples", formatHResult(hr).c_str(),
+          static_cast<unsigned long long>(samples));
+        return false;
+      }
+      return true;
+    }
+
+    // A tbuffer is a buffer view at t#.
+    bool testTbufferRead(std::string& error) {
+      static const char* kCs = R"(
+        tbuffer Values : register(t0) { float4 v[2]; };
+        RWBuffer<float> result : register(u0);
+        [numthreads(1, 1, 1)] void main() { result[0] = v[1].y; result[1] = v[0].w; })";
+      ComPtr<ID3D11ComputeShader> cs;
+      if (!createComputeShader(kCs, "main", cs, error))
+        return false;
+      const float values[8] = { 1, 2, 3, 4, 5, 6, 7, 8 };
+      D3D11_BUFFER_DESC tbDesc = { sizeof(values), D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, 0, 0 };
+      D3D11_SUBRESOURCE_DATA init = { values, 0, 0 };
+      D3D11_BUFFER_DESC resultDesc = { 16, D3D11_USAGE_DEFAULT, D3D11_BIND_UNORDERED_ACCESS, 0, 0, 0 };
+      D3D11_BUFFER_DESC readDesc = { 16, D3D11_USAGE_STAGING, 0, D3D11_CPU_ACCESS_READ, 0, 0 };
+      ComPtr<ID3D11Buffer> tb, resultBuffer, readBuffer;
+      ComPtr<ID3D11ShaderResourceView> srv;
+      ComPtr<ID3D11UnorderedAccessView> uav;
+      D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+      srvDesc.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+      srvDesc.ViewDimension = D3D11_SRV_DIMENSION_BUFFER;
+      srvDesc.Buffer.NumElements = 2;
+      D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc = {};
+      uavDesc.Format = DXGI_FORMAT_R32_FLOAT;
+      uavDesc.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
+      uavDesc.Buffer.NumElements = 4;
+      HRESULT hr = m_device->CreateBuffer(&tbDesc, &init, tb.GetAddressOf());
+      if (SUCCEEDED(hr)) hr = m_device->CreateShaderResourceView(tb.Get(), &srvDesc, srv.GetAddressOf());
+      if (SUCCEEDED(hr)) hr = m_device->CreateBuffer(&resultDesc, nullptr, resultBuffer.GetAddressOf());
+      if (SUCCEEDED(hr)) hr = m_device->CreateBuffer(&readDesc, nullptr, readBuffer.GetAddressOf());
+      if (SUCCEEDED(hr)) hr = m_device->CreateUnorderedAccessView(resultBuffer.Get(), &uavDesc, uav.GetAddressOf());
+      if (FAILED(hr)) {
+        error = "buffers failed: " + formatHResult(hr);
+        return false;
+      }
+      m_context->CSSetShader(cs.Get(), nullptr, 0);
+      m_context->CSSetShaderResources(0, 1, srv.GetAddressOf());
+      m_context->CSSetUnorderedAccessViews(0, 1, uav.GetAddressOf(), nullptr);
+      m_context->Dispatch(1, 1, 1);
+      ID3D11ShaderResourceView* nullSrv = nullptr;
+      ID3D11UnorderedAccessView* nullUav = nullptr;
+      m_context->CSSetShaderResources(0, 1, &nullSrv);
+      m_context->CSSetUnorderedAccessViews(0, 1, &nullUav, nullptr);
+      m_context->CopyResource(readBuffer.Get(), resultBuffer.Get());
+      D3D11_MAPPED_SUBRESOURCE mapped = {};
+      if (FAILED(hr = m_context->Map(readBuffer.Get(), 0, D3D11_MAP_READ, 0, &mapped))) {
+        error = "Map failed: " + formatHResult(hr);
+        return false;
+      }
+      const float a = static_cast<const float*>(mapped.pData)[0], b = static_cast<const float*>(mapped.pData)[1];
+      m_context->Unmap(readBuffer.Get(), 0);
+      if (a != 6.0f || b != 4.0f) {
+        error = formatString("read %g and %g, expected 6 and 4", a, b);
+        return false;
+      }
+      return true;
+    }
+
+    // A constant buffer of 128 KB bound whole: shaders see its first 4096
+    // constants.
+    bool testLargeConstantBuffer(std::string& error) {
+      static const char* kCs = R"(
+        cbuffer Big : register(b0) { uint4 c[4096]; };
+        RWBuffer<uint> result : register(u0);
+        [numthreads(1, 1, 1)] void main() { result[0] = c[0].x; result[1] = c[4095].w; })";
+      ComPtr<ID3D11ComputeShader> cs;
+      if (!createComputeShader(kCs, "main", cs, error))
+        return false;
+      std::vector<uint32_t> constants(32768);
+      for (uint32_t i = 0; i < constants.size(); i++)
+        constants[i] = i * 3 + 1;
+      D3D11_BUFFER_DESC cbDesc = { UINT(constants.size() * 4), D3D11_USAGE_DEFAULT, D3D11_BIND_CONSTANT_BUFFER, 0, 0, 0 };
+      D3D11_SUBRESOURCE_DATA init = { constants.data(), 0, 0 };
+      D3D11_BUFFER_DESC resultDesc = { 16, D3D11_USAGE_DEFAULT, D3D11_BIND_UNORDERED_ACCESS, 0, 0, 0 };
+      D3D11_BUFFER_DESC readDesc = { 16, D3D11_USAGE_STAGING, 0, D3D11_CPU_ACCESS_READ, 0, 0 };
+      ComPtr<ID3D11Buffer> cb, resultBuffer, readBuffer;
+      ComPtr<ID3D11UnorderedAccessView> uav;
+      D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc = {};
+      uavDesc.Format = DXGI_FORMAT_R32_UINT;
+      uavDesc.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
+      uavDesc.Buffer.NumElements = 4;
+      HRESULT hr = m_device->CreateBuffer(&cbDesc, &init, cb.GetAddressOf());
+      if (SUCCEEDED(hr)) hr = m_device->CreateBuffer(&resultDesc, nullptr, resultBuffer.GetAddressOf());
+      if (SUCCEEDED(hr)) hr = m_device->CreateBuffer(&readDesc, nullptr, readBuffer.GetAddressOf());
+      if (SUCCEEDED(hr)) hr = m_device->CreateUnorderedAccessView(resultBuffer.Get(), &uavDesc, uav.GetAddressOf());
+      if (FAILED(hr)) {
+        error = "buffers failed: " + formatHResult(hr);
+        return false;
+      }
+      m_context->CSSetShader(cs.Get(), nullptr, 0);
+      m_context->CSSetConstantBuffers(0, 1, cb.GetAddressOf());
+      m_context->CSSetUnorderedAccessViews(0, 1, uav.GetAddressOf(), nullptr);
+      m_context->Dispatch(1, 1, 1);
+      ID3D11Buffer* nullBuffer = nullptr;
+      ID3D11UnorderedAccessView* nullUav = nullptr;
+      m_context->CSSetConstantBuffers(0, 1, &nullBuffer);
+      m_context->CSSetUnorderedAccessViews(0, 1, &nullUav, nullptr);
+      m_context->CopyResource(readBuffer.Get(), resultBuffer.Get());
+      D3D11_MAPPED_SUBRESOURCE mapped = {};
+      if (FAILED(hr = m_context->Map(readBuffer.Get(), 0, D3D11_MAP_READ, 0, &mapped))) {
+        error = "Map failed: " + formatHResult(hr);
+        return false;
+      }
+      const uint32_t first = static_cast<const uint32_t*>(mapped.pData)[0];
+      const uint32_t last = static_cast<const uint32_t*>(mapped.pData)[1];
+      m_context->Unmap(readBuffer.Get(), 0);
+      if (first != constants[0] || last != constants[4095 * 4 + 3]) {
+        error = formatString("read %u and %u, expected %u and %u", first, last, constants[0], constants[4095 * 4 + 3]);
+        return false;
+      }
+      return true;
+    }
+
+    // Render targets with an empty slot between them: the second one is
+    // drawn, the empty slot takes nothing.
+    bool testRenderTargetHole(std::string& error) {
+      static const char* kVs = "float4 main(uint id : SV_VertexID) : SV_Position {"
+        " float2 p = float2((id << 1) & 2, id & 2); return float4(p * float2(2, -2) + float2(-1, 1), 0, 1); }";
+      static const char* kPs = "struct O { float4 a : SV_Target0; float4 b : SV_Target2; };"
+        " O main() { O o; o.a = float4(1, 0, 0, 1); o.b = float4(0, 0.5, 1, 1); return o; }";
+      ComPtr<ID3D11VertexShader> vs;
+      ComPtr<ID3DBlob> vsBytecode;
+      ComPtr<ID3D11PixelShader> ps;
+      if (!createVertexShader(kVs, "main", vs, vsBytecode, error) || !createPixelShader(kPs, "main", ps, error))
+        return false;
+      D3D11_TEXTURE2D_DESC desc = { 8, 8, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, { 1, 0 }, D3D11_USAGE_DEFAULT,
+                                    D3D11_BIND_RENDER_TARGET, 0, 0 };
+      ComPtr<ID3D11Texture2D> first, third, staging;
+      ComPtr<ID3D11RenderTargetView> firstRtv, thirdRtv;
+      HRESULT hr = m_device->CreateTexture2D(&desc, nullptr, first.GetAddressOf());
+      if (SUCCEEDED(hr)) hr = m_device->CreateTexture2D(&desc, nullptr, third.GetAddressOf());
+      if (SUCCEEDED(hr)) hr = m_device->CreateRenderTargetView(first.Get(), nullptr, firstRtv.GetAddressOf());
+      if (SUCCEEDED(hr)) hr = m_device->CreateRenderTargetView(third.Get(), nullptr, thirdRtv.GetAddressOf());
+      desc.Usage = D3D11_USAGE_STAGING;
+      desc.BindFlags = 0;
+      desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+      if (SUCCEEDED(hr)) hr = m_device->CreateTexture2D(&desc, nullptr, staging.GetAddressOf());
+      if (FAILED(hr)) {
+        error = "targets failed: " + formatHResult(hr);
+        return false;
+      }
+      ID3D11RenderTargetView* targets[3] = { firstRtv.Get(), nullptr, thirdRtv.Get() };
+      m_context->ClearState();
+      m_context->OMSetRenderTargets(3, targets, nullptr);
+      setViewport(8, 8);
+      m_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+      m_context->VSSetShader(vs.Get(), nullptr, 0);
+      m_context->PSSetShader(ps.Get(), nullptr, 0);
+      m_context->Draw(3, 0);
+      m_context->ClearState();
+      for (int i = 0; i < 2; i++) {
+        m_context->CopyResource(staging.Get(), i ? third.Get() : first.Get());
+        D3D11_MAPPED_SUBRESOURCE mapped = {};
+        if (FAILED(hr = m_context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped))) {
+          error = "Map failed: " + formatHResult(hr);
+          return false;
+        }
+        const uint32_t texel = *static_cast<const uint32_t*>(mapped.pData);
+        m_context->Unmap(staging.Get(), 0);
+        const uint32_t expected = i ? 0xffff8000u : 0xff0000ffu;
+        if ((texel & 0xffff00ffu) != (expected & 0xffff00ffu) || ((texel >> 8) & 0xff) < 0x7e || ((texel >> 8) & 0xff) > 0x81) {
+          if (i || texel != expected) {
+            error = formatString("target %d reads %08X, expected %08X", i ? 2 : 0, texel, expected);
+            return false;
+          }
         }
       }
       return true;
@@ -13546,6 +13753,66 @@ float4 main(float4 position : SV_Position) : SV_Target { return color; }
         if (!ok) {
           error = formatString("%s cleared texel 0x%016llx", wide ? "D32S8" : "D24S8", static_cast<unsigned long long>(texel));
           return false;
+        }
+
+        // Depth-stencil to depth-stencil copies take both planes.
+        ComPtr<ID3D11Texture2D> copy;
+        if (FAILED(hr = m_device->CreateTexture2D(&desc, nullptr, copy.GetAddressOf()))) {
+          error = "CreateTexture2D(depth copy) failed: " + formatHResult(hr);
+          return false;
+        }
+        m_context->CopySubresourceRegion(copy.Get(), 0, 0, 0, 0, depth.Get(), 0, nullptr);
+        m_context->CopyResource(staging.Get(), copy.Get());
+        if (FAILED(hr = m_context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped))) {
+          error = "Map(depth copy) failed: " + formatHResult(hr);
+          return false;
+        }
+        uint64_t copied = 0;
+        std::memcpy(&copied, static_cast<const uint8_t*>(mapped.pData) + 7 * mapped.RowPitch + 9 * texelSize, texelSize);
+        m_context->Unmap(staging.Get(), 0);
+        if (copied != texel) {
+          error = formatString("%s copied texel 0x%016llx, expected 0x%016llx", wide ? "D32S8" : "D24S8",
+            static_cast<unsigned long long>(copied), static_cast<unsigned long long>(texel));
+          return false;
+        }
+
+        // The second level of a mipmapped depth buffer into a one-level
+        // staging texture: its own stencil.
+        {
+          D3D11_TEXTURE2D_DESC mipped = desc;
+          mipped.MipLevels = 2;
+          ComPtr<ID3D11Texture2D> levels, levelStaging;
+          ComPtr<ID3D11DepthStencilView> level0, level1;
+          D3D11_DEPTH_STENCIL_VIEW_DESC dsvDesc = {};
+          dsvDesc.Format = format;
+          dsvDesc.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
+          D3D11_TEXTURE2D_DESC smallDesc = stagingDesc;
+          smallDesc.Width = 16;
+          smallDesc.Height = 8;
+          hr = m_device->CreateTexture2D(&mipped, nullptr, levels.GetAddressOf());
+          if (SUCCEEDED(hr)) hr = m_device->CreateDepthStencilView(levels.Get(), &dsvDesc, level0.GetAddressOf());
+          dsvDesc.Texture2D.MipSlice = 1;
+          if (SUCCEEDED(hr)) hr = m_device->CreateDepthStencilView(levels.Get(), &dsvDesc, level1.GetAddressOf());
+          if (SUCCEEDED(hr)) hr = m_device->CreateTexture2D(&smallDesc, nullptr, levelStaging.GetAddressOf());
+          if (FAILED(hr)) {
+            error = "mipmapped depth setup failed: " + formatHResult(hr);
+            return false;
+          }
+          m_context->ClearDepthStencilView(level0.Get(), D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 0.25f, 0x5A);
+          m_context->ClearDepthStencilView(level1.Get(), D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 0.25f, 0x33);
+          m_context->CopySubresourceRegion(levelStaging.Get(), 0, 0, 0, 0, levels.Get(), 1, nullptr);
+          if (FAILED(hr = m_context->Map(levelStaging.Get(), 0, D3D11_MAP_READ, 0, &mapped))) {
+            error = "Map(level copy) failed: " + formatHResult(hr);
+            return false;
+          }
+          uint64_t level = 0;
+          std::memcpy(&level, static_cast<const uint8_t*>(mapped.pData) + 3 * mapped.RowPitch + 5 * texelSize, texelSize);
+          m_context->Unmap(levelStaging.Get(), 0);
+          const uint8_t stencil = wide ? uint8_t(level >> 32) : uint8_t(level >> 24);
+          if (stencil != 0x33) {
+            error = formatString("%s level 1 copied stencil 0x%02x, expected 0x33", wide ? "D32S8" : "D24S8", stencil);
+            return false;
+          }
         }
 
         // Initial data goes to the depth buffer and comes back.

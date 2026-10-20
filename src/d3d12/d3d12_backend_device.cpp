@@ -187,9 +187,9 @@ namespace dxup::d3d12 {
         uint32_t endSlot = bindDesc.BindPoint + (std::max)(bindDesc.BindCount, 1u);
         switch (bindDesc.Type) {
           case D3D_SIT_CBUFFER:
-          case D3D_SIT_TBUFFER:
             limits.cbvCount = (std::max)(limits.cbvCount, endSlot);
             break;
+          case D3D_SIT_TBUFFER:   // a buffer view at t#: an SRV
           case D3D_SIT_TEXTURE:
           case D3D_SIT_STRUCTURED:
           case D3D_SIT_BYTEADDRESS:
@@ -2058,7 +2058,7 @@ namespace dxup::d3d12 {
         char adapterName[256];
         WideCharToMultiByte(CP_UTF8, 0, desc.Description, -1, adapterName, sizeof(adapterName), nullptr, nullptr);
         logMessage(LogLevel::Info, "Adapter[%u]: %s (VRAM: %llu MB, Flags: 0x%x)",
-          i, adapterName, desc.DedicatedVideoMemory / (1024 * 1024), desc.Flags);
+          i, adapterName, static_cast<unsigned long long>(desc.DedicatedVideoMemory / (1024 * 1024)), desc.Flags);
 
         if (!acceptsAdapter(desc)) {
           logMessage(LogLevel::Debug, "  Skipping adapter");
@@ -2933,7 +2933,7 @@ namespace dxup::d3d12 {
       static uint32_t s_bufCount = 0;
       s_bufCount++;
       char tag[64];
-      snprintf(tag, sizeof(tag), "createBuffer#%u-%lluB-flags0x%x", s_bufCount, desc.size, static_cast<uint32_t>(desc.bindFlags));
+      snprintf(tag, sizeof(tag), "createBuffer#%u-%lluB-flags0x%x", s_bufCount, static_cast<unsigned long long>(desc.size), static_cast<uint32_t>(desc.bindFlags));
       flushAndCheckGpu(tag);
     }
 
@@ -4552,7 +4552,7 @@ namespace dxup::d3d12 {
     // The in-memory key is entirely content-based and therefore also provides
     // a stable cross-run key for the driver PSO blob cache.
     // Pipelines with masked pixel shader outputs get blobs of their own.
-    size_t psoKeyHash = PsoDiskKeyHash{}(cacheKey) ^ kRootSignatureLayoutVersion
+    uint64_t psoKeyHash = PsoDiskKeyHash{}(cacheKey) ^ kRootSignatureLayoutVersion
       ^ (outputsMasked ? kPixelOutputMaskVersion : 0);
 
     const std::vector<uint8_t> diskBlob = takePsoDiskBlob(psoKeyHash);
@@ -4580,14 +4580,12 @@ namespace dxup::d3d12 {
 
     // If cached blob was stale (driver update etc.), retry without it
     if (FAILED(hr) && hadDiskCache) {
-      logMessage(LogLevel::Warn, "PSO disk cache: cached blob failed, retrying without cache hash=%zx", psoKeyHash);
+      logMessage(LogLevel::Warn, "PSO disk cache: cached blob failed, retrying without cache hash=%llx",
+        static_cast<unsigned long long>(psoKeyHash));
       psoDesc.CachedPSO = {};
       rawPso = nullptr;
       hr = safeCreateGraphicsPSO(m_device.Get(), &psoDesc, &rawPso);
-      char staleFile[64];
-      snprintf(staleFile, sizeof(staleFile), "%zx.pso", psoKeyHash);
-      std::string stalePath = m_psoDiskCacheDir + "\\" + staleFile;
-      DeleteFileA(stalePath.c_str());
+      DeleteFileA(psoDiskPath(psoKeyHash).c_str());
       hadDiskCache = false;
     }
 
@@ -4878,8 +4876,8 @@ namespace dxup::d3d12 {
 
     // Namespace compute entries away from the graphics-key hash while keeping
     // the existing on-disk filename format stable.
-    size_t psoKeyHash = ComputePsoCacheHash{}(cacheKey)
-      ^ static_cast<size_t>(0xC04E50534F434143ull) ^ kRootSignatureLayoutVersion;
+    uint64_t psoKeyHash = ComputePsoCacheHash::hash64(cacheKey)
+      ^ 0xC04E50534F434143ull ^ kRootSignatureLayoutVersion;
     const std::vector<uint8_t> diskBlob = takePsoDiskBlob(psoKeyHash);
     bool hadDiskCache = !diskBlob.empty();
     if (hadDiskCache) {
@@ -4891,16 +4889,13 @@ namespace dxup::d3d12 {
     HRESULT hr = m_device->CreateComputePipelineState(&psoDesc, IID_PPV_ARGS(&pso));
     if (FAILED(hr) && hadDiskCache) {
       logMessage(LogLevel::Warn,
-        "Compute PSO disk cache: cached blob failed, retrying without cache hash=%zx",
-        psoKeyHash);
+        "Compute PSO disk cache: cached blob failed, retrying without cache hash=%llx",
+        static_cast<unsigned long long>(psoKeyHash));
       psoDesc.CachedPSO = {};
       pso.Reset();
       hr = m_device->CreateComputePipelineState(&psoDesc, IID_PPV_ARGS(&pso));
 
-      char staleFile[64];
-      snprintf(staleFile, sizeof(staleFile), "%zx.pso", psoKeyHash);
-      std::string stalePath = m_psoDiskCacheDir + "\\" + staleFile;
-      DeleteFileA(stalePath.c_str());
+      DeleteFileA(psoDiskPath(psoKeyHash).c_str());
       hadDiskCache = false;
     }
     if (FAILED(hr)) {
@@ -5292,7 +5287,13 @@ namespace dxup::d3d12 {
     return false;
   }
 
-  std::vector<uint8_t> D3D12BackendDevice::takePsoDiskBlob(size_t keyHash) {
+  std::string D3D12BackendDevice::psoDiskPath(uint64_t keyHash) const {
+    char filename[64];
+    snprintf(filename, sizeof(filename), "%llx.pso", static_cast<unsigned long long>(keyHash));
+    return m_psoDiskCacheDir + "\\" + filename;
+  }
+
+  std::vector<uint8_t> D3D12BackendDevice::takePsoDiskBlob(uint64_t keyHash) {
     // Each key is compiled once and then served from the in-memory PSO cache,
     // so the blob is moved out rather than copied.
     {
@@ -5307,14 +5308,12 @@ namespace dxup::d3d12 {
         return {};
     }
     // Listed at start, read now (on a compiler thread, mostly).
-    char filename[64];
-    snprintf(filename, sizeof(filename), "%zx.pso", keyHash);
     std::vector<uint8_t> blob;
-    readPsoFile(m_psoDiskCacheDir + "\\" + filename, blob);
+    readPsoFile(psoDiskPath(keyHash), blob);
     return blob;
   }
 
-  void D3D12BackendDevice::deferPsoBlobWrite(size_t keyHash, ID3D12PipelineState* pso) {
+  void D3D12BackendDevice::deferPsoBlobWrite(uint64_t keyHash, ID3D12PipelineState* pso) {
 #ifdef _WIN32
     if (m_psoDiskCacheDir.empty() || !pso)
       return;
@@ -5407,7 +5406,7 @@ namespace dxup::d3d12 {
       if (dotPos == std::string::npos) continue;
       std::string stem = name.substr(0, dotPos);
 
-      size_t hash = 0;
+      uint64_t hash = 0;
       try { hash = std::stoull(stem, nullptr, 16); }
       catch (...) { continue; }
 
@@ -5424,7 +5423,7 @@ namespace dxup::d3d12 {
 #endif
   }
 
-  void D3D12BackendDevice::savePsoBlobToDisk(size_t keyHash, ID3D12PipelineState* pso) {
+  void D3D12BackendDevice::savePsoBlobToDisk(uint64_t keyHash, ID3D12PipelineState* pso) {
 #ifdef _WIN32
     if (m_psoDiskCacheDir.empty() || !pso) return;
 
@@ -5436,16 +5435,14 @@ namespace dxup::d3d12 {
       return;
     }
 
-    char filename[64];
-    snprintf(filename, sizeof(filename), "%zx.pso", keyHash);
-    std::string path = m_psoDiskCacheDir + "\\" + filename;
+    const std::string path = psoDiskPath(keyHash);
 
     std::ofstream f(path, std::ios::binary);
     if (f) {
       f.write(static_cast<const char*>(rawBlob->GetBufferPointer()),
               static_cast<std::streamsize>(rawBlob->GetBufferSize()));
       logMessage(LogLevel::Debug, "PSO disk cache: saved %zu bytes to %s",
-        rawBlob->GetBufferSize(), filename);
+        rawBlob->GetBufferSize(), path.c_str());
     }
     rawBlob->Release();
 #endif

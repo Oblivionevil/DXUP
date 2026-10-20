@@ -1022,8 +1022,13 @@ namespace dxup::d3d12 {
     // destroying allocators, since all contexts share one command queue.
     if (m_fence && m_fenceValue > 0)
       synchronize();
-    // The upscaler's resources go while the device lives.
+    // The upscaler's resources go while the device lives, one still being
+    // made as well.
     m_upscaler.reset();
+    if (m_upscalerPending.valid())
+      m_upscalerPending.get();
+    if (m_upscalerThread.joinable())
+      m_upscalerThread.join();
 
     for (auto* query : m_activeQueries)
       query->m_context = nullptr;
@@ -1168,6 +1173,9 @@ namespace dxup::d3d12 {
 
       UINT size = static_cast<UINT>(d3d12Buffer->getDesc().size);
       size = (size + 255) & ~255u;  // CBV size must be 256-aligned
+      // Shaders see the first 4096 constants of larger buffers (D3D11), and
+      // a D3D12 CBV holds no more.
+      size = (std::min)(size, UINT(D3D12_REQ_CONSTANT_BUFFER_ELEMENT_COUNT * 16));
 
       D3D12_GPU_VIRTUAL_ADDRESS gpuAddress = d3d12Buffer->getGpuAddress();
       if (binding.bound && binding.gpuAddress == gpuAddress && binding.sizeInBytes == size)
@@ -1234,6 +1242,7 @@ namespace dxup::d3d12 {
         return;
       }
       byteSize = (byteSize + 255) & ~255u;  // CBV size must be 256-aligned
+      byteSize = (std::min)(byteSize, uint32_t(D3D12_REQ_CONSTANT_BUFFER_ELEMENT_COUNT * 16));
 
       D3D12_GPU_VIRTUAL_ADDRESS gpuAddress = d3d12Buffer->getGpuAddress() + byteOffset;
       if (binding.bound && binding.gpuAddress == gpuAddress && binding.sizeInBytes == byteSize)
@@ -2771,7 +2780,15 @@ namespace dxup::d3d12 {
 
     for (uint32_t i = 0; i < effectiveCount; i++) {
       if (!rtvs[i]) {
-        hasRtvHole = true;
+        // A null descriptor: writes there go nowhere (D3D11's empty slot).
+        if (!m_nullRtv.ptr) {
+          m_nullRtv = m_device->getDescriptorHeapManager().allocateRtv();
+          D3D12_RENDER_TARGET_VIEW_DESC nullDesc = {};
+          nullDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+          nullDesc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+          m_device->getDevice()->CreateRenderTargetView(nullptr, &nullDesc, m_nullRtv);
+        }
+        rtvHandles[i] = m_nullRtv;
         continue;
       }
       auto* d3d12View = static_cast<D3D12BackendImageView*>(rtvs[i]);
@@ -2794,9 +2811,7 @@ namespace dxup::d3d12 {
         dsv);
     }
 
-    if (hasRtvHole) {
-      logMessage(LogLevel::Error, "bindRenderTargets: RTV hole detected (count=%u effectiveCount=%u)", count, effectiveCount);
-    }
+    (void)hasRtvHole;
 
     if (dsv) {
       auto* d3d12View = static_cast<D3D12BackendImageView*>(dsv);
@@ -3806,7 +3821,9 @@ namespace dxup::d3d12 {
 
     transitionStreamOutputCounter(d3d12Buffer, D3D12_RESOURCE_STATE_COPY_SOURCE);
     holdBatchResource(d3d12Buffer->streamOutputCounter());
+    const bool paused = pausePredication();
     m_cmdList->CopyBufferRegion(m_soReadback.Get(), 0, d3d12Buffer->streamOutputCounter(), 0, sizeof(uint64_t));
+    resumePredication(paused);
 
     // A buffer that is still a stream output target keeps being written.
     for (uint32_t i = 0; i < m_soBufferCount; i++) {
@@ -3946,6 +3963,9 @@ namespace dxup::d3d12 {
         d3d12Dst->getArraySubresourceCount() == 1 && d3d12Src->getArraySubresourceCount() == 1) {
       transitionResource(d3d12Dst, D3D12_RESOURCE_STATE_COPY_DEST);
       transitionResource(d3d12Src, D3D12_RESOURCE_STATE_COPY_SOURCE);
+      // Both live until the GPU has copied (the application may let go now).
+      holdBatchResource(d3d12Dst->getResource());
+      holdBatchResource(d3d12Src->getResource());
       flushBarriers();
       m_cmdList->CopyResource(d3d12Dst->getResource(), d3d12Src->getResource());
       m_copyOpsSinceFlush++;
@@ -3971,63 +3991,46 @@ namespace dxup::d3d12 {
       return;
 
     // Row pitch must be aligned to D3D12_TEXTURE_DATA_PITCH_ALIGNMENT (256)
-    uint32_t rowPitch = (width * 4 + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1)
-                      & ~(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1);
-    uint32_t totalSize = rowPitch * height;
+    const uint32_t rowPitch = (width * 4 + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1)
+                            & ~(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1);
+    const uint64_t totalSize = uint64_t(rowPitch) * height;
 
-    // Create or grow the upload buffer
-    if (!m_overlayUploadBuffer || m_overlayUploadCapacity < totalSize) {
-      m_overlayUploadBuffer.Reset();
-      m_overlayUploadMapped = nullptr;
-
-      D3D12_HEAP_PROPERTIES heapProps = {};
-      heapProps.Type = D3D12_HEAP_TYPE_UPLOAD;
-
-      D3D12_RESOURCE_DESC bufDesc = {};
-      bufDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-      bufDesc.Width = totalSize;
-      bufDesc.Height = 1;
-      bufDesc.DepthOrArraySize = 1;
-      bufDesc.MipLevels = 1;
-      bufDesc.SampleDesc.Count = 1;
-      bufDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-
-      HRESULT hr = m_device->getDevice()->CreateCommittedResource(
-        &heapProps, D3D12_HEAP_FLAG_NONE,
-        &bufDesc, D3D12_RESOURCE_STATE_GENERIC_READ,
-        nullptr, IID_PPV_ARGS(&m_overlayUploadBuffer));
-      if (FAILED(hr)) return;
-
-      D3D12_RANGE readRange = {0, 0};
-      m_overlayUploadBuffer->Map(0, &readRange, &m_overlayUploadMapped);
-      m_overlayUploadCapacity = totalSize;
-    }
-
-    if (!m_overlayUploadMapped) return;
-
-    // Write pixels with proper row pitch alignment
-    auto* mapped = static_cast<uint8_t*>(m_overlayUploadMapped);
+    // From the upload ring, which the GPU's progress frees (a buffer of its
+    // own was written again while the last copy could still read it).
+    ID3D12Resource* upload = nullptr;
+    uint64_t uploadOffset = 0;
+    void* uploadPtr = nullptr;
+    if (!allocateUploadScratch(totalSize, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT, &upload, &uploadOffset, &uploadPtr))
+      return;
+    auto* mapped = static_cast<uint8_t*>(uploadPtr);
     for (uint32_t y = 0; y < height; y++)
       memcpy(mapped + y * rowPitch, rgbaPixels + y * width, width * 4);
 
     // Source: upload buffer with placed footprint
     D3D12_TEXTURE_COPY_LOCATION srcLoc = {};
-    srcLoc.pResource = m_overlayUploadBuffer.Get();
+    srcLoc.pResource = upload;
     srcLoc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-    srcLoc.PlacedFootprint.Offset = 0;
+    srcLoc.PlacedFootprint.Offset = uploadOffset;
     srcLoc.PlacedFootprint.Footprint.Format = d3d12Dst->getFormat();
     srcLoc.PlacedFootprint.Footprint.Width = width;
     srcLoc.PlacedFootprint.Footprint.Height = height;
     srcLoc.PlacedFootprint.Footprint.Depth = 1;
     srcLoc.PlacedFootprint.Footprint.RowPitch = rowPitch;
 
-    // Destination: subresource 0 of the target image
+    // Destination: subresource 0 of the target image, in the copy state.
+    transitionResource(d3d12Dst, D3D12_RESOURCE_STATE_COPY_DEST);
+    holdBatchResource(d3d12Dst->getResource());
+    flushBarriers();
     D3D12_TEXTURE_COPY_LOCATION dstLoc = {};
     dstLoc.pResource = d3d12Dst->getResource();
     dstLoc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
     dstLoc.SubresourceIndex = 0;
 
-    D3D12_BOX srcBox = {0, 0, 0, width, height, 1};
+    // Cut to the image (an overlay wider than a small window).
+    const uint32_t dstWidth = d3d12Dst->getDesc().width, dstHeight = d3d12Dst->getDesc().height;
+    if (dstX >= dstWidth || dstY >= dstHeight)
+      return;
+    D3D12_BOX srcBox = {0, 0, 0, (std::min)(width, dstWidth - dstX), (std::min)(height, dstHeight - dstY), 1};
     m_cmdList->CopyTextureRegion(&dstLoc, dstX, dstY, 0, &srcLoc, &srcBox);
 #endif
   }
@@ -4054,6 +4057,8 @@ namespace dxup::d3d12 {
 
     transitionResource(d3d12Dst, dstSubres, D3D12_RESOURCE_STATE_COPY_DEST);
     transitionResource(d3d12Src, srcSubres, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    holdBatchResource(d3d12Dst->getResource());
+    holdBatchResource(d3d12Src->getResource());
     flushBarriers();
 
     D3D12_TEXTURE_COPY_LOCATION dstLoc = {};
@@ -4080,6 +4085,16 @@ namespace dxup::d3d12 {
     }
 
     safeCopyTextureRegionSimple(m_cmdList.Get(), &dstLoc, dstX, dstY, dstZ, &srcLoc, srcBoxPtr, m_device);
+    // Depth/stencil images: the stencil plane too (D3D11 copies both; their
+    // copies are of whole subresources).
+    const uint32_t planes = (std::min)(d3d12Dst->getPlaneCount(), d3d12Src->getPlaneCount());
+    for (uint32_t plane = 1; plane < planes; plane++) {
+      D3D12_TEXTURE_COPY_LOCATION dstPlane = dstLoc;
+      D3D12_TEXTURE_COPY_LOCATION srcPlane = srcLoc;
+      dstPlane.SubresourceIndex = d3d12Dst->calcSubresource(dstSubres.mipLevel, dstSubres.arrayLayer, plane);
+      srcPlane.SubresourceIndex = d3d12Src->calcSubresource(srcSubres.mipLevel, srcSubres.arrayLayer, plane);
+      m_cmdList->CopyTextureRegion(&dstPlane, 0, 0, 0, &srcPlane, nullptr);
+    }
 #endif
   }
 
@@ -4136,6 +4151,10 @@ namespace dxup::d3d12 {
 
   void D3D12BackendContext::prepareShaderAccess(bool compute) {
 #ifdef _WIN32
+    // A submission for descriptor space comes first: it forgets the
+    // unordered access written so far, which then must not include this
+    // draw's (its next reader would get no barrier).
+    ensureDescriptorHeapSpace();
     if (compute ? m_computeImageStatesDirty : m_graphicsImageStatesDirty)
       restoreBoundImageStates(compute);
     orderUavAccess(compute);
@@ -4639,9 +4658,13 @@ namespace dxup::d3d12 {
       ? 1u
       : (std::max)(uint32_t(staging->getStagingLayout().footprints.size() / planeStride), 1u);
 
+    // Each image steps to its planes by its own subresource count (a level
+    // of a mipmapped texture against a one-level staging texture).
+    const uint32_t dstPlaneStride = dst->getMipLevelCount() * dst->getArraySubresourceCount();
+    const uint32_t srcPlaneStride = src->getMipLevelCount() * src->getArraySubresourceCount();
     for (uint32_t plane = 0; plane < planes; plane++) {
-      const UINT dstSub = dstIndex + plane * planeStride;
-      const UINT srcSub = srcIndex + plane * planeStride;
+      const UINT dstSub = dstIndex + plane * dstPlaneStride;
+      const UINT srcSub = srcIndex + plane * srcPlaneStride;
 
       if (dst->isStaging() && src->isStaging()) {
         const auto& dstLayout = dst->getStagingLayout();
@@ -4924,8 +4947,9 @@ namespace dxup::d3d12 {
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint = {};
     UINT numRows = 0;
     UINT64 rowSizeBytes = 0;
+    // Suballocated buffers start at their offset in the resource.
     m_device->getDevice()->GetCopyableFootprints(
-      &srcDesc, subresourceIdx, 1, dstOffset,
+      &srcDesc, subresourceIdx, 1, d3d12Dst->getOffset() + dstOffset,
       &footprint, &numRows, &rowSizeBytes, nullptr);
     dstLoc.PlacedFootprint = footprint;
 
@@ -4957,7 +4981,9 @@ namespace dxup::d3d12 {
     ContextLock ctxLock(*this);
     if (m_deviceRemoved) return nullptr;
     auto* d3d12Buffer = static_cast<D3D12BackendBuffer*>(buffer);
-    if (perfStatsEnabled() && !m_copyOnly) {
+    // Behind a CS thread this runs on the application thread too, beside
+    // the recording one: no counters of the recording state then.
+    if (perfStatsEnabled() && !m_copyOnly && !m_externallySynchronized) {
       if (mode == MapMode::Read || mode == MapMode::ReadWrite)
         m_perfIntervalMapReadCalls++;
       if (mode == MapMode::Write || mode == MapMode::WriteDiscard ||
@@ -5230,7 +5256,9 @@ namespace dxup::d3d12 {
     m_pendingSlices.push_back(buffer->replaceSlice(slice, &allocator));
     transitionResource(buffer, D3D12_RESOURCE_STATE_COPY_DEST);
     flushBarriers();
+    const bool paused = pausePredication();
     m_cmdList->CopyBufferRegion(buffer->getResource(), buffer->getOffset(), source, sourceOffset, desc.size);
+    resumePredication(paused);
     restoreBoundBufferState(buffer);
     rebindConstantBuffer(buffer);
 #else
@@ -6102,7 +6130,7 @@ namespace dxup::d3d12 {
         continue;
 
       relativeOffset = alignUp(relativeOffset, kUploadAlignment);
-      std::memcpy(static_cast<uint8_t*>(uploadPtr) + relativeOffset, regions[i].data, regions[i].size);
+      std::memcpy(static_cast<uint8_t*>(uploadPtr) + relativeOffset, regions[i].data, static_cast<size_t>(regions[i].size));
 
       UploadedRegion uploaded = {};
       uploaded.dstOffset = regions[i].offset;
@@ -6687,6 +6715,27 @@ namespace dxup::d3d12 {
 #endif
   }
 
+  bool D3D12BackendContext::pausePredication() {
+#ifdef _WIN32
+    if (!m_predicationApplied)
+      return false;
+    m_cmdList->SetPredication(nullptr, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
+    m_predicationApplied = false;
+    return true;
+#else
+    return false;
+#endif
+  }
+
+  void D3D12BackendContext::resumePredication(bool paused) {
+#ifdef _WIN32
+    if (paused && !m_deviceRemoved)
+      applyPredication();
+#else
+    (void)paused;
+#endif
+  }
+
   void D3D12BackendContext::suspendPredication(bool suspended) {
 #ifdef _WIN32
     ContextLock ctxLock(*this);
@@ -6703,7 +6752,17 @@ namespace dxup::d3d12 {
   void D3D12BackendContext::forgetQuery(D3D12BackendQuery* query) {
 #ifdef _WIN32
     ContextLock ctxLock(*this);
-    m_activeQueries.erase(std::remove(m_activeQueries.begin(), m_activeQueries.end(), query), m_activeQueries.end());
+    auto active = std::find(m_activeQueries.begin(), m_activeQueries.end(), query);
+    if (active != m_activeQueries.end()) {
+      // Destroyed while begun: its open segment ends before the slots go
+      // back to the pool (a slot begun twice fails the command list). Its
+      // results are nobody's.
+      if (!m_deviceRemoved && !m_closedForSubmission && m_cmdList) {
+        std::vector<D3D12QueryResolve> unused;
+        query->endSegment(m_cmdList.Get(), unused);
+      }
+      m_activeQueries.erase(active);
+    }
     if (m_predicate == query) {
       m_predicate = nullptr;
       if (!m_deviceRemoved && !m_closedForSubmission)
@@ -7647,6 +7706,8 @@ namespace dxup::d3d12 {
 #ifdef _WIN32
     ContextLock ctxLock(*this);
     if (!view) return;
+    // Its descriptors before any state is set (see ensureDescriptorHeapSpace).
+    ensureDescriptorHeapSpace();
     auto* d3d12View = static_cast<D3D12BackendImageView*>(view);
     auto* d3d12Image = static_cast<D3D12BackendImage*>(d3d12View->getImage());
 
@@ -7679,6 +7740,8 @@ namespace dxup::d3d12 {
 #ifdef _WIN32
     ContextLock ctxLock(*this);
     if (!view) return;
+    // Its descriptors before any state is set (see ensureDescriptorHeapSpace).
+    ensureDescriptorHeapSpace();
     auto* d3d12View = static_cast<D3D12BackendBufferView*>(view);
     auto* d3d12Buffer = static_cast<D3D12BackendBuffer*>(d3d12View->getBuffer());
 
@@ -7720,6 +7783,8 @@ namespace dxup::d3d12 {
 #ifdef _WIN32
     ContextLock ctxLock(*this);
     if (!view) return;
+    // Its descriptors before any state is set (see ensureDescriptorHeapSpace).
+    ensureDescriptorHeapSpace();
     auto* d3d12View = static_cast<D3D12BackendImageView*>(view);
     auto* d3d12Image = static_cast<D3D12BackendImage*>(d3d12View->getImage());
 
@@ -7757,6 +7822,8 @@ namespace dxup::d3d12 {
 #ifdef _WIN32
     ContextLock ctxLock(*this);
     if (!view) return;
+    // Its descriptors before any state is set (see ensureDescriptorHeapSpace).
+    ensureDescriptorHeapSpace();
     // Element ranges; empty ones clear nothing.
     std::vector<D3D12_RECT> clearRects;
     for (uint32_t i = 0; i < rectCount; i++)
@@ -7960,6 +8027,8 @@ namespace dxup::d3d12 {
 #ifdef _WIN32
     ContextLock ctxLock(*this);
     if (!srv) return;
+    // Its descriptors before any state is set (see ensureDescriptorHeapSpace).
+    ensureDescriptorHeapSpace();
 
     auto* d3d12View = static_cast<D3D12BackendImageView*>(srv);
     auto* d3d12Image = static_cast<D3D12BackendImage*>(d3d12View->getImage());
@@ -8189,6 +8258,8 @@ namespace dxup::d3d12 {
     initMipGenResources();
     if (!m_mipGenRootSignature)
       return;
+    // Its descriptors before any state is set (see ensureDescriptorHeapSpace).
+    ensureDescriptorHeapSpace();
     const auto& dstDesc = dst->getDesc();
     const auto& srcDesc = src->getDesc();
     ID3D12PipelineState* pso = getOrCreateMsaaPassPso(pass, format, dstDesc.sampleCount ? dstDesc.sampleCount : 1u,
@@ -8502,6 +8573,8 @@ namespace dxup::d3d12 {
     auto* src = static_cast<D3D12BackendImage*>(srcImage);
     if (!dst || !src || m_deviceRemoved)
       return;
+    // Its descriptors before any state is set (see ensureDescriptorHeapSpace).
+    ensureDescriptorHeapSpace();
     if (resolveStencilPlane(dst, src, readFormat))
       return;
     initMipGenResources();
@@ -8835,7 +8908,9 @@ namespace dxup::d3d12 {
     // The descriptor is read when the clear is recorded: one serves all.
     m_device->getDevice()->CreateRenderTargetView(resource, &rtvDesc, m_lazyClearRtv);
     const float zero[4] = {};
+    const bool paused = pausePredication();
     m_cmdList->ClearRenderTargetView(m_lazyClearRtv, zero, 0, nullptr);
+    resumePredication(paused);
   }
 
   void D3D12BackendContext::transitionResource(D3D12BackendImage* image, D3D12_RESOURCE_STATES newState) {

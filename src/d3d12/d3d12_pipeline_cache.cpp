@@ -466,7 +466,7 @@ namespace dxup::d3d12 {
   }
 
   void D3D12BackendDevice::storePipelineRecord(const GraphicsPipelineDesc& desc, const PsoCacheKey& key) {
-    if (m_stateCachePath.empty() || !m_psoDiskWriter.joinable())
+    if (m_stateCachePath.empty() || m_stateCacheFailed.load(std::memory_order_relaxed) || !m_psoDiskWriter.joinable())
       return;
     {
       std::lock_guard<std::mutex> lock(m_stateCacheMutex);
@@ -486,11 +486,13 @@ namespace dxup::d3d12 {
     // Runs on the disk writer thread only. The file stays shared: other
     // devices of the process (Trine 4 has three) and other processes append
     // too, each record in one write at the end of the file.
+    if (m_stateCacheFailed.load(std::memory_order_relaxed))
+      return;
     if (m_stateCacheHandle == INVALID_HANDLE_VALUE) {
       HANDLE handle = CreateFileA(m_stateCachePath.c_str(), GENERIC_READ | GENERIC_WRITE,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
       if (handle == INVALID_HANDLE_VALUE) {
-        m_stateCachePath.clear();
+        m_stateCacheFailed.store(true, std::memory_order_relaxed);
         return;
       }
       LARGE_INTEGER size = {};
@@ -517,7 +519,7 @@ namespace dxup::d3d12 {
       m_stateCacheHandle = CreateFileA(m_stateCachePath.c_str(), FILE_APPEND_DATA | SYNCHRONIZE,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
       if (m_stateCacheHandle == INVALID_HANDLE_VALUE) {
-        m_stateCachePath.clear();
+        m_stateCacheFailed.store(true, std::memory_order_relaxed);
         return;
       }
     }

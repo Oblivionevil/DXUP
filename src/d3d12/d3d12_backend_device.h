@@ -89,10 +89,10 @@ namespace dxup::d3d12 {
     return index + slot;
   }
   // Changes whenever the layout changes; part of the PSO disk cache key.
-  constexpr size_t kRootSignatureLayoutVersion = 0x52434256u;
+  constexpr uint64_t kRootSignatureLayoutVersion = 0x52434256u;
   // Mixed into the PSO disk cache key of pipelines whose pixel shader
   // outputs DXUP masked (dxbc::maskOutputWrites).
-  constexpr size_t kPixelOutputMaskVersion = 0x504f4d31u;
+  constexpr uint64_t kPixelOutputMaskVersion = 0x504f4d31u;
 
   // ============================================================
   // Upload heap suballocation
@@ -1309,9 +1309,10 @@ namespace dxup::d3d12 {
     };
     // Byte-wise hash that names on-disk PSO cache files. Only computed when
     // a pipeline is compiled; kept unchanged so existing caches stay valid.
+    // 64 bits in 32-bit builds as well.
     struct PsoDiskKeyHash {
-      size_t operator()(const PsoCacheKey& k) const {
-        size_t h = 14695981039346656037ULL;
+      uint64_t operator()(const PsoCacheKey& k) const {
+        uint64_t h = 14695981039346656037ULL;
         auto append = [&h](const void* value, size_t size) {
           const auto* bytes = static_cast<const uint8_t*>(value);
           for (size_t i = 0; i < size; i++) {
@@ -1355,14 +1356,18 @@ namespace dxup::d3d12 {
       }
     };
     struct ComputePsoCacheHash {
-      size_t operator()(const ComputePsoCacheKey& key) const {
-        size_t hash = 14695981039346656037ULL;
+      // Also names the on-disk cache files: 64 bits in 32-bit builds as well.
+      static uint64_t hash64(const ComputePsoCacheKey& key) {
+        uint64_t hash = 14695981039346656037ULL;
         const uint8_t* data = reinterpret_cast<const uint8_t*>(&key);
         for (size_t i = 0; i < sizeof(key); i++) {
           hash ^= data[i];
           hash = fnv64Multiply(hash);
         }
         return hash;
+      }
+      size_t operator()(const ComputePsoCacheKey& key) const {
+        return static_cast<size_t>(hash64(key));
       }
     };
     std::unordered_map<ComputePsoCacheKey, Rc<IBackendPipeline>, ComputePsoCacheHash> m_computePsoCache;
@@ -1432,7 +1437,8 @@ namespace dxup::d3d12 {
       uint8_t missing = 0;
     };
     std::mutex m_stateCacheMutex;
-    std::string m_stateCachePath;
+    std::string m_stateCachePath;   // set before other threads run, then only read
+    std::atomic<bool> m_stateCacheFailed{false};   // the file could not be written
     // Fixed once the device is created; `missing` changes under the mutex.
     std::vector<StoredPipeline> m_storedPipelines;
     std::unordered_map<uint64_t, std::vector<uint32_t>> m_storedPipelinesByShader;
@@ -1505,7 +1511,7 @@ namespace dxup::d3d12 {
     // PSO disk cache. Newly compiled blobs are serialized by a background
     // worker so GetCachedBlob and file I/O stay off frame-critical threads.
     struct DeferredPsoDiskWrite {
-      size_t keyHash = 0;
+      uint64_t keyHash = 0;
       ComPtr<ID3D12PipelineState> pso;
       // Or a pipeline description for the state cache.
       std::vector<uint8_t> record;
@@ -1513,15 +1519,15 @@ namespace dxup::d3d12 {
     std::string m_psoDiskCacheDir;
     // Pipelines are compiled from arbitrary threads (deferred contexts, shader
     // creation), so blobs are handed out under a lock and removed on use.
-    std::unordered_map<size_t, std::vector<uint8_t>> m_psoDiskBlobs;
+    std::unordered_map<uint64_t, std::vector<uint8_t>> m_psoDiskBlobs;
     // The files are only listed at start and read when their pipeline
     // compiles (mostly on a compiler thread).
-    std::unordered_set<size_t> m_psoDiskFiles;
+    std::unordered_set<uint64_t> m_psoDiskFiles;
     std::mutex m_psoDiskBlobMutex;
 
     std::shared_ptr<BackendRetireQueue> m_retireQueue;
     std::deque<DeferredPsoDiskWrite> m_deferredPsoDiskWrites;
-    std::unordered_set<size_t> m_deferredPsoDiskWriteKeys;
+    std::unordered_set<uint64_t> m_deferredPsoDiskWriteKeys;
     std::mutex m_psoDiskWriteMutex;
     std::condition_variable m_psoDiskWriteCv;
     Thread m_psoDiskWriter;
@@ -1536,11 +1542,12 @@ namespace dxup::d3d12 {
     bool m_stopPsoDiskWriter = false;
     void initPsoDiskCache();
     void loadPsoDiskCache();
-    std::vector<uint8_t> takePsoDiskBlob(size_t keyHash);
-    void deferPsoBlobWrite(size_t keyHash, ID3D12PipelineState* pso);
+    std::string psoDiskPath(uint64_t keyHash) const;
+    std::vector<uint8_t> takePsoDiskBlob(uint64_t keyHash);
+    void deferPsoBlobWrite(uint64_t keyHash, ID3D12PipelineState* pso);
     void runPsoDiskWriter();
     void stopPsoDiskWriter();
-    void savePsoBlobToDisk(size_t keyHash, ID3D12PipelineState* pso);
+    void savePsoBlobToDisk(uint64_t keyHash, ID3D12PipelineState* pso);
 #endif
 
   public:

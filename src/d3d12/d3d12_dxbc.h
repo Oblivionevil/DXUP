@@ -263,7 +263,7 @@ namespace dxup::d3d12::dxbc {
       uint32_t length = (tokens[insert] >> 24) & 0x7f;
       if (opcode == 0x35)
         length = insert + 1 < tokens.size() ? tokens[insert + 1] : 0;
-      if (!length || insert + length > tokens.size())
+      if (!length || length > tokens.size() - insert)
         return false;
       if (!isDeclaration(opcode))
         break;
@@ -308,7 +308,7 @@ namespace dxup::d3d12::dxbc {
       uint32_t length = (tokens[at] >> 24) & 0x7f;
       if (opcode == 0x35)
         length = at + 1 < tokens.size() ? tokens[at + 1] : 0;
-      if (!length || at + length > tokens.size())
+      if (!length || length > tokens.size() - at)
         return false;
       if (!isDeclaration(opcode))
         break;
@@ -396,7 +396,7 @@ namespace dxup::d3d12::dxbc {
       uint32_t length = (tokens[at] >> 24) & 0x7f;
       if (opcode == 0x35)
         length = at + 1 < tokens.size() ? tokens[at + 1] : 0;
-      if (!length || at + length > tokens.size())
+      if (!length || length > tokens.size() - at)
         return traits;
       const uint32_t mode = (tokens[at] >> 11) & 0xf;
       const bool interpolated = mode >= 2 && mode <= 5;
@@ -432,7 +432,7 @@ namespace dxup::d3d12::dxbc {
       uint32_t length = (tokens[at] >> 24) & 0x7f;
       if (opcode == 0x35)
         length = at + 1 < tokens.size() ? tokens[at + 1] : 0;
-      if (!length || at + length > tokens.size())
+      if (!length || length > tokens.size() - at)
         return false;
       if (!isDeclaration(opcode))
         break;
@@ -474,7 +474,7 @@ namespace dxup::d3d12::dxbc {
       uint32_t length = (tokens[at] >> 24) & 0x7f;
       if (opcode == 0x35)
         length = at + 1 < tokens.size() ? tokens[at + 1] : 0;
-      if (!length || at + length > tokens.size())
+      if (!length || length > tokens.size() - at)
         return false;
       if (!isDeclaration(opcode))
         break;
@@ -607,7 +607,7 @@ namespace dxup::d3d12::dxbc {
       uint32_t length = (tokens[at] >> 24) & 0x7f;
       if (opcode == 0x35)
         length = at + 1 < tokens.size() ? tokens[at + 1] : 0;
-      if (!length || at + length > tokens.size())
+      if (!length || length > tokens.size() - at)
         return false;
       // fcall carries a function table index before its operand.
       if (opcode == 0x78)
@@ -670,7 +670,7 @@ namespace dxup::d3d12::dxbc {
       uint32_t length = (tokens[at] >> 24) & 0x7f;
       if (opcode == 0x35)
         length = at + 1 < tokens.size() ? tokens[at + 1] : 0;
-      if (!length || at + length > tokens.size())
+      if (!length || length > tokens.size() - at)
         return false;
       // dcl_resource(_raw, _structured), dcl_constantbuffer, dcl_sampler,
       // dcl_uav_typed(_raw, _structured): the register's slot is the first
@@ -766,7 +766,7 @@ namespace dxup::d3d12::dxbc {
       uint32_t length = (tokens[at] >> 24) & 0x7f;
       if (opcode == 0x35)
         length = at + 1 < tokens.size() ? tokens[at + 1] : 0;
-      if (!length || at + length > tokens.size())
+      if (!length || length > tokens.size() - at)
         return false;
       // fcall carries a function table index before its operand.
       if (opcode == 0x78)
@@ -779,7 +779,12 @@ namespace dxup::d3d12::dxbc {
         const uint32_t end = uint32_t(at + length);
         // imul, udiv, sincos, umul, uaddc, usubb and swapc have two
         // destinations; the immediate atomics write a UAV besides theirs.
-        const bool keepInstruction = opcode == 0x26 || opcode == 0x4d || opcode == 0x4e || opcode == 0x51
+        // Double precision operations map components in pairs (a mask of
+        // their own changes what goes where) and the *_FEEDBACK loads and
+        // samples write a status besides: they stay whole.
+        const bool keepWhole = (opcode >= 0xbf && opcode <= 0xca) || (opcode >= 0xd2 && opcode <= 0xd9)
+          || (opcode >= 0xdd && opcode <= 0xec);
+        const bool keepInstruction = keepWhole || opcode == 0x26 || opcode == 0x4d || opcode == 0x4e || opcode == 0x51
           || opcode == 0x84 || opcode == 0x85 || opcode == 0x8e || (opcode >= 0xb2 && opcode <= 0xbd);
         bool writesNothing = false;
         while (operandAt < end) {
@@ -800,7 +805,7 @@ namespace dxup::d3d12::dxbc {
               return false;
             const uint32_t reg = tokens[indexAt];
             const uint32_t mask = (operand >> 4) & 0xf;
-            const uint32_t kept = reg < maskCount ? mask & masks[reg] : mask;
+            const uint32_t kept = reg < maskCount && !keepWhole ? mask & masks[reg] : mask;
             if (kept != mask) {
               if (kept) {
                 operand = (operand & ~(0xfu << 4)) | (kept << 4);
@@ -1019,7 +1024,7 @@ namespace dxup::d3d12::dxbc {
       uint32_t length = (tokens[at] >> 24) & 0x7f;
       if (opcode == 0x35)
         length = at + 1 < tokens.size() ? tokens[at + 1] : 0;
-      if (!length || at + length > tokens.size())
+      if (!length || length > tokens.size() - at)
         return false;
       if (opcode == 0x78)   // fcall: interfaces
         return false;
@@ -1079,7 +1084,7 @@ namespace dxup::d3d12::dxbc {
         rewritten.push_back(tokens[at]);
         rewritten.push_back(newCount);
         tempsDeclared = true;
-      } else if (opcode == 0x69 && tokens[at + 1] < arrays.size() && arrays[tokens[at + 1]].promote) {
+      } else if (opcode == 0x69 && length >= 4 && tokens[at + 1] < arrays.size() && arrays[tokens[at + 1]].promote) {
         // Its elements are temporaries now.
       } else if (isDeclaration(opcode)) {
         rewritten.insert(rewritten.end(), tokens.begin() + at, tokens.begin() + at + length);
@@ -1198,7 +1203,7 @@ namespace dxup::d3d12::dxbc {
       uint32_t length = (tokens[at] >> 24) & 0x7f;
       if (opcode == 0x35)
         length = at + 1 < tokens.size() ? tokens[at + 1] : 0;
-      if (!length || at + length > tokens.size())
+      if (!length || length > tokens.size() - at)
         return false;
       if (opcode == 0x78)   // fcall: interfaces
         return false;

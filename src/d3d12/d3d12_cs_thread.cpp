@@ -880,12 +880,19 @@ namespace dxup {
     }
     const BufferDesc& desc = d3d12Buffer->getDesc();
     const uint64_t dataSize = desc.dataSize ? desc.dataSize : desc.size;
+    // Updated the ordinary way after all: the renamed contents (a partial
+    // update's base, the last whole update) are not the buffer's any more.
+    auto updateNormally = [d3d12Buffer] {
+      d3d12Buffer->setRenamedData(nullptr);
+      d3d12Buffer->forgetLastUpdate();
+      return false;
+    };
     bool whole = false;
     for (uint32_t i = 0; i < regionCount; i++) {
       if (!regions[i].data || !regions[i].size)
         continue;
       if (regions[i].offset >= dataSize)
-        return false;
+        return updateNormally();
       whole |= regions[i].offset == 0 && regions[i].size >= dataSize;
     }
     // A partial update builds on the contents of the previous rename.
@@ -906,14 +913,14 @@ namespace dxup {
     if (!m_sliceCache)
       m_sliceCache = std::make_unique<CsSliceCache>();
     if (m_sliceCache->owner && m_sliceCache->owner != allocator)
-      return false;
+      return updateNormally();
     m_sliceCache->owner = allocator;
     auto& cache = m_sliceCache->slices[allocator->sizeClassOf(desc.size)];
     if (cache.empty()) {
       d3d12::D3D12UploadSuballocator::Slice batch[kSliceBatch];
       const uint32_t count = allocator->allocateMany(real->getBackendDevice()->getDevice(), desc.size, batch, kSliceBatch);
       if (!count)
-        return false;
+        return updateNormally();
       cache.assign(batch, batch + count);
     }
     d3d12::D3D12UploadSuballocator::Slice slice = cache.back();

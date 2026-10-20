@@ -993,11 +993,26 @@ namespace dxup::d3d12 {
       info.settings.hdr = request.hdr;
       info.settings.depthInverted = request.depthInverted;
       const UpscalerFactory factory = g_upscalerFactory;
-      m_upscalerPending = std::async(std::launch::async, [factory, info]() {
-        PendingUpscaler made;
-        made.upscaler = factory(info, made.error);
-        return made;
-      });
+      // The last one has handed over its upscaler: it is done or about to be.
+      if (m_upscalerThread.joinable())
+        m_upscalerThread.join();
+      auto promise = std::make_shared<std::promise<PendingUpscaler>>();
+      m_upscalerPending = promise->get_future();
+      try {
+        m_upscalerThread = Thread([factory, info, promise] {
+          PendingUpscaler made;
+          try {
+            made.upscaler = factory(info, made.error);
+          } catch (const std::exception& e) {
+            made.upscaler.reset();
+            made.error = e.what();
+          }
+          promise->set_value(std::move(made));
+        });
+      } catch (const std::system_error&) {
+        m_upscalerPending = {};
+        m_upscalerFailed = true;
+      }
       return false;
     }
     if (!m_upscaler)

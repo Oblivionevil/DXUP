@@ -3338,7 +3338,7 @@ namespace dxup {
                 if (uploadBuf) {
                   void* dstPtr = m_backendCtx->mapBuffer(uploadBuf.get(), MapMode::Write);
                   if (dstPtr) {
-                    std::memcpy(dstPtr, srcPtr, uploadLayout.totalSize);
+                    std::memcpy(dstPtr, srcPtr, static_cast<size_t>(uploadLayout.totalSize));
                     m_backendCtx->unmapBuffer(uploadBuf.get());
                     m_backendCtx->copyBufferToImage(info.image, subres, uploadBuf.get(), 0);
                     m_backendCtx->retainTemporaryBuffer(uploadBuf);
