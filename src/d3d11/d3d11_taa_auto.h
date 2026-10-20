@@ -21,6 +21,8 @@
 #include <windows.h>
 #include <d3d11.h>
 
+#include "../util/util_paths.h"
+
 #include <atomic>
 #include <cmath>
 #include <cstdint>
@@ -648,15 +650,7 @@ namespace dxup {
     }
 
     static std::string profilePath() {
-      char path[MAX_PATH] = {};
-      HMODULE module = nullptr;
-      if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-            reinterpret_cast<LPCSTR>(&taa_auto::halton), &module)
-       || !GetModuleFileNameA(module, path, MAX_PATH))
-        return std::string();
-      std::string result = path;
-      const size_t slash = result.find_last_of("\\/");
-      return slash == std::string::npos ? std::string() : result.substr(0, slash + 1) + "dxup_upscaler_auto.txt";
+      return dxupSiblingPath("dxup_upscaler_auto.txt");
     }
 
     void saveProfile() const {

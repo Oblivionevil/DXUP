@@ -1,4 +1,5 @@
 #include "util_types.h"
+#include "util_paths.h"
 #include <cstdio>
 #include <cstdarg>
 #include <ctime>
@@ -17,21 +18,7 @@ namespace dxup {
   // Whether a marker file lies next to this DLL.
   static bool dllSiblingExists(const char* fileName) {
 #ifdef _WIN32
-    char path[MAX_PATH] = {};
-    HMODULE hModule = nullptr;
-    GetModuleHandleExA(
-      GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-      reinterpret_cast<LPCSTR>(&dllSiblingExists),
-      &hModule);
-    if (hModule)
-      GetModuleFileNameA(hModule, path, MAX_PATH);
-    char* lastSlash = strrchr(path, '\\');
-    if (!lastSlash)
-      return false;
-    *(lastSlash + 1) = '\0';
-    strncat_s(path, MAX_PATH, fileName, _TRUNCATE);
-    DWORD attributes = GetFileAttributesA(path);
-    return attributes != INVALID_FILE_ATTRIBUTES && !(attributes & FILE_ATTRIBUTE_DIRECTORY);
+    return dxupSiblingExists(fileName);
 #else
     (void)fileName;
     return false;
@@ -41,24 +28,8 @@ namespace dxup {
   static LogLevel getMinimumLogLevel() {
     static LogLevel level = [] {
 #ifdef _WIN32
-      char markerPath[MAX_PATH] = {};
-      HMODULE hModule = nullptr;
-      GetModuleHandleExA(
-        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-        reinterpret_cast<LPCSTR>(&getMinimumLogLevel),
-        &hModule);
-
-      if (hModule)
-        GetModuleFileNameA(hModule, markerPath, MAX_PATH);
-
-      char* lastSlash = strrchr(markerPath, '\\');
-      if (lastSlash) {
-        *(lastSlash + 1) = '\0';
-        strncat_s(markerPath, MAX_PATH, "dxup_info_log.txt", _TRUNCATE);
-        DWORD attributes = GetFileAttributesA(markerPath);
-        if (attributes != INVALID_FILE_ATTRIBUTES && !(attributes & FILE_ATTRIBUTE_DIRECTORY))
-          return LogLevel::Info;
-      }
+      if (dxupSiblingExists("dxup_info_log.txt"))
+        return LogLevel::Info;
 #endif
       return LogLevel::Warn;
     }();

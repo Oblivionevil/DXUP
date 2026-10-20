@@ -6,6 +6,7 @@
 #include "../d3d12/d3d12_backend_device.h"
 #include "../util/com_ptr.h"
 #include "../util/util_types.h"
+#include "../util/util_paths.h"
 
 #include <windows.h>
 #include <d3d11.h>
@@ -296,18 +297,7 @@ HRESULT D3D11Device::CreateDeferredContext(
 }
 
 static bool dxupExceptionTraceEnabled() {
-  static const bool enabled = [] {
-    char path[MAX_PATH] = {};
-    if (!s_ourDllInstance || !GetModuleFileNameA(s_ourDllInstance, path, MAX_PATH))
-      return false;
-    char* lastSlash = strrchr(path, '\\');
-    if (!lastSlash)
-      return false;
-    *(lastSlash + 1) = '\0';
-    strncat_s(path, MAX_PATH, "dxup_exception_trace.txt", _TRUNCATE);
-    const DWORD attributes = GetFileAttributesA(path);
-    return attributes != INVALID_FILE_ATTRIBUTES && !(attributes & FILE_ATTRIBUTE_DIRECTORY);
-  }();
+  static const bool enabled = dxupSiblingExists("dxup_exception_trace.txt");
   return enabled;
 }
 

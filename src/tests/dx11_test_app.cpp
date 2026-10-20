@@ -400,6 +400,7 @@ void main(uint2 id : SV_DispatchThreadID) {
         {"device_creation_rules", &Dx11TestApp::testDeviceCreationRules},
         {"stream_output_gap", &Dx11TestApp::testStreamOutputGap},
         {"planar_initial_data", &Dx11TestApp::testPlanarInitialData},
+        {"planar_region_copy", &Dx11TestApp::testPlanarRegionCopy},
         {"dxgi_device_interfaces", &Dx11TestApp::testDxgiDeviceInterfaces},
         {"swap_chain_buffer_index", &Dx11TestApp::testSwapChainBufferIndex},
         {"context_interfaces", &Dx11TestApp::testContextInterfaces},
@@ -5338,6 +5339,72 @@ float4 main(float4 position : SV_Position) : SV_Target { return float4(1.0f, 1.0
 
     // Planar video textures take the luma and the chroma plane from their
     // initial data (chroma rows follow the luma rows at the same pitch).
+    // A region of an NV12 texture copied to an offset in another: the luma
+    // and the chroma (half size) of the region only.
+    bool testPlanarRegionCopy(std::string& error) {
+      UINT support = 0;
+      if (FAILED(m_device->CheckFormatSupport(DXGI_FORMAT_NV12, &support)) || !(support & D3D11_FORMAT_SUPPORT_TEXTURE2D))
+        return true;
+      const UINT sw = 32, sh = 16, dw = 64, dh = 32;
+      std::vector<uint8_t> source(size_t(sw) * (sh + sh / 2)), zeros(size_t(dw) * (dh + dh / 2), 0);
+      for (size_t i = 0; i < source.size(); i++)
+        source[i] = uint8_t(1 + (i * 7 + i / sw * 13) % 250);
+      D3D11_TEXTURE2D_DESC desc = { sw, sh, 1, 1, DXGI_FORMAT_NV12, { 1, 0 }, D3D11_USAGE_DEFAULT,
+                                    D3D11_BIND_SHADER_RESOURCE, 0, 0 };
+      D3D11_SUBRESOURCE_DATA init = { source.data(), sw, 0 };
+      ComPtr<ID3D11Texture2D> src, dst, staging;
+      HRESULT hr = m_device->CreateTexture2D(&desc, &init, src.GetAddressOf());
+      desc.Width = dw;
+      desc.Height = dh;
+      init = { zeros.data(), dw, 0 };
+      if (SUCCEEDED(hr)) hr = m_device->CreateTexture2D(&desc, &init, dst.GetAddressOf());
+      desc.Usage = D3D11_USAGE_STAGING;
+      desc.BindFlags = 0;
+      desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+      if (SUCCEEDED(hr)) hr = m_device->CreateTexture2D(&desc, nullptr, staging.GetAddressOf());
+      if (FAILED(hr)) {
+        error = "textures failed: " + formatHResult(hr);
+        return false;
+      }
+      const D3D11_BOX box = { 4, 2, 0, 20, 10, 1 };
+      const UINT dx = 16, dy = 8;
+      m_context->CopySubresourceRegion(dst.Get(), 0, dx, dy, 0, src.Get(), 0, &box);
+      m_context->CopyResource(staging.Get(), dst.Get());
+      D3D11_MAPPED_SUBRESOURCE mapped = {};
+      if (FAILED(hr = m_context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped))) {
+        error = "Map failed: " + formatHResult(hr);
+        return false;
+      }
+      std::string mismatch;
+      const auto* bytes = static_cast<const uint8_t*>(mapped.pData);
+      for (UINT y = 0; y < dh && mismatch.empty(); y++)
+        for (UINT x = 0; x < dw && mismatch.empty(); x++) {
+          const bool inside = x >= dx && x < dx + (box.right - box.left) && y >= dy && y < dy + (box.bottom - box.top);
+          const uint8_t want = inside ? source[size_t(box.top + y - dy) * sw + box.left + x - dx] : 0;
+          const uint8_t got = bytes[size_t(y) * mapped.RowPitch + x];
+          if (got != want)
+            mismatch = formatString("luma (%u, %u): %u, expected %u", x, y, got, want);
+        }
+      // Chroma rows follow the luma rows; a chroma texel (two bytes) covers 2x2 luma texels.
+      for (UINT y = 0; y < dh / 2 && mismatch.empty(); y++)
+        for (UINT x = 0; x < dw && mismatch.empty(); x++) {
+          const UINT cx = x / 2;
+          const bool inside = cx >= dx / 2 && cx < (dx + box.right - box.left) / 2 && y >= dy / 2
+            && y < (dy + box.bottom - box.top) / 2;
+          const uint8_t want = inside
+            ? source[size_t(sh + box.top / 2 + y - dy / 2) * sw + (box.left / 2 + cx - dx / 2) * 2 + (x & 1)] : 0;
+          const uint8_t got = bytes[size_t(dh + y) * mapped.RowPitch + x];
+          if (got != want)
+            mismatch = formatString("chroma byte (%u, %u): %u, expected %u", x, y, got, want);
+        }
+      m_context->Unmap(staging.Get(), 0);
+      if (!mismatch.empty()) {
+        error = mismatch;
+        return false;
+      }
+      return true;
+    }
+
     bool testPlanarInitialData(std::string& error) {
       static const char* kCs = R"(
         Texture2D<float> luma : register(t0);

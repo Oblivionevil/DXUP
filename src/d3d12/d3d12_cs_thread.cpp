@@ -2,6 +2,7 @@
 #include "d3d12_backend_device.h"
 #include "d3d12_backend_context.h"
 #include "../util/util_types.h"
+#include "../util/util_paths.h"
 
 #include <array>
 #include <cstdio>
@@ -20,25 +21,7 @@ namespace dxup {
   bool csThreadEnabled() {
 #ifdef _WIN32
     static bool enabled = [] {
-      char path[MAX_PATH] = {};
-      HMODULE module = nullptr;
-      GetModuleHandleExA(
-        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-        reinterpret_cast<LPCSTR>(&csThreadEnabled),
-        &module);
-      if (module)
-        GetModuleFileNameA(module, path, MAX_PATH);
-
-      char* lastSlash = strrchr(path, '\\');
-      if (lastSlash)
-        *(lastSlash + 1) = '\0';
-      else
-        path[0] = '\0';
-      strncat_s(path, MAX_PATH, "dxup_disable_cs_thread.txt", _TRUNCATE);
-
-      FILE* marker = fopen(path, "r");
-      if (marker) {
-        fclose(marker);
+      if (dxupSiblingExists("dxup_disable_cs_thread.txt")) {
         logMessage(LogLevel::Info, "CS thread disabled by dxup_disable_cs_thread.txt");
         return false;
       }

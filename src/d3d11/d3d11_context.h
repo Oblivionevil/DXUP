@@ -931,7 +931,7 @@ namespace dxup {
         pDepthStencilView,
         D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT_MAX);
       // The native runtime unbinds the output merger's UAVs here too.
-      clearPixelUnorderedAccessViewsBefore(D3D11_1_UAV_SLOT_COUNT_MAX);
+      clearPixelUnorderedAccessViewsBefore(m_state.om.uavSlotEnd);
     }
 
     void STDMETHODCALLTYPE OMSetRenderTargetsAndUnorderedAccessViews(
@@ -992,7 +992,8 @@ namespace dxup {
           maxRenderTargetCount);
         // Kept UAVs of the new targets' parts are unbound (native runtime).
         if (!newUavs) {
-          for (UINT slot = 0; slot < D3D11_1_UAV_SLOT_COUNT_MAX; slot++)
+          const UINT uavEnd = m_state.om.uavSlotEnd;
+          for (UINT slot = 0; slot < uavEnd; slot++)
             for (UINT rt = 0; rt < m_state.om.numRenderTargets; rt++)
               if (overlaps(m_state.om.renderTargets[rt], m_state.om.uavs[slot])) {
                 clearPixelUnorderedAccessView(slot);
@@ -1026,7 +1027,8 @@ namespace dxup {
 
       // The UAVs outside the new range are unbound (native runtime; NumUAVs
       // of 0 unbinds them all).
-      for (UINT slot = 0; slot < D3D11_1_UAV_SLOT_COUNT_MAX; slot++)
+      const UINT boundEnd = m_state.om.uavSlotEnd;
+      for (UINT slot = 0; slot < boundEnd; slot++)
         if (slot < UAVStartSlot || slot - UAVStartSlot >= NumUAVs)
           clearPixelUnorderedAccessView(slot);
       if (!NumUAVs)
@@ -1569,22 +1571,16 @@ namespace dxup {
       ComPtr<ID3D11Buffer> staging;
       if (!size || FAILED(m_device->CreateBuffer(&stagingDesc, nullptr, staging.GetAddressOf())))
         return false;
-      char path[MAX_PATH] = {};
-      HMODULE module = nullptr;
-      GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-        reinterpret_cast<LPCSTR>(&d3d11InfoLoggingEnabled), &module);
-      if (!module || !GetModuleFileNameA(module, path, MAX_PATH) || !strrchr(path, '\\'))
-        return false;
       char name[64];
       sprintf_s(name, "dxup_trace_%u_cb%u.bin", call, slot);
-      strcpy_s(strrchr(path, '\\') + 1, MAX_PATH - (strrchr(path, '\\') + 1 - path), name);
+      const std::string path = dxupSiblingPath(name);
       m_probing = true;
       const D3D11_BOX box = { 0, 0, 0, size, 1, 1 };
       CopySubresourceRegion(staging.Get(), 0, 0, 0, 0, buffer, 0, &box);
       bool written = false;
       D3D11_MAPPED_SUBRESOURCE mapped = {};
       if (SUCCEEDED(Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped))) {
-        if (FILE* file = fopen(path, "wb")) {
+        if (FILE* file = fopen(path.c_str(), "wb")) {
           written = fwrite(mapped.pData, 1, size, file) == size;
           fclose(file);
         }
@@ -4518,19 +4514,11 @@ namespace dxup {
     void dumpCallTargets(uint32_t index) {
       static const std::vector<uint32_t> calls = [] {
         std::vector<uint32_t> list;
-        char path[MAX_PATH] = {};
-        HMODULE module = nullptr;
-        GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-          reinterpret_cast<LPCSTR>(&d3d11InfoLoggingEnabled), &module);
-        if (module && GetModuleFileNameA(module, path, MAX_PATH) && strrchr(path, '\\'))
-          strcpy_s(strrchr(path, '\\') + 1, MAX_PATH - (strrchr(path, '\\') + 1 - path), "dxup_dump_calls.txt");
-        if (path[0]) {
-          if (FILE* file = fopen(path, "r")) {
-            unsigned value = 0;
-            while (fscanf_s(file, "%u", &value) == 1)
-              list.push_back(value);
-            fclose(file);
-          }
+        if (FILE* file = fopen(dxupSiblingPath("dxup_dump_calls.txt").c_str(), "r")) {
+          unsigned value = 0;
+          while (fscanf_s(file, "%u", &value) == 1)
+            list.push_back(value);
+          fclose(file);
         }
         return list;
       }();
@@ -4585,13 +4573,7 @@ namespace dxup {
       CopySubresourceRegion(staging.Get(), 0, 0, 0, 0, resource, 0, nullptr);
       D3D11_MAPPED_SUBRESOURCE mapped = {};
       if (SUCCEEDED(Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped))) {
-        char path[MAX_PATH] = {};
-        HMODULE module = nullptr;
-        GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-          reinterpret_cast<LPCSTR>(&d3d11InfoLoggingEnabled), &module);
-        if (module && GetModuleFileNameA(module, path, MAX_PATH) && strrchr(path, '\\'))
-          strcpy_s(strrchr(path, '\\') + 1, MAX_PATH - (strrchr(path, '\\') + 1 - path), name);
-        if (FILE* file = path[0] ? fopen(path, "wb") : nullptr) {
+        if (FILE* file = fopen(dxupSiblingPath(name).c_str(), "wb")) {
           const uint32_t imageSize = desc.Width * desc.Height * 4;
           BITMAPFILEHEADER fileHeader = {};
           BITMAPINFOHEADER infoHeader = {};
@@ -4672,17 +4654,10 @@ namespace dxup {
     void probeRenderTarget(std::string& line) {
       static const POINT probe = [] {
         POINT point = { -1, -1 };
-        char path[MAX_PATH] = {};
-        HMODULE module = nullptr;
-        GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-          reinterpret_cast<LPCSTR>(&d3d11InfoLoggingEnabled), &module);
-        if (module && GetModuleFileNameA(module, path, MAX_PATH) && strrchr(path, '\\')) {
-          strcpy_s(strrchr(path, '\\') + 1, MAX_PATH - (strrchr(path, '\\') + 1 - path), "dxup_probe_pixel.txt");
-          if (FILE* file = fopen(path, "r")) {
-            if (fscanf_s(file, "%ld %ld", &point.x, &point.y) != 2)
-              point = { -1, -1 };
-            fclose(file);
-          }
+        if (FILE* file = fopen(dxupSiblingPath("dxup_probe_pixel.txt").c_str(), "r")) {
+          if (fscanf_s(file, "%ld %ld", &point.x, &point.y) != 2)
+            point = { -1, -1 };
+          fclose(file);
         }
         return point;
       }();

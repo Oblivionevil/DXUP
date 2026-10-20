@@ -4,6 +4,7 @@
 #include "../util/util_types.h"
 #include "../util/util_config.h"
 #include "../util/util_thread.h"
+#include "../util/util_paths.h"
 #include "../d3d12/d3d12_dxbc.h"
 
 #include "ffp_vs.h"
@@ -198,18 +199,10 @@ namespace dxup::legacy {
 
     HMODULE loadD3D11() {
       // DXUP's d3d11.dll next to this module, else the system's.
-      HMODULE self = nullptr;
-      GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-        reinterpret_cast<LPCWSTR>(&loadD3D11), &self);
-      wchar_t path[MAX_PATH] = {};
-      if (self && GetModuleFileNameW(self, path, MAX_PATH)) {
-        if (wchar_t* name = wcsrchr(path, L'\\')) {
-          wcscpy_s(name + 1, MAX_PATH - size_t(name + 1 - path), L"d3d11.dll");
-          if (GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES)
-            if (HMODULE module = LoadLibraryW(path))
-              return module;
-        }
-      }
+      const std::wstring path = dxupSiblingPathW(L"d3d11.dll");
+      if (!path.empty() && GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES)
+        if (HMODULE module = LoadLibraryW(path.c_str()))
+          return module;
       return LoadLibraryW(L"d3d11.dll");
     }
   }
@@ -1058,18 +1051,9 @@ namespace dxup::legacy {
 
     // dxup_pso_cache next to the DLL (created), empty when unknown.
     std::wstring cacheDirectory() {
-      HMODULE self = nullptr;
-      GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-        reinterpret_cast<LPCWSTR>(&compiler), &self);
-      wchar_t path[MAX_PATH] = {};
-      if (!self || !GetModuleFileNameW(self, path, MAX_PATH))
-        return std::wstring();
-      wchar_t* name = wcsrchr(path, L'\\');
-      if (!name)
-        return std::wstring();
-      name[1] = 0;
-      std::wstring dir = std::wstring(path) + L"dxup_pso_cache";
-      CreateDirectoryW(dir.c_str(), nullptr);
+      const std::wstring dir = dxupSiblingPathW(L"dxup_pso_cache");
+      if (!dir.empty())
+        CreateDirectoryW(dir.c_str(), nullptr);
       return dir;
     }
 
@@ -1136,8 +1120,13 @@ namespace dxup::legacy {
         FILE* file = nullptr;
         if (_wfopen_s(&file, m_path.c_str(), L"r+b") != 0)
           file = nullptr;
-        if (!file)
+        if (!file) {
+          // There but not to be opened (another process of the game has
+          // it): nothing appended this run (a header amid its entries).
+          if (GetFileAttributesW(m_path.c_str()) != INVALID_FILE_ATTRIBUTES)
+            m_path.clear();
           return;
+        }
         uint64_t header[2] = {};
         size_t good = 0;
         if (fread(header, sizeof(header), 1, file) == 1 && header[0] == kHeader[0] && header[1] == kHeader[1]) {
@@ -1270,8 +1259,6 @@ namespace dxup::legacy {
         if (m_path.empty() || m_size + size > kMaxBytes)
           return;
         std::vector<uint8_t>& entry = m_pending;
-        if (m_size == 0)
-          entry.insert(entry.end(), reinterpret_cast<const uint8_t*>(kHeader), reinterpret_cast<const uint8_t*>(kHeader) + sizeof(kHeader));
         const uint32_t head[2] = { type, uint32_t(size) };
         entry.insert(entry.end(), reinterpret_cast<const uint8_t*>(head), reinterpret_cast<const uint8_t*>(head) + sizeof(head));
         entry.insert(entry.end(), static_cast<const uint8_t*>(data), static_cast<const uint8_t*>(data) + size);
@@ -1292,6 +1279,9 @@ namespace dxup::legacy {
       void write() {
         SetThreadDescription(GetCurrentThread(), L"dxup-d3d9-records");
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+        // A new file gets the header with the first batch written (a batch
+        // that could not be written takes only its entries along).
+        bool needHeader = m_newFile;
         for (;;) {
           std::vector<uint8_t> batch;
           {
@@ -1302,8 +1292,11 @@ namespace dxup::legacy {
           FILE* file = nullptr;
           if (_wfopen_s(&file, m_path.c_str(), L"ab") != 0 || !file)
             continue;
-          fwrite(batch.data(), 1, batch.size(), file);
+          const bool headerWritten = !needHeader || fwrite(kHeader, sizeof(kHeader), 1, file) == 1;
+          if (headerWritten)
+            fwrite(batch.data(), 1, batch.size(), file);
           fclose(file);
+          needHeader = !headerWritten;
         }
       }
 
@@ -1313,18 +1306,26 @@ namespace dxup::legacy {
           return;
         m_path = dir + L"\\d3d9_variants.bin";
         FILE* file = nullptr;
-        if (_wfopen_s(&file, m_path.c_str(), L"rb") != 0)
+        if (_wfopen_s(&file, m_path.c_str(), L"r+b") != 0)
           file = nullptr;
-        if (!file)
+        if (!file) {
+          // There but not to be opened (another process of the game has
+          // it): nothing appended this run; else a new file.
+          if (GetFileAttributesW(m_path.c_str()) != INVALID_FILE_ATTRIBUTES)
+            m_path.clear();
+          m_newFile = true;
           return;
+        }
         uint32_t header[2] = {};
         const bool valid = fread(header, sizeof(header), 1, file) == 1 && header[0] == kHeader[0] && header[1] == kHeader[1];
+        size_t good = valid ? sizeof(header) : 0;
         uint32_t head[2];
         std::vector<uint8_t> data;
         while (valid && fread(head, sizeof(head), 1, file) == 1 && head[1] <= kMaxEntry) {
           data.resize(head[1]);
           if (fread(data.data(), 1, data.size(), file) != data.size())
             break;
+          good += sizeof(head) + data.size();
           if (head[0] == kCode && data.size() > sizeof(uint64_t) && (data.size() - sizeof(uint64_t)) % sizeof(uint32_t) == 0) {
             uint64_t shader;
             std::memcpy(&shader, data.data(), sizeof(shader));
@@ -1341,17 +1342,19 @@ namespace dxup::legacy {
               m_records.emplace(record.shader, record);
           }
         }
-        m_size = valid ? size_t(_ftelli64(file)) : 0;
+        // Another layout: started anew; a part entry at the end (a write cut
+        // short) goes, so that later entries follow whole ones.
+        _chsize_s(_fileno(file), static_cast<__int64>(good));
         fclose(file);
-        // Another layout: started anew.
-        if (!valid)
-          DeleteFileW(m_path.c_str());
+        m_size = good;
+        m_newFile = !valid;
       }
 
       std::mutex m_mutex;
       std::condition_variable m_wake;
       std::vector<uint8_t> m_pending;   // entries the writer has not written
       bool m_writerStarted = false;
+      bool m_newFile = false;           // without a header yet (the writer's)
       std::wstring m_path;              // fixed once made
       size_t m_size = 0;
       std::unordered_set<uint64_t> m_known;
@@ -3112,17 +3115,8 @@ namespace dxup::legacy {
   // dxup_frame_dump.txt next to the DLL (DXUP Manager's "Record a problem").
   bool glitchReportsEnabled() {
     static const bool enabled = [] {
-      HMODULE self = nullptr;
-      GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-        reinterpret_cast<LPCWSTR>(&glitchReportsEnabled), &self);
-      wchar_t path[MAX_PATH] = {};
-      if (!self || !GetModuleFileNameW(self, path, MAX_PATH))
-        return false;
-      wchar_t* name = wcsrchr(path, L'\\');
-      if (!name)
-        return false;
-      wcscpy_s(name + 1, MAX_PATH - (name + 1 - path), L"dxup_frame_dump.txt");
-      const DWORD attributes = GetFileAttributesW(path);
+      const std::wstring path = dxupSiblingPathW(L"dxup_frame_dump.txt");
+      const DWORD attributes = path.empty() ? INVALID_FILE_ATTRIBUTES : GetFileAttributesW(path.c_str());
       return attributes != INVALID_FILE_ATTRIBUTES && !(attributes & FILE_ATTRIBUTE_DIRECTORY);
     }();
     return enabled;
@@ -3389,20 +3383,12 @@ namespace dxup::legacy {
     logMessage(LogLevel::Warn, "trace9   depth %s: %ux%u format %u min %.7f max %.7f mean %.7f, %llu at 0, %llu at 1, probe %.7f",
       when, width, height, unsigned(depth.format), minimum, maximum, sum / (double(width) * height),
       static_cast<unsigned long long>(zeros), static_cast<unsigned long long>(ones), probe);
-    wchar_t path[MAX_PATH] = {};
-    HMODULE self = nullptr;
-    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-      reinterpret_cast<LPCWSTR>(&glitchReportsEnabled), &self);
-    if (self && GetModuleFileNameW(self, path, MAX_PATH)) {
-      if (wchar_t* name = wcsrchr(path, L'\\')) {
-        wcscpy_s(name + 1, MAX_PATH - (name + 1 - path), L"dxup_trace9_depth.pgm");
-        FILE* f = nullptr;
-        if (_wfopen_s(&f, path, L"wb") == 0 && f) {
-          std::fprintf(f, "P5 %u %u 65535 ", width, height);
-          std::fwrite(image.data(), 1, image.size(), f);
-          std::fclose(f);
-        }
-      }
+    const std::wstring path = dxupSiblingPathW(L"dxup_trace9_depth.pgm");
+    FILE* f = nullptr;
+    if (!path.empty() && _wfopen_s(&f, path.c_str(), L"wb") == 0 && f) {
+      std::fprintf(f, "P5 %u %u 65535 ", width, height);
+      std::fwrite(image.data(), 1, image.size(), f);
+      std::fclose(f);
     }
   }
 
@@ -4790,17 +4776,7 @@ namespace dxup::legacy {
     const uint64_t now = GetTickCount64();
     if (!m_trace9Done && now - m_trace9LastCheck >= 2000) {
       m_trace9LastCheck = now;
-      static const std::wstring goPath = [] {
-        wchar_t path[MAX_PATH] = {};
-        HMODULE self = nullptr;
-        GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-          reinterpret_cast<LPCWSTR>(&glitchReportsEnabled), &self);
-        wchar_t* name = self && GetModuleFileNameW(self, path, MAX_PATH) ? wcsrchr(path, L'\\') : nullptr;
-        if (!name)
-          return std::wstring();
-        wcscpy_s(name + 1, MAX_PATH - (name + 1 - path), L"dxup_trace9_go.txt");
-        return std::wstring(path);
-      }();
+      static const std::wstring goPath = dxupSiblingPathW(L"dxup_trace9_go.txt");
       if (!goPath.empty() && GetFileAttributesW(goPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
         m_trace9 = m_trace9Done = true;
         m_trace9DepthDone = false;

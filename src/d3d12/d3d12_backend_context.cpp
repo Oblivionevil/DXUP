@@ -761,21 +761,8 @@ namespace dxup::d3d12 {
       static bool limitRead = false;
       if (!limitRead) {
         limitRead = true;
-        // Try to find the file next to d3d11.dll
-        char dllPath[MAX_PATH] = {};
-        HMODULE hMod = nullptr;
-        GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                           reinterpret_cast<LPCSTR>(&g_gpuOpLimit), &hMod);
-        if (hMod) {
-          GetModuleFileNameA(hMod, dllPath, MAX_PATH);
-          // Strip filename to get directory
-          char* lastSlash = strrchr(dllPath, '\\');
-          if (lastSlash) *(lastSlash + 1) = '\0';
-          strcat_s(dllPath, "dxup_gpu_limit.txt");
-        } else {
-          strcpy_s(dllPath, "dxup_gpu_limit.txt");
-        }
-        FILE* f = fopen(dllPath, "r");
+        // The file next to d3d11.dll.
+        FILE* f = fopen(dxupSiblingPath("dxup_gpu_limit.txt").c_str(), "r");
         if (f) {
           int val = -1;
           if (fscanf(f, "%d", &val) == 1) {
@@ -926,6 +913,11 @@ namespace dxup::d3d12 {
       m_upscalerPending.get();
     if (m_upscalerThread.joinable())
       m_upscalerThread.join();
+    // The context's own render target descriptors (read when recorded).
+    if (m_nullRtv.ptr)
+      m_device->getDescriptorHeapManager().freeRtv(m_nullRtv);
+    if (m_lazyClearRtv.ptr)
+      m_device->getDescriptorHeapManager().freeRtv(m_lazyClearRtv);
 
     for (auto* query : m_activeQueries)
       query->m_context = nullptr;
@@ -3982,15 +3974,26 @@ namespace dxup::d3d12 {
     }
 
     safeCopyTextureRegionSimple(m_cmdList.Get(), &dstLoc, dstX, dstY, dstZ, &srcLoc, srcBoxPtr, m_device);
-    // Depth/stencil images: the stencil plane too (D3D11 copies both; their
-    // copies are of whole subresources).
+    // The second plane too (D3D11 copies both): depth/stencil copies are of
+    // whole subresources; the chroma of video images is subsampled, its
+    // region and offset scaled (NV11: a quarter of the width; else halves).
     const uint32_t planes = (std::min)(d3d12Dst->getPlaneCount(), d3d12Src->getPlaneCount());
+    const DXGI_FORMAT dstFormat = d3d12Dst->getDesc().format;
+    const bool video = isPlanarVideoFormat(dstFormat);
+    const uint32_t sx = dstFormat == DXGI_FORMAT_NV11 ? 4u : 2u, sy = dstFormat == DXGI_FORMAT_NV11 ? 1u : 2u;
     for (uint32_t plane = 1; plane < planes; plane++) {
       D3D12_TEXTURE_COPY_LOCATION dstPlane = dstLoc;
       D3D12_TEXTURE_COPY_LOCATION srcPlane = srcLoc;
       dstPlane.SubresourceIndex = d3d12Dst->calcSubresource(dstSubres.mipLevel, dstSubres.arrayLayer, plane);
       srcPlane.SubresourceIndex = d3d12Src->calcSubresource(srcSubres.mipLevel, srcSubres.arrayLayer, plane);
-      m_cmdList->CopyTextureRegion(&dstPlane, 0, 0, 0, &srcPlane, nullptr);
+      if (!video) {
+        m_cmdList->CopyTextureRegion(&dstPlane, 0, 0, 0, &srcPlane, nullptr);
+        continue;
+      }
+      D3D12_BOX chromaBox = {};
+      if (srcBoxPtr)
+        chromaBox = { srcBox.left / sx, srcBox.top / sy, 0, (srcBox.right + sx - 1) / sx, (srcBox.bottom + sy - 1) / sy, 1 };
+      m_cmdList->CopyTextureRegion(&dstPlane, dstX / sx, dstY / sy, 0, &srcPlane, srcBoxPtr ? &chromaBox : nullptr);
     }
 #endif
   }

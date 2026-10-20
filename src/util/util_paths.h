@@ -39,6 +39,21 @@ namespace dxup {
     return true;
   }
 
+  // A wide path (any characters), empty when the DLL's path is unknown.
+  inline std::wstring dxupSiblingPathW(const wchar_t* name) {
+    wchar_t path[MAX_PATH] = {};
+    HMODULE module = nullptr;
+    GetModuleHandleExW(
+      GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+      reinterpret_cast<LPCWSTR>(&dxupSiblingPathW), &module);
+    const DWORD length = module ? GetModuleFileNameW(module, path, MAX_PATH) : 0;
+    wchar_t* lastSlash = length && length < MAX_PATH ? wcsrchr(path, L'\\') : nullptr;
+    if (!lastSlash)
+      return std::wstring();
+    lastSlash[1] = L'\0';
+    return std::wstring(path) + name;
+  }
+
   // Whether a file (a dxup_*.txt marker) lies next to the DLL.
   inline bool dxupSiblingExists(const char* name) {
     const DWORD attributes = GetFileAttributesA(dxupSiblingPath(name).c_str());

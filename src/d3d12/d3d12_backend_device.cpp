@@ -1903,41 +1903,26 @@ namespace dxup::d3d12 {
     // Try to enable debug layer if dxup_debug.txt exists next to our DLL
     m_debugLayerEnabled = false;
     {
-      static int s_debugAnchor = 0;
-      HMODULE hMod = nullptr;
-      GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-        reinterpret_cast<LPCSTR>(&s_debugAnchor), &hMod);
-      if (hMod) {
-        char dllPath[MAX_PATH];
-        GetModuleFileNameA(hMod, dllPath, MAX_PATH);
-        std::string dir(dllPath);
-        auto pos = dir.find_last_of("\\/");
-        if (pos != std::string::npos)
-          dir = dir.substr(0, pos + 1);
-        std::string debugFile = dir + "dxup_debug.txt";
-        FILE* f = fopen(debugFile.c_str(), "r");
-        if (f) {
-          fclose(f);
-          ComPtr<ID3D12Debug> debugController;
-          HRESULT hr = D3D12GetDebugInterface(IID_PPV_ARGS(&debugController));
-          if (SUCCEEDED(hr)) {
-            debugController->EnableDebugLayer();
-            m_debugLayerEnabled = true;
-            logMessage(LogLevel::Info, "D3D12 debug layer ENABLED (dxup_debug.txt found)");
+      if (markerFileEnabled("dxup_debug.txt")) {
+        ComPtr<ID3D12Debug> debugController;
+        HRESULT hr = D3D12GetDebugInterface(IID_PPV_ARGS(&debugController));
+        if (SUCCEEDED(hr)) {
+          debugController->EnableDebugLayer();
+          m_debugLayerEnabled = true;
+          logMessage(LogLevel::Info, "D3D12 debug layer ENABLED (dxup_debug.txt found)");
 
-            if (markerFileEnabled("dxup_gpu_validation.txt")) {
-              ComPtr<ID3D12Debug1> debugController1;
-              if (SUCCEEDED(debugController.As(&debugController1))) {
-                debugController1->SetEnableGPUBasedValidation(TRUE);
-                debugController1->SetEnableSynchronizedCommandQueueValidation(TRUE);
-                logMessage(LogLevel::Warn, "D3D12 GPU-based validation ENABLED (dxup_gpu_validation.txt found)");
-              } else {
-                logMessage(LogLevel::Warn, "D3D12 GPU-based validation requested but ID3D12Debug1 is unavailable");
-              }
+          if (markerFileEnabled("dxup_gpu_validation.txt")) {
+            ComPtr<ID3D12Debug1> debugController1;
+            if (SUCCEEDED(debugController.As(&debugController1))) {
+              debugController1->SetEnableGPUBasedValidation(TRUE);
+              debugController1->SetEnableSynchronizedCommandQueueValidation(TRUE);
+              logMessage(LogLevel::Warn, "D3D12 GPU-based validation ENABLED (dxup_gpu_validation.txt found)");
+            } else {
+              logMessage(LogLevel::Warn, "D3D12 GPU-based validation requested but ID3D12Debug1 is unavailable");
             }
-          } else {
-            logMessage(LogLevel::Warn, "D3D12GetDebugInterface failed (hr=0x%08x) - debug layer not available", hr);
           }
+        } else {
+          logMessage(LogLevel::Warn, "D3D12GetDebugInterface failed (hr=0x%08x) - debug layer not available", hr);
         }
       }
     }
@@ -4655,23 +4640,12 @@ namespace dxup::d3d12 {
 
       // Save first shader to file for offline analysis
       if (csCreateLogCount == 0) {
-        char dllPath[MAX_PATH] = {};
-        HMODULE hMod = nullptr;
-        static int s_anchor2 = 0;
-        GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-          reinterpret_cast<LPCSTR>(&s_anchor2), &hMod);
-        if (hMod) {
-          GetModuleFileNameA(hMod, dllPath, MAX_PATH);
-          std::string dir(dllPath);
-          auto p = dir.find_last_of("\\/");
-          if (p != std::string::npos) dir = dir.substr(0, p + 1);
-          std::string shaderFile = dir + "dxup_cs0.dxbc";
-          FILE* sf = fopen(shaderFile.c_str(), "wb");
-          if (sf) {
-            fwrite(desc.csBytecode, 1, desc.csBytecodeSize, sf);
-            fclose(sf);
-            logMessage(LogLevel::Info, "  Saved shader to %s", shaderFile.c_str());
-          }
+        const std::string shaderFile = dxupSiblingPath("dxup_cs0.dxbc");
+        FILE* sf = fopen(shaderFile.c_str(), "wb");
+        if (sf) {
+          fwrite(desc.csBytecode, 1, desc.csBytecodeSize, sf);
+          fclose(sf);
+          logMessage(LogLevel::Info, "  Saved shader to %s", shaderFile.c_str());
         }
       }
 
@@ -5172,18 +5146,8 @@ namespace dxup::d3d12 {
 #ifdef _WIN32
   void D3D12BackendDevice::initPsoDiskCache() {
 #ifdef _WIN32
-    // Get our DLL's directory
-    char dllPath[MAX_PATH] = {};
-    HMODULE hMod = nullptr;
-    GetModuleHandleExA(
-      GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-      reinterpret_cast<LPCSTR>(&safeCreateGraphicsPSO), &hMod);
-    if (hMod) {
-      GetModuleFileNameA(hMod, dllPath, MAX_PATH);
-      char* lastSlash = strrchr(dllPath, '\\');
-      if (lastSlash) *(lastSlash + 1) = '\0';
-    }
-    m_psoDiskCacheDir = std::string(dllPath) + "dxup_pso_cache";
+    // dxup_pso_cache next to the DLL.
+    m_psoDiskCacheDir = dxupSiblingPath("dxup_pso_cache");
 
     // Create directory if it doesn't exist
     CreateDirectoryA(m_psoDiskCacheDir.c_str(), nullptr);
