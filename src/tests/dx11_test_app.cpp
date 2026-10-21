@@ -22777,8 +22777,9 @@ float4 main() : SV_Target { return color; }
     }
     context->Flush();
     // Trims every 100 ms; renamed blocks stay for three periods after their
-    // last use.
-    present(60, 20);
+    // last use, and two go a present (250 blocks of 1 MB in a 32-bit
+    // process).
+    present(160, 20);
     const int64_t after = usage();
     std::printf("  idle memory: %lld MB after\n", static_cast<long long>(after));
     swapChain.Reset();

@@ -2651,9 +2651,10 @@ namespace dxup::d3d12 {
     if (it == m_recycledBuffers.end() || it->second.empty())
       return nullptr;
 
-    auto buffer = std::move(it->second.back());
+    auto buffer = std::move(it->second.back().buffer);
     it->second.pop_back();
     m_recycledBufferCount--;
+    m_recycledBufferBytes -= desc.size;
     if (it->second.empty())
       m_recycledBuffers.erase(it);
 
@@ -2672,10 +2673,10 @@ namespace dxup::d3d12 {
      || static_cast<D3D12BackendBuffer*>(buffer.get())->isSuballocated())
       return false;
 
-    if (!isReusableUploadBuffer(desc))
+    if (!isReusableUploadBuffer(desc) || desc.size > kMaxRecycledBytes / 4)
       return false;
 
-    Rc<IBackendBuffer> evicted;
+    Rc<IBackendBuffer> evicted;   // released after the lock
     std::lock_guard<std::mutex> lock(m_recycledBufferMutex);
     auto& bucket = m_recycledBuffers[makeRecycledBufferKey(desc)];
     if (bucket.size() >= kMaxRecycledBuffersPerKey)
@@ -2683,24 +2684,72 @@ namespace dxup::d3d12 {
 
     if (m_recycledBufferCount >= kMaxRecycledBuffers) {
       // Buffers left over from a load spike must not keep the sizes a
-      // frame uses every time from being recycled: drop the oldest buffer
-      // of the largest bucket instead.
-      auto largest = m_recycledBuffers.end();
-      for (auto it = m_recycledBuffers.begin(); it != m_recycledBuffers.end(); ++it) {
-        if (largest == m_recycledBuffers.end() || it->second.size() > largest->second.size())
-          largest = it;
-      }
-      if (largest == m_recycledBuffers.end() || largest->second.empty() || &largest->second == &bucket)
+      // frame uses every time from being recycled: the one waiting
+      // longest goes.
+      auto oldest = oldestRecycledBucket();
+      if (oldest == m_recycledBuffers.end())
         return false;
-
-      evicted = std::move(largest->second.front());
-      largest->second.erase(largest->second.begin());
+      evicted = std::move(oldest->second.front().buffer);
+      oldest->second.erase(oldest->second.begin());
       m_recycledBufferCount--;
+      m_recycledBufferBytes -= oldest->first.size;
     }
 
-    bucket.push_back(std::move(buffer));
+    bucket.push_back({ std::move(buffer), ++m_recycleSequence });
     m_recycledBufferCount++;
+    m_recycledBufferBytes += desc.size;
     return true;
+  }
+
+  D3D12BackendDevice::RecycledBufferMap::iterator D3D12BackendDevice::oldestRecycledBucket() {
+    auto oldest = m_recycledBuffers.end();
+    for (auto it = m_recycledBuffers.begin(); it != m_recycledBuffers.end(); ++it) {
+      if (!it->second.empty()
+       && (oldest == m_recycledBuffers.end() || it->second.front().sequence < oldest->second.front().sequence))
+        oldest = it;
+    }
+    return oldest;
+  }
+
+  void D3D12BackendDevice::trimRecycledBuffers() {
+    // At present: what a load (texture uploads) recycled between two
+    // presents comes down to kMaxRecycledBytes, the buffers waiting longest
+    // first; and every trim interval, the buffers not taken again since
+    // the last one go.
+    const uint64_t now = GetTickCount64();
+    uint64_t last = m_lastRecycleTrim.load(std::memory_order_relaxed);
+    const bool idleTrim = now - last >= trimIntervalMs()
+      && m_lastRecycleTrim.compare_exchange_strong(last, now, std::memory_order_relaxed);
+    if (!idleTrim && m_recycledBufferBytes.load(std::memory_order_relaxed) <= kMaxRecycledBytes)
+      return;
+    std::vector<Rc<IBackendBuffer>> released;   // after the lock
+    std::lock_guard<std::mutex> lock(m_recycledBufferMutex);
+    if (idleTrim) {
+      for (auto it = m_recycledBuffers.begin(); it != m_recycledBuffers.end();) {
+        auto& bucket = it->second;
+        size_t idle = 0;
+        while (idle < bucket.size() && bucket[idle].sequence <= m_recycleTrimMark)
+          released.push_back(std::move(bucket[idle++].buffer));
+        if (idle) {
+          bucket.erase(bucket.begin(), bucket.begin() + idle);
+          m_recycledBufferCount -= idle;
+          m_recycledBufferBytes -= idle * it->first.size;
+        }
+        it = bucket.empty() ? m_recycledBuffers.erase(it) : std::next(it);
+      }
+      m_recycleTrimMark = m_recycleSequence;
+    }
+    while (m_recycledBufferBytes.load(std::memory_order_relaxed) > kMaxRecycledBytes) {
+      auto oldest = oldestRecycledBucket();
+      if (oldest == m_recycledBuffers.end())
+        break;
+      released.push_back(std::move(oldest->second.front().buffer));
+      oldest->second.erase(oldest->second.begin());
+      m_recycledBufferCount--;
+      m_recycledBufferBytes -= oldest->first.size;
+      if (oldest->second.empty())
+        m_recycledBuffers.erase(oldest);
+    }
   }
 #endif
 

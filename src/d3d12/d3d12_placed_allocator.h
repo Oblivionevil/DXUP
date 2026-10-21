@@ -43,14 +43,14 @@ namespace dxup::d3d12 {
 
   class D3D12PlacedAllocator : public std::enable_shared_from_this<D3D12PlacedAllocator> {
   public:
-    static constexpr uint64_t kHeapSize = 64ull << 20;
+    static constexpr uint64_t kDefaultHeapSize = 64ull << 20;
 
     // Larger resources than maxPlacedSize take a committed resource of
     // their own.
     D3D12PlacedAllocator(D3D12_HEAP_FLAGS heapFlags, uint64_t maxPlacedSize,
-                         D3D12_HEAP_TYPE heapType = D3D12_HEAP_TYPE_DEFAULT)
-    : m_heapFlags(heapFlags), m_maxPlacedSize(maxPlacedSize), m_heapType(heapType),
-      m_lowWater((std::min)(kHeapSize / 2, (std::max)(maxPlacedSize, kHeapSize / 4))) { }
+                         D3D12_HEAP_TYPE heapType = D3D12_HEAP_TYPE_DEFAULT, uint64_t heapSize = kDefaultHeapSize)
+    : m_heapFlags(heapFlags), m_maxPlacedSize(maxPlacedSize), m_heapType(heapType), m_heapSize(heapSize),
+      m_lowWater((std::min)(heapSize / 2, (std::max)(maxPlacedSize, heapSize / 4))) { }
 
     ~D3D12PlacedAllocator() { shutdown(); }
 
@@ -90,13 +90,13 @@ namespace dxup::d3d12 {
       std::lock_guard<std::mutex> lock(m_mutex);
       size_t released = 0;
       for (auto& entry : m_heaps) {
-        if (m_freeBytes < m_lowWater + 2 * kHeapSize)
+        if (m_freeBytes < m_lowWater + 2 * m_heapSize)
           break;
         if (entry.heap && entry.free.size() == 1 && entry.free.begin()->first == 0
-         && entry.free.begin()->second == kHeapSize) {
+         && entry.free.begin()->second == m_heapSize) {
           m_releasing.push_back(std::move(entry.heap));
           entry.free.clear();
-          m_freeBytes -= kHeapSize;
+          m_freeBytes -= m_heapSize;
           released++;
         }
       }
@@ -267,7 +267,7 @@ namespace dxup::d3d12 {
 
     ComPtr<ID3D12Heap> createHeap(ID3D12Device* device) const {
       D3D12_HEAP_DESC heapDesc = {};
-      heapDesc.SizeInBytes = kHeapSize;
+      heapDesc.SizeInBytes = m_heapSize;
       heapDesc.Properties.Type = m_heapType;
       heapDesc.Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
       heapDesc.Flags = m_heapFlags;
@@ -313,8 +313,8 @@ namespace dxup::d3d12 {
       }
       slot->heap = std::move(heap);
       slot->free.clear();
-      slot->free[0] = kHeapSize;
-      m_freeBytes += kHeapSize;
+      slot->free[0] = m_heapSize;
+      m_freeBytes += m_heapSize;
     }
 
     // With m_mutex held.
@@ -411,6 +411,7 @@ namespace dxup::d3d12 {
     const D3D12_HEAP_FLAGS m_heapFlags;
     const uint64_t         m_maxPlacedSize;
     const D3D12_HEAP_TYPE  m_heapType;
+    const uint64_t         m_heapSize;
     const uint64_t         m_lowWater;
     std::mutex             m_mutex;
     std::vector<Heap>      m_heaps;

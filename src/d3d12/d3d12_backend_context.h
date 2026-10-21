@@ -50,7 +50,9 @@ namespace dxup::d3d12 {
   constexpr D3D12_RESOURCE_STATES kShaderReadState = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
     | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
   constexpr uint32_t kEarlySubmitMinDraws = 512;
-  constexpr uint64_t kPendingUploadFlushThreshold = 128ull * 1024ull * 1024ull;
+  // Upload buffers a command list may collect before it is submitted (less
+  // in a 32-bit process: their memory is address space).
+  constexpr uint64_t kPendingUploadFlushThreshold = (sizeof(void*) == 4 ? 32ull : 128ull) * 1024ull * 1024ull;
 
   // ============================================================
   // D3D12 Backend Context

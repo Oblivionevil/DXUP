@@ -17,10 +17,11 @@ namespace dxup {
 #ifdef _WIN32
   // A thread with a stack of its own size. std::thread takes the
   // executable's default, which old games set as low as 64 KB: too little
-  // for the drivers our threads call into.
+  // for the drivers our threads call into. 1 MB reserved in a 32-bit
+  // process (Windows' default), where address space runs short.
   class Thread {
   public:
-    static constexpr size_t kStackSize = 2u << 20;
+    static constexpr size_t kStackSize = sizeof(void*) == 4 ? 1u << 20 : 2u << 20;
 
     Thread() = default;
 

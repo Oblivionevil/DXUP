@@ -507,7 +507,8 @@ namespace dxup::legacy {
   size_t Texture::levelSize(uint32_t subresource) const {
     // At least what a lock lets the application write (ATI1: height rows of
     // the pitch it reports, twice its blocks).
-    const size_t locked = size_t(legacyLockPitch(m_desc.format, width(subresource))) * height(subresource);
+    const size_t locked = size_t(legacyLockPitch(m_desc.format, width(subresource)))
+                        * legacyLockRows(m_desc.format, height(subresource));
     return (std::max)(size_t(slicePitch(subresource)), locked) * depth(subresource);
   }
 

@@ -2385,13 +2385,14 @@ float4 main(float2 t : TEXCOORD0) : COLOR {
   // until they are unbound (a texture and a vertex buffer drawn after their
   // release), then lets them go (textures of 1 MB created, bound, released
   // and unbound frame by frame must not pile up).
+  double privateBytes() {
+    PROCESS_MEMORY_COUNTERS_EX counters = {};
+    counters.cb = sizeof(counters);
+    K32GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&counters), sizeof(counters));
+    return double(counters.PrivateUsage);
+  }
+
   bool sceneReleasedBound(IDirect3DDevice9* d) {
-    auto privateBytes = [] {
-      PROCESS_MEMORY_COUNTERS_EX counters = {};
-      counters.cb = sizeof(counters);
-      K32GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&counters), sizeof(counters));
-      return double(counters.PrivateUsage);
-    };
     d->SetRenderState(D3DRS_LIGHTING, FALSE);
     d->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
     d->SetRenderState(D3DRS_ZENABLE, FALSE);
@@ -2443,6 +2444,73 @@ float4 main(float2 t : TEXCOORD0) : COLOR {
     return true;
   }
 
+  // Locked DXT5 levels: the application's copy takes the size of its
+  // blocks, not that of a row of blocks per pixel row (four times the
+  // memory: Overlord II, a 32-bit game, ran out of address space).
+  // Windows: 88 MB (32-bit), 112 MB (64-bit); DXUP 102 and 256 MB (upload
+  // heaps and reuse kept smaller in 32-bit processes), 247 and 397 MB with
+  // rows of blocks per pixel row.
+  constexpr double kCompressedMemoryLimitMb = sizeof(void*) == 4 ? 160.0 : 330.0;
+  bool sceneCompressedMemory(IDirect3DDevice9* d) {
+    d->SetRenderState(D3DRS_LIGHTING, FALSE);
+    d->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+    d->SetRenderState(D3DRS_ZENABLE, FALSE);
+    d->SetFVF(D3DFVF_XYZRHW | D3DFVF_TEX1);
+    struct V { float x, y, z, w, u, v; };
+    const V tiny[4] = { { 0, 0, 0.5f, 1, 0, 0 }, { 4, 0, 0.5f, 1, 1, 0 }, { 0, 4, 0.5f, 1, 0, 1 }, { 4, 4, 0.5f, 1, 1, 1 } };
+    // Opaque blocks of one colour: alpha 255, colour 0 a green.
+    const uint8_t block[16] = { 255, 255, 0, 0, 0, 0, 0, 0, 0xe0, 0x07, 0, 0, 0, 0, 0, 0 };
+    const double before = privateBytes();
+    std::vector<IDirect3DTexture9*> textures;
+    bool ok = true;
+    // 36 textures of 1024x1024 with their mips: 48 MB of blocks.
+    for (int i = 0; i < 36 && ok; i++) {
+      IDirect3DTexture9* texture = nullptr;
+      if (FAILED(d->CreateTexture(1024, 1024, 0, 0, D3DFMT_DXT5, D3DPOOL_MANAGED, &texture, nullptr))) {
+        ok = false;
+        break;
+      }
+      textures.push_back(texture);
+      for (UINT level = 0; level < texture->GetLevelCount(); level++) {
+        D3DSURFACE_DESC desc;
+        D3DLOCKED_RECT locked;
+        texture->GetLevelDesc(level, &desc);
+        if (FAILED(texture->LockRect(level, &locked, nullptr, 0))) {
+          ok = false;
+          break;
+        }
+        for (UINT y = 0; y < (desc.Height + 3) / 4; y++)
+          for (UINT x = 0; x < (desc.Width + 3) / 4; x++)
+            std::memcpy(static_cast<uint8_t*>(locked.pBits) + y * locked.Pitch + x * 16, block, 16);
+        texture->UnlockRect(level);
+      }
+      // Drawn: uploaded.
+      d->SetTexture(0, texture);
+      d->BeginScene();
+      d->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, tiny, sizeof(V));
+      d->EndScene();
+    }
+    d->SetTexture(0, nullptr);
+    d->Present(nullptr, nullptr, nullptr, nullptr);
+    const double grown = (privateBytes() - before) / (1024.0 * 1024.0);
+    if (ok && grown > kCompressedMemoryLimitMb) {
+      std::printf("  compressed_memory: private bytes grew by %.0f MB for 48 MB of DXT5 textures\n", grown);
+      ok = false;
+    }
+    d->Clear(0, nullptr, D3DCLEAR_TARGET, 0xff102030u, 1.0f, 0);
+    if (ok) {
+      const V quad[4] = { { 16, 16, 0.5f, 1, 0, 0 }, { 112, 16, 0.5f, 1, 1, 0 }, { 16, 112, 0.5f, 1, 0, 1 }, { 112, 112, 0.5f, 1, 1, 1 } };
+      d->SetTexture(0, textures.back());
+      d->BeginScene();
+      d->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, quad, sizeof(V));
+      d->EndScene();
+      d->SetTexture(0, nullptr);
+    }
+    for (IDirect3DTexture9* texture : textures)
+      texture->Release();
+    return ok;
+  }
+
   const Scene kScenes[] = {
     { "msaa_resolve", sceneMsaaResolve, 80 },   // edge coverage: NVIDIA's 4x pattern differs
     { "formats", sceneFormats },
@@ -2492,6 +2560,7 @@ float4 main(float2 t : TEXCOORD0) : COLOR {
     { "ffp_no_texture", sceneFfpNoTexture },
     { "relative_window", sceneRelativeWindow },
     { "released_bound", sceneReleasedBound },
+    { "compressed_memory", sceneCompressedMemory },
   };
 
   // ---- Running ----

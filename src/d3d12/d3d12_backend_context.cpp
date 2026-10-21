@@ -5445,7 +5445,8 @@ namespace dxup::d3d12 {
 #ifdef _WIN32
     // One per command allocator and context: 8 MB each keeps the ring at
     // the memory three 16 MB slots took; larger requests grow their slot.
-    constexpr uint64_t kDefaultUploadScratchCapacity = 8ull * 1024ull * 1024ull;
+    // 2 MB in a 32-bit process, where upload memory is address space.
+    constexpr uint64_t kDefaultUploadScratchCapacity = (kSmallAddressSpace ? 2ull : 8ull) * 1024ull * 1024ull;
     auto& scratchBuffer = m_uploadScratchBuffers[m_currentAllocatorIndex];
     auto& scratchMapped = m_uploadScratchMapped[m_currentAllocatorIndex];
     auto& scratchCapacity = m_uploadScratchCapacities[m_currentAllocatorIndex];

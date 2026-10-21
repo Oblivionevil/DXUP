@@ -94,6 +94,11 @@ namespace dxup::d3d12 {
   // outputs DXUP masked (dxbc::maskOutputWrites).
   constexpr uint64_t kPixelOutputMaskVersion = 0x504f4d31u;
 
+  // A 32-bit process: CPU-visible memory (upload heaps, mapped buffers)
+  // takes its address space, 2 GB in games without large-address
+  // awareness, where a D3D12 device alone takes 130 MB of it.
+  constexpr bool kSmallAddressSpace = sizeof(void*) == 4;
+
   // ============================================================
   // Upload heap suballocation
   // ============================================================
@@ -107,7 +112,7 @@ namespace dxup::d3d12 {
   // shared by their slices, which share the block's resource state too.
   class D3D12UploadSuballocator {
   public:
-    static constexpr uint64_t kChunkSize = 4ull << 20;
+    static constexpr uint64_t kChunkSize = kSmallAddressSpace ? 1ull << 20 : 4ull << 20;
     static constexpr uint64_t kMaxSlice = 64ull << 10;
     static constexpr uint32_t kMaxClassCount = 9;
 
@@ -1161,9 +1166,24 @@ namespace dxup::d3d12 {
         return hash;
       }
     };
-    std::unordered_map<RecycledBufferKey, std::vector<Rc<IBackendBuffer>>, RecycledBufferKeyHash> m_recycledBuffers;
+    // Oldest first in each bucket: the sequence says when it came back.
+    struct RecycledBuffer {
+      Rc<IBackendBuffer> buffer;
+      uint64_t sequence = 0;
+    };
+    using RecycledBufferMap = std::unordered_map<RecycledBufferKey, std::vector<RecycledBuffer>, RecycledBufferKeyHash>;
+    RecycledBufferMap m_recycledBuffers;
+    RecycledBufferMap::iterator oldestRecycledBucket();   // under the mutex
     std::mutex m_recycledBufferMutex;
     size_t m_recycledBufferCount = 0;
+    // Upload memory kept for reuse past a present: in a 32-bit process each
+    // byte of it is address space (2 GB without large-address awareness).
+    static constexpr uint64_t kMaxRecycledBytes = kSmallAddressSpace ? (32ull << 20) : (256ull << 20);
+    std::atomic<uint64_t> m_recycledBufferBytes{ 0 };   // written under the mutex
+    uint64_t m_recycleSequence = 0;
+    uint64_t m_recycleTrimMark = 0;          // buffers back before the last trim
+    std::atomic<uint64_t> m_lastRecycleTrim{ 0 };
+    void trimRecycledBuffers();
 
     static bool isReusableUploadBuffer(const BufferDesc& desc);
     static RecycledBufferKey makeRecycledBufferKey(const BufferDesc& desc);
@@ -1180,13 +1200,18 @@ namespace dxup::d3d12 {
     std::shared_ptr<D3D12PlacedAllocator> m_bufferAllocator =
       std::make_shared<D3D12PlacedAllocator>(D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS, 32ull << 20);
     // Dynamic buffers that cannot be upload slices (shader views): upload
-    // heaps.
+    // heaps. Upload memory is address space: smaller heaps in a 32-bit
+    // process (2 GB without large-address awareness).
     std::shared_ptr<D3D12PlacedAllocator> m_dynamicBufferAllocator =
-      std::make_shared<D3D12PlacedAllocator>(D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS, 32ull << 20, D3D12_HEAP_TYPE_UPLOAD);
+      std::make_shared<D3D12PlacedAllocator>(D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS, kSmallAddressSpace ? 8ull << 20 : 32ull << 20,
+        D3D12_HEAP_TYPE_UPLOAD, kSmallAddressSpace ? 16ull << 20 : D3D12PlacedAllocator::kDefaultHeapSize);
   public:
     // Memory no longer needed goes back (upload blocks, empty placed heaps);
     // at present, each at most every 10 seconds.
     void trimIdleMemory() {
+#ifdef _WIN32
+      trimRecycledBuffers();
+#endif
       m_uploadSuballocator.trim();
       m_textureAllocator->trim();
       m_bufferAllocator->trim();

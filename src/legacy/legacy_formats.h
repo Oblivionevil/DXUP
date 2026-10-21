@@ -93,6 +93,12 @@ namespace dxup::legacy {
     return formatInfo(format).block ? (height + 3) / 4 : height;
   }
 
+  // Rows of the lock pitch the application may write: height rows for ATI1
+  // and ATI2, rows of blocks for the other compressed formats.
+  inline uint32_t legacyLockRows(Format format, uint32_t height) {
+    return format == FormatATI1 || format == FormatATI2 ? height : legacyRows(format, height);
+  }
+
   // The DXGI format with the same memory layout, or UNKNOWN when the data
   // converts (to B8G8R8A8).
   inline DXGI_FORMAT directDxgiFormat(Format format) {
