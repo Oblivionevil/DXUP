@@ -171,6 +171,8 @@ namespace dxup::d3d9 {
     if (m_backBuffers.empty())
       return D3DERR_INVALIDCALL;
     DeviceLock lock(m_device);
+    // What the frame drew with and no longer binds goes.
+    m_device->releaseHeld(false);
     legacy::Device* core = m_device->core();
     legacy::Texture* source = m_backBuffers[0]->texture();
     if (m_resolved && m_resolved->valid()) {
@@ -313,6 +315,7 @@ namespace dxup::d3d9 {
   }
 
   Device::~Device() {
+    releaseHeld(true);
     for (auto& entry : m_fvfDeclarations)
       entry.second->releasePrivate();
     m_fvfDeclarations.clear();
@@ -335,8 +338,6 @@ namespace dxup::d3d9 {
     for (auto& target : m_renderTargets) target.reset();
     m_depthStencil.reset();
     for (uint32_t i = 0; i < m_textures.size(); i++) {
-      if (BaseTexture* texture = m_textureBases[i])
-        texture->releasePrivateTexture();
       m_textures[i] = nullptr;
       m_textureBases[i] = nullptr;
     }
@@ -345,6 +346,7 @@ namespace dxup::d3d9 {
     m_declaration.reset();
     m_vertexShader.reset();
     m_pixelShader.reset();
+    releaseHeld(true);
     if (m_recording) {
       m_recording->Release();
       m_recording = nullptr;
@@ -455,8 +457,6 @@ namespace dxup::d3d9 {
 
   void Device::resetState() {
     for (uint32_t i = 0; i < m_textures.size(); i++) {
-      if (BaseTexture* texture = m_textureBases[i])
-        texture->releasePrivateTexture();
       m_textures[i] = nullptr;
       m_textureBases[i] = nullptr;
     }
@@ -470,7 +470,38 @@ namespace dxup::d3d9 {
     m_fvf = 0;
     m_vertexShader.reset();
     m_pixelShader.reset();
+    releaseHeld(true);
     m_core->resetState();
+  }
+
+  void Device::releaseHeld(bool all) {
+    if (!all) {
+      // Bound now: kept.
+      for (BaseTexture* texture : m_textureBases)
+        if (texture) texture->refCounted().heldEpoch = m_heldEpoch;
+      for (auto& stream : m_streams)
+        if (stream.buffer) stream.buffer->heldEpoch = m_heldEpoch;
+      if (m_indices) m_indices->heldEpoch = m_heldEpoch;
+      if (m_declaration) m_declaration->heldEpoch = m_heldEpoch;
+      if (m_vertexShader) m_vertexShader->heldEpoch = m_heldEpoch;
+      if (m_pixelShader) m_pixelShader->heldEpoch = m_heldEpoch;
+    }
+    size_t kept = 0;
+    for (RefCounted* object : m_held) {
+      if (!all && object->heldEpoch == m_heldEpoch)
+        m_held[kept++] = object;
+      else
+        m_heldReleasing.push_back(object);
+    }
+    m_held.resize(kept);
+    if (++m_heldEpoch == 0)
+      m_heldEpoch = 1;
+    // Releasing may destroy the object (and what it holds).
+    for (RefCounted* object : m_heldReleasing) {
+      object->heldEpoch = 0;
+      object->releasePrivate();
+    }
+    m_heldReleasing.clear();
   }
 
   HRESULT Device::QueryInterface(REFIID riid, void** object) {
@@ -1326,8 +1357,7 @@ namespace dxup::d3d9 {
     if (m_textures[index] == texture)
       return D3D_OK;
     BaseTexture* next = baseTextureOf(texture);
-    if (next) next->addRefPrivateTexture();
-    if (BaseTexture* old = m_textureBases[index]) old->releasePrivateTexture();
+    if (next) hold(&next->refCounted());
     m_textures[index] = texture;
     m_textureBases[index] = next;
     m_core->setTexture(uint32_t(index), next ? next->texture() : nullptr);
@@ -1635,7 +1665,8 @@ namespace dxup::d3d9 {
       rec->declarationSet = true;
       return D3D_OK;
     }
-    m_declaration.set(decl);
+    if (m_declaration.set(decl) && decl)
+      hold(decl);
     m_fvf = decl ? decl->fvf() : 0;
     m_core->setVertexDeclaration(decl ? decl->decl() : nullptr);
     return D3D_OK;
@@ -1672,7 +1703,8 @@ namespace dxup::d3d9 {
       decl = new VertexDeclaration(this, d3dElements.data(), fvf, true);
       decl->addRefPrivate();
     }
-    m_declaration.set(decl);
+    if (m_declaration.set(decl) && decl)
+      hold(decl);
     m_fvf = fvf;
     m_core->setVertexDeclaration(decl->decl());
     return D3D_OK;
@@ -1699,7 +1731,8 @@ namespace dxup::d3d9 {
       rec->streamsSet.set(stream);
       return D3D_OK;
     }
-    m_streams[stream].buffer.set(vb);
+    if (m_streams[stream].buffer.set(vb) && vb)
+      hold(vb);
     m_streams[stream].offset = offset;
     m_streams[stream].stride = stride;
     m_core->setStreamSource(stream, vb ? vb->buffer() : nullptr, offset, stride);
@@ -1748,7 +1781,8 @@ namespace dxup::d3d9 {
       rec->indicesSet = true;
       return D3D_OK;
     }
-    m_indices.set(ib);
+    if (m_indices.set(ib) && ib)
+      hold(ib);
     m_core->setIndices(ib ? ib->buffer() : nullptr, ib && ib->index32());
     return D3D_OK;
   }
@@ -1810,7 +1844,8 @@ namespace dxup::d3d9 {
       rec->vertexShaderSet = true;
       return D3D_OK;
     }
-    m_vertexShader.set(vs);
+    if (m_vertexShader.set(vs) && vs)
+      hold(vs);
     m_core->setVertexShader(vs ? vs->shader() : nullptr);
     return D3D_OK;
   }
@@ -1834,7 +1869,8 @@ namespace dxup::d3d9 {
       rec->pixelShaderSet = true;
       return D3D_OK;
     }
-    m_pixelShader.set(ps);
+    if (m_pixelShader.set(ps) && ps)
+      hold(ps);
     m_core->setPixelShader(ps ? ps->shader() : nullptr);
     return D3D_OK;
   }

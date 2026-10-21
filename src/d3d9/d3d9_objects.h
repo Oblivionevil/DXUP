@@ -49,6 +49,9 @@ namespace dxup::d3d9 {
     virtual ~RefCounted() = default;
     virtual void addRefPrivate() { m_refs.fetch_add(kPrivateOne); }
     virtual void releasePrivate() { releaseHold(); }
+    // Device::hold, on the device's thread only: the frame its held set
+    // last saw the object bound (0: not in the set).
+    uint32_t heldEpoch = 0;
   protected:
     static constexpr uint64_t kPrivateOne = uint64_t(1) << 32;
     ULONG addRefPublic() {
@@ -100,6 +103,27 @@ namespace dxup::d3d9 {
       m_object = object;
     }
     void reset() { set(nullptr); }
+    T* get() const { return m_object; }
+    T* operator->() const { return m_object; }
+    explicit operator bool() const { return m_object != nullptr; }
+  private:
+    T* m_object = nullptr;
+  };
+
+  // A binding whose private reference the device's held set keeps
+  // (Device::hold): objects bound again and again (shaders, buffers draw by
+  // draw) take no reference count each time.
+  template<typename T>
+  class Held {
+  public:
+    // Whether the binding changed (the caller holds the new object then).
+    bool set(T* object) {
+      if (object == m_object)
+        return false;
+      m_object = object;
+      return true;
+    }
+    void reset() { m_object = nullptr; }
     T* get() const { return m_object; }
     T* operator->() const { return m_object; }
     explicit operator bool() const { return m_object != nullptr; }
@@ -237,6 +261,7 @@ namespace dxup::d3d9 {
     const std::shared_ptr<legacy::Texture>& sharedTexture() const { return m_texture; }
     virtual void addRefPrivateTexture() = 0;
     virtual void releasePrivateTexture() = 0;
+    virtual RefCounted& refCounted() = 0;
   protected:
     std::shared_ptr<legacy::Texture> m_texture;
     DWORD m_usage = 0;
@@ -258,6 +283,7 @@ namespace dxup::d3d9 {
     void STDMETHODCALLTYPE GenerateMipSubLevels() override;
     void addRefPrivateTexture() override { this->addRefPrivate(); }
     void releasePrivateTexture() override { this->releasePrivate(); }
+    RefCounted& refCounted() override { return *this; }
   };
 
   class Texture2D final : public TextureCommon<IDirect3DTexture9> {
@@ -723,15 +749,34 @@ namespace dxup::d3d9 {
     std::array<Bound<Surface>, legacy::kMaxRenderTargets> m_renderTargets;
     Bound<Surface>                  m_depthStencil;
     std::array<IDirect3DBaseTexture9*, legacy::kSamplerCount> m_textures = {};
-    std::array<BaseTexture*, legacy::kSamplerCount> m_textureBases = {};   // the same, held privately
-    struct Stream { Bound<VertexBuffer> buffer; UINT offset = 0, stride = 0, frequency = 1; };
+    std::array<BaseTexture*, legacy::kSamplerCount> m_textureBases = {};   // the same (held)
+    struct Stream { Held<VertexBuffer> buffer; UINT offset = 0, stride = 0, frequency = 1; };
     std::array<Stream, 16>          m_streams;
-    Bound<IndexBuffer>              m_indices;
-    Bound<VertexDeclaration>        m_declaration;
+    Held<IndexBuffer>               m_indices;
+    Held<VertexDeclaration>         m_declaration;
     DWORD                           m_fvf = 0;
     std::map<DWORD, VertexDeclaration*> m_fvfDeclarations;
-    Bound<VertexShader>             m_vertexShader;
-    Bound<PixelShader>              m_pixelShader;
+    Held<VertexShader>              m_vertexShader;
+    Held<PixelShader>               m_pixelShader;
+    // Private references to what draws bound (textures, buffers, shaders,
+    // declarations): taken when an object is first bound, given back at a
+    // Present when it was neither bound nor used in the frame before.
+    std::vector<RefCounted*>        m_held;
+    std::vector<RefCounted*>        m_heldReleasing;
+    uint32_t                        m_heldEpoch = 1;
+    void hold(RefCounted* object) {
+      if (object->heldEpoch) {
+        object->heldEpoch = m_heldEpoch;
+        return;
+      }
+      object->addRefPrivate();
+      object->heldEpoch = m_heldEpoch;
+      m_held.push_back(object);
+    }
+  public:
+    // At a Present (all: when bindings are cleared).
+    void releaseHeld(bool all);
+  private:
     StateBlock*                     m_recording = nullptr;
     D3DCLIPSTATUS9                  m_clipStatus = {};
     UINT                            m_currentPalette = 0;

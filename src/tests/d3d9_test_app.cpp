@@ -10,6 +10,7 @@
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <psapi.h>
 #include <d3d9.h>
 #include <d3dcompiler.h>
 
@@ -2380,6 +2381,68 @@ float4 main(float2 t : TEXCOORD0) : COLOR {
     return true;
   }
 
+  // Objects the application released while bound: the device keeps them
+  // until they are unbound (a texture and a vertex buffer drawn after their
+  // release), then lets them go (textures of 1 MB created, bound, released
+  // and unbound frame by frame must not pile up).
+  bool sceneReleasedBound(IDirect3DDevice9* d) {
+    auto privateBytes = [] {
+      PROCESS_MEMORY_COUNTERS_EX counters = {};
+      counters.cb = sizeof(counters);
+      K32GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&counters), sizeof(counters));
+      return double(counters.PrivateUsage);
+    };
+    d->SetRenderState(D3DRS_LIGHTING, FALSE);
+    d->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+    d->SetRenderState(D3DRS_ZENABLE, FALSE);
+    d->SetFVF(D3DFVF_XYZRHW | D3DFVF_TEX1);
+    struct V { float x, y, z, w, u, v; };
+    const V tiny[4] = { { 0, 0, 0.5f, 1, 0, 0 }, { 4, 0, 0.5f, 1, 1, 0 }, { 0, 4, 0.5f, 1, 0, 1 }, { 4, 4, 0.5f, 1, 1, 1 } };
+    // The memory of the second 300 frames against the first: allocators
+    // keep some (a plateau), released textures that stay grow without end.
+    double settled = 0.0;
+    for (int frame = 0; frame < 600; frame++) {
+      if (frame == 300)
+        settled = privateBytes();
+      IDirect3DTexture9* big = nullptr;
+      if (FAILED(d->CreateTexture(512, 512, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, &big, nullptr)))
+        return false;
+      d->SetTexture(0, big);
+      big->Release();
+      d->BeginScene();
+      d->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, tiny, sizeof(V));
+      d->EndScene();
+      d->SetTexture(0, nullptr);
+      d->Present(nullptr, nullptr, nullptr, nullptr);
+    }
+    const double grown = (privateBytes() - settled) / (1024.0 * 1024.0);
+    if (grown > 64.0) {
+      std::printf("  released_bound: private bytes grew by %.0f MB over another 300 textures of 1 MB\n", grown);
+      return false;
+    }
+    d->Clear(0, nullptr, D3DCLEAR_TARGET, 0xff102030u, 1.0f, 0);
+    IDirect3DTexture9* texture = checkerTexture(d, 16);
+    IDirect3DVertexBuffer9* vb = nullptr;
+    if (!texture || FAILED(d->CreateVertexBuffer(sizeof(V) * 4, D3DUSAGE_WRITEONLY, D3DFVF_XYZRHW | D3DFVF_TEX1,
+                                                 D3DPOOL_MANAGED, &vb, nullptr)))
+      return false;
+    V* v = nullptr;
+    vb->Lock(0, 0, reinterpret_cast<void**>(&v), 0);
+    const V quad[4] = { { 16, 16, 0.5f, 1, 0, 0 }, { 112, 16, 0.5f, 1, 1, 0 }, { 16, 112, 0.5f, 1, 0, 1 }, { 112, 112, 0.5f, 1, 1, 1 } };
+    std::memcpy(v, quad, sizeof(quad));
+    vb->Unlock();
+    d->SetTexture(0, texture);
+    d->SetStreamSource(0, vb, 0, sizeof(V));
+    texture->Release();
+    vb->Release();
+    d->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_POINT);
+    d->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
+    d->DrawPrimitive(D3DPT_TRIANGLESTRIP, 0, 2);
+    d->SetTexture(0, nullptr);
+    d->SetStreamSource(0, nullptr, 0, 0);
+    return true;
+  }
+
   const Scene kScenes[] = {
     { "msaa_resolve", sceneMsaaResolve, 80 },   // edge coverage: NVIDIA's 4x pattern differs
     { "formats", sceneFormats },
@@ -2428,6 +2491,7 @@ float4 main(float2 t : TEXCOORD0) : COLOR {
     { "target_feedback", sceneTargetFeedback },
     { "ffp_no_texture", sceneFfpNoTexture },
     { "relative_window", sceneRelativeWindow },
+    { "released_bound", sceneReleasedBound },
   };
 
   // ---- Running ----
