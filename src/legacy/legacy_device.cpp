@@ -4011,7 +4011,46 @@ namespace dxup::legacy {
     m_viewportDirty = false;
   }
 
+  std::atomic<uint32_t> g_shaderObjectGeneration{0};
+
   void Device::selectShaders() {
+    // The selection made for the same shaders, declaration and states.
+    uint32_t projectedStages = 0;
+    for (uint32_t stage = 0; stage < 4; stage++)
+      projectedStages |= (m_stageStates[stage][TssTextureTransformFlags] & 256) ? 1u << stage : 0u;
+    const uint32_t states = (m_shadowMask & 0xffffu) | uint32_t(m_renderStates[RsClipPlaneEnable] & 0x3f) << 16
+                          | projectedStages << 22;
+    const uint32_t generation = g_shaderObjectGeneration.load(std::memory_order_acquire);
+    if (generation != m_selectionGeneration) {
+      for (ShaderSelection& selection : m_selections)
+        selection.valid = false;
+      m_selectionGeneration = generation;
+    }
+    const uint32_t selectionHash = uint32_t(uintptr_t(m_vertexShader) >> 4) * 0x9e3779b9u
+                                 ^ uint32_t(uintptr_t(m_pixelShader) >> 4) * 0x85ebca6bu
+                                 ^ uint32_t(uintptr_t(m_decl) >> 4) * 0xc2b2ae35u;
+    ShaderSelection& selection = m_selections[(selectionHash * 0x9e3779b9u) >> 24];
+    if (selection.valid && selection.vs == m_vertexShader && selection.ps == m_pixelShader && selection.decl == m_decl
+     && (states & selection.stateMask) == selection.states
+     && (!selection.psTextureTypes || selection.psTextureTypes == m_psTextureTypes)) {
+      m_psVariant = selection.psVariant;
+      m_vsVariant = selection.vsVariant;
+      if (m_vertexShader) {
+        if (!m_pixelShader)
+          m_fixedPixelsWithShaders = true;
+        if (m_constants[0].limits[1] != selection.inputModes || m_constants[0].limits[2] != selection.inputWOne) {
+          m_constants[0].limits[1] = selection.inputModes;
+          m_constants[0].limits[2] = selection.inputWOne;
+          m_shaderIntsDirty[0] = true;
+        }
+      }
+      const bool ffpPixel = !m_psVariant;
+      if (ffpPixel != m_boundFfpPixel) {
+        m_boundFfpPixel = ffpPixel;
+        m_textureDirtyMask = m_samplerDirtyMask = (1u << kSamplerCount) - 1;
+      }
+      return;
+    }
     // Pixel stage first: the vertex shader writes what it reads.
     uint32_t pixelVaryings = kFixedPixelVaryings;
     m_psVariant = nullptr;
@@ -4081,6 +4120,22 @@ namespace dxup::legacy {
       }
       options.clipPlanes = uint8_t(m_renderStates[RsClipPlaneEnable] & 0x3f);
       m_vsVariant = m_vertexShader->variant(options);
+    }
+    {
+      // What the variants depend on (the rest of the states may change).
+      uint32_t stateMask = 0, psTypes = 0;
+      if (m_pixelShader) {
+        stateMask |= m_pixelShader->info().major == 1 ? 0xffffu : uint32_t(m_pixelShader->m_usedSamplers);
+        if (m_pixelShader->info().major == 1) {
+          psTypes = m_psTextureTypes | 0x80000000u;   // never 0: compared
+          if (m_pixelShader->info().minor < 4)
+            stateMask |= 0xfu << 22;
+        }
+      }
+      if (m_vertexShader)
+        stateMask |= 0x3fu << 16;
+      selection = { m_vertexShader, m_pixelShader, m_decl, psTypes, states & stateMask, stateMask, m_vsVariant, m_psVariant,
+                    m_constants[0].limits[1], m_constants[0].limits[2], true };
     }
     // The fixed-function pixel stage binds textures by type.
     const bool ffpPixel = !m_psVariant;

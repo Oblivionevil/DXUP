@@ -223,9 +223,14 @@ namespace dxup::legacy {
   };
 
   // A vertex declaration (Direct3D 9) or flexible vertex format.
+  // Destroyed shaders and declarations (Device::selectShaders forgets the
+  // selections it kept by their addresses).
+  extern std::atomic<uint32_t> g_shaderObjectGeneration;
+
   class VertexDecl {
   public:
     VertexDecl(const VertexElement* elements, uint32_t count, uint32_t fvf = 0);
+    ~VertexDecl() { g_shaderObjectGeneration.fetch_add(1, std::memory_order_release); }
     const std::vector<VertexElement>& elements() const { return m_elements; }
     uint64_t hash() const { return m_hash; }
     uint32_t streamMask() const { return m_streamMask; }
@@ -257,6 +262,7 @@ namespace dxup::legacy {
       uint32_t                id = 0;
       uint8_t                 clipPlanes = 0;   // vertex: clip distances written
     };
+    ~Shader() { g_shaderObjectGeneration.fetch_add(1, std::memory_order_release); }
     static std::shared_ptr<Shader> create(Device* device, const uint32_t* tokens, size_t tokenCount, std::string& error);
     // A shader of the tokens (count of them, hash as create forms it), no
     // variant compiled yet.
@@ -655,6 +661,23 @@ namespace dxup::legacy {
       uint32_t limits[4];   // the last float constant, vertex input modes (dxup_inputModes, dxup_inputWOne)
     };
     ConstantStore m_constants[2] = {};      // vertex, pixel
+    // Recent shader selections: the variants of a shader pair, declaration
+    // and the states the variants depend on (texture types, shadow samplers,
+    // clip planes, projected stages), without reading the shaders again.
+    struct ShaderSelection {
+      const Shader* vs = nullptr;
+      const Shader* ps = nullptr;
+      const VertexDecl* decl = nullptr;
+      uint32_t psTextureTypes = 0;   // when ps is shader model 1 (else 0)
+      uint32_t states = 0;           // of these:
+      uint32_t stateMask = 0;        // shadow samplers ps reads, clip planes with vs, projection with ps 1.0-1.3
+      const Shader::Variant* vsVariant = nullptr;
+      const Shader::Variant* psVariant = nullptr;
+      uint32_t inputModes = 0, inputWOne = 0;
+      bool valid = false;
+    };
+    ShaderSelection m_selections[256];
+    uint32_t m_selectionGeneration = 0;
     // The input modes of recent vertex shaders and declarations (by hashes).
     struct InputModes { uint64_t key = 0; uint32_t modes = 0, wOne = 0; };
     InputModes m_inputModes[256];
