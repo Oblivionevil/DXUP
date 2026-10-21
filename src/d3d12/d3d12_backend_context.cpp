@@ -5443,10 +5443,6 @@ namespace dxup::d3d12 {
 
   bool D3D12BackendContext::ensureUploadScratchCapacity(uint64_t capacity) {
 #ifdef _WIN32
-    // One per command allocator and context: 8 MB each keeps the ring at
-    // the memory three 16 MB slots took; larger requests grow their slot.
-    // 2 MB in a 32-bit process, where upload memory is address space.
-    constexpr uint64_t kDefaultUploadScratchCapacity = (kSmallAddressSpace ? 2ull : 8ull) * 1024ull * 1024ull;
     auto& scratchBuffer = m_uploadScratchBuffers[m_currentAllocatorIndex];
     auto& scratchMapped = m_uploadScratchMapped[m_currentAllocatorIndex];
     auto& scratchCapacity = m_uploadScratchCapacities[m_currentAllocatorIndex];
@@ -6015,6 +6011,35 @@ namespace dxup::d3d12 {
           return;
         }
       }
+    }
+
+    // 32-bit processes: a large update goes in pieces of the ring's slot
+    // size. A slot grown for it would keep the address space: the driver
+    // does not reliably give freed upload memory back to the process.
+    if (kSmallAddressSpace && totalUploadSize > kDefaultUploadScratchCapacity) {
+      for (uint32_t i = 0; i < regionCount; i++) {
+        if (!regions[i].data || !regions[i].size)
+          continue;
+        for (uint64_t done = 0; done < regions[i].size;) {
+          const uint64_t piece = (std::min)(regions[i].size - done, kDefaultUploadScratchCapacity);
+          ID3D12Resource* upload = nullptr;
+          uint64_t offset = 0;
+          void* ptr = nullptr;
+          // May submit the command list when the slot is full: the copies
+          // before stay in order.
+          if (!allocateUploadScratch(piece, kUploadAlignment, &upload, &offset, &ptr))
+            return;
+          std::memcpy(ptr, static_cast<const uint8_t*>(regions[i].data) + done, static_cast<size_t>(piece));
+          transitionResource(d3d12Buffer, D3D12_RESOURCE_STATE_COPY_DEST);
+          holdBatchResource(d3d12Buffer->getResource());
+          flushBarriers();
+          m_cmdList->CopyBufferRegion(d3d12Buffer->getResource(), d3d12Buffer->getOffset() + regions[i].offset + done,
+                                      upload, offset, piece);
+          done += piece;
+        }
+      }
+      restoreBoundBufferState(d3d12Buffer);
+      return;
     }
 
     ID3D12Resource* uploadResource = nullptr;
@@ -9332,6 +9357,15 @@ namespace dxup::d3d12 {
       resetDescriptorHeapPartition();
     }
     m_uploadScratchOffsets[m_currentAllocatorIndex] = 0;
+    // The GPU is done with this allocator's upload slot: one a large upload
+    // grew goes (made again at its default size when needed).
+    if (kSmallAddressSpace && m_uploadScratchCapacities[m_currentAllocatorIndex] > kDefaultUploadScratchCapacity) {
+      if (m_uploadScratchMapped[m_currentAllocatorIndex])
+        m_uploadScratchBuffers[m_currentAllocatorIndex]->Unmap(0, nullptr);
+      m_uploadScratchBuffers[m_currentAllocatorIndex].Reset();
+      m_uploadScratchMapped[m_currentAllocatorIndex] = nullptr;
+      m_uploadScratchCapacities[m_currentAllocatorIndex] = 0;
+    }
     initNullDescriptorsAndRootTables();
 
     markAllDescriptorStagesDirty();

@@ -871,8 +871,9 @@ namespace dxup::legacy {
   // Buffer
   // ============================================================
 
-  Buffer::Buffer(Device* device, uint32_t size, bool index, bool dynamic)
-  : m_device(device), m_data(size), m_dynamic(dynamic), m_declaredDynamic(dynamic) {
+  Buffer::Buffer(Device* device, uint32_t size, bool index, bool dynamic, bool dropCopy)
+  : m_device(device), m_data(size), m_size(size), m_dropCopy(dropCopy && !dynamic && !index && size >= (64u << 10)),
+    m_dynamic(dynamic), m_declaredDynamic(dynamic) {
     D3D11_BUFFER_DESC bd = {};
     bd.ByteWidth = (size + 15) & ~15u;
     bd.Usage = D3D11_USAGE_DEFAULT;
@@ -884,8 +885,10 @@ namespace dxup::legacy {
 
   bool Buffer::indexRange(uint32_t start, uint32_t count, bool index32, uint32_t& lo, uint32_t& hi) {
     const uint32_t size = index32 ? 4 : 2;
-    if (!count || (uint64_t(start) + count) * size > m_data.size())
+    if (!count || (uint64_t(start) + count) * size > m_size)
       return false;
+    if (m_dropped)
+      restoreCopy();
     const uint64_t key = (uint64_t(start) << 33) ^ (uint64_t(count) << 1) ^ (index32 ? 1u : 0u);
     // Ranges of dynamic buffers are drawn once each: not kept.
     const bool keep = !m_dynamic;
@@ -959,7 +962,13 @@ namespace dxup::legacy {
   void Buffer::prepare(uint32_t offset, uint32_t size) {
     if (!m_buffer)
       return;
-    const uint32_t total = uint32_t(m_data.size());
+    // A copy that goes once uploaded: all of the buffer at once, or bytes
+    // no draw reads (padding) would keep it.
+    if (m_dropCopy && !m_keptCopy && !m_dynamic) {
+      offset = 0;
+      size = 0;
+    }
+    const uint32_t total = m_size;
     uint32_t begin = (std::min)(offset, total);
     const uint32_t end = uint32_t((std::min)(size ? uint64_t(offset) + size : uint64_t(total), uint64_t(total)));
     if (begin >= end)
@@ -978,6 +987,8 @@ namespace dxup::legacy {
       D3D11_BOX box = { from, 0, 0, to, 1, 1 };
       m_device->context()->UpdateSubresource(m_buffer.get(), 0, &box, m_data.data() + from, 0, 0);
     };
+    if (m_dropped)
+      restoreCopy();
     // Upload the gaps between clean ranges inside [begin, end).
     for (const auto& range : m_clean) {
       if (range.second <= begin)
@@ -1012,6 +1023,33 @@ namespace dxup::legacy {
     if (!placed)
       merged.push_back(added);
     m_clean.swap(merged);
+    // All of it on the GPU, and not rewritten between draws: the copy goes.
+    if (m_dropCopy && !m_keptCopy && !m_dynamic && uploaded()) {
+      std::vector<uint8_t>().swap(m_data);
+      m_dropped = true;
+    }
+  }
+
+  void Buffer::restoreCopy() {
+    // Back from the GPU, as uploaded; kept from now on.
+    m_dropped = false;
+    m_keptCopy = true;
+    m_data.resize(m_size);
+    D3D11_BUFFER_DESC bd = {};
+    m_buffer->GetDesc(&bd);
+    bd.Usage = D3D11_USAGE_STAGING;
+    bd.BindFlags = 0;
+    bd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    bd.MiscFlags = 0;
+    Ref<ID3D11Buffer> copy;
+    if (FAILED(m_device->d3d11()->CreateBuffer(&bd, nullptr, copy.put())))
+      return;
+    m_device->context()->CopyResource(copy.get(), m_buffer.get());
+    D3D11_MAPPED_SUBRESOURCE mapped = {};
+    if (FAILED(m_device->context()->Map(copy.get(), 0, D3D11_MAP_READ, 0, &mapped)))
+      return;
+    std::memcpy(m_data.data(), mapped.pData, m_size);
+    m_device->context()->Unmap(copy.get(), 0);
   }
 
   // ============================================================

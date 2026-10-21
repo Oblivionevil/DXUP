@@ -2630,6 +2630,62 @@ float4 main(float2 t : TEXCOORD0) : COLOR {
     return ok;
   }
 
+  // A managed vertex buffer locked again after it was drawn: in a 32-bit
+  // process DXUP lets its copy go once all of it is on the GPU and reads it
+  // back then. A read-only lock sees the vertices, a partial write moves
+  // one quad and keeps the others.
+  bool sceneRelockedVertexBuffer(IDirect3DDevice9* d) {
+    struct V { float x, y, z, w; DWORD color; };
+    // 64x48 one-pixel quads as triangle lists: 18432 vertices, 368 KB.
+    const UINT quads = kWidth * kHeight, vertices = quads * 6;
+    IDirect3DVertexBuffer9* vb = nullptr;
+    if (FAILED(d->CreateVertexBuffer(vertices * sizeof(V), D3DUSAGE_WRITEONLY, D3DFVF_XYZRHW | D3DFVF_DIFFUSE,
+                                     D3DPOOL_MANAGED, &vb, nullptr)))
+      return false;
+    auto quad = [](V* v, float x, float y, DWORD color) {
+      const V corners[6] = { { x, y, 0.5f, 1, color }, { x + 1, y, 0.5f, 1, color }, { x, y + 1, 0.5f, 1, color },
+                             { x + 1, y, 0.5f, 1, color }, { x + 1, y + 1, 0.5f, 1, color }, { x, y + 1, 0.5f, 1, color } };
+      std::memcpy(v, corners, sizeof(corners));
+    };
+    auto colorOf = [](UINT i) { return 0xff000000u | (i * 2654435761u >> 8); };
+    V* v = nullptr;
+    if (FAILED(vb->Lock(0, 0, reinterpret_cast<void**>(&v), 0)))
+      return false;
+    for (UINT i = 0; i < quads; i++)
+      quad(v + i * 6, float(i % kWidth) - 0.5f, float(i / kWidth) - 0.5f, colorOf(i));
+    vb->Unlock();
+    d->SetRenderState(D3DRS_LIGHTING, FALSE);
+    d->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+    d->SetRenderState(D3DRS_ZENABLE, FALSE);
+    d->SetFVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE);
+    d->SetStreamSource(0, vb, 0, sizeof(V));
+    d->BeginScene();
+    d->DrawPrimitive(D3DPT_TRIANGLELIST, 0, quads * 2);
+    d->EndScene();
+    d->Present(nullptr, nullptr, nullptr, nullptr);
+    bool ok = true;
+    if (FAILED(vb->Lock(0, 0, reinterpret_cast<void**>(&v), D3DLOCK_READONLY)))
+      return false;
+    for (UINT i = 0; i < quads && ok; i++)
+      if (v[i * 6 + 4].color != colorOf(i) || v[i * 6 + 4].x != float(i % kWidth) + 0.5f) {
+        std::printf("  relocked_vertex_buffer: quad %u reads 0x%08lx at %.1f\n", i, v[i * 6 + 4].color, v[i * 6 + 4].x);
+        ok = false;
+      }
+    vb->Unlock();
+    // Quad 100 (row 1, column 36) becomes white: the rest stays.
+    if (FAILED(vb->Lock(100 * 6 * sizeof(V), 6 * sizeof(V), reinterpret_cast<void**>(&v), 0)))
+      return false;
+    quad(v, float(100 % kWidth) - 0.5f, float(100 / kWidth) - 0.5f, 0xffffffffu);
+    vb->Unlock();
+    d->Clear(0, nullptr, D3DCLEAR_TARGET, 0xff102030u, 1.0f, 0);
+    d->BeginScene();
+    d->DrawPrimitive(D3DPT_TRIANGLELIST, 0, quads * 2);
+    d->EndScene();
+    d->SetStreamSource(0, nullptr, 0, 0);
+    vb->Release();
+    return ok;
+  }
+
   const Scene kScenes[] = {
     { "msaa_resolve", sceneMsaaResolve, 80 },   // edge coverage: NVIDIA's 4x pattern differs
     { "formats", sceneFormats },
@@ -2681,6 +2737,7 @@ float4 main(float2 t : TEXCOORD0) : COLOR {
     { "released_bound", sceneReleasedBound },
     { "texture_memory", sceneTextureMemory },
     { "relocked_managed", sceneRelockedManaged },
+    { "relocked_vertex_buffer", sceneRelockedVertexBuffer },
   };
 
   // ---- Running ----

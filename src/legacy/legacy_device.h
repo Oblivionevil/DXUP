@@ -193,7 +193,11 @@ namespace dxup::legacy {
   public:
     // Dynamic buffers (rewritten between draws) stream the range each draw
     // reads through the device's rings instead of updating GPU memory.
-    Buffer(Device* device, uint32_t size, bool index, bool dynamic = false);
+    // dropCopy: the application's copy goes once all of it is uploaded and
+    // comes back from the GPU when data() is asked for again (then it
+    // stays): managed vertex buffers in 32-bit processes, as textures
+    // (TextureDesc::dropCopies).
+    Buffer(Device* device, uint32_t size, bool index, bool dynamic = false, bool dropCopy = false);
     bool dynamic() const { return m_dynamic; }
     // A draw streamed the buffer: buffers drawn often between writes go
     // back to GPU memory (unless created dynamic).
@@ -205,15 +209,19 @@ namespace dxup::legacy {
     }
     ~Buffer();
     bool valid() const { return m_buffer.get() != nullptr; }
-    uint32_t size() const { return uint32_t(m_data.size()); }
-    uint8_t* data() { return m_data.data(); }
+    uint32_t size() const { return m_size; }
+    uint8_t* data() {
+      if (m_dropped)
+        restoreCopy();
+      return m_data.data();
+    }
     // The application may have written [offset, offset + size) (size 0: all).
     void invalidate(uint32_t offset = 0, uint32_t size = 0);
     // Uploads what of [offset, offset + size) changed since its last upload.
     void prepare(uint32_t offset, uint32_t size);
     // All of it uploaded: draws need not know which part they read.
     bool uploaded() const {
-      return m_clean.size() == 1 && m_clean[0].first == 0 && m_clean[0].second >= m_data.size();
+      return m_clean.size() == 1 && m_clean[0].first == 0 && m_clean[0].second >= m_size;
     }
     ID3D11Buffer* resource() const { return m_buffer.get(); }
     // The smallest and largest of `count` indices from index `start`, kept
@@ -227,7 +235,12 @@ namespace dxup::legacy {
     uint32_t           m_indexRangesVersion = 0;
     uint32_t           m_version = 0;   // counts writes
     Device*            m_device;
+    void restoreCopy();
     std::vector<uint8_t> m_data;
+    uint32_t           m_size = 0;
+    bool               m_dropCopy = false;
+    bool               m_dropped = false;    // m_data released after the upload
+    bool               m_keptCopy = false;   // asked for again after a drop: stays
     Ref<ID3D11Buffer>  m_buffer;
     bool               m_dynamic = false;
     bool               m_declaredDynamic = false;

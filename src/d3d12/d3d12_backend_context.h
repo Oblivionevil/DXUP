@@ -53,6 +53,11 @@ namespace dxup::d3d12 {
   // Upload buffers a command list may collect before it is submitted (less
   // in a 32-bit process: their memory is address space).
   constexpr uint64_t kPendingUploadFlushThreshold = (sizeof(void*) == 4 ? 32ull : 128ull) * 1024ull * 1024ull;
+  // The upload ring's slot per command allocator: 8 MB each keeps the ring
+  // at the memory three 16 MB slots took; larger requests grow their slot.
+  // 2 MB in a 32-bit process, where upload memory is address space, and a
+  // grown slot goes back to that once its allocator comes round again.
+  constexpr uint64_t kDefaultUploadScratchCapacity = (sizeof(void*) == 4 ? 2ull : 8ull) * 1024ull * 1024ull;
 
   // ============================================================
   // D3D12 Backend Context

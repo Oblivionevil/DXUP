@@ -823,7 +823,9 @@ namespace dxup::d3d9 {
         return D3DERR_INVALIDCALL;
       *buffer = nullptr;
       DeviceLock lock(this);
-      auto core = std::make_unique<legacy::Buffer>(m_core.get(), length, false, (usage & D3DUSAGE_DYNAMIC) != 0);
+      // Managed vertex buffers in a 32-bit process: the copy goes once on the GPU.
+      auto core = std::make_unique<legacy::Buffer>(m_core.get(), length, false, (usage & D3DUSAGE_DYNAMIC) != 0,
+                                                   sizeof(void*) == 4 && pool == D3DPOOL_MANAGED);
       if (!core->valid())
         return D3DERR_OUTOFVIDEOMEMORY;
       D3DVERTEXBUFFER_DESC desc = { D3DFMT_VERTEXDATA, D3DRTYPE_VERTEXBUFFER, usage, pool, length, fvf };
