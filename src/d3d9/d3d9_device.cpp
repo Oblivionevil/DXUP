@@ -335,9 +335,10 @@ namespace dxup::d3d9 {
     for (auto& target : m_renderTargets) target.reset();
     m_depthStencil.reset();
     for (uint32_t i = 0; i < m_textures.size(); i++) {
-      if (BaseTexture* texture = baseTextureOf(m_textures[i]))
+      if (BaseTexture* texture = m_textureBases[i])
         texture->releasePrivateTexture();
       m_textures[i] = nullptr;
+      m_textureBases[i] = nullptr;
     }
     for (auto& stream : m_streams) stream.buffer.reset();
     m_indices.reset();
@@ -454,9 +455,10 @@ namespace dxup::d3d9 {
 
   void Device::resetState() {
     for (uint32_t i = 0; i < m_textures.size(); i++) {
-      if (BaseTexture* texture = baseTextureOf(m_textures[i]))
+      if (BaseTexture* texture = m_textureBases[i])
         texture->releasePrivateTexture();
       m_textures[i] = nullptr;
+      m_textureBases[i] = nullptr;
     }
     for (auto& stream : m_streams) {
       stream.buffer.reset();
@@ -1325,8 +1327,9 @@ namespace dxup::d3d9 {
       return D3D_OK;
     BaseTexture* next = baseTextureOf(texture);
     if (next) next->addRefPrivateTexture();
-    if (BaseTexture* old = baseTextureOf(m_textures[index])) old->releasePrivateTexture();
+    if (BaseTexture* old = m_textureBases[index]) old->releasePrivateTexture();
     m_textures[index] = texture;
+    m_textureBases[index] = next;
     m_core->setTexture(uint32_t(index), next ? next->texture() : nullptr);
     return D3D_OK;
   }

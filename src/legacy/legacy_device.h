@@ -283,6 +283,7 @@ namespace dxup::legacy {
     Ref<ID3D11Device>       m_d3d11;
     std::vector<uint32_t>   m_tokens;
     ShaderInfo9             m_info;
+    uint16_t                m_usedSamplers = 0;   // samplers the shader reads
     uint64_t                m_hash = 0;
     bool                    m_ahead = false;   // compiled ahead (Device::takeWarmShader)
     std::mutex              m_mutex;

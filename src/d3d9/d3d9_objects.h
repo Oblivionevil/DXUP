@@ -723,6 +723,7 @@ namespace dxup::d3d9 {
     std::array<Bound<Surface>, legacy::kMaxRenderTargets> m_renderTargets;
     Bound<Surface>                  m_depthStencil;
     std::array<IDirect3DBaseTexture9*, legacy::kSamplerCount> m_textures = {};
+    std::array<BaseTexture*, legacy::kSamplerCount> m_textureBases = {};   // the same, held privately
     struct Stream { Bound<VertexBuffer> buffer; UINT offset = 0, stride = 0, frequency = 1; };
     std::array<Stream, 16>          m_streams;
     Bound<IndexBuffer>              m_indices;

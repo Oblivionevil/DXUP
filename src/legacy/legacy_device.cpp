@@ -1508,6 +1508,8 @@ namespace dxup::legacy {
     driverBehavior(options);
     if (!translateShader9(shader->m_tokens.data(), shader->m_tokens.size(), options, hlsl, shader->m_info, error))
       return nullptr;
+    for (uint32_t i = 0; i < 16; i++)
+      if (shader->m_info.samplerTypes[i]) shader->m_usedSamplers |= uint16_t(1u << i);
     return shader;
   }
 
@@ -1651,9 +1653,7 @@ namespace dxup::legacy {
       options.minVaryings = 0;
     // Only the samplers the shader reads tell variants apart; 2D textures
     // are what it assumes without bound types (the variant compiled ahead).
-    uint16_t usedSamplers = 0;
-    for (uint32_t i = 0; i < 16; i++)
-      if (m_info.samplerTypes[i]) usedSamplers |= uint16_t(1u << i);
+    const uint16_t usedSamplers = m_usedSamplers;
     options.shadowSamplers &= usedSamplers;
     uint8_t usedTypes[16] = {};
     if (options.boundSamplerTypes) {
@@ -3948,9 +3948,11 @@ namespace dxup::legacy {
         options.boundSamplerTypes = types;
       }
       uint16_t shadow = 0;
-      for (uint32_t i = 0; i < 16; i++)
-        if ((m_shadowMask >> i) & 1 && (m_pixelShader->info().samplerTypes[i] == Sampler2D || m_pixelShader->info().major == 1))
+      for (uint32_t bits = m_shadowMask & 0xffffu; bits; bits &= bits - 1) {
+        const uint32_t i = lowestBit(bits);
+        if (m_pixelShader->info().samplerTypes[i] == Sampler2D || m_pixelShader->info().major == 1)
           shadow |= uint16_t(1u << i);
+      }
       options.shadowSamplers = shadow;
       // Pixel shaders 1.1 to 1.3 project t# as the stage's D3DTTFF_PROJECTED
       // says, by w whatever D3DTTFF_COUNTn says (Windows' NVIDIA Direct3D 9;
