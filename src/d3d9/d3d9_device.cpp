@@ -635,8 +635,8 @@ namespace dxup::d3d9 {
       m_renderTargets[i].reset();
     resetState();
     const HRESULT hr = resetSwapChain(params);
-    logMessage(LogLevel::Info, "D3D9 Reset: %ux%u %s -> 0x%08lx", params->BackBufferWidth, params->BackBufferHeight,
-      params->Windowed ? "windowed" : "fullscreen", hr);
+    logMessage(LogLevel::Info, "D3D9 Reset: %ux%u %s, interval 0x%x -> 0x%08lx", params->BackBufferWidth, params->BackBufferHeight,
+      params->Windowed ? "windowed" : "fullscreen", params->PresentationInterval, hr);
     return hr;
   }
 

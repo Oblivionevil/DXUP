@@ -307,6 +307,8 @@ namespace dxup::legacy {
     std::shared_ptr<Shader> takeWarmShader(uint64_t hash, const uint32_t* tokens, size_t count);
     static constexpr uint32_t kFixedPixelVaryings = 11;   // fog, two colors, eight coordinates
     ID3D11DeviceContext* context() const { return m_context.get(); }
+    // A frame's draws go into the log (dxup_trace9_go.txt).
+    bool tracing() const { return m_trace9; }
     // Whether textures of a format can be created directly (else converted).
     bool supports(DXGI_FORMAT format, UINT usage) const;
 

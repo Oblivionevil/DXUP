@@ -878,6 +878,9 @@ namespace dxup::legacy {
         return;
     }
     auto upload = [&](uint32_t from, uint32_t to) {
+      if (m_device->tracing())
+        logMessage(LogLevel::Warn, "trace9   upload buffer %p size %u bytes %u-%u%s%s", static_cast<void*>(this), total, from, to,
+          m_dynamic ? " dynamic" : "", m_settled ? " settled" : "");
       D3D11_BOX box = { from, 0, 0, to, 1, 1 };
       m_device->context()->UpdateSubresource(m_buffer.get(), 0, &box, m_data.data() + from, 0, 0);
     };
@@ -4178,7 +4181,20 @@ namespace dxup::legacy {
         stride = s.stride;
         const bool instanced = (s.frequency & kInstanceData) != 0;
         if (instanced) {
-          s.buffer->prepare(s.offset, 0);
+          // Instance data of dynamic buffers goes through the ring too
+          // (StarCraft II appends each particle draw's instances): uploads
+          // into GPU memory between draws stall the GPU.
+          const uint32_t divider = (std::max)(1u, s.frequency & 0x3fffffffu);
+          const uint64_t bytes = uint64_t((instances + divider - 1) / divider) * stride;
+          const uint32_t ringOffset = s.buffer->dynamic() && bytes && uint64_t(s.offset) + bytes <= s.buffer->size()
+            ? uploadVertices(s.buffer->data() + s.offset, uint32_t(bytes)) : UINT32_MAX;
+          if (ringOffset != UINT32_MAX) {
+            s.buffer->noteStreamedDraw();
+            buffer = m_vertexRing.get();
+            offset = ringOffset;
+          } else {
+            s.buffer->prepare(s.offset, 0);
+          }
         } else if (rebase && s.buffer->dynamic()) {
           s.buffer->noteStreamedDraw();
           const uint64_t begin = s.offset + uint64_t(firstVertex) * stride;

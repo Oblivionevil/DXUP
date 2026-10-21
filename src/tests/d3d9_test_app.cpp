@@ -4,14 +4,20 @@
 //
 //   d3d9_test_app [--dump] [scene-name-filter]
 //   d3d9_test_app --bench FRAMES DRAWS     (draw calls per second on DXUP and Windows)
+//   d3d9_test_app --bench-shaders FILE [N] (GPU time of a d3d9_variants.bin's pixel shaders on both;
+//     DXUP_BENCH_SIZE=N an N x N target, DXUP_BENCH_DXUP_FIRST, DXUP_BENCH_DXUP_ONLY (Windows' D3D9
+//     needs the display on), DXUP_BENCH_CHECK pixels and failures of the first shaders)
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <d3d9.h>
 #include <d3dcompiler.h>
 
+#include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <functional>
@@ -1215,7 +1221,7 @@ float4 main(float4 a : TEXCOORD0, float4 b : TEXCOORD1, float2 v : VPOS) : COLOR
   }
 
   bool sceneInstancing(IDirect3DDevice9* d) {
-    d->Clear(0, nullptr, D3DCLEAR_TARGET, 0xff000000u, 1.0f, 0);
+    d->Clear(0, nullptr, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, 0xff000000u, 1.0f, 0);
     const char* vsSource = R"(
 struct VO { float4 p : POSITION; float4 c : COLOR0; };
 VO main(float2 p : POSITION, float4 offset : TEXCOORD1, float4 c : COLOR0) {
@@ -1261,6 +1267,33 @@ VO main(float2 p : POSITION, float4 offset : TEXCOORD1, float4 c : COLOR0) {
     d->SetIndices(ib);
     d->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
     d->DrawIndexedPrimitive(D3DPT_TRIANGLELIST, 0, 0, 4, 0, 2);
+    // Instances appended to a dynamic buffer draw by draw (StarCraft II's
+    // particles): 3 instances, then 4 with every element used twice, then 2.
+    IDirect3DVertexBuffer9* ring = nullptr;
+    if (SUCCEEDED(d->CreateVertexBuffer(64 * sizeof(Instance), D3DUSAGE_DYNAMIC | D3DUSAGE_WRITEONLY, 0, D3DPOOL_DEFAULT, &ring,
+                                        nullptr))) {
+      struct Draw { UINT count, divider; DWORD flags; };
+      const Draw draws[3] = { { 3, 1, D3DLOCK_DISCARD }, { 4, 2, D3DLOCK_NOOVERWRITE }, { 2, 1, D3DLOCK_NOOVERWRITE } };
+      UINT used = 0;
+      for (int i = 0; i < 3; i++) {
+        const UINT elements = (draws[i].count + draws[i].divider - 1) / draws[i].divider;
+        Instance* written = nullptr;
+        if (FAILED(ring->Lock(used * sizeof(Instance), elements * sizeof(Instance), reinterpret_cast<void**>(&written), draws[i].flags)))
+          break;
+        for (UINT e = 0; e < elements; e++) {
+          const float x = -0.8f + 0.3f * float(e) + 0.1f * float(i), y = 0.8f - 0.25f * float(i);
+          written[e] = { x, y, 0, 0, 0xff000000u | (0x40u << (8 * (e % 3))) | (0x30u * DWORD(i + 1)) };
+        }
+        ring->Unlock();
+        d->SetStreamSource(1, ring, used * sizeof(Instance), sizeof(Instance));
+        d->SetStreamSourceFreq(0, D3DSTREAMSOURCE_INDEXEDDATA | draws[i].count);
+        d->SetStreamSourceFreq(1, D3DSTREAMSOURCE_INSTANCEDATA | draws[i].divider);
+        d->DrawIndexedPrimitive(D3DPT_TRIANGLELIST, 0, 0, 4, 0, 2);
+        used += elements;
+      }
+      d->SetStreamSource(1, nullptr, 0, 0);
+      ring->Release();
+    }
     d->SetStreamSourceFreq(0, 1);
     d->SetStreamSourceFreq(1, 1);
     d->SetVertexShader(nullptr);
@@ -2523,6 +2556,369 @@ float4 main(float2 t : TEXCOORD0) : COLOR {
     return 0;
   }
 
+  // A benchmark option: the environment variable's value, empty when unset.
+  std::string benchOption(const char* name) {
+    char value[64] = {};
+    const DWORD length = GetEnvironmentVariableA(name, value, sizeof(value));
+    return length && length < sizeof(value) ? std::string(value) : std::string();
+  }
+
+  // ---- GPU time of a game's pixel shaders on Windows' Direct3D 9 and DXUP ----
+
+  // Pixel shaders 2.0-3.0 of a d3d9_variants.bin (dxup_pso_cache next to a
+  // game), each drawn full screen at 1920x1080 into a half-float target with
+  // a vertex shader writing every input it reads, textures of its sampler
+  // types and constants in [0, 1]: --bench-shaders FILE [COUNT].
+  struct BenchShader {
+    uint64_t hash = 0;         // as trace9 and d3d9_shader_test --dump-record name it
+    std::vector<DWORD> tokens;
+    std::string vs;            // HLSL source
+    uint8_t samplers[16] = {}; // 0 none, 2 2D, 3 cube, 4 volume
+    UINT outputs = 1;          // render targets written
+  };
+
+  std::vector<BenchShader> benchShaderList(const char* path) {
+    std::vector<BenchShader> list;
+    FILE* f = nullptr;
+    if (fopen_s(&f, path, "rb") != 0 || !f)
+      return list;
+    uint32_t header[2] = {}, head[2];
+    if (std::fread(header, sizeof(header), 1, f) != 1) {
+      std::fclose(f);
+      return list;
+    }
+    static const char* kUsages[14] = { "POSITION", "BLENDWEIGHT", "BLENDINDICES", "NORMAL", "PSIZE", "TEXCOORD", "TANGENT",
+                                       "BINORMAL", "TESSFACTOR", "POSITIONT", "COLOR", "FOG", "DEPTH", "SAMPLE" };
+    while (std::fread(head, sizeof(head), 1, f) == 1 && head[1] <= (4u << 20)) {
+      std::vector<uint8_t> data(head[1]);
+      if (std::fread(data.data(), 1, data.size(), f) != data.size())
+        break;
+      if (head[0] != 1 || data.size() < 12)
+        continue;
+      BenchShader s;
+      std::memcpy(&s.hash, data.data(), 8);
+      s.tokens.resize((data.size() - 8) / 4);
+      std::memcpy(s.tokens.data(), data.data() + 8, s.tokens.size() * 4);
+      const DWORD version = s.tokens[0];
+      if ((version >> 16) != 0xffff || ((version >> 8) & 0xff) < 2)
+        continue;
+      const bool sm3 = ((version >> 8) & 0xff) >= 3;
+      std::string outputs;
+      bool ok = true;
+      for (size_t i = 1; i < s.tokens.size() && ok;) {
+        const DWORD token = s.tokens[i];
+        const DWORD opcode = token & 0xffff;
+        if (opcode == 0xffff)
+          break;
+        if (opcode == 0xfffe) {   // comment
+          i += 1 + ((token >> 16) & 0x7fff);
+          continue;
+        }
+        const DWORD length = (token >> 24) & 0xf;
+        if (opcode == 31 && i + 2 < s.tokens.size()) {   // dcl
+          const DWORD usage = s.tokens[i + 1], reg = s.tokens[i + 2];
+          const DWORD type = ((reg >> 28) & 7) | ((reg >> 8) & 0x18);
+          const DWORD index = reg & 0x7ff;
+          if (type == 10 && index < 16)   // sampler
+            s.samplers[index] = uint8_t((usage >> 27) & 0xf);
+          else if (type == 1 && sm3) {    // input
+            const DWORD u = usage & 0x1f, n = (usage >> 16) & 0xf;
+            if (u >= 14) { ok = false; break; }
+            char line[96];
+            sprintf_s(line, "  float4 o%u : %s%u;\n", index, kUsages[u], n);
+            outputs += line;
+          }
+        }
+        if (length) {
+          // Writes to oC1-oC3 need targets.
+          if (opcode != 31 && opcode != 81 && opcode != 47 && i + 1 < s.tokens.size()) {
+            const DWORD dst = s.tokens[i + 1];
+            const DWORD type = ((dst >> 28) & 7) | ((dst >> 8) & 0x18);
+            if (type == 8)
+              s.outputs = (std::max)(s.outputs, UINT((dst & 0x7ff) + 1));
+          }
+          i += 1 + length;
+        } else {
+          i++;
+        }
+      }
+      if (!ok)
+        continue;
+      if (!sm3) {
+        outputs = "  float4 c0 : COLOR0;\n  float4 c1 : COLOR1;\n";
+        for (int t = 0; t < 8; t++)
+          outputs += "  float4 t" + std::to_string(t) + " : TEXCOORD" + std::to_string(t) + ";\n";
+      }
+      s.vs = "struct VO {\n  float4 position : POSITION;\n" + outputs + "};\n"
+             "VO main(float4 p : POSITION) {\n  VO o = (VO)0;\n  o.position = p;\n";
+      // Every output a different function of the position.
+      std::string body;
+      size_t at = 0;
+      int n = 0;
+      while ((at = outputs.find("float4 ", at)) != std::string::npos) {
+        at += 7;
+        const size_t end = outputs.find(' ', at);
+        const std::string name = outputs.substr(at, end - at);
+        char line[160];
+        sprintf_s(line, "  o.%s = float4(p.x * 0.5 + 0.5, 0.5 - p.y * 0.5, %0.2f, 1) * %0.2f + %0.2f;\n", name.c_str(),
+                  0.25 + 0.05 * n, 0.8 + 0.1 * (n % 3), 0.05 * (n % 4));
+        body += line;
+        n++;
+      }
+      s.vs += body + "  return o;\n}\n";
+      list.push_back(std::move(s));
+    }
+    std::fclose(f);
+    return list;
+  }
+
+  // ms per full-screen draw of each shader (negative: not drawn).
+  std::vector<double> benchShaderTimes(Runtime& runtime, const std::vector<BenchShader>& shaders) {
+    std::vector<double> times(shaders.size(), -1.0);
+    IDirect3D9* d3d = runtime.create(D3D_SDK_VERSION);
+    HWND window = createWindow();
+    D3DPRESENT_PARAMETERS pp = {};
+    pp.Windowed = TRUE;
+    pp.SwapEffect = D3DSWAPEFFECT_DISCARD;
+    pp.BackBufferWidth = kWidth;
+    pp.BackBufferHeight = kHeight;
+    pp.BackBufferFormat = D3DFMT_A8R8G8B8;
+    pp.hDeviceWindow = window;
+    pp.PresentationInterval = D3DPRESENT_INTERVAL_IMMEDIATE;
+    IDirect3DDevice9* d = nullptr;
+    if (!d3d || FAILED(d3d->CreateDevice(0, D3DDEVTYPE_HAL, window, D3DCREATE_HARDWARE_VERTEXPROCESSING, &pp, &d))) {
+      if (d3d) d3d->Release();
+      DestroyWindow(window);
+      return times;
+    }
+    // DXUP_BENCH_SIZE=N: N x N pixels (small: what a draw costs besides its pixels).
+    const std::string size = benchOption("DXUP_BENCH_SIZE");
+    const UINT width = size.empty() ? 1920 : UINT(std::atoi(size.c_str())), height = size.empty() ? 1080 : width;
+    IDirect3DSurface9* targets[4] = {};
+    for (auto& t : targets)
+      d->CreateRenderTarget(width, height, D3DFMT_A16B16G16R16F, D3DMULTISAMPLE_NONE, 0, FALSE, &t, nullptr);
+    // Textures of noise, with mips.
+    uint32_t seed = 12345;
+    auto noise = [&]() { seed = seed * 1664525u + 1013904223u; return seed; };
+    IDirect3DTexture9* flat = nullptr;
+    IDirect3DCubeTexture9* cube = nullptr;
+    IDirect3DVolumeTexture9* volume = nullptr;
+    d->CreateTexture(512, 512, 0, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, &flat, nullptr);
+    d->CreateCubeTexture(128, 0, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, &cube, nullptr);
+    d->CreateVolumeTexture(32, 32, 32, 0, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, &volume, nullptr);
+    for (UINT level = 0; flat && level < flat->GetLevelCount(); level++) {
+      D3DLOCKED_RECT r;
+      D3DSURFACE_DESC desc;
+      flat->GetLevelDesc(level, &desc);
+      if (SUCCEEDED(flat->LockRect(level, &r, nullptr, 0))) {
+        for (UINT y = 0; y < desc.Height; y++)
+          for (UINT x = 0; x < desc.Width; x++)
+            reinterpret_cast<DWORD*>(static_cast<BYTE*>(r.pBits) + y * r.Pitch)[x] = noise();
+        flat->UnlockRect(level);
+      }
+    }
+    for (UINT face = 0; cube && face < 6; face++)
+      for (UINT level = 0; level < cube->GetLevelCount(); level++) {
+        D3DLOCKED_RECT r;
+        D3DSURFACE_DESC desc;
+        cube->GetLevelDesc(level, &desc);
+        if (SUCCEEDED(cube->LockRect(D3DCUBEMAP_FACES(face), level, &r, nullptr, 0))) {
+          for (UINT y = 0; y < desc.Height; y++)
+            for (UINT x = 0; x < desc.Width; x++)
+              reinterpret_cast<DWORD*>(static_cast<BYTE*>(r.pBits) + y * r.Pitch)[x] = noise();
+          cube->UnlockRect(D3DCUBEMAP_FACES(face), level);
+        }
+      }
+    for (UINT level = 0; volume && level < volume->GetLevelCount(); level++) {
+      D3DLOCKED_BOX b;
+      D3DVOLUME_DESC desc;
+      volume->GetLevelDesc(level, &desc);
+      if (SUCCEEDED(volume->LockBox(level, &b, nullptr, 0))) {
+        for (UINT z = 0; z < desc.Depth; z++)
+          for (UINT y = 0; y < desc.Height; y++)
+            for (UINT x = 0; x < desc.Width; x++)
+              reinterpret_cast<DWORD*>(static_cast<BYTE*>(b.pBits) + z * b.SlicePitch + y * b.RowPitch)[x] = noise();
+        volume->UnlockBox(level);
+      }
+    }
+    std::vector<float> constants(224 * 4);
+    for (float& c : constants)
+      c = float(noise() % 1000) / 1000.0f;
+    const int loops[16 * 4] = { 4, 0, 1, 0, 4, 0, 1, 0, 4, 0, 1, 0, 4, 0, 1, 0, 4, 0, 1, 0, 4, 0, 1, 0, 4, 0, 1, 0, 4, 0, 1, 0,
+                                4, 0, 1, 0, 4, 0, 1, 0, 4, 0, 1, 0, 4, 0, 1, 0, 4, 0, 1, 0, 4, 0, 1, 0, 4, 0, 1, 0, 4, 0, 1, 0 };
+    const float quad[4][4] = { { -1, 1, 0.5f, 1 }, { 1, 1, 0.5f, 1 }, { -1, -1, 0.5f, 1 }, { 1, -1, 0.5f, 1 } };
+    IDirect3DQuery9* event = nullptr;
+    d->CreateQuery(D3DQUERYTYPE_EVENT, &event);
+    d->SetFVF(D3DFVF_XYZW);
+    d->SetRenderState(D3DRS_ZENABLE, FALSE);
+    d->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+    d->SetPixelShaderConstantF(0, constants.data(), 224);
+    d->SetVertexShaderConstantF(0, constants.data(), 224);
+    d->SetPixelShaderConstantI(0, loops, 16);
+    for (DWORD s = 0; s < 16; s++) {
+      d->SetSamplerState(s, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
+      d->SetSamplerState(s, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
+      d->SetSamplerState(s, D3DSAMP_MIPFILTER, D3DTEXF_LINEAR);
+    }
+    auto wait = [&](IDirect3DQuery9* q, void* data, DWORD size) {
+      const ULONGLONG start = GetTickCount64();
+      while (GetTickCount64() - start < 5000) {
+        const HRESULT hr = q->GetData(data, size, D3DGETDATA_FLUSH);
+        if (hr == S_OK) return true;
+        if (FAILED(hr)) return false;
+      }
+      return false;
+    };
+    {
+      // Half a second of full-screen clears first: the GPU at its clocks.
+      d->SetRenderTarget(0, targets[0]);
+      const ULONGLONG start = GetTickCount64();
+      BOOL done = FALSE;
+      while (GetTickCount64() - start < 500) {
+        for (int i = 0; i < 20; i++)
+          d->Clear(0, nullptr, D3DCLEAR_TARGET, D3DCOLOR_ARGB(255, i, 0, 0), 1.0f, 0);
+        event->Issue(D3DISSUE_END);
+        wait(event, &done, sizeof(done));
+      }
+    }
+    for (size_t n = 0; n < shaders.size(); n++) {
+      const BenchShader& s = shaders[n];
+      const auto vsCode = compile(s.vs.c_str(), (s.tokens[0] >> 8 & 0xff) >= 3 ? "vs_3_0" : "vs_2_0");
+      IDirect3DVertexShader9* vs = nullptr;
+      IDirect3DPixelShader9* ps = nullptr;
+      if (vsCode.empty() || FAILED(d->CreateVertexShader(vsCode.data(), &vs)) || FAILED(d->CreatePixelShader(s.tokens.data(), &ps))) {
+        if (!benchOption("DXUP_BENCH_CHECK").empty())
+          std::printf("%s shader %zu: %s\n", runtime.name, n, vsCode.empty() ? "vertex shader not compiled" : "shader not created");
+        if (vs) vs->Release();
+        continue;
+      }
+      d->SetVertexShader(vs);
+      d->SetPixelShader(ps);
+      // Added up: Windows' NVIDIA D3D9 leaves out draws that repeat the one
+      // before without blending.
+      d->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
+      d->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_ONE);
+      d->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_ONE);
+      for (DWORD t = 0; t < 4; t++)
+        d->SetRenderTarget(t, t < s.outputs ? targets[t] : nullptr);
+      for (DWORD i = 0; i < 16; i++) {
+        IDirect3DBaseTexture9* texture = s.samplers[i] == 3 ? static_cast<IDirect3DBaseTexture9*>(cube)
+          : s.samplers[i] == 4 ? static_cast<IDirect3DBaseTexture9*>(volume)
+          : s.samplers[i] ? static_cast<IDirect3DBaseTexture9*>(flat) : nullptr;
+        d->SetTexture(i, texture);
+      }
+      // Wall time until an event after the draws completes (Windows' D3D9
+      // writes timestamps before the draws before them finish): the GPU is
+      // idle first, and enough draws that their submission does not count.
+      double best = 1e30;
+      LARGE_INTEGER hz;
+      QueryPerformanceFrequency(&hz);
+      for (int round = 0; round < 3; round++) {
+        d->BeginScene();
+        for (int i = 0; i < 2; i++)
+          d->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, quad, sizeof(quad[0]));
+        d->EndScene();
+        BOOL done = FALSE;
+        event->Issue(D3DISSUE_END);
+        wait(event, &done, sizeof(done));
+        LARGE_INTEGER t0, t1;
+        QueryPerformanceCounter(&t0);
+        d->BeginScene();
+        constexpr int kDraws = 200;
+        for (int i = 0; i < kDraws; i++)
+          d->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, quad, sizeof(quad[0]));
+        d->EndScene();
+        event->Issue(D3DISSUE_END);
+        if (wait(event, &done, sizeof(done)) && round) {
+          QueryPerformanceCounter(&t1);
+          best = (std::min)(best, double(t1.QuadPart - t0.QuadPart) * 1000.0 / double(hz.QuadPart) / kDraws);
+        }
+      }
+      if (best < 1e30)
+        times[n] = best;
+      if (!benchOption("DXUP_BENCH_CHECK").empty() && n < 3) {
+        // What the draws wrote: the target's centre and corner.
+        IDirect3DSurface9* copy = nullptr;
+        if (SUCCEEDED(d->CreateOffscreenPlainSurface(width, height, D3DFMT_A16B16G16R16F, D3DPOOL_SYSTEMMEM, &copy, nullptr))
+         && SUCCEEDED(d->GetRenderTargetData(targets[0], copy))) {
+          D3DLOCKED_RECT r;
+          if (SUCCEEDED(copy->LockRect(&r, nullptr, D3DLOCK_READONLY))) {
+            const WORD* centre = reinterpret_cast<const WORD*>(static_cast<const BYTE*>(r.pBits) + (height / 2) * r.Pitch) + (width / 2) * 4;
+            const WORD* corner = static_cast<const WORD*>(r.pBits);
+            std::printf("%s shader %zu: centre %04x %04x %04x %04x corner %04x %04x %04x %04x\n", runtime.name, n, centre[0], centre[1],
+                        centre[2], centre[3], corner[0], corner[1], corner[2], corner[3]);
+            copy->UnlockRect();
+          }
+        }
+        if (copy) copy->Release();
+      }
+      d->SetVertexShader(nullptr);
+      d->SetPixelShader(nullptr);
+      vs->Release();
+      ps->Release();
+    }
+    for (DWORD i = 0; i < 16; i++)
+      d->SetTexture(i, nullptr);
+    d->SetRenderTarget(0, nullptr);
+    if (event)
+      event->Release();
+    for (auto* t : targets)
+      if (t) t->Release();
+    if (flat) flat->Release();
+    if (cube) cube->Release();
+    if (volume) volume->Release();
+    d->Release();
+    d3d->Release();
+    DestroyWindow(window);
+    return times;
+  }
+
+  int benchShaderFile(Runtime& windows, Runtime& dxup, const char* path, size_t limit) {
+    std::vector<BenchShader> shaders = benchShaderList(path);
+    if (limit && shaders.size() > limit)
+      shaders.resize(limit);
+    std::printf("%zu pixel shaders (2.0-3.0) in %s\n", shaders.size(), path);
+    // DXUP_BENCH_DXUP_FIRST: DXUP measured first (the GPU's clocks change as it warms).
+    const bool dxupFirst = !benchOption("DXUP_BENCH_DXUP_FIRST").empty();
+    const std::vector<double> b0 = dxupFirst ? benchShaderTimes(dxup, shaders) : std::vector<double>();
+    const std::vector<double> a = !benchOption("DXUP_BENCH_DXUP_ONLY").empty() ? std::vector<double>(shaders.size(), -1.0)
+                                                                      : benchShaderTimes(windows, shaders);
+    const std::vector<double> b = dxupFirst ? b0 : benchShaderTimes(dxup, shaders);
+    struct Row { size_t n; double windows, dxup; };
+    std::vector<Row> rows;
+    double totalA = 0.0, totalB = 0.0;
+    // DXUP_BENCH_DXUP_ONLY (Windows' D3D9 needs the display on): DXUP's times.
+    if (!benchOption("DXUP_BENCH_DXUP_ONLY").empty()) {
+      double total = 0.0;
+      for (size_t n = 0; n < shaders.size(); n++) {
+        if (b[n] <= 0.0)
+          continue;
+        total += b[n];
+        std::printf("  shader %4zu (%5zu tokens, %016llX): DXUP %.4f ms\n", n, shaders[n].tokens.size(),
+                    static_cast<unsigned long long>(shaders[n].hash), b[n]);
+      }
+      std::printf("DXUP total %.3f ms\n", total);
+      return 0;
+    }
+    for (size_t n = 0; n < shaders.size(); n++) {
+      if (a[n] <= 0.0 || b[n] <= 0.0)
+        continue;
+      rows.push_back({ n, a[n], b[n] });
+      totalA += a[n];
+      totalB += b[n];
+    }
+    std::sort(rows.begin(), rows.end(), [](const Row& x, const Row& y) { return x.dxup - x.windows > y.dxup - y.windows; });
+    for (size_t i = 0; i < rows.size() && i < 20; i++) {
+      std::printf("  shader %4zu (%5zu tokens, %016llX): Windows %.4f ms, DXUP %.4f ms (%+.0f %%)\n", rows[i].n,
+                  shaders[rows[i].n].tokens.size(), static_cast<unsigned long long>(shaders[rows[i].n].hash), rows[i].windows,
+                  rows[i].dxup,
+                  (rows[i].dxup / rows[i].windows - 1.0) * 100.0);
+    }
+    std::printf("%zu drawn on both, 1920x1080 each: Windows %.3f ms, DXUP %.3f ms (%+.1f %%)\n", rows.size(), totalA, totalB,
+                totalA > 0 ? (totalB / totalA - 1.0) * 100.0 : 0.0);
+    return 0;
+  }
+
   // dxup.conf d3d11.msaaForce: the back buffer and the depth buffer made
   // with the device are a swap chain's size, so they get forced samples (on
   // DXUP's D3D11, the swap chain comes only at the first Present). A white
@@ -2802,6 +3198,8 @@ int main(int argc, char** argv) {
   bool dumpImages = false, memory = false;
   const char* filter = nullptr;
   int benchFrames = 0, benchDraws = 0;
+  const char* benchShadersPath = nullptr;
+  size_t benchShadersLimit = 0;
   bool childForcedMsaa = false, identifier = false, childDpi = false, childFloatStrict = false, childDropped = false;
   bool childSelfTest = false, dxupOnly = false;
   unsigned variantNonce = 0;
@@ -2818,6 +3216,10 @@ int main(int argc, char** argv) {
     else if (std::strcmp(argv[i], "--dxup-only") == 0) dxupOnly = true;
     else if (std::strcmp(argv[i], "--variant-child") == 0 && i + 1 < argc) variantNonce = unsigned(std::strtoul(argv[++i], nullptr, 10));
     else if (std::strcmp(argv[i], "--bench") == 0 && i + 2 < argc) { benchFrames = std::atoi(argv[i + 1]); benchDraws = std::atoi(argv[i + 2]); i += 2; }
+    else if (std::strcmp(argv[i], "--bench-shaders") == 0 && i + 1 < argc) {
+      benchShadersPath = argv[++i];
+      if (i + 1 < argc && std::isdigit(static_cast<unsigned char>(argv[i + 1][0]))) benchShadersLimit = std::strtoul(argv[++i], nullptr, 10);
+    }
     else filter = argv[i];
   }
 
@@ -2905,6 +3307,9 @@ int main(int argc, char** argv) {
     }
     return 0;
   }
+
+  if (benchShadersPath)
+    return benchShaderFile(windows, dxup, benchShadersPath, benchShadersLimit);
 
   if (benchFrames) {
     bench(dxup, benchFrames, benchDraws);

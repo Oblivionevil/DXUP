@@ -4469,6 +4469,21 @@ namespace dxup::d3d12 {
     ComPtr<ID3D12PipelineState> pso;
     logMessage(LogLevel::Info, "createGfxPSO-step9: calling CreateGraphicsPipelineState device=%p rootSig=%p sampleMask=0x%X",
       m_device.Get(), psoDesc.pRootSignature, psoDesc.SampleMask);
+    {
+      // The whole fixed state, to compare pipelines of two programs.
+      const D3D12_RENDER_TARGET_BLEND_DESC& b = psoDesc.BlendState.RenderTarget[0];
+      const D3D12_RASTERIZER_DESC& r = psoDesc.RasterizerState;
+      const D3D12_DEPTH_STENCIL_DESC& z = psoDesc.DepthStencilState;
+      logMessage(LogLevel::Info, "createGfxPSO-state: blend0 %d %d/%d/%d %d/%d/%d mask 0x%x logic %d a2c %d independent %d | "
+        "raster fill %d cull %d ccw %d bias %d/%g/%g clip %d ms %d aaline %d forced %u conservative %d | depth %d write %d func %d "
+        "stencil %d | topo %d cut %d | vs %zu ps %zu gs %zu inputs %u samples %u",
+        b.BlendEnable, b.SrcBlend, b.DestBlend, b.BlendOp, b.SrcBlendAlpha, b.DestBlendAlpha, b.BlendOpAlpha, b.RenderTargetWriteMask,
+        b.LogicOpEnable, psoDesc.BlendState.AlphaToCoverageEnable, psoDesc.BlendState.IndependentBlendEnable,
+        r.FillMode, r.CullMode, r.FrontCounterClockwise, r.DepthBias, r.DepthBiasClamp, r.SlopeScaledDepthBias, r.DepthClipEnable,
+        r.MultisampleEnable, r.AntialiasedLineEnable, r.ForcedSampleCount, r.ConservativeRaster, z.DepthEnable, z.DepthWriteMask,
+        z.DepthFunc, z.StencilEnable, psoDesc.PrimitiveTopologyType, psoDesc.IBStripCutValue, psoDesc.VS.BytecodeLength,
+        psoDesc.PS.BytecodeLength, psoDesc.GS.BytecodeLength, psoDesc.InputLayout.NumElements, psoDesc.SampleDesc.Count);
+    }
 
     // The in-memory key is entirely content-based and therefore also provides
     // a stable cross-run key for the driver PSO blob cache.
