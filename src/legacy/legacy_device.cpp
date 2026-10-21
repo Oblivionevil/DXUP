@@ -2199,7 +2199,7 @@ namespace dxup::legacy {
   void Device::invalidateBindings() {
     m_dirty = DirtyAll;
     m_targetsDirty = m_viewportDirty = true;
-    m_targetsBound = false;
+    m_targetsBound = m_viewportBound = false;
     m_constantStageKinds[0] = m_constantStageKinds[1] = -1;
     m_textureDirtyMask = m_samplerDirtyMask = (1u << kSamplerCount) - 1;
     // What the context holds is unknown now (quads bind their own views): a value no
@@ -2335,7 +2335,11 @@ namespace dxup::legacy {
 
   void Device::setViewport(const Viewport& viewport) {
     // Field by field: callers build it so right before (a wider copy
-    // would wait for those stores).
+    // would wait for those stores). The same again changes nothing.
+    if (m_viewport.x == viewport.x && m_viewport.y == viewport.y && m_viewport.width == viewport.width
+     && m_viewport.height == viewport.height && asUint(m_viewport.minZ) == asUint(viewport.minZ)
+     && asUint(m_viewport.maxZ) == asUint(viewport.maxZ))
+      return;
     m_viewport.x = viewport.x;
     m_viewport.y = viewport.y;
     m_viewport.width = viewport.width;
@@ -2347,7 +2351,13 @@ namespace dxup::legacy {
   }
 
   void Device::setScissor(const Rect& rect) {
-    m_scissor = rect;
+    if (m_scissor.left == rect.left && m_scissor.top == rect.top && m_scissor.right == rect.right
+     && m_scissor.bottom == rect.bottom)
+      return;
+    m_scissor.left = rect.left;
+    m_scissor.top = rect.top;
+    m_scissor.right = rect.right;
+    m_scissor.bottom = rect.bottom;
     m_viewportDirty = true;
   }
 
@@ -3988,9 +3998,16 @@ namespace dxup::legacy {
     // half: the viewport moves half a pixel.
     D3D11_VIEWPORT vp = { float(m_viewport.x) + 0.5f, float(m_viewport.y) + 0.5f, float(m_viewport.width),
                           float(m_viewport.height), m_viewport.minZ, m_viewport.maxZ };
-    m_context->RSSetViewports(1, &vp);
+    if (!m_viewportBound || std::memcmp(&vp, &m_boundViewport, sizeof(vp)) != 0) {
+      m_context->RSSetViewports(1, &vp);
+      m_boundViewport = vp;
+    }
     D3D11_RECT scissor = { m_scissor.left, m_scissor.top, m_scissor.right, m_scissor.bottom };
-    m_context->RSSetScissorRects(1, &scissor);
+    if (!m_viewportBound || std::memcmp(&scissor, &m_boundScissor, sizeof(scissor)) != 0) {
+      m_context->RSSetScissorRects(1, &scissor);
+      m_boundScissor = scissor;
+    }
+    m_viewportBound = true;
     m_viewportDirty = false;
   }
 

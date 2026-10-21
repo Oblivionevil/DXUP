@@ -766,6 +766,9 @@ namespace dxup::legacy {
     ID3D11RenderTargetView*   m_boundRtvs[kMaxRenderTargets] = {};   // valid with m_targetsBound
     ID3D11DepthStencilView*   m_boundDsv = nullptr;
     bool                      m_targetsBound = false;
+    D3D11_VIEWPORT            m_boundViewport = {};   // valid with m_viewportBound
+    D3D11_RECT                m_boundScissor = {};
+    bool                      m_viewportBound = false;
     ID3D11ShaderResourceView* m_boundVertexViews[4] = {};
     ID3D11SamplerState*       m_boundSamplers[kSamplerCount] = {};
     ID3D11Buffer*             m_boundStreams[kMaxStreams] = {};
