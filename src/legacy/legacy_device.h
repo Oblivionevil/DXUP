@@ -578,16 +578,32 @@ namespace dxup::legacy {
     std::unordered_map<uint64_t, ID3D11InputLayout*>        m_inputLayouts;
     std::unordered_map<uint64_t, ID3D11BlendState*>         m_blendStates;   // by the states they come from
     // The states of recent draws by key, before the maps (games switch
-    // among a few states draw by draw).
+    // among a few states draw by draw): 32 sets of two, the recent first.
     template<typename T>
     struct StateCache {
       struct Entry { uint64_t key = 0; T* state = nullptr; };
-      Entry entries[16];
-      Entry& at(uint64_t key) { return entries[(key * 0x9e3779b97f4a7c15ull) >> 60]; }
+      Entry entries[64];
+      Entry* set(uint64_t key) { return &entries[((uint32_t(key) ^ uint32_t(key >> 32)) * 0x9e3779b9u >> 27) * 2]; }
+      T* find(uint64_t key) {
+        Entry* e = set(key);
+        if (e[0].state && e[0].key == key)
+          return e[0].state;
+        if (!e[1].state || e[1].key != key)
+          return nullptr;
+        std::swap(e[0], e[1]);
+        return e[0].state;
+      }
+      void insert(uint64_t key, T* state) {
+        Entry* e = set(key);
+        e[1] = e[0];
+        e[0] = { key, state };
+      }
     };
     StateCache<ID3D11BlendState>                            m_blendCache;
     StateCache<ID3D11DepthStencilState>                     m_depthCache;
     StateCache<ID3D11RasterizerState>                       m_rasterCache;
+    StateCache<ID3D11InputLayout>                           m_layoutCache;
+    StateCache<ID3D11SamplerState>                          m_samplerCache;
     std::unordered_map<uint64_t, ID3D11DepthStencilState*>  m_depthStates;
     std::unordered_map<uint64_t, ID3D11RasterizerState*>    m_rasterStates;
     std::unordered_map<uint64_t, ID3D11SamplerState*>       m_samplerStates;
@@ -634,6 +650,9 @@ namespace dxup::legacy {
       uint32_t limits[4];   // the last float constant, vertex input modes (dxup_inputModes, dxup_inputWOne)
     };
     ConstantStore m_constants[2] = {};      // vertex, pixel
+    // The input modes of the last vertex shader and declaration (by hash).
+    uint64_t m_inputModesShader = 0, m_inputModesDecl = 0;
+    uint32_t m_inputModes[2] = {};
     // Float constants the application set: those below this, ever.
     uint32_t m_constantsWritten[2] = {};
     // The float constants of a draw's shader: relative reads find no more

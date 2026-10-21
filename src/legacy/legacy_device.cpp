@@ -2216,20 +2216,27 @@ namespace dxup::legacy {
   void Device::setTexture(uint32_t stage, Texture* texture) {
     if (stage >= kSamplerCount || m_textures[stage] == texture)
       return;
-    const uint32_t oldType = textureTypeOf(m_textures[stage]), newType = textureTypeOf(texture);
+    m_textures[stage] = texture;
+    m_textureDirtyMask |= 1u << stage;
+    if (texture && texture->pending())
+      m_texturesPending = true;
+    // Vertex textures: neither types nor shadow samplers to keep.
+    if (stage >= kPixelSamplers)
+      return;
+    // The bound texture's type and whether it is a shadow map as kept
+    // (without reading the texture).
+    const uint32_t oldType = (m_psTextureTypes >> (stage * 2)) & 3, newType = textureTypeOf(texture);
     if (oldType != newType) {
       if (stage < kFixedStages)
         m_pixelConstantsDirty = true;
       // Shader model 1 pixel shaders sample with the bound textures' types.
-      if (stage < kPixelSamplers) {
-        m_psTextureTypes = (m_psTextureTypes & ~(3u << (stage * 2))) | (newType << (stage * 2));
-        if (m_pixelShader && m_pixelShader->info().major == 1)
-          m_dirty |= DirtyShaders;
-      }
+      m_psTextureTypes = (m_psTextureTypes & ~(3u << (stage * 2))) | (newType << (stage * 2));
+      if (m_pixelShader && m_pixelShader->info().major == 1)
+        m_dirty |= DirtyShaders;
     }
-    const bool oldShadow = m_textures[stage] && m_textures[stage]->shadow();
+    const bool oldShadow = (m_shadowMask >> stage) & 1;
     const bool newShadow = texture && texture->shadow();
-    if (oldShadow != newShadow && stage < kPixelSamplers) {
+    if (oldShadow != newShadow) {
       m_shadowMask = newShadow ? (m_shadowMask | (1u << stage)) : (m_shadowMask & ~(1u << stage));
       if (m_pixelShader)
         m_dirty |= DirtyShaders;
@@ -2237,10 +2244,6 @@ namespace dxup::legacy {
         m_pixelConstantsDirty = true;
       m_samplerDirtyMask |= 1u << stage;
     }
-    m_textures[stage] = texture;
-    m_textureDirtyMask |= 1u << stage;
-    if (texture && texture->pending())
-      m_texturesPending = true;
   }
 
   void Device::setTransform(uint32_t state, const float* matrix) {
@@ -2572,15 +2575,14 @@ namespace dxup::legacy {
         key |= 1ull << 35 | field(rs[RsSrcBlendAlpha]) << 36 | field(rs[RsDestBlendAlpha]) << 41
              | field(rs[RsBlendOpAlpha]) << 46;
     }
-    auto& cached = m_blendCache.at(key);
-    if (cached.key == key && cached.state)
-      return cached.state;
+    if (auto* cached = m_blendCache.find(key))
+      return cached;
     auto& state = m_blendStates[key];
     if (!state) {
       D3D11_BLEND_DESC desc = blendDesc();
       m_device->CreateBlendState(&desc, &state);
     }
-    cached = { key, state };
+    m_blendCache.insert(key, state);
     return state;
   }
 
@@ -2643,13 +2645,12 @@ namespace dxup::legacy {
       desc.DepthFunc = D3D11_COMPARISON_ALWAYS;
     }
     const uint64_t key = hashBytes(desc);
-    auto& cached = m_depthCache.at(key);
-    if (cached.key == key && cached.state)
-      return cached.state;
+    if (auto* cached = m_depthCache.find(key))
+      return cached;
     auto& state = m_depthStates[key];
     if (!state)
       m_device->CreateDepthStencilState(&desc, &state);
-    cached = { key, state };
+    m_depthCache.insert(key, state);
     return state;
   }
 
@@ -2672,18 +2673,21 @@ namespace dxup::legacy {
     desc.ScissorEnable = rs[RsScissorTestEnable] != 0;
     desc.MultisampleEnable = TRUE;
     const uint64_t key = hashBytes(desc);
-    auto& cached = m_rasterCache.at(key);
-    if (cached.key == key && cached.state)
-      return cached.state;
+    if (auto* cached = m_rasterCache.find(key))
+      return cached;
     auto& state = m_rasterStates[key];
     if (!state)
       m_device->CreateRasterizerState(&desc, &state);
-    cached = { key, state };
+    m_rasterCache.insert(key, state);
     return state;
   }
 
   ID3D11SamplerState* Device::d3dSampler(uint32_t sampler, bool compare) {
     const auto& ss = m_samplerStatesValues[sampler];
+    // Recent samplers by the stage's states, before describing them.
+    const uint64_t recentKey = hashBytes(ss) ^ uint64_t(compare);
+    if (auto* cached = m_samplerCache.find(recentKey))
+      return cached;
     D3D11_SAMPLER_DESC desc = {};
     const uint32_t mag = ss[SampMagFilter], min = ss[SampMinFilter], mip = ss[SampMipFilter];
     const bool anisotropic = mag == 3 || min == 3;
@@ -2726,6 +2730,7 @@ namespace dxup::legacy {
         m_device->CreateSamplerState(&desc, &state);
       }
     }
+    m_samplerCache.insert(recentKey, state);
     return state;
   }
 
@@ -2739,9 +2744,13 @@ namespace dxup::legacy {
       if ((m_decl->streamMask() >> stream) & 1 && (frequency & kInstanceData))
         key = fnv64Multiply(key ^ (uint64_t(stream) << 32) ^ frequency);
     }
+    if (auto* cached = m_layoutCache.find(key))
+      return cached;
     auto& layout = m_inputLayouts[key];
-    if (layout)
+    if (layout) {
+      m_layoutCache.insert(key, layout);
       return layout;
+    }
 
     std::vector<D3D11_INPUT_ELEMENT_DESC> elements;
     auto find = [&](uint8_t usage, uint8_t index) -> const VertexElement* {
@@ -3965,7 +3974,10 @@ namespace dxup::legacy {
       // How the inputs' bits become floats (dxup_inputModes): integers of
       // the declaration's UBYTE4 and SHORT types.
       uint32_t inputModes = 0, inputWOne = 0;
-      if (m_decl) {
+      if (m_decl && m_inputModesShader == m_vertexShader->hash() && m_inputModesDecl == m_decl->hash()) {
+        inputModes = m_inputModes[0];
+        inputWOne = m_inputModes[1];
+      } else if (m_decl) {
         for (const auto& in : m_vertexShader->info().inputs) {
           for (const auto& e : m_decl->elements()) {
             if (e.usage != in.usage || e.usageIndex != in.usageIndex)
@@ -3977,6 +3989,10 @@ namespace dxup::legacy {
             break;
           }
         }
+        m_inputModesShader = m_vertexShader->hash();
+        m_inputModesDecl = m_decl->hash();
+        m_inputModes[0] = inputModes;
+        m_inputModes[1] = inputWOne;
       }
       if (m_constants[0].limits[1] != inputModes || m_constants[0].limits[2] != inputWOne) {
         m_constants[0].limits[1] = inputModes;
