@@ -247,7 +247,7 @@ SamplerState samplers[MAX_STAGES]     : register(s0);
 SamplerComparisonState compareSamplers[MAX_STAGES] : register(s8);
 
 cbuffer FfpPixel : register(b1) {
-  uint4  stageOps[MAX_STAGES];   // color op, alpha op, result (0 current, 1 temp), texture type | projected << 4 | count << 8
+  uint4  stageOps[MAX_STAGES];   // color op, alpha op, result (0 current, 1 temp), texture type | projected << 4 | count << 8 | keyed << 12
   uint4  stageArgs[MAX_STAGES];  // color arg 1, 2, 0, alpha args 1 | 2 << 8 | 0 << 16
   float4 stageConstant[MAX_STAGES];
   float4 bumpMatrix[MAX_STAGES];
@@ -347,6 +347,11 @@ float4 ps_main(PSInput input) : SV_Target {
       texel = texturesCube[stage].Sample(samplers[stage], tc.xyz);
     else if (textureType == 3)
       texel = textures3d[stage].Sample(samplers[stage], tc.xyz);
+    // A colour-keyed texture (DirectDraw): where only texels of its key
+    // were sampled (alpha 0 after the key) nothing is drawn, whatever the
+    // stages do with alpha, as with Windows' Direct3D 7.
+    if (((ops.w >> 12) & 1u) != 0 && texel.a <= 0.0f)
+      discard;
     texel.rgb *= bumpScale;
     bumpOffset = 0.0f;
     bumpScale = 1.0f;

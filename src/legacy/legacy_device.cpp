@@ -561,6 +561,13 @@ namespace dxup::legacy {
         return false;
     }
     Level& level = m_levels[subresource];
+    if (level.dropped) {
+      // Locked again: back from the GPU, and kept from now on.
+      level.dropped = false;
+      level.kept = true;
+      if (!discard)
+        restoreCopy(subresource);
+    }
     if (level.data.empty())
       level.data.resize(levelSize(subresource));
     if (m_gpuWritten && d3dResource() && !discard) {
@@ -680,6 +687,10 @@ namespace dxup::legacy {
     }
     if (!m_convert && !keyed && m_desc.format != FormatX1R5G5B5) {
       write(subresource, box, level.data.data(), srcPitch, srcSlice);
+      if (canDropCopy(subresource)) {
+        std::vector<uint8_t>().swap(m_levels[subresource].data);
+        m_levels[subresource].dropped = true;
+      }
       return;
     }
     std::vector<uint32_t> converted(size_t(w) * h * d);
@@ -705,6 +716,65 @@ namespace dxup::legacy {
     for (size_t i = 0; i < converted.size(); i++)
       fromArgb(m_desc.format == FormatX1R5G5B5 ? FormatA1R5G5B5 : m_desc.format, converted[i], packed.data() + i * bpp);
     m_device->context()->UpdateSubresource(d3dResource(), subresource, &box, packed.data(), w * bpp, w * h * bpp);
+  }
+
+  bool Texture::canDropCopy(uint32_t subresource) const {
+    const Level& level = m_levels[subresource];
+    if (!m_desc.dropCopies || !m_texture || m_convert || m_colorKeyEnabled || m_desc.samples != 1
+     || m_desc.renderTarget || m_desc.depthStencil || level.kept || level.locked)
+      return false;
+    switch (m_desc.format) {
+      case FormatX1R5G5B5:      // uploaded with the alpha bit set
+      case FormatA2R10G10B10:   // red and blue swapped
+      case FormatATI1:          // locked with another pitch than its blocks
+      case FormatATI2:
+        return false;
+      default:
+        break;
+    }
+    const FormatInfo info = formatInfo(m_desc.format);
+    const uint32_t w = width(subresource), h = height(subresource);
+    // Small levels: a readback is not worth what they take. Compressed
+    // levels the D3D11 texture holds at their size only (whole blocks).
+    if (info.depth || levelSize(subresource) < (16u << 10) || (info.block && ((w & 3) || (h & 3))))
+      return false;
+    D3D11_TEXTURE2D_DESC td;
+    m_texture->GetDesc(&td);
+    const uint32_t mip = subresource % m_desc.levels;
+    return td.MipLevels == m_desc.levels && (std::max)(1u, td.Width >> mip) == w && (std::max)(1u, td.Height >> mip) == h;
+  }
+
+  void Texture::restoreCopy(uint32_t subresource) {
+    // A copy of the level's size for this read only: kept staging copies
+    // are CPU-visible memory, what dropping the data saves.
+    Level& level = m_levels[subresource];
+    level.data.resize(levelSize(subresource));
+    const uint32_t w = width(subresource), h = height(subresource);
+    D3D11_TEXTURE2D_DESC td;
+    m_texture->GetDesc(&td);
+    td.Width = w;
+    td.Height = h;
+    td.MipLevels = 1;
+    td.ArraySize = 1;
+    td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_STAGING;
+    td.BindFlags = 0;
+    td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    td.MiscFlags = 0;
+    Ref<ID3D11Texture2D> copy;
+    if (FAILED(m_device->d3d11()->CreateTexture2D(&td, nullptr, copy.put())))
+      return;
+    m_device->context()->CopySubresourceRegion(copy.get(), 0, 0, 0, 0, m_texture.get(), subresource, nullptr);
+    D3D11_MAPPED_SUBRESOURCE mapped = {};
+    if (FAILED(m_device->context()->Map(copy.get(), 0, D3D11_MAP_READ, 0, &mapped)))
+      return;
+    const FormatInfo info = formatInfo(m_desc.format);
+    const size_t rowBytes = info.block ? size_t(w / 4) * info.bytesPerBlock : size_t(w) * info.bytesPerBlock;
+    const uint32_t rowPitch = pitch(subresource);
+    for (uint32_t y = 0; y < legacyRows(m_desc.format, h); y++)
+      std::memcpy(level.data.data() + size_t(y) * rowPitch, static_cast<const uint8_t*>(mapped.pData) + size_t(y) * mapped.RowPitch,
+                  rowBytes);
+    m_device->context()->Unmap(copy.get(), 0);
   }
 
   void Texture::readBack(uint32_t subresource) {
@@ -780,10 +850,20 @@ namespace dxup::legacy {
   void Texture::setColorKey(bool enabled, uint32_t key) {
     if (m_colorKeyEnabled == enabled && m_colorKey == key)
       return;
+    if (m_colorKeyEnabled != enabled)
+      m_device->markPixelConstantsDirty();
     m_colorKeyEnabled = enabled;
     m_colorKey = key;
-    for (auto& level : m_levels)
+    for (uint32_t i = 0; i < m_levels.size(); i++) {
+      Level& level = m_levels[i];
+      // Uploaded again with the key: a dropped copy comes back first.
+      if (level.dropped) {
+        level.dropped = false;
+        level.kept = true;
+        restoreCopy(i);
+      }
       if (!level.data.empty()) level.dirty = true;
+    }
     markPending();
   }
 
@@ -3240,7 +3320,8 @@ namespace dxup::legacy {
       c->stageOps[stage][0] = tss[TssColorOp];
       c->stageOps[stage][1] = tss[TssAlphaOp];
       c->stageOps[stage][2] = tss[TssResultArg] == 5 ? 1u : 0u;
-      c->stageOps[stage][3] = type | (projected << 4) | ((flags & 0xf) << 8);
+      const uint32_t keyed = m_textures[stage] && m_textures[stage]->colorKeyed() ? 1u : 0u;
+      c->stageOps[stage][3] = type | (projected << 4) | ((flags & 0xf) << 8) | (keyed << 12);
       c->stageArgs[stage][0] = tss[TssColorArg1];
       c->stageArgs[stage][1] = tss[TssColorArg2];
       c->stageArgs[stage][2] = tss[TssColorArg0];

@@ -67,6 +67,11 @@ namespace dxup::legacy {
     uint32_t samples = 1;           // multisampled targets
     bool     backBuffer = false;    // a swap chain's buffer (forced multisampling covers its size)
     bool     colorKeyed = false;    // DirectDraw textures: alpha for colour-keyed texels
+    // The application's copy of a level goes once it is uploaded and comes
+    // back from the GPU when the level is locked again (then it stays):
+    // managed textures in 32-bit processes, where Windows' copies take the
+    // address space games run out of.
+    bool     dropCopies = false;
   };
 
   struct Box { uint32_t left, top, front, right, bottom, back; };
@@ -99,8 +104,10 @@ namespace dxup::legacy {
     void flush(bool mips = true);
 
     void setPalette(const uint32_t* entries);
-    // Texels of the key color become transparent (color-keyed textures).
+    // Texels of the key color become transparent (color-keyed textures):
+    // the fixed-function pixel shader drops them.
     void setColorKey(bool enabled, uint32_t key);
+    bool colorKeyed() const { return m_colorKeyEnabled; }
 
     ID3D11Texture2D*          resource() const { return m_texture.get(); }
     ID3D11Resource*           d3dResource() const;
@@ -133,9 +140,15 @@ namespace dxup::legacy {
       bool locked = false;
       bool lockReadOnly = false;
       bool uploaded = false;       // written to the D3D11 texture before
+      bool dropped = false;        // data released after the upload (TextureDesc::dropCopies)
+      bool kept = false;           // locked again after a drop: the data stays
     };
     void upload(uint32_t subresource);
     void readBack(uint32_t subresource);
+    // Whether the GPU gives a level back exactly as the application wrote
+    // it, so its copy may go (TextureDesc::dropCopies).
+    bool canDropCopy(uint32_t subresource) const;
+    void restoreCopy(uint32_t subresource);
     void markPending();
     // CPU-visible copy of a mip level's size, kept: render targets locked
     // every frame (video frames written into the back buffer) neither
@@ -320,6 +333,8 @@ namespace dxup::legacy {
                                      ID3D11ShaderResourceView** view);
     // A texture has writes for the GPU: draws flush their textures.
     void noteTexturePending() { m_texturesPending = true; }
+    // A bound texture's colour key turned on or off (stage constants).
+    void markPixelConstantsDirty() { m_pixelConstantsDirty = true; }
     // Vertex shaders have drawn with the fixed-function pixel stage, which
     // reads all its varyings: their variants for it are compiled ahead.
     bool fixedPixelsWithShaders() const { return m_fixedPixelsWithShaders; }

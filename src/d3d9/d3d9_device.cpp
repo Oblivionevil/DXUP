@@ -736,6 +736,7 @@ namespace dxup::d3d9 {
       desc.systemMemory = pool == D3DPOOL_SYSTEMMEM || pool == D3DPOOL_SCRATCH;
       desc.srgb = true;
       desc.autoMips = (usage & D3DUSAGE_AUTOGENMIPMAP) != 0;
+      desc.dropCopies = sizeof(void*) == 4 && pool == D3DPOOL_MANAGED && !(usage & D3DUSAGE_DYNAMIC);
       auto shared_ = std::make_shared<legacy::Texture>(m_core.get(), desc);
       if (!shared_->valid())
         return D3DERR_INVALIDCALL;
@@ -801,6 +802,7 @@ namespace dxup::d3d9 {
       desc.systemMemory = pool == D3DPOOL_SYSTEMMEM || pool == D3DPOOL_SCRATCH;
       desc.srgb = true;
       desc.autoMips = (usage & D3DUSAGE_AUTOGENMIPMAP) != 0;
+      desc.dropCopies = sizeof(void*) == 4 && pool == D3DPOOL_MANAGED && !(usage & D3DUSAGE_DYNAMIC);
       auto shared_ = std::make_shared<legacy::Texture>(m_core.get(), desc);
       if (!shared_->valid())
         return D3DERR_INVALIDCALL;

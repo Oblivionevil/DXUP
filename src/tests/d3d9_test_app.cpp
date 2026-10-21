@@ -2539,6 +2539,97 @@ float4 main(float2 t : TEXCOORD0) : COLOR {
     return ok;
   }
 
+  // Managed textures locked again after they were drawn: in a 32-bit
+  // process DXUP lets their copies go once uploaded and reads them back
+  // from the GPU then. Read-only locks see what was written, partial
+  // writes keep the rest of the level.
+  bool sceneRelockedManaged(IDirect3DDevice9* d) {
+    struct Case { D3DFORMAT format; UINT size; UINT blockBytes; };   // blockBytes 0: 4 bytes a texel
+    const Case cases[] = { { D3DFMT_A8R8G8B8, 128, 0 }, { D3DFMT_DXT1, 256, 8 }, { D3DFMT_DXT5, 128, 16 } };
+    auto bytesOf = [](const Case& c, UINT level, UINT& rows, UINT& rowBytes) {
+      const UINT s = (std::max)(1u, c.size >> level);
+      rows = c.blockBytes ? (s + 3) / 4 : s;
+      rowBytes = c.blockBytes ? (s + 3) / 4 * c.blockBytes : s * 4;
+    };
+    auto pattern = [](UINT seed, UINT row, UINT column) {
+      uint32_t v = seed * 2654435761u ^ row * 40503u ^ column * 2246822519u;
+      v ^= v >> 13;
+      v *= 0x5bd1e995u;
+      return uint8_t(v >> 24);
+    };
+    d->SetRenderState(D3DRS_LIGHTING, FALSE);
+    d->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+    d->SetRenderState(D3DRS_ZENABLE, FALSE);
+    d->SetFVF(D3DFVF_XYZRHW | D3DFVF_TEX1);
+    d->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_POINT);
+    d->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
+    d->SetSamplerState(0, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
+    struct V { float x, y, z, w, u, v; };
+    const V tiny[4] = { { 0, 0, 0.5f, 1, 0, 0 }, { 4, 0, 0.5f, 1, 1, 0 }, { 0, 4, 0.5f, 1, 0, 1 }, { 4, 4, 0.5f, 1, 1, 1 } };
+    IDirect3DTexture9* textures[3] = {};
+    bool ok = true;
+    for (int i = 0; i < 3 && ok; i++) {
+      const Case& c = cases[i];
+      if (FAILED(d->CreateTexture(c.size, c.size, 2, 0, c.format, D3DPOOL_MANAGED, &textures[i], nullptr)))
+        return false;
+      for (UINT level = 0; level < 2; level++) {
+        D3DLOCKED_RECT locked;
+        UINT rows, rowBytes;
+        bytesOf(c, level, rows, rowBytes);
+        if (FAILED(textures[i]->LockRect(level, &locked, nullptr, 0)))
+          return false;
+        for (UINT y = 0; y < rows; y++)
+          for (UINT x = 0; x < rowBytes; x++)
+            static_cast<uint8_t*>(locked.pBits)[y * locked.Pitch + x] = pattern(i * 2 + level, y, x);
+        textures[i]->UnlockRect(level);
+      }
+      // Drawn: uploaded (and the copies gone in a 32-bit process).
+      d->SetTexture(0, textures[i]);
+      d->BeginScene();
+      d->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, tiny, sizeof(V));
+      d->EndScene();
+    }
+    d->SetTexture(0, nullptr);
+    d->Present(nullptr, nullptr, nullptr, nullptr);
+    for (int i = 0; i < 3 && ok; i++) {
+      const Case& c = cases[i];
+      // Level 1 read-only, level 0 partly written: the rest stays.
+      for (UINT level = 0; level < 2 && ok; level++) {
+        D3DLOCKED_RECT locked;
+        UINT rows, rowBytes;
+        bytesOf(c, level, rows, rowBytes);
+        if (FAILED(textures[i]->LockRect(level, &locked, nullptr, level ? D3DLOCK_READONLY : 0)))
+          return false;
+        for (UINT y = 0; y < rows && ok; y++)
+          for (UINT x = 0; x < rowBytes && ok; x++)
+            if (static_cast<uint8_t*>(locked.pBits)[y * locked.Pitch + x] != pattern(i * 2 + level, y, x)) {
+              std::printf("  relocked_managed: format %u level %u differs at row %u byte %u\n", unsigned(c.format), level, y, x);
+              ok = false;
+            }
+        if (level == 0 && c.format == D3DFMT_A8R8G8B8)
+          for (UINT y = 8; y < 24; y++)
+            for (UINT x = 8; x < 24; x++)
+              reinterpret_cast<DWORD*>(static_cast<uint8_t*>(locked.pBits) + y * locked.Pitch)[x] = 0xff40c040u;
+        textures[i]->UnlockRect(level);
+      }
+    }
+    d->Clear(0, nullptr, D3DCLEAR_TARGET, 0xff102030u, 1.0f, 0);
+    if (ok) {
+      // The A8R8G8B8 texture's top-left 32x32 texels, one a pixel.
+      const V quad[4] = { { -0.5f, -0.5f, 0.5f, 1, 0, 0 }, { 31.5f, -0.5f, 0.5f, 1, 0.25f, 0 },
+                          { -0.5f, 31.5f, 0.5f, 1, 0, 0.25f }, { 31.5f, 31.5f, 0.5f, 1, 0.25f, 0.25f } };
+      d->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+      d->SetTexture(0, textures[0]);
+      d->BeginScene();
+      d->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, quad, sizeof(V));
+      d->EndScene();
+      d->SetTexture(0, nullptr);
+    }
+    for (IDirect3DTexture9* texture : textures)
+      if (texture) texture->Release();
+    return ok;
+  }
+
   const Scene kScenes[] = {
     { "msaa_resolve", sceneMsaaResolve, 80 },   // edge coverage: NVIDIA's 4x pattern differs
     { "formats", sceneFormats },
@@ -2589,6 +2680,7 @@ float4 main(float2 t : TEXCOORD0) : COLOR {
     { "relative_window", sceneRelativeWindow },
     { "released_bound", sceneReleasedBound },
     { "texture_memory", sceneTextureMemory },
+    { "relocked_managed", sceneRelockedManaged },
   };
 
   // ---- Running ----

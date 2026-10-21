@@ -212,6 +212,69 @@ namespace {
         && expectPixel(c, 50, 30, 0xffff00, "texture right half", error);
   }
 
+  // Colour keying turned on after the texture was drawn without it: DXUP
+  // uploads it again with the key from the application's copy, which in a
+  // 32-bit process went after the first upload and comes back from the GPU.
+  // The key's texels are dropped whatever the stages do with alpha (an
+  // alpha operation taking the diffuse alpha here), as Windows' Direct3D 7
+  // does. A lock reads the texels back too.
+  bool lateColorKey(Context& c, std::string& error) {
+    DDSURFACEDESC2 desc = {};
+    desc.dwSize = sizeof(desc);
+    desc.dwFlags = DDSD_CAPS | DDSD_WIDTH | DDSD_HEIGHT | DDSD_PIXELFORMAT;
+    desc.dwWidth = desc.dwHeight = 128;
+    desc.ddsCaps.dwCaps = DDSCAPS_TEXTURE;
+    desc.ddsCaps.dwCaps2 = DDSCAPS2_TEXTUREMANAGE;
+    // A format DXUP keeps as it is (64 KB): its copy goes after the upload.
+    desc.ddpfPixelFormat = rgbFormat(32, 0xff0000, 0xff00, 0xff, 0xff000000);
+    Com<IDirectDrawSurface7> texture;
+    HRESULT hr = c.dd->CreateSurface(&desc, texture.put(), nullptr);
+    if (FAILED(hr)) { error = format("texture 0x%08lx", hr); return false; }
+    DDSURFACEDESC2 locked = {};
+    locked.dwSize = sizeof(locked);
+    if (FAILED(texture->Lock(nullptr, &locked, DDLOCK_WAIT | DDLOCK_WRITEONLY, nullptr))) { error = "texture Lock"; return false; }
+    for (DWORD y = 0; y < 128; y++)
+      for (DWORD x = 0; x < 128; x++)
+        reinterpret_cast<DWORD*>(static_cast<BYTE*>(locked.lpSurface) + y * locked.lPitch)[x] = x < 64 ? 0xff0000ffu : 0xffff00ffu;
+    texture->Unlock(nullptr);
+    DDCOLORKEY key = { 0xffff00ffu, 0xffff00ffu };   // the whole texel, alpha too (Windows compares it)
+    if (FAILED(texture->SetColorKey(DDCKEY_SRCBLT, &key))) { error = "SetColorKey"; return false; }
+
+    c.device->SetTexture(0, texture.get());
+    c.device->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
+    c.device->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
+    c.device->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG2);
+    c.device->SetTextureStageState(0, D3DTSS_ALPHAARG2, D3DTA_DIFFUSE);   // as transformed_quad left them
+    c.device->SetTextureStageState(0, D3DTSS_MAGFILTER, D3DTFG_POINT);
+    c.device->SetTextureStageState(0, D3DTSS_MINFILTER, D3DTFN_POINT);
+    TLVertex v[4];
+    quad(v, 0.0f, 0.0f, 64.0f, 64.0f, 0xffffffff);
+    for (int pass = 0; pass < 2; pass++) {
+      c.device->SetRenderState(D3DRENDERSTATE_COLORKEYENABLE, pass == 1);
+      c.device->Clear(0, nullptr, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, 0xffff0000, 1.0f, 0);
+      c.device->BeginScene();
+      c.device->DrawPrimitive(D3DPT_TRIANGLESTRIP, kTLFvf, v, 4, 0);
+      c.device->EndScene();
+      if (pass == 0 && !expectPixel(c, 50, 30, 0xff00ff, "without keying", error))
+        return false;
+    }
+    c.device->SetRenderState(D3DRENDERSTATE_COLORKEYENABLE, FALSE);
+    c.device->SetTexture(0, nullptr);
+    if (!expectPixel(c, 10, 30, 0x0000ff, "left half", error) || !expectPixel(c, 50, 30, 0xff0000, "keyed half", error))
+      return false;
+    locked = {};
+    locked.dwSize = sizeof(locked);
+    if (FAILED(texture->Lock(nullptr, &locked, DDLOCK_WAIT | DDLOCK_READONLY, nullptr))) { error = "texture Lock again"; return false; }
+    const DWORD left = reinterpret_cast<DWORD*>(static_cast<BYTE*>(locked.lpSurface) + 100 * locked.lPitch)[10];
+    const DWORD right = reinterpret_cast<DWORD*>(static_cast<BYTE*>(locked.lpSurface) + 100 * locked.lPitch)[100];
+    texture->Unlock(nullptr);
+    if (left != 0xff0000ffu || right != 0xffff00ffu) {
+      error = format("locked again: texels 0x%08lx 0x%08lx", left, right);
+      return false;
+    }
+    return true;
+  }
+
   bool alphaBlend(Context& c, std::string& error) {
     c.device->Clear(0, nullptr, D3DCLEAR_TARGET, 0xff0000ff, 1.0f, 0);
     c.device->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG2);
@@ -776,6 +839,7 @@ int main(int argc, char** argv) {
     { "clear", clearAndRead },
     { "transformed_quad", transformedQuad },
     { "textured_quad", texturedQuad },
+    { "late_color_key", lateColorKey },
     { "alpha_blend", alphaBlend },
     { "depth_test", depthTest },
     { "transform_and_light", transformAndLight },

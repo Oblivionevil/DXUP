@@ -1262,8 +1262,6 @@ namespace dxup::ddraw {
   HRESULT Device7::SetRenderState(D3DRENDERSTATETYPE state, DWORD value) {
     const uint32_t s = uint32_t(state);
     if (m_recording) { m_recording->renderStates[s] = value; return D3D_OK; }
-    if (s == D3DRENDERSTATE_ALPHATESTENABLE || s == D3DRENDERSTATE_ALPHAFUNC || s == D3DRENDERSTATE_ALPHAREF)
-      endKeyAlphaTest();
     switch (s) {
       case D3DRENDERSTATE_COLORKEYENABLE:
         m_colorKeyEnable = value != 0;
@@ -1292,7 +1290,7 @@ namespace dxup::ddraw {
 
   HRESULT Device7::GetRenderState(D3DRENDERSTATETYPE state, LPDWORD value) {
     if (!value) return DDERR_INVALIDPARAMS;
-    *value = uint32_t(state) == D3DRENDERSTATE_COLORKEYENABLE ? m_colorKeyEnable : appRenderState(uint32_t(state));
+    *value = uint32_t(state) == D3DRENDERSTATE_COLORKEYENABLE ? m_colorKeyEnable : m_device->renderState(uint32_t(state));
     return D3D_OK;
   }
 
@@ -1378,45 +1376,11 @@ namespace dxup::ddraw {
   }
 
   void Device7::prepareDraw() {
-    // Color-keyed textures: transparent texels, dropped like an alpha test.
-    bool keyed = false;
-    for (uint32_t stage = 0; stage < 8; stage++) {
-      if (!m_textures[stage])
-        continue;
-      m_textures[stage]->applyColorKey(m_colorKeyEnable);
-      DDCOLORKEY key;
-      keyed = keyed || (m_colorKeyEnable && SUCCEEDED(m_textures[stage]->GetColorKey(DDCKEY_SRCBLT, &key)));
-    }
-    if (keyed && !m_keyAlphaTest && !m_device->renderState(legacy::RsAlphaTestEnable)) {
-      // The application's states come back once nothing is keyed.
-      m_keySavedFunc = m_device->renderState(legacy::RsAlphaFunc);
-      m_keySavedRef = m_device->renderState(legacy::RsAlphaRef);
-      m_device->setRenderState(legacy::RsAlphaTestEnable, 1);
-      m_device->setRenderState(legacy::RsAlphaFunc, 5);   // greater
-      m_device->setRenderState(legacy::RsAlphaRef, 0);
-      m_keyAlphaTest = true;
-    } else if (!keyed) {
-      endKeyAlphaTest();
-    }
-  }
-
-  // A render state as the application set it (not the colour-key alpha test).
-  uint32_t Device7::appRenderState(uint32_t state) const {
-    if (m_keyAlphaTest) {
-      if (state == D3DRENDERSTATE_ALPHATESTENABLE) return 0;
-      if (state == D3DRENDERSTATE_ALPHAFUNC) return m_keySavedFunc;
-      if (state == D3DRENDERSTATE_ALPHAREF) return m_keySavedRef;
-    }
-    return m_device->renderState(state);
-  }
-
-  void Device7::endKeyAlphaTest() {
-    if (!m_keyAlphaTest)
-      return;
-    m_keyAlphaTest = false;
-    m_device->setRenderState(legacy::RsAlphaTestEnable, 0);
-    m_device->setRenderState(legacy::RsAlphaFunc, m_keySavedFunc);
-    m_device->setRenderState(legacy::RsAlphaRef, m_keySavedRef);
+    // Color-keyed textures: the pixel shader drops their key's texels,
+    // whatever the stages' alpha operations and the alpha test.
+    for (uint32_t stage = 0; stage < 8; stage++)
+      if (m_textures[stage])
+        m_textures[stage]->applyColorKey(m_colorKeyEnable);
   }
 
   namespace {
@@ -1525,7 +1489,7 @@ namespace dxup::ddraw {
   Device7::StateBlock Device7::capture() const {
     StateBlock block;
     for (uint32_t s = 1; s < legacy::RsCount; s++)
-      block.renderStates[s] = appRenderState(s);
+      block.renderStates[s] = m_device->renderState(s);
     block.renderStates[D3DRENDERSTATE_COLORKEYENABLE] = m_colorKeyEnable;
     for (uint32_t stage = 0; stage < 8; stage++) {
       for (uint32_t t = 1; t <= 24; t++) {
@@ -2061,6 +2025,7 @@ namespace dxup::ddraw {
     if (!td.systemMemory && !texture && !zbuffer)
       td.renderTarget = true;
     td.colorKeyed = texture && !td.renderTarget;
+    td.dropCopies = sizeof(void*) == 4 && texture && !td.renderTarget && !td.systemMemory;
     // The full screen primary and its back buffers are the swap chain; a
     // windowed application draws into surfaces of the window's size.
     td.backBuffer = primary && !td.systemMemory;
