@@ -655,7 +655,7 @@ namespace dxup::legacy {
     ConstantStore m_constants[2] = {};      // vertex, pixel
     // The input modes of recent vertex shaders and declarations (by hashes).
     struct InputModes { uint64_t key = 0; uint32_t modes = 0, wOne = 0; };
-    InputModes m_inputModes[32];
+    InputModes m_inputModes[256];
     // Float constants the application set: those below this, ever.
     uint32_t m_constantsWritten[2] = {};
     // The float constants of a draw's shader: relative reads find no more

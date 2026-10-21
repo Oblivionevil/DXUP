@@ -2402,13 +2402,21 @@ namespace dxup::legacy {
     // draw) need no upload, and uploads pass only changed groups.
     float (*target)[4] = m_constants[pixel].f;
     uint64_t changed = 0;
-    for (uint32_t i = 0; i < count; i++) {
+    auto copy = [&](uint32_t i) {
       const __m128i value = _mm_loadu_si128(reinterpret_cast<const __m128i*>(data + size_t(i) * 4));
       const __m128i old = _mm_loadu_si128(reinterpret_cast<const __m128i*>(target[start + i]));
-      const uint64_t differs = _mm_movemask_epi8(_mm_cmpeq_epi32(value, old)) != 0xffff;
-      changed |= differs << ((start + i) / 4);
       _mm_storeu_si128(reinterpret_cast<__m128i*>(target[start + i]), value);
+      return _mm_cmpeq_epi32(value, old);
+    };
+    uint32_t i = 0;
+    for (; i < count && ((start + i) & 3); i++)
+      changed |= uint64_t(_mm_movemask_epi8(copy(i)) != 0xffff) << ((start + i) / 4);
+    for (; i + 4 <= count; i += 4) {
+      const __m128i same = _mm_and_si128(_mm_and_si128(copy(i), copy(i + 1)), _mm_and_si128(copy(i + 2), copy(i + 3)));
+      changed |= uint64_t(_mm_movemask_epi8(same) != 0xffff) << ((start + i) / 4);
     }
+    for (; i < count; i++)
+      changed |= uint64_t(_mm_movemask_epi8(copy(i)) != 0xffff) << ((start + i) / 4);
     if (!changed)
       return;
     m_shaderConstantsDirty[pixel] = true;
@@ -2644,6 +2652,20 @@ namespace dxup::legacy {
 
   ID3D11DepthStencilState* Device::depthStencilState() {
     const auto& rs = m_renderStates;
+    // Recent states by the render states they come from (4 bits per
+    // comparison or operation: valid values are 1-8), before describing.
+    const bool depth = m_depthStencil != nullptr;
+    auto op = [](uint32_t value) { return uint64_t(value < 16 ? value : 0); };
+    uint64_t recentKey = uint64_t(depth) | uint64_t(rs[RsZEnable] != 0) << 1 | uint64_t(rs[RsZWriteEnable] != 0) << 2
+                       | uint64_t(rs[RsStencilEnable] != 0) << 3 | uint64_t(rs[RsTwoSidedStencilMode] != 0) << 4
+                       | uint64_t(depth && formatInfo(m_depthStencil->desc().format).stencil) << 5
+                       | op(rs[RsZFunc]) << 6 | uint64_t(rs[RsStencilMask] & 0xff) << 10
+                       | uint64_t(rs[RsStencilWriteMask] & 0xff) << 18 | op(rs[RsStencilFail]) << 26
+                       | op(rs[RsStencilZFail]) << 30 | op(rs[RsStencilPass]) << 34 | op(rs[RsStencilFunc]) << 38
+                       | op(rs[RsCcwStencilFail]) << 42 | op(rs[RsCcwStencilZFail]) << 46 | op(rs[RsCcwStencilPass]) << 50
+                       | op(rs[RsCcwStencilFunc]) << 54;
+    if (auto* cached = m_depthCache.find(recentKey))
+      return cached;
     D3D11_DEPTH_STENCIL_DESC desc = {};
     desc.DepthEnable = rs[RsZEnable] != 0 && m_depthStencil;
     desc.DepthWriteMask = rs[RsZWriteEnable] ? D3D11_DEPTH_WRITE_MASK_ALL : D3D11_DEPTH_WRITE_MASK_ZERO;
@@ -2662,12 +2684,10 @@ namespace dxup::legacy {
       desc.DepthFunc = D3D11_COMPARISON_ALWAYS;
     }
     const uint64_t key = hashBytes(desc);
-    if (auto* cached = m_depthCache.find(key))
-      return cached;
     auto& state = m_depthStates[key];
     if (!state)
       m_device->CreateDepthStencilState(&desc, &state);
-    m_depthCache.insert(key, state);
+    m_depthCache.insert(recentKey, state);
     return state;
   }
 
@@ -4004,7 +4024,7 @@ namespace dxup::legacy {
       uint32_t inputModes = 0, inputWOne = 0;
       const uint64_t declHash = m_decl ? m_decl->hash() : 0;
       const uint64_t modesKey = (m_vertexShader->hash() ^ (declHash << 29 | declHash >> 35)) | 1u;
-      InputModes& cachedModes = m_inputModes[(uint32_t(modesKey) ^ uint32_t(modesKey >> 32)) * 0x9e3779b9u >> 27];
+      InputModes& cachedModes = m_inputModes[(uint32_t(modesKey) ^ uint32_t(modesKey >> 32)) * 0x9e3779b9u >> 24];
       if (m_decl && cachedModes.key == modesKey) {
         inputModes = cachedModes.modes;
         inputWOne = cachedModes.wOne;
