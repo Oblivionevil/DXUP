@@ -1091,6 +1091,25 @@ namespace dxup {
         unmapBuffer(buffer);
       }
     }
+    // The same with the bytes from fn(user, target, size, data, dataSize):
+    // pack(packUser, data) fills its dataSize bytes right away, fn runs
+    // where the bytes are written (the worker thread) and keeps its own
+    // state there. Without a buffer, fn(user, nullptr, 0, data, dataSize)
+    // runs after the commands before.
+    using WriteFn = void (*)(void* user, uint8_t* target, size_t size, const void* data, size_t dataSize);
+    using PackFn = void (*)(void* packUser, uint8_t* data);
+    virtual void writeMappedBufferWith(IBackendBuffer* buffer, uint64_t offset, size_t size, WriteFn fn, void* user,
+                                       PackFn pack, void* packUser, size_t dataSize) {
+      std::vector<uint8_t> data(dataSize);
+      if (pack && dataSize)
+        pack(packUser, data.data());
+      if (!buffer) {
+        fn(user, nullptr, 0, data.data(), dataSize);
+      } else if (void* mapped = mapBuffer(buffer, MapMode::WriteNoOverwrite)) {
+        fn(user, static_cast<uint8_t*>(mapped) + offset, size, data.data(), dataSize);
+        unmapBuffer(buffer);
+      }
+    }
     // WRITE_DISCARD on a buffer that can take new memory in place: returns
     // where the application writes; commands recorded before keep reading
     // the old memory. Null when the buffer has to be renamed instead.

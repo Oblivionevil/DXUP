@@ -1823,8 +1823,17 @@ namespace dxup::legacy {
     return device;
   }
 
+  struct Device::WorkerConstants {
+    alignas(64) float f[256][4] = {};
+    alignas(64) float window[256][4] = {};   // with def constants
+  };
+
   Device::~Device() {
     stopShaderWarmup();
+    // Freed by the worker thread after the uploads queued before.
+    for (WorkerConstants* constants : m_workerConstants)
+      if (constants)
+        m_writeBufferWith(m_context.get(), nullptr, 0, 0, freeWorkerConstants, constants, nullptr, nullptr, 0);
     if (m_context)
       m_context->ClearState();
     for (auto& entry : m_inputLayouts) if (entry.second) entry.second->Release();
@@ -1886,6 +1895,12 @@ namespace dxup::legacy {
     m_writeBuffer = reinterpret_cast<decltype(m_writeBuffer)>(GetProcAddress(m_d3d11Module, "DXUPWriteBuffer"));
     if (m_writeBuffer && FAILED(m_writeBuffer(m_context.get(), nullptr, 0, nullptr, 0)))
       m_writeBuffer = nullptr;
+    if (m_writeBuffer) {
+      m_writeBufferWith = reinterpret_cast<decltype(m_writeBufferWith)>(GetProcAddress(m_d3d11Module, "DXUPWriteBufferWith"));
+      if (m_writeBufferWith)
+        for (WorkerConstants*& constants : m_workerConstants)
+          constants = new WorkerConstants();
+    }
     // The GPU's maker, before the first shader is translated.
     using GetVendorId = UINT (WINAPI*)(IUnknown*);
     if (auto getVendorId = reinterpret_cast<GetVendorId>(GetProcAddress(m_d3d11Module, "DXUPGetVendorId")))
@@ -2020,6 +2035,7 @@ namespace dxup::legacy {
     std::memset(m_constants, 0, sizeof(m_constants));
     m_constants[0].limits[0] = m_constants[1].limits[0] = 255;
     m_constantsWritten[0] = m_constantsWritten[1] = 0;
+    m_changedConstants[0] = m_changedConstants[1] = ~0ull;
     m_shaderConstantsDirty[0] = m_shaderConstantsDirty[1] = true;
     m_shaderIntsDirty[0] = m_shaderIntsDirty[1] = true;
     m_renderTargets = {};
@@ -2167,6 +2183,7 @@ namespace dxup::legacy {
   void Device::invalidateBindings() {
     m_dirty = DirtyAll;
     m_targetsDirty = m_viewportDirty = true;
+    m_targetsBound = false;
     m_textureDirtyMask = m_samplerDirtyMask = (1u << kSamplerCount) - 1;
     // What the context holds is unknown now (quads bind their own views): a value no
     // view has, so the next bindTextures sets every slot.
@@ -2374,6 +2391,8 @@ namespace dxup::legacy {
       return;
     std::memcpy(m_constants[pixel].f[start], data, size_t(count) * 16);
     m_shaderConstantsDirty[pixel] = true;
+    const uint32_t first = start / 4, groups = (start + count + 3) / 4 - first;
+    m_changedConstants[pixel] |= (groups >= 64 ? ~0ull : (uint64_t(1) << groups) - 1) << first;
   }
 
   uint32_t Device::shaderFloats(bool pixel, const ShaderInfo9& info) const {
@@ -3624,17 +3643,14 @@ namespace dxup::legacy {
       m_constants[pixel].limits[0] = copied - 1;
       m_shaderIntsDirty[pixel] = true;
     }
-    const void* source = m_constants[pixel].f;
-    if (!variant->info.relativeDefs.empty()) {
-      m_uploadScratch.resize(size_t(copied) * 16);
-      std::memcpy(m_uploadScratch.data(), m_constants[pixel].f, m_uploadScratch.size());
-      for (const auto& def : variant->info.relativeDefs)
-        if (def.first < copied)
-          std::memcpy(m_uploadScratch.data() + size_t(def.first) * 16, def.second.data(), 16);
-      source = m_uploadScratch.data();
-    }
-    if (!writeBuffer(ring, offset, source, copied * 16, mode == D3D11_MAP_WRITE_DISCARD))
+    // Large windows (relative addressing: all the application set) as the
+    // floats changed; small ones whole, cheaper (the changes stay marked).
+    if (m_workerConstants[pixel] && copied > 64) {
+      if (!uploadWorkerConstants(pixel, ring, offset, copied, variant->info, mode == D3D11_MAP_WRITE_DISCARD))
+        return;
+    } else if (!uploadConstants(pixel, ring, offset, copied, variant->info, mode == D3D11_MAP_WRITE_DISCARD)) {
       return;
+    }
     const UINT first = offset / 16, count = windowSize;
     if (pixel)
       m_context1->PSSetConstantBuffers1(0, 1, &ring, &first, &count);
@@ -3644,6 +3660,136 @@ namespace dxup::legacy {
     // Another shader's def constants are not the application's floats.
     m_constantWindows[pixel] = { first, count, copied, variant->info.relativeDefs.empty() };
     m_shaderConstantsDirty[pixel] = m_shaderConstantsUnbound[pixel] = false;
+  }
+
+  // The window's floats from the application's, def constants over them.
+  bool Device::uploadConstants(bool pixel, ID3D11Buffer* ring, uint32_t offset, uint32_t copied, const ShaderInfo9& info,
+                               bool discard) {
+    const void* source = m_constants[pixel].f;
+    if (!info.relativeDefs.empty()) {
+      m_uploadScratch.resize(size_t(copied) * 16);
+      std::memcpy(m_uploadScratch.data(), m_constants[pixel].f, m_uploadScratch.size());
+      for (const auto& def : info.relativeDefs)
+        if (def.first < copied)
+          std::memcpy(m_uploadScratch.data() + size_t(def.first) * 16, def.second.data(), 16);
+      source = m_uploadScratch.data();
+    }
+    return writeBuffer(ring, offset, source, copied * 16, discard);
+  }
+
+  namespace {
+    // What uploadWorkerConstants passes: the header, runs of floats changed
+    // ({first, count}, then the floats), then def constants ({register, value}).
+    struct WorkerUpload { uint32_t copied, runs, defs; };
+    struct WorkerRun { uint32_t first, count; };
+    struct WorkerDef { uint32_t index; uint32_t value[4]; };
+
+    uint32_t lowestBit64(uint64_t bits) {
+      const uint32_t low = uint32_t(bits);
+      return low ? lowestBit(low) : 32 + lowestBit(uint32_t(bits >> 32));
+    }
+
+    uint32_t bitCount64(uint64_t bits) {
+      bits = bits - ((bits >> 1) & 0x5555555555555555ull);
+      bits = (bits & 0x3333333333333333ull) + ((bits >> 2) & 0x3333333333333333ull);
+      bits = (bits + (bits >> 4)) & 0x0f0f0f0f0f0f0f0full;
+      return uint32_t((bits * 0x0101010101010101ull) >> 56);
+    }
+  }
+
+  // On the worker thread: the changes into its copy, the window from it.
+  void Device::writeWorkerConstants(void* user, uint8_t* target, size_t size, const void* data, size_t dataSize) {
+    auto* constants = static_cast<WorkerConstants*>(user);
+    const auto* bytes = static_cast<const uint8_t*>(data);
+    WorkerUpload upload;
+    if (dataSize < sizeof(upload))
+      return;
+    std::memcpy(&upload, bytes, sizeof(upload));
+    bytes += sizeof(upload);
+    for (uint32_t i = 0; i < upload.runs; i++) {
+      WorkerRun run;
+      std::memcpy(&run, bytes, sizeof(run));
+      std::memcpy(constants->f[run.first], bytes + sizeof(run), size_t(run.count) * 16);
+      bytes += sizeof(run) + size_t(run.count) * 16;
+    }
+    if (!target)
+      return;
+    const size_t windowBytes = (std::min)(size, size_t(upload.copied) * 16);
+    if (!upload.defs) {
+      std::memcpy(target, constants->f, windowBytes);
+      return;
+    }
+    // Whole lines into write-combined memory: the defs go in before.
+    std::memcpy(constants->window, constants->f, windowBytes);
+    for (uint32_t i = 0; i < upload.defs; i++) {
+      WorkerDef def;
+      std::memcpy(&def, bytes, sizeof(def));
+      std::memcpy(constants->window[def.index], def.value, 16);
+      bytes += sizeof(def);
+    }
+    std::memcpy(target, constants->window, windowBytes);
+  }
+
+  void Device::freeWorkerConstants(void* user, uint8_t*, size_t, const void*, size_t) {
+    delete static_cast<WorkerConstants*>(user);
+  }
+
+  // What packWorkerConstants writes into the queue.
+  struct Device::WorkerPack {
+    const float (*floats)[4];
+    uint64_t changed;
+    WorkerUpload upload;
+    const ShaderInfo9* info;
+  };
+
+  void Device::packWorkerConstants(void* packUser, uint8_t* out) {
+    const auto& pack = *static_cast<const WorkerPack*>(packUser);
+    std::memcpy(out, &pack.upload, sizeof(pack.upload));
+    out += sizeof(pack.upload);
+    for (uint64_t bits = pack.changed; bits; ) {
+      const uint32_t first = lowestBit64(bits);
+      const uint64_t rest = ~bits & (~0ull << first);
+      const uint32_t end = rest ? lowestBit64(rest) : 64;
+      const WorkerRun run = { first * 4, (end - first) * 4 };
+      std::memcpy(out, &run, sizeof(run));
+      std::memcpy(out + sizeof(run), pack.floats[run.first], size_t(run.count) * 16);
+      out += sizeof(run) + size_t(run.count) * 16;
+      bits = end == 64 ? 0 : bits & (~0ull << end);
+    }
+    if (!pack.upload.defs)
+      return;
+    for (const auto& def : pack.info->relativeDefs) {
+      if (def.first >= pack.upload.copied)
+        continue;
+      WorkerDef value = { def.first, {} };
+      std::memcpy(value.value, def.second.data(), 16);
+      std::memcpy(out, &value, sizeof(value));
+      out += sizeof(value);
+    }
+  }
+
+  // The worker thread writes the window from its copy of the floats: only
+  // the floats changed since the last upload pass through the queue.
+  bool Device::uploadWorkerConstants(bool pixel, ID3D11Buffer* ring, uint32_t offset, uint32_t copied,
+                                     const ShaderInfo9& info, bool discard) {
+    WorkerPack pack = { m_constants[pixel].f, m_changedConstants[pixel], { copied, 0, 0 }, &info };
+    for (const auto& def : info.relativeDefs)
+      pack.upload.defs += def.first < copied;
+    // Runs start at groups whose lower neighbor did not change.
+    pack.upload.runs = bitCount64(pack.changed & ~(pack.changed << 1));
+    const size_t size = sizeof(WorkerUpload) + pack.upload.runs * sizeof(WorkerRun) + bitCount64(pack.changed) * 64
+                      + pack.upload.defs * sizeof(WorkerDef);
+    if (discard) {
+      D3D11_MAPPED_SUBRESOURCE mapped = {};
+      if (FAILED(m_context->Map(ring, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped)))
+        return false;
+      m_context->Unmap(ring, 0);
+    }
+    if (FAILED(m_writeBufferWith(m_context.get(), ring, offset, copied * 16, writeWorkerConstants, m_workerConstants[pixel],
+                                 packWorkerConstants, &pack, UINT(size))))
+      return false;
+    m_changedConstants[pixel] = 0;
+    return true;
   }
 
   // b0 again after the stage's constant buffers were set: the window last
@@ -3725,6 +3871,14 @@ namespace dxup::legacy {
         count = i + 1;
     }
     ID3D11DepthStencilView* dsv = m_depthStencil ? m_depthStencil->dsv() : nullptr;
+    // The same views again (a state of the group changed back and forth):
+    // nothing to do, the textures bound are no target's.
+    m_targetsDirty = false;
+    if (m_targetsBound && dsv == m_boundDsv && std::memcmp(rtvs, m_boundRtvs, sizeof(rtvs)) == 0)
+      return;
+    std::memcpy(m_boundRtvs, rtvs, sizeof(rtvs));
+    m_boundDsv = dsv;
+    m_targetsBound = true;
     // Unbind the views of textures that are now targets (D3D11 would,
     // behind the bindings kept here); the others stay bound.
     // Views bound are a texture's own (targets read copies, see bindTextures).
@@ -3757,7 +3911,6 @@ namespace dxup::legacy {
     }
     m_textureDirtyMask = (1u << kSamplerCount) - 1;
     m_context->OMSetRenderTargets(count, rtvs, dsv);
-    m_targetsDirty = false;
   }
 
   void Device::bindViewport() {

@@ -997,6 +997,26 @@ namespace dxup {
     });
   }
 
+  void CsThreadContext::writeMappedBufferWith(IBackendBuffer* buffer, uint64_t offset, size_t size, WriteFn fn,
+                                              void* user, PackFn pack, void* packUser, size_t dataSize) {
+    if (m_recording) {
+      IBackendContext::writeMappedBufferWith(buffer, offset, size, fn, user, pack, packUser, dataSize);
+      return;
+    }
+    uint8_t* target = nullptr;
+    if (buffer) {
+      auto* d3d12Buffer = static_cast<d3d12::D3D12BackendBuffer*>(buffer);
+      uint8_t* mapped = d3d12Buffer->getAppMappedData();
+      if (!mapped) {
+        IBackendContext::writeMappedBufferWith(buffer, offset, size, fn, user, pack, packUser, dataSize);
+        return;
+      }
+      target = mapped + offset;
+    }
+    emitFilled(dataSize, [pack, packUser, dataSize](uint8_t* data) { if (pack && dataSize) pack(packUser, data); },
+      [target, size, fn, user](CsWorkerState&, const uint8_t* data, size_t n) { fn(user, target, target ? size : 0, data, n); });
+  }
+
   void CsThreadContext::retainTemporaryBuffer(Rc<IBackendBuffer> buffer) {
     // Slices of upload blocks are not recycled; dropping the reference
     // retires them behind the queued commands and their GPU work.

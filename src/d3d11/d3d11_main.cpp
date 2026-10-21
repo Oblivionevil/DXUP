@@ -773,6 +773,19 @@ HRESULT WINAPI DXUPWriteBuffer(ID3D11DeviceContext* pContext, ID3D11Buffer* pBuf
   return static_cast<D3D11ImmediateContext*>(pContext)->WriteDynamicBuffer(pBuffer, Offset, pData, Size);
 }
 
+// The same, the bytes written by fn(user, target, Size, data, DataSize) on the
+// worker thread, which keeps fn's state there; pack(packUser, data) fills the
+// DataSize bytes of data in the queue right away. DXUP's Direct3D 9 layer
+// keeps its constants there and passes only those that changed. Without a
+// buffer, fn(user, nullptr, 0, ...) runs after the commands queued before.
+HRESULT WINAPI DXUPWriteBufferWith(ID3D11DeviceContext* pContext, ID3D11Buffer* pBuffer, UINT Offset, UINT Size,
+    dxup::IBackendContext::WriteFn fn, void* user, dxup::IBackendContext::PackFn pack, void* packUser, UINT DataSize) {
+  if (!pContext)
+    return E_INVALIDARG;
+  return static_cast<D3D11ImmediateContext*>(pContext)->WriteDynamicBufferWith(pBuffer, Offset, Size, fn, user, pack,
+                                                                                packUser, DataSize);
+}
+
 // A sampler of DXUP's device that may also use D3D12's anisotropic filter
 // with point mips (0x54), as Direct3D 9 filters: DXUP's Direct3D 9 layer.
 HRESULT WINAPI DXUPCreateSamplerState(IUnknown* pDevice, const D3D11_SAMPLER_DESC* pDesc,

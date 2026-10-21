@@ -270,6 +270,8 @@ namespace dxup {
     void retainTemporaryBuffer(Rc<IBackendBuffer> buffer) override;
     void* discardBuffer(IBackendBuffer* buffer) override;
     void writeMappedBuffer(IBackendBuffer* buffer, uint64_t offset, const void* data, size_t size, size_t padded) override;
+    void writeMappedBufferWith(IBackendBuffer* buffer, uint64_t offset, size_t size, WriteFn fn, void* user,
+                               PackFn pack, void* packUser, size_t dataSize) override;
     // Writes an update of a renamable constant buffer to a new upload slice;
     // false when the update takes the GPU copy.
     bool renameConstantBuffer(IBackendBuffer* buffer, const BufferUpdateRegion* regions, uint32_t regionCount);
@@ -435,6 +437,32 @@ namespace dxup {
         submitChunk();
         m_chunk->push(std::forward<Fn>(fn));
       }
+    }
+
+    // fill(data) writes bytes into the chunk the command lands in, which
+    // records fn(state, data, bytes). Sizes above kMaxInlineData go through
+    // a heap copy.
+    template<typename Fill, typename Fn>
+    void emitFilled(size_t bytes, Fill&& fill, Fn&& fn) {
+      if (bytes > kMaxInlineData) {
+        std::vector<uint8_t> copy(bytes);
+        fill(copy.data());
+        emit([fn = std::forward<Fn>(fn), copy = std::move(copy)](CsWorkerState& state) mutable {
+          fn(state, static_cast<const uint8_t*>(copy.data()), copy.size());
+        });
+        return;
+      }
+      if (m_recording && !m_hasHold && m_retireQueue) {
+        m_hold = m_retireQueue->acquireHold();
+        m_hasHold = true;
+      }
+      if (m_chunk->remaining() < bytes + sizeof(Fn) + 256)
+        submitChunk();
+      auto* data = static_cast<uint8_t*>(m_chunk->allocate(bytes ? bytes : 1, 8));
+      fill(data);
+      emit([fn = std::forward<Fn>(fn), data, bytes](CsWorkerState& state) mutable {
+        fn(state, static_cast<const uint8_t*>(data), bytes);
+      });
     }
 
     // Copies count items into the chunk the command lands in and records

@@ -504,6 +504,20 @@ namespace dxup::legacy {
     HRESULT (WINAPI* m_createSampler)(IUnknown*, const D3D11_SAMPLER_DESC*, ID3D11SamplerState**) = nullptr;
     // DXUP's D3D11 (DXUPWriteBuffer): its worker thread writes dynamic buffers.
     HRESULT (WINAPI* m_writeBuffer)(ID3D11DeviceContext*, ID3D11Buffer*, UINT, const void*, UINT) = nullptr;
+    // DXUPWriteBufferWith: the worker thread keeps a copy of each stage's
+    // float constants (WorkerConstants, its own after creation) and writes
+    // the windows from it; uploads pass the constants changed since the last.
+    using WriteWith = void (*)(void* user, uint8_t* target, size_t size, const void* data, size_t dataSize);
+    using PackWith = void (*)(void* packUser, uint8_t* data);
+    HRESULT (WINAPI* m_writeBufferWith)(ID3D11DeviceContext*, ID3D11Buffer*, UINT, UINT, WriteWith, void*, PackWith, void*,
+                                        UINT) = nullptr;
+    struct WorkerConstants;
+    struct WorkerPack;
+    static void writeWorkerConstants(void* user, uint8_t* target, size_t size, const void* data, size_t dataSize);
+    static void freeWorkerConstants(void* user, uint8_t* target, size_t size, const void* data, size_t dataSize);
+    static void packWorkerConstants(void* packUser, uint8_t* data);
+    WorkerConstants* m_workerConstants[2] = {};
+    uint64_t m_changedConstants[2] = { ~0ull, ~0ull };   // groups of 4 floats changed since the last upload
     std::vector<uint8_t> m_uploadScratch;   // a constant window with def constants
     Ref<ID3D11Device>               m_device;
     Ref<ID3D11DeviceContext>        m_context;
@@ -626,6 +640,10 @@ namespace dxup::legacy {
     // than the application set and one zero constant past them (DXVK too
     // uploads no more than the highest constant set).
     uint32_t shaderFloats(bool pixel, const ShaderInfo9& info) const;
+    bool uploadConstants(bool pixel, ID3D11Buffer* ring, uint32_t offset, uint32_t copied, const ShaderInfo9& info,
+                         bool discard);
+    bool uploadWorkerConstants(bool pixel, ID3D11Buffer* ring, uint32_t offset, uint32_t copied, const ShaderInfo9& info,
+                               bool discard);
     bool m_shaderConstantsDirty[2] = { true, true };   // the floats changed
     bool m_shaderConstantsUnbound[2] = { true, true };  // b0 lost its window
     bool m_shaderIntsDirty[2] = { true, true };
@@ -719,6 +737,9 @@ namespace dxup::legacy {
     bool m_targetsDirty = true;
     bool m_viewportDirty = true;   // viewport and scissor only
     ID3D11ShaderResourceView* m_boundViews[24] = {};
+    ID3D11RenderTargetView*   m_boundRtvs[kMaxRenderTargets] = {};   // valid with m_targetsBound
+    ID3D11DepthStencilView*   m_boundDsv = nullptr;
+    bool                      m_targetsBound = false;
     ID3D11ShaderResourceView* m_boundVertexViews[4] = {};
     ID3D11SamplerState*       m_boundSamplers[kSamplerCount] = {};
     ID3D11Buffer*             m_boundStreams[kMaxStreams] = {};

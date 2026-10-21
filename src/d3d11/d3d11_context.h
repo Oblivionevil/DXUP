@@ -1735,6 +1735,26 @@ namespace dxup {
       return S_OK;
     }
 
+    // The same with the bytes from fn on the worker thread (DXUPWriteBufferWith).
+    HRESULT WriteDynamicBufferWith(ID3D11Buffer* buffer, UINT offset, UINT size, IBackendContext::WriteFn fn, void* user,
+                                   IBackendContext::PackFn pack, void* packUser, UINT dataSize) {
+      DXUP_CONTEXT_MT_GUARD;
+      if (m_isDeferred || !fn)
+        return E_INVALIDARG;
+      IBackendBuffer* backend = nullptr;
+      if (buffer) {
+        auto* tracked = static_cast<D3D11Buffer*>(buffer);
+        const D3D11_BUFFER_DESC& desc = tracked->GetDescRef();
+        if (desc.Usage != D3D11_USAGE_DYNAMIC || uint64_t(offset) + size > desc.ByteWidth)
+          return E_INVALIDARG;
+        backend = getBackendBuffer(tracked);
+        if (!backend)
+          return E_INVALIDARG;
+      }
+      m_backendCtx->writeMappedBufferWith(backend, offset, size, fn, user, pack, packUser, dataSize);
+      return S_OK;
+    }
+
     // At each Present of the swap chain (application thread).
     void NoteFramePresented() {
       DXUP_CONTEXT_MT_GUARD;
