@@ -18,6 +18,7 @@
 #include <intrin.h>
 #endif
 #include <xmmintrin.h>
+#include <emmintrin.h>
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -2396,14 +2397,22 @@ namespace dxup::legacy {
       return;
     count = (std::min)(count, 256u - start);
     m_constantsWritten[pixel] = (std::max)(m_constantsWritten[pixel], start + count);
-    // The same values again (games set their camera for every draw): the
-    // window uploaded last still holds them.
-    if (std::memcmp(m_constants[pixel].f[start], data, size_t(count) * 16) == 0)
+    // Copied in one pass that notes the groups of 4 registers whose bits
+    // changed: the same values again (games set their camera for every
+    // draw) need no upload, and uploads pass only changed groups.
+    float (*target)[4] = m_constants[pixel].f;
+    uint64_t changed = 0;
+    for (uint32_t i = 0; i < count; i++) {
+      const __m128i value = _mm_loadu_si128(reinterpret_cast<const __m128i*>(data + size_t(i) * 4));
+      const __m128i old = _mm_loadu_si128(reinterpret_cast<const __m128i*>(target[start + i]));
+      const uint64_t differs = _mm_movemask_epi8(_mm_cmpeq_epi32(value, old)) != 0xffff;
+      changed |= differs << ((start + i) / 4);
+      _mm_storeu_si128(reinterpret_cast<__m128i*>(target[start + i]), value);
+    }
+    if (!changed)
       return;
-    std::memcpy(m_constants[pixel].f[start], data, size_t(count) * 16);
     m_shaderConstantsDirty[pixel] = true;
-    const uint32_t first = start / 4, groups = (start + count + 3) / 4 - first;
-    m_changedConstants[pixel] |= (groups >= 64 ? ~0ull : (uint64_t(1) << groups) - 1) << first;
+    m_changedConstants[pixel] |= changed;
   }
 
   uint32_t Device::shaderFloats(bool pixel, const ShaderInfo9& info) const {
