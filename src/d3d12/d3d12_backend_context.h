@@ -1044,6 +1044,7 @@ namespace dxup::d3d12 {
     void releaseCompletedResourceBatches(uint64_t completedFenceValue);
     void releaseAllResourceBatches();
     bool ensureUploadScratchCapacity(uint64_t capacity);
+    void warnLowAddressSpace();
     bool allocateUploadScratch(uint64_t size, uint64_t alignment,
                                ID3D12Resource** resource, uint64_t* offset, void** ptr);
 

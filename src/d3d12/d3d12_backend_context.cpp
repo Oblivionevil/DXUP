@@ -7355,6 +7355,32 @@ namespace dxup::d3d12 {
 #endif
   }
 
+  // 32-bit processes: a warning in the log when the address space runs
+  // short (2 GB without large-address awareness): allocations fail then,
+  // and textures or buffers stay broken. Again for every 128 MB less.
+  void D3D12BackendContext::warnLowAddressSpace() {
+#ifdef _WIN32
+    MEMORYSTATUSEX status = { sizeof(status) };
+    if (!GlobalMemoryStatusEx(&status))
+      return;
+    const uint64_t freeMb = status.ullAvailVirtual >> 20;
+    static uint64_t s_warnedBelow = 384;
+    if (freeMb >= s_warnedBelow)
+      return;
+    s_warnedBelow = freeMb / 128 * 128;
+    size_t largest = 0;
+    MEMORY_BASIC_INFORMATION mbi;
+    for (char* p = nullptr; VirtualQuery(p, &mbi, sizeof(mbi)); p = static_cast<char*>(mbi.BaseAddress) + mbi.RegionSize) {
+      if (mbi.State == MEM_FREE)
+        largest = (std::max)(largest, size_t(mbi.RegionSize));
+      if (static_cast<char*>(mbi.BaseAddress) + mbi.RegionSize < p)
+        break;
+    }
+    logMessage(LogLevel::Warn, "glitch: address space low: %llu MB of %llu MB free, largest free block %zu MB (32-bit process)",
+      static_cast<unsigned long long>(freeMb), static_cast<unsigned long long>(status.ullTotalVirtual >> 20), largest >> 20);
+#endif
+  }
+
   void D3D12BackendContext::presentImage(IBackendImage* backBuffer) {
 #ifdef _WIN32
     ContextLock ctxLock(*this);
@@ -7368,6 +7394,8 @@ namespace dxup::d3d12 {
     const bool logPresent = infoDiagnosticsEnabled()
       && (presentIndex < 3 || (presentIndex % 300) == 0);
     m_device->trimIdleMemory();
+    if (kSmallAddressSpace && presentIndex % 300 == 0)
+      warnLowAddressSpace();
     if (memstats::enabled()) {
       m_descriptorsFrameMax = (std::max)(m_descriptorsFrameMax, m_descriptorsTaken - m_descriptorsAtPresent);
       m_descriptorsAtPresent = m_descriptorsTaken;
