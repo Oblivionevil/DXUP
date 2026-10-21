@@ -106,7 +106,7 @@ namespace dxup::legacy {
     ID3D11Resource*           d3dResource() const;
     ID3D11ShaderResourceView* srv() const { return m_srv.get(); }
     ID3D11ShaderResourceView* srv(bool srgb);
-    bool ownsView(ID3D11ShaderResourceView* view) const { return view == m_srv.get() || view == m_srvSrgb.get(); }
+    ID3D11ShaderResourceView* srgbSrv() const { return m_srvSrgb.get(); }   // made by srv(true)
     // A view of a copy of the texture as it is now: shaders reading a
     // texture they also draw into (null when no copy can be made).
     ID3D11ShaderResourceView* copySrv(bool srgb);
@@ -206,6 +206,8 @@ namespace dxup::legacy {
   private:
     struct IndexRange { uint32_t lo, hi; };
     std::unordered_map<uint64_t, IndexRange> m_indexRanges;   // of m_indexRangesVersion
+    struct RecentRange { uint64_t key; uint32_t version, lo, hi; };
+    RecentRange        m_recentRanges[8] = {};   // before the map (key 0 is never asked)
     uint32_t           m_indexRangesVersion = 0;
     uint32_t           m_version = 0;   // counts writes
     Device*            m_device;
@@ -651,9 +653,9 @@ namespace dxup::legacy {
       uint32_t limits[4];   // the last float constant, vertex input modes (dxup_inputModes, dxup_inputWOne)
     };
     ConstantStore m_constants[2] = {};      // vertex, pixel
-    // The input modes of the last vertex shader and declaration (by hash).
-    uint64_t m_inputModesShader = 0, m_inputModesDecl = 0;
-    uint32_t m_inputModes[2] = {};
+    // The input modes of recent vertex shaders and declarations (by hashes).
+    struct InputModes { uint64_t key = 0; uint32_t modes = 0, wOne = 0; };
+    InputModes m_inputModes[32];
     // Float constants the application set: those below this, ever.
     uint32_t m_constantsWritten[2] = {};
     // The float constants of a draw's shader: relative reads find no more
@@ -757,6 +759,7 @@ namespace dxup::legacy {
     bool m_targetsDirty = true;
     bool m_viewportDirty = true;   // viewport and scissor only
     ID3D11ShaderResourceView* m_boundViews[24] = {};
+    ID3D11ShaderResourceView* m_samplerViews[kPixelSamplers] = {};   // shader stages: the views wanted
     ID3D11RenderTargetView*   m_boundRtvs[kMaxRenderTargets] = {};   // valid with m_targetsBound
     ID3D11DepthStencilView*   m_boundDsv = nullptr;
     bool                      m_targetsBound = false;

@@ -803,11 +803,18 @@ namespace dxup::legacy {
     const uint64_t key = (uint64_t(start) << 33) ^ (uint64_t(count) << 1) ^ (index32 ? 1u : 0u);
     // Ranges of dynamic buffers are drawn once each: not kept.
     const bool keep = !m_dynamic;
+    RecentRange& recent = m_recentRanges[(uint32_t(key) ^ uint32_t(key >> 32)) * 0x9e3779b9u >> 29];
+    if (keep && recent.key == key && recent.version == m_version) {
+      lo = recent.lo;
+      hi = recent.hi;
+      return true;
+    }
     if (keep && m_indexRangesVersion == m_version) {
       auto it = m_indexRanges.find(key);
       if (it != m_indexRanges.end()) {
         lo = it->second.lo;
         hi = it->second.hi;
+        recent = { key, m_version, lo, hi };
         return true;
       }
     }
@@ -834,6 +841,7 @@ namespace dxup::legacy {
       m_indexRangesVersion = m_version;
     }
     m_indexRanges[key] = { lo, hi };
+    recent = { key, m_version, lo, hi };
     return true;
   }
 
@@ -3891,13 +3899,22 @@ namespace dxup::legacy {
     // Unbind the views of textures that are now targets (D3D11 would,
     // behind the bindings kept here); the others stay bound.
     // Views bound are a texture's own (targets read copies, see bindTextures).
+    ID3D11ShaderResourceView* targetViews[2 * (kMaxRenderTargets + 1)];
+    uint32_t targetViewCount = 0;
+    auto addViews = [&](Texture* t) {
+      if (t) {
+        targetViews[targetViewCount++] = t->srv();
+        targetViews[targetViewCount++] = t->srgbSrv();
+      }
+    };
+    addViews(m_depthStencil);
+    for (Texture* t : m_renderTargets)
+      addViews(t);
     auto target = [&](ID3D11ShaderResourceView* view) {
       if (!view)
         return false;
-      if (m_depthStencil && m_depthStencil->ownsView(view))
-        return true;
-      for (Texture* t : m_renderTargets)
-        if (t && t->ownsView(view)) return true;
+      for (uint32_t i = 0; i < targetViewCount; i++)
+        if (targetViews[i] == view) return true;
       return false;
     };
     ID3D11ShaderResourceView* nulls[24] = {};
@@ -3976,9 +3993,12 @@ namespace dxup::legacy {
       // How the inputs' bits become floats (dxup_inputModes): integers of
       // the declaration's UBYTE4 and SHORT types.
       uint32_t inputModes = 0, inputWOne = 0;
-      if (m_decl && m_inputModesShader == m_vertexShader->hash() && m_inputModesDecl == m_decl->hash()) {
-        inputModes = m_inputModes[0];
-        inputWOne = m_inputModes[1];
+      const uint64_t declHash = m_decl ? m_decl->hash() : 0;
+      const uint64_t modesKey = (m_vertexShader->hash() ^ (declHash << 29 | declHash >> 35)) | 1u;
+      InputModes& cachedModes = m_inputModes[(uint32_t(modesKey) ^ uint32_t(modesKey >> 32)) * 0x9e3779b9u >> 27];
+      if (m_decl && cachedModes.key == modesKey) {
+        inputModes = cachedModes.modes;
+        inputWOne = cachedModes.wOne;
       } else if (m_decl) {
         for (const auto& in : m_vertexShader->info().inputs) {
           for (const auto& e : m_decl->elements()) {
@@ -3991,10 +4011,7 @@ namespace dxup::legacy {
             break;
           }
         }
-        m_inputModesShader = m_vertexShader->hash();
-        m_inputModesDecl = m_decl->hash();
-        m_inputModes[0] = inputModes;
-        m_inputModes[1] = inputWOne;
+        cachedModes = { modesKey, inputModes, inputWOne };
       }
       if (m_constants[0].limits[1] != inputModes || m_constants[0].limits[2] != inputWOne) {
         m_constants[0].limits[1] = inputModes;
@@ -4032,10 +4049,10 @@ namespace dxup::legacy {
       }
       return texture->srv(srgb);
     };
-    if (m_textureDirtyMask & ((1u << kPixelSamplers) - 1)) {
-      m_feedbackMask &= ~((1u << kPixelSamplers) - 1);
+    if (const uint32_t dirty = m_textureDirtyMask & ((1u << kPixelSamplers) - 1)) {
       ID3D11ShaderResourceView* views[24] = {};
       if (ffpPixel) {
+        m_feedbackMask &= ~((1u << kPixelSamplers) - 1);
         bool enabled = true;
         for (uint32_t stage = 0; stage < kFixedStages; stage++) {
           enabled = enabled && m_stageStates[stage][TssColorOp] != 1;   // stages after a disabled one are off
@@ -4045,11 +4062,16 @@ namespace dxup::legacy {
             views[(type - 1) * 8 + stage] = view(stage, texture, enabled);
         }
       } else {
-        for (uint32_t sampler = 0; sampler < kPixelSamplers; sampler++) {
+        // Only samplers whose texture or sRGB state changed (new targets
+        // and the fixed-function stage change all, copies every draw).
+        m_feedbackMask &= ~dirty;
+        for (uint32_t bits = dirty; bits; bits &= bits - 1) {
+          const uint32_t sampler = lowestBit(bits);
           Texture* texture = m_textures[sampler];
-          if (textureTypeOf(texture))
-            views[sampler] = view(sampler, texture, m_psVariant->info.samplerTypes[sampler] != 0);
+          m_samplerViews[sampler] = textureTypeOf(texture)
+            ? view(sampler, texture, m_psVariant->info.samplerTypes[sampler] != 0) : nullptr;
         }
+        std::memcpy(views, m_samplerViews, sizeof(m_samplerViews));
       }
       // Runs of changed slots in one call each.
       uint32_t slot = 0;
