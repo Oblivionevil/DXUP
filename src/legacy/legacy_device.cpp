@@ -1654,7 +1654,14 @@ namespace dxup::legacy {
 
   const Shader::Variant* Shader::variant(const TranslateOptions9& in, bool draw) {
     // A vertex shader writes its own varyings at least: the same variant.
-    TranslateOptions9 options = in;
+    // Field by field: the caller just stored them so, and a wider copy
+    // would wait for those stores.
+    TranslateOptions9 options;
+    options.boundSamplerTypes = in.boundSamplerTypes;
+    options.minVaryings = in.minVaryings;
+    options.shadowSamplers = in.shadowSamplers;
+    options.clipPlanes = in.clipPlanes;
+    options.projected = in.projected;
     driverBehavior(options);
     if (vertex())
       options.minVaryings = (std::max)(options.minVaryings, m_info.varyingCount);
@@ -4406,8 +4413,7 @@ namespace dxup::legacy {
     a.minIndex = first;
   }
 
-  void Device::drawWith(const DrawArgs& args) {
-    DrawArgs a = args;
+  void Device::drawWith(DrawArgs& a) {
     // The vertices the indices reach matter to streamed buffers and to
     // uploads of written parts only.
     if (a.indexed && a.indexCount) {

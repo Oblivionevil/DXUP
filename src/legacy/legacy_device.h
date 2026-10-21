@@ -484,7 +484,9 @@ namespace dxup::legacy {
     void bindTargets();
     void bindViewport();
     void bindTextures();
-    void drawWith(const DrawArgs& args);
+    // a: the caller's, changed here (no copy: its fields were just stored
+    // one by one, and a wider copy would wait for them).
+    void drawWith(DrawArgs& a);
     void widenVertexRange(DrawArgs& a);
     // Uploads application data into the ring buffers; returns offsets.
     uint32_t uploadVertices(const void* data, uint32_t size);
