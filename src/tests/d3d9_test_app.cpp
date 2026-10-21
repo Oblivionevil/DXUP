@@ -2874,6 +2874,8 @@ float4 main(float2 t : TEXCOORD0) : COLOR {
   }
 
   int benchShaderFile(Runtime& windows, Runtime& dxup, const char* path, size_t limit) {
+    // No screen saver or display off meanwhile: Windows' D3D9 then draws nothing.
+    SetThreadExecutionState(ES_CONTINUOUS | ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED);
     std::vector<BenchShader> shaders = benchShaderList(path);
     if (limit && shaders.size() > limit)
       shaders.resize(limit);
