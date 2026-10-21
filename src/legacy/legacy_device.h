@@ -132,6 +132,7 @@ namespace dxup::legacy {
       bool dirty = false;
       bool locked = false;
       bool lockReadOnly = false;
+      bool uploaded = false;       // written to the D3D11 texture before
     };
     void upload(uint32_t subresource);
     void readBack(uint32_t subresource);
@@ -139,6 +140,8 @@ namespace dxup::legacy {
     // CPU-visible copy of a mip level's size, kept: render targets locked
     // every frame (video frames written into the back buffer) neither
     // create one per lock nor pass whole frames through UpdateSubresource.
+    // Only for levels written again or read back: each is CPU-visible
+    // memory, address space in a 32-bit process.
     ID3D11Texture2D* staging(uint32_t subresource);
     void write(uint32_t subresource, const D3D11_BOX& box, const void* data, uint32_t pitch, uint32_t depthPitch);
     size_t levelSize(uint32_t subresource) const;

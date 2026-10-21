@@ -370,6 +370,10 @@ namespace dxup {
     uint64_t                m_chunksSubmitted = 0;
     // The chunk the last flush was submitted with.
     uint64_t                m_flushChunk = 0;
+    // 32-bit processes: temporary upload memory (texture uploads) queued
+    // since the last window ended, and the chunk that ended it.
+    uint64_t                m_uploadWindowBytes = 0;
+    uint64_t                m_uploadWindowChunk = 0;
     std::vector<StagedMap>  m_stagedMaps;
 
     // Worker queue

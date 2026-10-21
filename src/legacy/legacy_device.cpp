@@ -470,7 +470,11 @@ namespace dxup::legacy {
   void Texture::write(uint32_t subresource, const D3D11_BOX& box, const void* data, uint32_t pitch, uint32_t depthPitch) {
     const FormatInfo info = formatInfo(m_dxgiFormat == DXGI_FORMAT_B8G8R8A8_UNORM && m_convert ? FormatA8R8G8B8 : m_desc.format);
     const size_t bytes = size_t(pitch) * (box.bottom - box.top);
-    ID3D11Texture2D* copy = !info.block && !m_volume && m_desc.samples == 1 && bytes >= (1u << 20) ? staging(subresource) : nullptr;
+    const uint32_t mip = subresource % m_desc.levels;
+    const bool again = m_levels[subresource].uploaded || (mip < m_staging.size() && m_staging[mip]);
+    m_levels[subresource].uploaded = true;
+    ID3D11Texture2D* copy = again && !info.block && !m_volume && m_desc.samples == 1 && bytes >= (1u << 20)
+                          ? staging(subresource) : nullptr;
     D3D11_MAPPED_SUBRESOURCE mapped = {};
     if (!copy || FAILED(m_device->context()->Map(copy, 0, D3D11_MAP_WRITE, 0, &mapped))) {
       m_device->context()->UpdateSubresource(d3dResource(), subresource, &box, data, pitch, depthPitch);

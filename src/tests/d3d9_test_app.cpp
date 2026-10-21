@@ -2444,65 +2444,93 @@ float4 main(float2 t : TEXCOORD0) : COLOR {
     return true;
   }
 
-  // Locked DXT5 levels: the application's copy takes the size of its
-  // blocks, not that of a row of blocks per pixel row (four times the
-  // memory: Overlord II, a 32-bit game, ran out of address space).
-  // Windows: 88 MB (32-bit), 112 MB (64-bit); DXUP 102 and 256 MB (upload
-  // heaps and reuse kept smaller in 32-bit processes), 247 and 397 MB with
-  // rows of blocks per pixel row.
-  constexpr double kCompressedMemoryLimitMb = sizeof(void*) == 4 ? 160.0 : 330.0;
-  bool sceneCompressedMemory(IDirect3DDevice9* d) {
+  // Memory textures take while their levels are locked, filled and
+  // uploaded (private bytes: address space in a 32-bit process, where
+  // Overlord II ran out of it). Megabytes 32-bit / 64-bit:
+  // - 48 MB of DXT5: the application's copy takes the size of its blocks,
+  //   not a row of blocks per pixel row (four times the memory). Windows
+  //   85-89 / 111-118, DXUP 101 / 252, 247 / 397 with the rows.
+  // - 128 MB of A8R8G8B8: levels written once keep no CPU-visible staging
+  //   copy. Windows 134 / 271, DXUP 198 / 395, 253 / 387 with the copies
+  //   (in 64-bit the buffers kept for reuse take as much).
+  bool sceneTextureMemory(IDirect3DDevice9* d) {
     d->SetRenderState(D3DRS_LIGHTING, FALSE);
     d->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
     d->SetRenderState(D3DRS_ZENABLE, FALSE);
     d->SetFVF(D3DFVF_XYZRHW | D3DFVF_TEX1);
     struct V { float x, y, z, w, u, v; };
     const V tiny[4] = { { 0, 0, 0.5f, 1, 0, 0 }, { 4, 0, 0.5f, 1, 1, 0 }, { 0, 4, 0.5f, 1, 0, 1 }, { 4, 4, 0.5f, 1, 1, 1 } };
-    // Opaque blocks of one colour: alpha 255, colour 0 a green.
+    // Opaque DXT5 blocks of one colour: alpha 255, colour 0 a green.
     const uint8_t block[16] = { 255, 255, 0, 0, 0, 0, 0, 0, 0xe0, 0x07, 0, 0, 0, 0, 0, 0 };
-    const double before = privateBytes();
+    const bool smallSpace = sizeof(void*) == 4;
+    const struct {
+      D3DFORMAT format;
+      int count;            // 1024x1024 with mips
+      int dataMb;
+      double limitMb;
+      const char* name;
+    } passes[] = {
+      { D3DFMT_DXT5, 36, 48, smallSpace ? 160.0 : 330.0, "DXT5" },
+      { D3DFMT_A8R8G8B8, 24, 128, smallSpace ? 225.0 : 450.0, "A8R8G8B8" },
+    };
+    // Kept to the end: memory one pass gave back must not lower the next.
     std::vector<IDirect3DTexture9*> textures;
+    IDirect3DTexture9* last[2] = {};
     bool ok = true;
-    // 36 textures of 1024x1024 with their mips: 48 MB of blocks.
-    for (int i = 0; i < 36 && ok; i++) {
-      IDirect3DTexture9* texture = nullptr;
-      if (FAILED(d->CreateTexture(1024, 1024, 0, 0, D3DFMT_DXT5, D3DPOOL_MANAGED, &texture, nullptr))) {
-        ok = false;
-        break;
-      }
-      textures.push_back(texture);
-      for (UINT level = 0; level < texture->GetLevelCount(); level++) {
-        D3DSURFACE_DESC desc;
-        D3DLOCKED_RECT locked;
-        texture->GetLevelDesc(level, &desc);
-        if (FAILED(texture->LockRect(level, &locked, nullptr, 0))) {
+    for (int p = 0; p < 2 && ok; p++) {
+      const double before = privateBytes();
+      for (int i = 0; i < passes[p].count && ok; i++) {
+        IDirect3DTexture9* texture = nullptr;
+        if (FAILED(d->CreateTexture(1024, 1024, 0, 0, passes[p].format, D3DPOOL_MANAGED, &texture, nullptr))) {
           ok = false;
           break;
         }
-        for (UINT y = 0; y < (desc.Height + 3) / 4; y++)
-          for (UINT x = 0; x < (desc.Width + 3) / 4; x++)
-            std::memcpy(static_cast<uint8_t*>(locked.pBits) + y * locked.Pitch + x * 16, block, 16);
-        texture->UnlockRect(level);
+        textures.push_back(texture);
+        for (UINT level = 0; level < texture->GetLevelCount(); level++) {
+          D3DSURFACE_DESC desc;
+          D3DLOCKED_RECT locked;
+          texture->GetLevelDesc(level, &desc);
+          if (FAILED(texture->LockRect(level, &locked, nullptr, 0))) {
+            ok = false;
+            break;
+          }
+          auto* bits = static_cast<uint8_t*>(locked.pBits);
+          if (passes[p].format == D3DFMT_DXT5) {
+            for (UINT y = 0; y < (desc.Height + 3) / 4; y++)
+              for (UINT x = 0; x < (desc.Width + 3) / 4; x++)
+                std::memcpy(bits + y * locked.Pitch + x * 16, block, 16);
+          } else {
+            for (UINT y = 0; y < desc.Height; y++)
+              for (UINT x = 0; x < desc.Width; x++)
+                reinterpret_cast<uint32_t*>(bits + y * locked.Pitch)[x] = 0xff3060c0u;
+          }
+          texture->UnlockRect(level);
+        }
+        // Drawn: uploaded.
+        d->SetTexture(0, texture);
+        d->BeginScene();
+        d->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, tiny, sizeof(V));
+        d->EndScene();
       }
-      // Drawn: uploaded.
-      d->SetTexture(0, texture);
-      d->BeginScene();
-      d->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, tiny, sizeof(V));
-      d->EndScene();
-    }
-    d->SetTexture(0, nullptr);
-    d->Present(nullptr, nullptr, nullptr, nullptr);
-    const double grown = (privateBytes() - before) / (1024.0 * 1024.0);
-    if (ok && grown > kCompressedMemoryLimitMb) {
-      std::printf("  compressed_memory: private bytes grew by %.0f MB for 48 MB of DXT5 textures\n", grown);
-      ok = false;
+      d->SetTexture(0, nullptr);
+      d->Present(nullptr, nullptr, nullptr, nullptr);
+      const double grown = (privateBytes() - before) / (1024.0 * 1024.0);
+      if (ok && grown > passes[p].limitMb) {
+        std::printf("  texture_memory: private bytes grew by %.0f MB for %d MB of %s textures\n", grown, passes[p].dataMb,
+                    passes[p].name);
+        ok = false;
+      }
+      last[p] = textures.empty() ? nullptr : textures.back();
     }
     d->Clear(0, nullptr, D3DCLEAR_TARGET, 0xff102030u, 1.0f, 0);
     if (ok) {
       const V quad[4] = { { 16, 16, 0.5f, 1, 0, 0 }, { 112, 16, 0.5f, 1, 1, 0 }, { 16, 112, 0.5f, 1, 0, 1 }, { 112, 112, 0.5f, 1, 1, 1 } };
-      d->SetTexture(0, textures.back());
+      const V inner[4] = { { 48, 48, 0.5f, 1, 0, 0 }, { 80, 48, 0.5f, 1, 1, 0 }, { 48, 80, 0.5f, 1, 0, 1 }, { 80, 80, 0.5f, 1, 1, 1 } };
       d->BeginScene();
+      d->SetTexture(0, last[0]);
       d->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, quad, sizeof(V));
+      d->SetTexture(0, last[1]);
+      d->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, inner, sizeof(V));
       d->EndScene();
       d->SetTexture(0, nullptr);
     }
@@ -2560,7 +2588,7 @@ float4 main(float2 t : TEXCOORD0) : COLOR {
     { "ffp_no_texture", sceneFfpNoTexture },
     { "relative_window", sceneRelativeWindow },
     { "released_bound", sceneReleasedBound },
-    { "compressed_memory", sceneCompressedMemory },
+    { "texture_memory", sceneTextureMemory },
   };
 
   // ---- Running ----

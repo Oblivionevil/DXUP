@@ -1022,7 +1022,19 @@ namespace dxup {
     // retires them behind the queued commands and their GPU work.
     if (buffer && static_cast<d3d12::D3D12BackendBuffer*>(buffer.get())->isSuballocated())
       return;
+    const uint64_t size = buffer ? buffer->getDesc().size : 0;
     emit([buffer = std::move(buffer)](CsWorkerState& s) { s.ctx->retainTemporaryBuffer(buffer); });
+    // In a 32-bit process upload memory is address space: a load must not
+    // run hundreds of megabytes of texture uploads ahead of the worker. Two
+    // windows of 32 MB at most: the end of the one before must have run.
+    constexpr uint64_t kUploadWindowBytes = 32ull << 20;
+    if (d3d12::kSmallAddressSpace && !m_recording && (m_uploadWindowBytes += size) >= kUploadWindowBytes) {
+      submitChunk();
+      if (m_uploadWindowChunk)
+        waitForChunk(m_uploadWindowChunk);
+      m_uploadWindowChunk = m_chunksSubmitted;
+      m_uploadWindowBytes = 0;
+    }
   }
 
   // ============================================================
