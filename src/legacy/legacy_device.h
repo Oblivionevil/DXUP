@@ -106,6 +106,7 @@ namespace dxup::legacy {
     ID3D11Resource*           d3dResource() const;
     ID3D11ShaderResourceView* srv() const { return m_srv.get(); }
     ID3D11ShaderResourceView* srv(bool srgb);
+    bool ownsView(ID3D11ShaderResourceView* view) const { return view == m_srv.get() || view == m_srvSrgb.get(); }
     // A view of a copy of the texture as it is now: shaders reading a
     // texture they also draw into (null when no copy can be made).
     ID3D11ShaderResourceView* copySrv(bool srgb);
@@ -194,6 +195,10 @@ namespace dxup::legacy {
     void invalidate(uint32_t offset = 0, uint32_t size = 0);
     // Uploads what of [offset, offset + size) changed since its last upload.
     void prepare(uint32_t offset, uint32_t size);
+    // All of it uploaded: draws need not know which part they read.
+    bool uploaded() const {
+      return m_clean.size() == 1 && m_clean[0].first == 0 && m_clean[0].second >= m_data.size();
+    }
     ID3D11Buffer* resource() const { return m_buffer.get(); }
     // The smallest and largest of `count` indices from index `start`, kept
     // until the buffer is written again; false past the buffer's end.
@@ -282,6 +287,10 @@ namespace dxup::legacy {
     bool                    m_ahead = false;   // compiled ahead (Device::takeWarmShader)
     std::mutex              m_mutex;
     std::unordered_map<uint64_t, std::shared_ptr<Slot>> m_variants;
+    // The variant the last draw used (draws only, on the device's thread):
+    // most draws use the one before, without the lock and the map.
+    uint64_t                m_drawnKey = 0;
+    const Variant*          m_drawnVariant = nullptr;
   };
 
   class Device {
@@ -309,6 +318,9 @@ namespace dxup::legacy {
     ID3D11DeviceContext* context() const { return m_context.get(); }
     // A frame's draws go into the log (dxup_trace9_go.txt).
     bool tracing() const { return m_trace9; }
+    // Bytes into a dynamic buffer (whole 64-byte lines), new memory first
+    // for WRITE_DISCARD: written by DXUP's worker thread where it has one.
+    bool writeBuffer(ID3D11Buffer* buffer, uint32_t offset, const void* data, uint32_t size, bool discard);
     // Whether textures of a format can be created directly (else converted).
     bool supports(DXGI_FORMAT format, UINT usage) const;
 
@@ -490,6 +502,9 @@ namespace dxup::legacy {
     HRESULT (WINAPI* m_createMappedView)(IUnknown*, ID3D11Resource*, const D3D11_SHADER_RESOURCE_VIEW_DESC*, UINT,
                                          ID3D11ShaderResourceView**) = nullptr;   // DXUP's d3d11.dll only
     HRESULT (WINAPI* m_createSampler)(IUnknown*, const D3D11_SAMPLER_DESC*, ID3D11SamplerState**) = nullptr;
+    // DXUP's D3D11 (DXUPWriteBuffer): its worker thread writes dynamic buffers.
+    HRESULT (WINAPI* m_writeBuffer)(ID3D11DeviceContext*, ID3D11Buffer*, UINT, const void*, UINT) = nullptr;
+    std::vector<uint8_t> m_uploadScratch;   // a constant window with def constants
     Ref<ID3D11Device>               m_device;
     Ref<ID3D11DeviceContext>        m_context;
     Ref<IDXGIFactory2>              m_factory;
@@ -548,8 +563,17 @@ namespace dxup::legacy {
     Ref<ID3D11RasterizerState>      m_quadRaster;
     std::unordered_map<uint64_t, ID3D11InputLayout*>        m_inputLayouts;
     std::unordered_map<uint64_t, ID3D11BlendState*>         m_blendStates;   // by the states they come from
-    uint64_t                                                m_lastBlendKey = 0;
-    ID3D11BlendState*                                       m_lastBlendState = nullptr;
+    // The states of recent draws by key, before the maps (games switch
+    // among a few states draw by draw).
+    template<typename T>
+    struct StateCache {
+      struct Entry { uint64_t key = 0; T* state = nullptr; };
+      Entry entries[16];
+      Entry& at(uint64_t key) { return entries[(key * 0x9e3779b97f4a7c15ull) >> 60]; }
+    };
+    StateCache<ID3D11BlendState>                            m_blendCache;
+    StateCache<ID3D11DepthStencilState>                     m_depthCache;
+    StateCache<ID3D11RasterizerState>                       m_rasterCache;
     std::unordered_map<uint64_t, ID3D11DepthStencilState*>  m_depthStates;
     std::unordered_map<uint64_t, ID3D11RasterizerState*>    m_rasterStates;
     std::unordered_map<uint64_t, ID3D11SamplerState*>       m_samplerStates;
@@ -596,6 +620,12 @@ namespace dxup::legacy {
       uint32_t limits[4];   // the last float constant, vertex input modes (dxup_inputModes, dxup_inputWOne)
     };
     ConstantStore m_constants[2] = {};      // vertex, pixel
+    // Float constants the application set: those below this, ever.
+    uint32_t m_constantsWritten[2] = {};
+    // The float constants of a draw's shader: relative reads find no more
+    // than the application set and one zero constant past them (DXVK too
+    // uploads no more than the highest constant set).
+    uint32_t shaderFloats(bool pixel, const ShaderInfo9& info) const;
     bool m_shaderConstantsDirty[2] = { true, true };   // the floats changed
     bool m_shaderConstantsUnbound[2] = { true, true };  // b0 lost its window
     bool m_shaderIntsDirty[2] = { true, true };

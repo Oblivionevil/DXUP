@@ -2028,6 +2028,55 @@ float4 main(float2 pos : VPOS) : COLOR {
     return true;
   }
 
+  // A vertex shader reading c[i] relatively, i per quad: constants set
+  // (colours), never set (black) and set later past the first ones.
+  bool sceneRelativeWindow(IDirect3DDevice9* d) {
+    d->Clear(0, nullptr, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, 0xff202020u, 1.0f, 0);
+    const char* vsSource = R"(
+float4 c[96] : register(c0);
+struct VO { float4 p : POSITION; float4 col : COLOR0; };
+VO main(float4 p : POSITION, float index : TEXCOORD0) { VO o; o.p = p; o.col = c[(int)index]; return o; })";
+    const char* psSource = "float4 main(float4 col : COLOR0) : COLOR { return col; }";
+    const auto vsCode = compile(vsSource, "vs_3_0");
+    const auto psCode = compile(psSource, "ps_3_0");
+    IDirect3DVertexShader9* vs = nullptr;
+    IDirect3DPixelShader9* ps = nullptr;
+    if (vsCode.empty() || psCode.empty() || FAILED(d->CreateVertexShader(vsCode.data(), &vs))
+     || FAILED(d->CreatePixelShader(psCode.data(), &ps)))
+      return false;
+    d->SetVertexShader(vs);
+    d->SetPixelShader(ps);
+    d->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+    d->SetFVF(D3DFVF_XYZW | D3DFVF_TEX1 | D3DFVF_TEXCOORDSIZE1(0));
+    struct V { float x, y, z, w, index; };
+    auto quad = [&](int cell, float index) {
+      const float x0 = -1.0f + 0.25f * float(cell % 8), y0 = 1.0f - 0.5f * float(cell / 8);
+      const V v[4] = { { x0, y0, 0.5f, 1, index }, { x0 + 0.25f, y0, 0.5f, 1, index },
+                       { x0, y0 - 0.5f, 0.5f, 1, index }, { x0 + 0.25f, y0 - 0.5f, 0.5f, 1, index } };
+      d->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, v, sizeof(V));
+    };
+    float colours[8][4];
+    for (int i = 0; i < 8; i++) {
+      colours[i][0] = float(i & 1);
+      colours[i][1] = float((i >> 1) & 1);
+      colours[i][2] = float((i >> 2) & 1) * 0.5f + 0.25f;
+      colours[i][3] = 1.0f;
+    }
+    d->SetVertexShaderConstantF(0, &colours[0][0], 8);
+    const float indices[8] = { 0, 3, 7, 8, 9, 31, 60, 95 };
+    for (int i = 0; i < 8; i++)
+      quad(i, indices[i]);
+    const float late[4] = { 1.0f, 0.5f, 0.0f, 1.0f };
+    d->SetVertexShaderConstantF(60, late, 1);
+    for (int i = 0; i < 8; i++)
+      quad(8 + i, indices[i]);
+    d->SetVertexShader(nullptr);
+    d->SetPixelShader(nullptr);
+    vs->Release();
+    ps->Release();
+    return true;
+  }
+
   // Fixed-function stages whose operation takes a texture none is bound
   // to: one 8x16 cell per operation (stage 0, then stage 1 after a stage 0
   // adding the texture factor), blended by the result's alpha; a third row
@@ -2378,6 +2427,7 @@ float4 main(float2 t : TEXCOORD0) : COLOR {
     { "autogen_target", sceneAutogenTarget },
     { "target_feedback", sceneTargetFeedback },
     { "ffp_no_texture", sceneFfpNoTexture },
+    { "relative_window", sceneRelativeWindow },
   };
 
   // ---- Running ----
@@ -2507,9 +2557,40 @@ float4 main(float2 t : TEXCOORD0) : COLOR {
     d->SetVertexShader(vs);
     d->SetPixelShader(ps);
     d->SetStreamSource(0, vb, 0, sizeof(V));
-    double best = 1e30, total = 0;
+    // Mask 16, a game's scene (StarCraft II): per draw 8 vertex and 2 pixel
+    // constant registers, 3 of 6 textures, indexed; every 16 draws another
+    // of 4 shader pairs and blending on or off.
+    IDirect3DIndexBuffer9* ib = nullptr;
+    IDirect3DVertexShader9* sceneVs[4] = {};
+    IDirect3DPixelShader9* scenePs[4] = {};
+    IDirect3DTexture9* sceneTextures[6] = {};
+    if (mask & 16) {
+      d->CreateIndexBuffer(12, D3DUSAGE_WRITEONLY, D3DFMT_INDEX16, D3DPOOL_MANAGED, &ib, nullptr);
+      WORD* indices = nullptr;
+      ib->Lock(0, 0, reinterpret_cast<void**>(&indices), 0);
+      const WORD quad[6] = { 0, 1, 2, 2, 1, 3 };
+      std::memcpy(indices, quad, sizeof(quad));
+      ib->Unlock();
+      for (int k = 0; k < 4; k++) {
+        const std::string vsSource = "float4x4 world : register(c0);\nfloat4x4 viewProj : register(c4);\n"
+          "struct VO { float4 p : POSITION; float4 c : COLOR0; float2 t : TEXCOORD0; };\n"
+          "VO main(float3 p : POSITION, float4 c : COLOR0, float2 t : TEXCOORD0) {\n"
+          "  VO o; o.p = mul(mul(float4(p, 1), world), viewProj); o.c = c * " + std::to_string(k + 1) + ".0 / 4.0; o.t = t; return o;\n}\n";
+        const std::string psSource = "sampler2D a : register(s0);\nsampler2D b : register(s1);\nsampler2D c : register(s2);\n"
+          "float4 k[2] : register(c0);\n"
+          "float4 main(float4 col : COLOR0, float2 t : TEXCOORD0) : COLOR {\n"
+          "  return (tex2D(a, t) * tex2D(b, t * " + std::to_string(k + 2) + ".0) + tex2D(c, t) * k[1]) * col + k[0];\n}\n";
+        const auto vsCode16 = compile(vsSource.c_str(), "vs_2_0");
+        const auto psCode16 = compile(psSource.c_str(), "ps_2_0");
+        d->CreateVertexShader(vsCode16.data(), &sceneVs[k]);
+        d->CreatePixelShader(psCode16.data(), &scenePs[k]);
+      }
+      for (int k = 0; k < 6; k++)
+        sceneTextures[k] = checkerTexture(d, 8u << (k % 3));
+    }
+    double best = 1e30, total = 0, issueBest = 1e30, issueTotal = 0;
     for (int f = 0; f < frames; f++) {
-      LARGE_INTEGER t0, t1, freq;
+      LARGE_INTEGER t0, t1, issued, freq;
       QueryPerformanceCounter(&t0);
       d->BeginScene();
       d->Clear(0, nullptr, D3DCLEAR_TARGET, 0, 1.0f, 0);
@@ -2517,6 +2598,32 @@ float4 main(float2 t : TEXCOORD0) : COLOR {
         D3DMATRIX m = translation(float(i % 17) * 0.1f - 0.8f, float(i % 13) * 0.1f - 0.6f, 0.0f);
         // Typical per-draw work: constants, a texture, a state.
         D3DMATRIX t = { m._11, m._21, m._31, m._41, m._12, m._22, m._32, m._42, m._13, m._23, m._33, m._43, m._14, m._24, m._34, m._44 };
+        if (mask & 16) {
+          if (i % 16 == 0) {
+            const int pair = (i / 16) & 3;
+            d->SetVertexShader(sceneVs[pair]);
+            d->SetPixelShader(scenePs[pair]);
+            d->SetRenderState(D3DRS_ALPHABLENDENABLE, (i / 16) & 1);
+          }
+          const D3DMATRIX identityMatrix = identity();
+          float vsConstants[32];
+          std::memcpy(vsConstants, &t._11, 64);
+          std::memcpy(vsConstants + 16, &identityMatrix._11, 64);
+          const float psConstants[8] = { 0.1f, 0.0f, 0.0f, 0.0f, 1.0f, float(i & 3) / 3.0f, 0.5f, 1.0f };
+          if (!(mask & 32)) {   // 32: the constants once only
+            d->SetVertexShaderConstantF(0, vsConstants, 8);
+            d->SetPixelShaderConstantF(0, psConstants, 2);
+          } else if (i == 0) {
+            d->SetVertexShaderConstantF(0, vsConstants, 8);
+            d->SetPixelShaderConstantF(0, psConstants, 2);
+          }
+          for (DWORD s = 0; s < 3; s++)
+            d->SetTexture(s, sceneTextures[(i + s * 2) % 6]);
+          d->SetStreamSource(0, vb, 0, sizeof(V));
+          d->SetIndices(ib);
+          d->DrawIndexedPrimitive(D3DPT_TRIANGLELIST, 0, 0, 4, 0, 2);
+          continue;
+        }
         if (mask & 1) {
           d->SetVertexShaderConstantF(0, &t._11, 4);
           const float tint[4] = { 1.0f, float(i & 7) / 7.0f, 0.5f, 1.0f };
@@ -2538,16 +2645,37 @@ float4 main(float2 t : TEXCOORD0) : COLOR {
         d->DrawPrimitive(D3DPT_TRIANGLESTRIP, 0, 2);
       }
       d->EndScene();
+      // The calls alone (what a game's thread spends), then the frame with
+      // Present (flip-model presents may wait for the display).
+      QueryPerformanceCounter(&issued);
       d->Present(nullptr, nullptr, nullptr, nullptr);
       QueryPerformanceCounter(&t1);
       QueryPerformanceFrequency(&freq);
       const double ms = double(t1.QuadPart - t0.QuadPart) * 1000.0 / double(freq.QuadPart);
-      if (f >= 10) { best = (std::min)(best, ms); total += ms; }
+      const double issue = double(issued.QuadPart - t0.QuadPart) * 1000.0 / double(freq.QuadPart);
+      if (f >= 10) {
+        best = (std::min)(best, ms);
+        total += ms;
+        issueBest = (std::min)(issueBest, issue);
+        issueTotal += issue;
+      }
     }
     const double avg = total / (std::max)(1, frames - 10);
-    std::printf("%s: %d draws per frame, %.3f ms per frame avg, %.3f best (%.0f ns per draw)\n", runtime.name, draws, avg, best,
-                best * 1e6 / draws);
-    d->SetTexture(0, nullptr);
+    const double issueAvg = issueTotal / (std::max)(1, frames - 10);
+    std::printf("%s: %d draws per frame, calls %.0f ns per draw (avg %.0f), frame %.3f ms avg, %.3f best\n", runtime.name, draws,
+                issueBest * 1e6 / draws, issueAvg * 1e6 / draws, avg, best);
+    for (DWORD s = 0; s < 3; s++)
+      d->SetTexture(s, nullptr);
+    d->SetIndices(nullptr);
+    d->SetVertexShader(nullptr);
+    d->SetPixelShader(nullptr);
+    for (int k = 0; k < 4; k++) {
+      if (sceneVs[k]) sceneVs[k]->Release();
+      if (scenePs[k]) scenePs[k]->Release();
+    }
+    for (auto* texture : sceneTextures)
+      if (texture) texture->Release();
+    if (ib) ib->Release();
     dynamicVb->Release();
     decl->Release(); vb->Release(); textures[0]->Release(); textures[1]->Release(); ps->Release(); vs->Release();
     d->Release();

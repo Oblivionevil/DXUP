@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <atomic>
 #include <cstddef>
+#include <cstring>
 #include <deque>
 #include <iterator>
 #include <set>
@@ -1076,6 +1077,20 @@ namespace dxup {
       }
     }
     virtual void retainTemporaryBuffer(Rc<IBackendBuffer> buffer) { (void)buffer; }
+    // Bytes into a dynamic buffer's memory where writes after
+    // WRITE_NO_OVERWRITE go (DXUP's Direct3D 9 layer): contexts with a
+    // worker thread let it write, so the application thread writes no
+    // write-combined memory (each locked instruction after such writes waits
+    // until they left the CPU). Bytes from size to padded are zeros (whole
+    // 64-byte lines: partly written lines wait in the CPU).
+    virtual void writeMappedBuffer(IBackendBuffer* buffer, uint64_t offset, const void* data, size_t size, size_t padded) {
+      if (void* mapped = mapBuffer(buffer, MapMode::WriteNoOverwrite)) {
+        std::memcpy(static_cast<uint8_t*>(mapped) + offset, data, size);
+        if (padded > size)
+          std::memset(static_cast<uint8_t*>(mapped) + offset + size, 0, padded - size);
+        unmapBuffer(buffer);
+      }
+    }
     // WRITE_DISCARD on a buffer that can take new memory in place: returns
     // where the application writes; commands recorded before keep reading
     // the old memory. Null when the buffer has to be renamed instead.

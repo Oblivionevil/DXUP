@@ -1715,6 +1715,26 @@ namespace dxup {
       }
     }
 
+    // DXUP's Direct3D 9 layer (DXUPWriteBuffer): bytes into a dynamic
+    // buffer where the application would write them after
+    // Map(WRITE_NO_OVERWRITE), written by the worker thread; the rest of the
+    // last 64-byte line inside the buffer becomes zeros.
+    HRESULT WriteDynamicBuffer(ID3D11Buffer* buffer, UINT offset, const void* data, UINT size) {
+      DXUP_CONTEXT_MT_GUARD;
+      if (m_isDeferred || !buffer || !data)
+        return E_INVALIDARG;
+      auto* tracked = static_cast<D3D11Buffer*>(buffer);
+      const D3D11_BUFFER_DESC& desc = tracked->GetDescRef();
+      if (desc.Usage != D3D11_USAGE_DYNAMIC || uint64_t(offset) + size > desc.ByteWidth)
+        return E_INVALIDARG;
+      IBackendBuffer* backend = getBackendBuffer(tracked);
+      if (!backend)
+        return E_INVALIDARG;
+      const uint64_t lineEnd = (std::min)((uint64_t(offset) + size + 63) & ~uint64_t(63), uint64_t(desc.ByteWidth));
+      m_backendCtx->writeMappedBuffer(backend, offset, data, size, size_t(lineEnd - offset));
+      return S_OK;
+    }
+
     // At each Present of the swap chain (application thread).
     void NoteFramePresented() {
       DXUP_CONTEXT_MT_GUARD;

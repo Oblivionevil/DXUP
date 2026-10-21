@@ -977,6 +977,26 @@ namespace dxup {
     return slice.mapped;
   }
 
+  void CsThreadContext::writeMappedBuffer(IBackendBuffer* buffer, uint64_t offset, const void* data, size_t size,
+                                          size_t padded) {
+    // The memory the application would write now (a later WRITE_DISCARD
+    // gives the buffer other memory; the worker hands this back only after
+    // the commands queued before, this write among them).
+    auto* d3d12Buffer = static_cast<d3d12::D3D12BackendBuffer*>(buffer);
+    uint8_t* mapped = d3d12Buffer && !m_recording ? d3d12Buffer->getAppMappedData() : nullptr;
+    if (!mapped || !data || !size) {
+      IBackendContext::writeMappedBuffer(buffer, offset, data, size, padded);
+      return;
+    }
+    uint8_t* target = mapped + offset;
+    const size_t zeros = padded > size ? padded - size : 0;
+    emitArray(static_cast<const uint8_t*>(data), size, [target, zeros](CsWorkerState&, const uint8_t* copy, size_t n) {
+      std::memcpy(target, copy, n);
+      if (zeros)
+        std::memset(target + n, 0, zeros);
+    });
+  }
+
   void CsThreadContext::retainTemporaryBuffer(Rc<IBackendBuffer> buffer) {
     // Slices of upload blocks are not recycled; dropping the reference
     // retires them behind the queued commands and their GPU work.

@@ -754,6 +754,25 @@ HRESULT WINAPI DXUPCreateShaderResourceView(IUnknown* pDevice, ID3D11Resource* p
   return static_cast<D3D11Device*>(dxupDevice.Get())->CreateMappedShaderResourceView(pResource, pDesc, ComponentMapping, ppView);
 }
 
+// Bytes into a dynamic buffer of DXUP's immediate context where writes after
+// Map(WRITE_NO_OVERWRITE) go, written by its worker thread: DXUP's Direct3D 9
+// layer uploads constants and vertices without writing write-combined memory
+// on the game's thread. With no buffer: whether the context is DXUP's.
+HRESULT WINAPI DXUPWriteBuffer(ID3D11DeviceContext* pContext, ID3D11Buffer* pBuffer, UINT Offset, const void* pData,
+    UINT Size) {
+  if (!pContext)
+    return E_INVALIDARG;
+  if (!pBuffer) {
+    ComPtr<ID3D11Device> device;
+    pContext->GetDevice(device.GetAddressOf());
+    ComPtr<ID3D11Device5> dxupDevice;
+    return device && pContext->GetType() == D3D11_DEVICE_CONTEXT_IMMEDIATE
+      && SUCCEEDED(device->QueryInterface(kDxupD3D11DeviceIid, reinterpret_cast<void**>(dxupDevice.GetAddressOf())))
+      ? S_OK : E_NOINTERFACE;
+  }
+  return static_cast<D3D11ImmediateContext*>(pContext)->WriteDynamicBuffer(pBuffer, Offset, pData, Size);
+}
+
 // A sampler of DXUP's device that may also use D3D12's anisotropic filter
 // with point mips (0x54), as Direct3D 9 filters: DXUP's Direct3D 9 layer.
 HRESULT WINAPI DXUPCreateSamplerState(IUnknown* pDevice, const D3D11_SAMPLER_DESC* pDesc,

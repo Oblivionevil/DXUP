@@ -1676,6 +1676,8 @@ namespace dxup::legacy {
     if (options.boundSamplerTypes)
       for (int i = 0; i < 16; i++)
         key = fnv64Multiply(key ^ (options.boundSamplerTypes[i] + 0x100u * uint32_t(i)));
+    if (draw && m_drawnVariant && key == m_drawnKey)
+      return m_drawnVariant;
     std::shared_ptr<Slot> slot;
     bool firstDraw = false;
     {
@@ -1713,7 +1715,14 @@ namespace dxup::legacy {
         logMessage(LogLevel::Info, "D3D9 shaders: a draw waited %.1f ms for %s shader %016llx's variant %016llx",
           ms, vertex() ? "vertex" : "pixel", (unsigned long long)m_hash, (unsigned long long)key);
     }
-    return slot->ok ? &slot->variant : nullptr;
+    if (!slot->ok)
+      return nullptr;
+    // Slots stay in the map for the shader's life.
+    if (draw) {
+      m_drawnKey = key;
+      m_drawnVariant = &slot->variant;
+    }
+    return &slot->variant;
   }
 
   bool Shader::compile(const TranslateOptions9& options, uint64_t key, Variant& v) {
@@ -1871,6 +1880,12 @@ namespace dxup::legacy {
       GetProcAddress(m_d3d11Module, "DXUPCreateShaderResourceView"));
     m_createSampler = reinterpret_cast<decltype(m_createSampler)>(
       GetProcAddress(m_d3d11Module, "DXUPCreateSamplerState"));
+    // Writes to write-combined memory on the game's thread make its next
+    // locked instruction (a reference count, a queue) wait until they left
+    // the CPU: DXUP's worker thread writes constants and vertices instead.
+    m_writeBuffer = reinterpret_cast<decltype(m_writeBuffer)>(GetProcAddress(m_d3d11Module, "DXUPWriteBuffer"));
+    if (m_writeBuffer && FAILED(m_writeBuffer(m_context.get(), nullptr, 0, nullptr, 0)))
+      m_writeBuffer = nullptr;
     // The GPU's maker, before the first shader is translated.
     using GetVendorId = UINT (WINAPI*)(IUnknown*);
     if (auto getVendorId = reinterpret_cast<GetVendorId>(GetProcAddress(m_d3d11Module, "DXUPGetVendorId")))
@@ -2004,6 +2019,7 @@ namespace dxup::legacy {
     m_vsVariant = m_psVariant = nullptr;
     std::memset(m_constants, 0, sizeof(m_constants));
     m_constants[0].limits[0] = m_constants[1].limits[0] = 255;
+    m_constantsWritten[0] = m_constantsWritten[1] = 0;
     m_shaderConstantsDirty[0] = m_shaderConstantsDirty[1] = true;
     m_shaderIntsDirty[0] = m_shaderIntsDirty[1] = true;
     m_renderTargets = {};
@@ -2152,8 +2168,11 @@ namespace dxup::legacy {
     m_dirty = DirtyAll;
     m_targetsDirty = m_viewportDirty = true;
     m_textureDirtyMask = m_samplerDirtyMask = (1u << kSamplerCount) - 1;
-    std::memset(m_boundViews, 0, sizeof(m_boundViews));
-    std::memset(m_boundVertexViews, 0, sizeof(m_boundVertexViews));
+    // What the context holds is unknown now (quads bind their own views): a value no
+    // view has, so the next bindTextures sets every slot.
+    auto* unknown = reinterpret_cast<ID3D11ShaderResourceView*>(~uintptr_t(0));
+    std::fill(std::begin(m_boundViews), std::end(m_boundViews), unknown);
+    std::fill(std::begin(m_boundVertexViews), std::end(m_boundVertexViews), unknown);
     std::memset(m_boundSamplers, 0, sizeof(m_boundSamplers));
     std::memset(m_boundStreams, 0, sizeof(m_boundStreams));
     m_boundLayout = nullptr;
@@ -2348,14 +2367,27 @@ namespace dxup::legacy {
     if (start >= 256 || !data)
       return;
     count = (std::min)(count, 256u - start);
+    m_constantsWritten[pixel] = (std::max)(m_constantsWritten[pixel], start + count);
+    // The same values again (games set their camera for every draw): the
+    // window uploaded last still holds them.
+    if (std::memcmp(m_constants[pixel].f[start], data, size_t(count) * 16) == 0)
+      return;
     std::memcpy(m_constants[pixel].f[start], data, size_t(count) * 16);
     m_shaderConstantsDirty[pixel] = true;
+  }
+
+  uint32_t Device::shaderFloats(bool pixel, const ShaderInfo9& info) const {
+    if (!info.relativeConstants)
+      return (std::min)(info.floatConstantCount, 256u);
+    return (std::max)(info.directConstantCount, (std::min)(m_constantsWritten[pixel] + 1, 256u));
   }
 
   void Device::setShaderConstantI(bool pixel, uint32_t start, const int32_t* data, uint32_t count) {
     if (start >= 16 || !data)
       return;
     count = (std::min)(count, 16u - start);
+    if (std::memcmp(m_constants[pixel].i[start], data, size_t(count) * 16) == 0)
+      return;
     std::memcpy(m_constants[pixel].i[start], data, size_t(count) * 16);
     m_shaderIntsDirty[pixel] = true;
   }
@@ -2364,9 +2396,14 @@ namespace dxup::legacy {
     if (start >= 16 || !data)
       return;
     count = (std::min)(count, 16u - start);
-    for (uint32_t i = 0; i < count; i++)
-      m_constants[pixel].b[start + i] = data[i] ? 1u : 0u;
-    m_shaderIntsDirty[pixel] = true;
+    bool changed = false;
+    for (uint32_t i = 0; i < count; i++) {
+      const uint32_t value = data[i] ? 1u : 0u;
+      changed |= m_constants[pixel].b[start + i] != value;
+      m_constants[pixel].b[start + i] = value;
+    }
+    if (changed)
+      m_shaderIntsDirty[pixel] = true;
   }
 
   void Device::getShaderConstantF(bool pixel, uint32_t start, float* data, uint32_t count) const {
@@ -2516,15 +2553,15 @@ namespace dxup::legacy {
         key |= 1ull << 35 | field(rs[RsSrcBlendAlpha]) << 36 | field(rs[RsDestBlendAlpha]) << 41
              | field(rs[RsBlendOpAlpha]) << 46;
     }
-    if (key == m_lastBlendKey && m_lastBlendState)
-      return m_lastBlendState;
+    auto& cached = m_blendCache.at(key);
+    if (cached.key == key && cached.state)
+      return cached.state;
     auto& state = m_blendStates[key];
     if (!state) {
       D3D11_BLEND_DESC desc = blendDesc();
       m_device->CreateBlendState(&desc, &state);
     }
-    m_lastBlendKey = key;
-    m_lastBlendState = state;
+    cached = { key, state };
     return state;
   }
 
@@ -2587,9 +2624,13 @@ namespace dxup::legacy {
       desc.DepthFunc = D3D11_COMPARISON_ALWAYS;
     }
     const uint64_t key = hashBytes(desc);
+    auto& cached = m_depthCache.at(key);
+    if (cached.key == key && cached.state)
+      return cached.state;
     auto& state = m_depthStates[key];
     if (!state)
       m_device->CreateDepthStencilState(&desc, &state);
+    cached = { key, state };
     return state;
   }
 
@@ -2612,9 +2653,13 @@ namespace dxup::legacy {
     desc.ScissorEnable = rs[RsScissorTestEnable] != 0;
     desc.MultisampleEnable = TRUE;
     const uint64_t key = hashBytes(desc);
+    auto& cached = m_rasterCache.at(key);
+    if (cached.key == key && cached.state)
+      return cached.state;
     auto& state = m_rasterStates[key];
     if (!state)
       m_device->CreateRasterizerState(&desc, &state);
+    cached = { key, state };
     return state;
   }
 
@@ -3052,11 +3097,7 @@ namespace dxup::legacy {
       c->texCoordSetup[stage][2] = transformed ? 0 : transform;
       c->texCoordSetup[stage][3] = set < texCount ? texCoordSize(fvf, set) : 4;
     }
-    D3D11_MAPPED_SUBRESOURCE mapped = {};
-    if (SUCCEEDED(m_context->Map(m_vertexConstants.get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
-      writeLines(static_cast<uint8_t*>(mapped.pData), c, sizeof(*c));
-      m_context->Unmap(m_vertexConstants.get(), 0);
-    }
+    writeBuffer(m_vertexConstants.get(), 0, c, sizeof(*c), true);
     m_vertexConstantsDirty = false;
   }
 
@@ -3076,11 +3117,7 @@ namespace dxup::legacy {
       if (normals)
         normalMatrixOf(constants.worldView[i], constants.normalMatrix[i]);
     }
-    D3D11_MAPPED_SUBRESOURCE mapped = {};
-    if (SUCCEEDED(m_context->Map(m_transformConstants.get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
-      writeLines(static_cast<uint8_t*>(mapped.pData), &constants, sizeof(constants));
-      m_context->Unmap(m_transformConstants.get(), 0);
-    }
+    writeBuffer(m_transformConstants.get(), 0, &constants, sizeof(constants), true);
     m_transformConstantsDirty = false;
   }
 
@@ -3139,11 +3176,7 @@ namespace dxup::legacy {
     c->pixelFlags[0] = rs[RsFogEnable] ? 1 : 0;
     c->pixelFlags[1] = stageCount;
     c->pixelFlags[2] = !tableMode && vertexMode && rs[RsRangeFogEnable] ? 1 : 0;
-    D3D11_MAPPED_SUBRESOURCE mapped = {};
-    if (SUCCEEDED(m_context->Map(m_pixelConstants.get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
-      writeLines(static_cast<uint8_t*>(mapped.pData), c, sizeof(*c));
-      m_context->Unmap(m_pixelConstants.get(), 0);
-    }
+    writeBuffer(m_pixelConstants.get(), 0, c, sizeof(*c), true);
     m_pixelConstantsDirty = false;
   }
 
@@ -3569,7 +3602,7 @@ namespace dxup::legacy {
       return;
     // The floats the shader reads, in a window of 16-constant steps of the
     // stage's ring: appended without waiting, discarded when it wraps.
-    const uint32_t floats = (std::min)(variant->info.floatConstantCount, 256u);
+    const uint32_t floats = shaderFloats(pixel, variant->info);
     const uint32_t windowSize = (std::max)(16u, (floats + 15) & ~15u);
     const uint32_t bytes = windowSize * 16;
     uint32_t& offset = m_constantRingOffsets[pixel];
@@ -3580,20 +3613,28 @@ namespace dxup::legacy {
       m_constantWindows[pixel].valid = false;
     }
     ID3D11Buffer* ring = m_constantRings[pixel].get();
-    D3D11_MAPPED_SUBRESOURCE mapped = {};
-    if (FAILED(m_context->Map(ring, 0, mode, 0, &mapped)))
-      return;
-    // Whole 64-byte lines: the ring is write-combined memory, and partly
-    // written lines wait in the CPU until the next locked instruction.
+    // Whole 64-byte lines (4 constants): the ring is write-combined memory,
+    // and partly written lines wait in the CPU until the next locked
+    // instruction.
     const uint32_t copied = (std::min)((floats + 3) & ~3u, 256u);
     if (glitchReportsEnabled())
       checkConstants(pixel, floats);
-    uint8_t* window = static_cast<uint8_t*>(mapped.pData) + offset;
-    std::memcpy(window, m_constants[pixel].f, size_t(copied) * 16);
-    for (const auto& def : variant->info.relativeDefs)
-      if (def.first < copied)
-        std::memcpy(window + size_t(def.first) * 16, def.second.data(), 16);
-    m_context->Unmap(ring, 0);
+    // Relative reads stop at the last constant written to the window.
+    if (variant->info.relativeConstants && m_constants[pixel].limits[0] != copied - 1) {
+      m_constants[pixel].limits[0] = copied - 1;
+      m_shaderIntsDirty[pixel] = true;
+    }
+    const void* source = m_constants[pixel].f;
+    if (!variant->info.relativeDefs.empty()) {
+      m_uploadScratch.resize(size_t(copied) * 16);
+      std::memcpy(m_uploadScratch.data(), m_constants[pixel].f, m_uploadScratch.size());
+      for (const auto& def : variant->info.relativeDefs)
+        if (def.first < copied)
+          std::memcpy(m_uploadScratch.data() + size_t(def.first) * 16, def.second.data(), 16);
+      source = m_uploadScratch.data();
+    }
+    if (!writeBuffer(ring, offset, source, copied * 16, mode == D3D11_MAP_WRITE_DISCARD))
+      return;
     const UINT first = offset / 16, count = windowSize;
     if (pixel)
       m_context1->PSSetConstantBuffers1(0, 1, &ring, &first, &count);
@@ -3613,12 +3654,16 @@ namespace dxup::legacy {
     if (!variant)
       return;
     const ConstantWindow& last = m_constantWindows[pixel];
-    const uint32_t floats = (std::min)(variant->info.floatConstantCount, 256u);
+    const uint32_t floats = shaderFloats(pixel, variant->info);
     const uint32_t window = (std::max)(16u, (floats + 15) & ~15u);
     if (!last.valid || floats > last.floats || window > last.count || !variant->info.relativeDefs.empty()
      || glitchReportsEnabled()) {
       updateShaderConstants(pixel);
       return;
+    }
+    if (variant->info.relativeConstants && m_constants[pixel].limits[0] != last.floats - 1) {
+      m_constants[pixel].limits[0] = last.floats - 1;
+      m_shaderIntsDirty[pixel] = true;
     }
     ID3D11Buffer* ring = m_constantRings[pixel].get();
     if (pixel)
@@ -3630,11 +3675,7 @@ namespace dxup::legacy {
 
   void Device::updateShaderInts(bool pixel) {
     ID3D11Buffer* buffer = m_shaderIntConstants[pixel].get();
-    D3D11_MAPPED_SUBRESOURCE mapped = {};
-    if (SUCCEEDED(m_context->Map(buffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
-      writeLines(static_cast<uint8_t*>(mapped.pData), m_constants[pixel].i, sizeof(ConstantStore) - offsetof(ConstantStore, i));
-      m_context->Unmap(buffer, 0);
-    }
+    writeBuffer(buffer, 0, m_constants[pixel].i, uint32_t(sizeof(ConstantStore) - offsetof(ConstantStore, i)), true);
     m_shaderIntsDirty[pixel] = false;
   }
 
@@ -3668,11 +3709,7 @@ namespace dxup::legacy {
       c.bumpLuminance[stage][0] = asFloat(tss[TssBumpEnvLScale]);
       c.bumpLuminance[stage][1] = asFloat(tss[TssBumpEnvLOffset]);
     }
-    D3D11_MAPPED_SUBRESOURCE mapped = {};
-    if (SUCCEEDED(m_context->Map(m_shaderFixedConstants.get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
-      writeLines(static_cast<uint8_t*>(mapped.pData), &c, sizeof(c));
-      m_context->Unmap(m_shaderFixedConstants.get(), 0);
-    }
+    writeBuffer(m_shaderFixedConstants.get(), 0, &c, sizeof(c), true);
     m_shaderFixedDirty = false;
   }
 
@@ -3688,12 +3725,36 @@ namespace dxup::legacy {
         count = i + 1;
     }
     ID3D11DepthStencilView* dsv = m_depthStencil ? m_depthStencil->dsv() : nullptr;
-    // Unbind textures that are now targets.
+    // Unbind the views of textures that are now targets (D3D11 would,
+    // behind the bindings kept here); the others stay bound.
+    // Views bound are a texture's own (targets read copies, see bindTextures).
+    auto target = [&](ID3D11ShaderResourceView* view) {
+      if (!view)
+        return false;
+      if (m_depthStencil && m_depthStencil->ownsView(view))
+        return true;
+      for (Texture* t : m_renderTargets)
+        if (t && t->ownsView(view)) return true;
+      return false;
+    };
     ID3D11ShaderResourceView* nulls[24] = {};
-    m_context->PSSetShaderResources(0, 24, nulls);
-    m_context->VSSetShaderResources(0, 4, nulls);
-    std::memset(m_boundViews, 0, sizeof(m_boundViews));
-    std::memset(m_boundVertexViews, 0, sizeof(m_boundVertexViews));
+    for (uint32_t slot = 0; slot < 24; slot++) {
+      if (!target(m_boundViews[slot]))
+        continue;
+      uint32_t end = slot + 1;
+      while (end < 24 && target(m_boundViews[end]))
+        end++;
+      m_context->PSSetShaderResources(slot, end - slot, nulls);
+      std::memset(&m_boundViews[slot], 0, (end - slot) * sizeof(m_boundViews[0]));
+      slot = end;
+    }
+    bool vertexHazard = false;
+    for (ID3D11ShaderResourceView* view : m_boundVertexViews)
+      vertexHazard |= target(view);
+    if (vertexHazard) {
+      m_context->VSSetShaderResources(0, 4, nulls);
+      std::memset(m_boundVertexViews, 0, sizeof(m_boundVertexViews));
+    }
     m_textureDirtyMask = (1u << kSamplerCount) - 1;
     m_context->OMSetRenderTargets(count, rtvs, dsv);
     m_targetsDirty = false;
@@ -3934,11 +3995,7 @@ namespace dxup::legacy {
       if (m_shaderIntsDirty[0])
         updateShaderInts(false);
       if (m_clipPlanesDirty && m_vsVariant && (m_renderStates[RsClipPlaneEnable] & 0x3f)) {
-        D3D11_MAPPED_SUBRESOURCE mapped = {};
-        if (SUCCEEDED(m_context->Map(m_clipPlaneConstants.get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
-          writeLines(static_cast<uint8_t*>(mapped.pData), m_clipPlanes.data(), sizeof(m_clipPlanes));
-          m_context->Unmap(m_clipPlaneConstants.get(), 0);
-        }
+        writeBuffer(m_clipPlaneConstants.get(), 0, m_clipPlanes.data(), uint32_t(sizeof(m_clipPlanes)), true);
         m_clipPlanesDirty = false;
       }
     }
@@ -4006,6 +4063,24 @@ namespace dxup::legacy {
     return true;
   }
 
+  bool Device::writeBuffer(ID3D11Buffer* buffer, uint32_t offset, const void* data, uint32_t size, bool discard) {
+    if (m_writeBuffer) {
+      if (discard) {
+        D3D11_MAPPED_SUBRESOURCE mapped = {};
+        if (FAILED(m_context->Map(buffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped)))
+          return false;
+        m_context->Unmap(buffer, 0);
+      }
+      return SUCCEEDED(m_writeBuffer(m_context.get(), buffer, offset, data, size));
+    }
+    D3D11_MAPPED_SUBRESOURCE mapped = {};
+    if (FAILED(m_context->Map(buffer, 0, discard ? D3D11_MAP_WRITE_DISCARD : D3D11_MAP_WRITE_NO_OVERWRITE, 0, &mapped)))
+      return false;
+    writeLines(static_cast<uint8_t*>(mapped.pData) + offset, data, size);
+    m_context->Unmap(buffer, 0);
+    return true;
+  }
+
   uint32_t Device::uploadVertices(const void* data, uint32_t size) {
     if (((size + 63) & ~63u) > m_vertexRingSize
      && !growRing(m_vertexRing, m_vertexRingSize, m_vertexRingOffset, (size + 63) & ~63u, D3D11_BIND_VERTEX_BUFFER))
@@ -4015,11 +4090,8 @@ namespace dxup::legacy {
       mode = D3D11_MAP_WRITE_DISCARD;
       m_vertexRingOffset = 0;
     }
-    D3D11_MAPPED_SUBRESOURCE mapped = {};
-    if (FAILED(m_context->Map(m_vertexRing.get(), 0, mode, 0, &mapped)))
+    if (!writeBuffer(m_vertexRing.get(), m_vertexRingOffset, data, size, mode == D3D11_MAP_WRITE_DISCARD))
       return UINT32_MAX;
-    writeLines(static_cast<uint8_t*>(mapped.pData) + m_vertexRingOffset, data, size);
-    m_context->Unmap(m_vertexRing.get(), 0);
     const uint32_t offset = m_vertexRingOffset;
     m_vertexRingOffset += (size + 63) & ~63u;
     return offset;
@@ -4034,11 +4106,8 @@ namespace dxup::legacy {
       mode = D3D11_MAP_WRITE_DISCARD;
       m_indexRingOffset = 0;
     }
-    D3D11_MAPPED_SUBRESOURCE mapped = {};
-    if (FAILED(m_context->Map(m_indexRing.get(), 0, mode, 0, &mapped)))
+    if (!writeBuffer(m_indexRing.get(), m_indexRingOffset, data, size, mode == D3D11_MAP_WRITE_DISCARD))
       return UINT32_MAX;
-    writeLines(static_cast<uint8_t*>(mapped.pData) + m_indexRingOffset, data, size);
-    m_context->Unmap(m_indexRing.get(), 0);
     const uint32_t offset = m_indexRingOffset;
     m_indexRingOffset += (size + 63) & ~63u;
     return offset;
@@ -4117,8 +4186,17 @@ namespace dxup::legacy {
 
   void Device::drawWith(const DrawArgs& args) {
     DrawArgs a = args;
-    if (a.indexed && a.indexCount)
-      widenVertexRange(a);
+    // The vertices the indices reach matter to streamed buffers and to
+    // uploads of written parts only.
+    if (a.indexed && a.indexCount) {
+      bool range = a.userIndices != nullptr || !m_decl;
+      for (uint32_t bits = m_decl ? m_decl->streamMask() & ((1u << kMaxStreams) - 1) : 0; bits && !range; bits &= bits - 1) {
+        const Stream& s = m_streams[lowestBit(bits)];
+        range = s.buffer && (s.buffer->dynamic() || !s.buffer->uploaded());
+      }
+      if (range)
+        widenVertexRange(a);
+    }
     if (m_trace9)
       traceDraw9(a);
     struct ProbeAfter {
@@ -4409,11 +4487,7 @@ namespace dxup::legacy {
     std::memcpy(words, c, sizeof(words));
     words[12] = m_vsVariant ? 0u : 1u;
     words[13] = !m_vsVariant && fixedPointSizes() ? 1u : 0u;
-    D3D11_MAPPED_SUBRESOURCE mapped = {};
-    if (SUCCEEDED(m_context->Map(m_pointConstants.get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
-      writeLines(static_cast<uint8_t*>(mapped.pData), words, sizeof(words));
-      m_context->Unmap(m_pointConstants.get(), 0);
-    }
+    writeBuffer(m_pointConstants.get(), 0, words, sizeof(words), true);
   }
 
   void Device::drawPrimitive(PrimitiveType type, uint32_t startVertex, uint32_t vertexCount) {

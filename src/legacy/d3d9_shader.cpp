@@ -1259,8 +1259,12 @@ namespace dxup::legacy {
     s += "  return output;\n}\n";
 
     info.floatConstantCount = info.relativeConstants ? 256 : (std::min)(w.maxConst, 256u);
-    if (info.relativeConstants)
+    info.directConstantCount = (std::min)(w.maxConst, 256u);
+    if (info.relativeConstants) {
       info.relativeDefs.assign(w.floatDefBits.begin(), w.floatDefBits.end());
+      for (const auto& def : info.relativeDefs)
+        info.directConstantCount = (std::max)(info.directConstantCount, (std::min)(def.first + 1, 256u));
+    }
     hlsl = std::move(s);
     if (layout) {
       layout->instructions = std::move(instructions);

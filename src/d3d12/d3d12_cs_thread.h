@@ -269,6 +269,7 @@ namespace dxup {
     void updateBufferRegions(IBackendBuffer* buffer, const BufferUpdateRegion* regions, uint32_t regionCount) override;
     void retainTemporaryBuffer(Rc<IBackendBuffer> buffer) override;
     void* discardBuffer(IBackendBuffer* buffer) override;
+    void writeMappedBuffer(IBackendBuffer* buffer, uint64_t offset, const void* data, size_t size, size_t padded) override;
     // Writes an update of a renamable constant buffer to a new upload slice;
     // false when the update takes the GPU copy.
     bool renameConstantBuffer(IBackendBuffer* buffer, const BufferUpdateRegion* regions, uint32_t regionCount);

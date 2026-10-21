@@ -47,6 +47,7 @@ namespace dxup::legacy {
     std::vector<ShaderIo9> outputs;    // vertex shader: varyings by usage
     uint8_t  samplerTypes[16] = {};    // pixel samplers (vertex: 0-3), 0 = unused
     uint32_t floatConstantCount = 0;   // highest float constant read + 1 (relative addressing: all)
+    uint32_t directConstantCount = 0;  // the same of direct reads and def constants
     uint32_t varyingCount = 0;         // varying slots written (vertex) or declared (pixel)
     bool     writesPointSize = false;  // vertex: point size in slot 0's z (w = 1)
     bool     relativeConstants = false;
