@@ -2200,6 +2200,7 @@ namespace dxup::legacy {
     m_dirty = DirtyAll;
     m_targetsDirty = m_viewportDirty = true;
     m_targetsBound = false;
+    m_constantStageKinds[0] = m_constantStageKinds[1] = -1;
     m_textureDirtyMask = m_samplerDirtyMask = (1u << kSamplerCount) - 1;
     // What the context holds is unknown now (quads bind their own views): a value no
     // view has, so the next bindTextures sets every slot.
@@ -2333,7 +2334,14 @@ namespace dxup::legacy {
   }
 
   void Device::setViewport(const Viewport& viewport) {
-    m_viewport = viewport;
+    // Field by field: callers build it so right before (a wider copy
+    // would wait for those stores).
+    m_viewport.x = viewport.x;
+    m_viewport.y = viewport.y;
+    m_viewport.width = viewport.width;
+    m_viewport.height = viewport.height;
+    m_viewport.minZ = viewport.minZ;
+    m_viewport.maxZ = viewport.maxZ;
     m_viewportDirty = true;
     m_vertexConstantsDirty = true;
   }
@@ -4195,21 +4203,32 @@ namespace dxup::legacy {
     if (m_dirty & DirtyShaders) {
       m_context->VSSetShader(m_vsVariant ? m_vsVariant->vs.get() : m_ffpVs.get(), nullptr, 0);
       m_context->PSSetShader(m_psVariant ? m_psVariant->ps.get() : m_ffpPs.get(), nullptr, 0);
-      ID3D11Buffer* vsConstants[4] = { m_vertexConstants.get(), nullptr, nullptr, m_transformConstants.get() };
-      if (!ffpVertex) {
-        vsConstants[0] = nullptr;
-        vsConstants[2] = m_shaderIntConstants[0].get();
-        vsConstants[3] = m_clipPlaneConstants.get();
-        m_shaderConstantsUnbound[0] = true;   // its window binds b0
-      }
-      ID3D11Buffer* psConstants[3] = { nullptr, m_pixelConstants.get(), nullptr };
-      if (!ffpPixel) {
-        psConstants[1] = m_shaderFixedConstants.get();
-        psConstants[2] = m_shaderIntConstants[1].get();
+      // A shader's window binds b0 (bindShaderConstants keeps the bound
+      // one when it fits); the other buffers change with the kind of stage
+      // only.
+      if (!ffpVertex)
+        m_shaderConstantsUnbound[0] = true;
+      if (!ffpPixel)
         m_shaderConstantsUnbound[1] = true;
+      if (m_constantStageKinds[0] != int8_t(ffpVertex)) {
+        m_constantStageKinds[0] = int8_t(ffpVertex);
+        ID3D11Buffer* vsConstants[4] = { m_vertexConstants.get(), nullptr, nullptr, m_transformConstants.get() };
+        if (!ffpVertex) {
+          vsConstants[0] = nullptr;
+          vsConstants[2] = m_shaderIntConstants[0].get();
+          vsConstants[3] = m_clipPlaneConstants.get();
+        }
+        m_context->VSSetConstantBuffers(0, 4, vsConstants);
       }
-      m_context->VSSetConstantBuffers(0, 4, vsConstants);
-      m_context->PSSetConstantBuffers(0, 3, psConstants);
+      if (m_constantStageKinds[1] != int8_t(ffpPixel)) {
+        m_constantStageKinds[1] = int8_t(ffpPixel);
+        ID3D11Buffer* psConstants[3] = { nullptr, m_pixelConstants.get(), nullptr };
+        if (!ffpPixel) {
+          psConstants[1] = m_shaderFixedConstants.get();
+          psConstants[2] = m_shaderIntConstants[1].get();
+        }
+        m_context->PSSetConstantBuffers(0, 3, psConstants);
+      }
     }
     if (ffpVertex) {
       if (m_vertexConstantsDirty)

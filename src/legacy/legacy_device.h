@@ -668,6 +668,7 @@ namespace dxup::legacy {
                          bool discard);
     bool uploadWorkerConstants(bool pixel, ID3D11Buffer* ring, uint32_t offset, uint32_t copied, const ShaderInfo9& info,
                                bool discard);
+    int8_t m_constantStageKinds[2] = { -1, -1 };   // constant buffers bound for: 1 fixed function, 0 shaders
     bool m_shaderConstantsDirty[2] = { true, true };   // the floats changed
     bool m_shaderConstantsUnbound[2] = { true, true };  // b0 lost its window
     bool m_shaderIntsDirty[2] = { true, true };
