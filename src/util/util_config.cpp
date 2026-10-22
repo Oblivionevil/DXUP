@@ -427,6 +427,7 @@ namespace dxup {
     overrides.relaxedUavBarriers = config.getBool("d3d11.relaxedUavBarriers", relaxedUavBarriersByDefault());
     overrides.barrierHoisting = config.getBool("d3d12.barrierHoisting", true);
     overrides.recordThread = config.getBool("d3d12.recordThread", false);
+    overrides.submitThread = config.getBool("d3d12.submitThread", false);
     overrides.pixelOutputMasks = config.getBool("d3d12.pixelOutputMasks", true);
     overrides.adapter = config.getString("dxgi.adapter", "");
     overrides.directBackBuffer = config.getBool("dxgi.directBackBuffer", true);
@@ -453,14 +454,14 @@ namespace dxup {
       UserOverrides result = fromConfig(Config::get());
       logMessage(LogLevel::Info, "dxup.conf: settings from %s", configSource().c_str());
       logMessage(LogLevel::Info,
-        "dxup.conf: samplerAnisotropy %d, samplerLodBias %.2f, msaaSamples %d, msaaForce %d, msaaScope %s, sgssaa %s, syncInterval %d, maxFrameLatency %d, asyncShaders %d, shaderPrecompile %d, upscaler %u (sharpness %.2f, shader %016llx, auto %d), spatial upscale %d (sharpness %.2f, render scale %.2f), relaxedUavBarriers %d, recordThread %d",
+        "dxup.conf: samplerAnisotropy %d, samplerLodBias %.2f, msaaSamples %d, msaaForce %d, msaaScope %s, sgssaa %s, syncInterval %d, maxFrameLatency %d, asyncShaders %d, shaderPrecompile %d, upscaler %u (sharpness %.2f, shader %016llx, auto %d), spatial upscale %d (sharpness %.2f, render scale %.2f), relaxedUavBarriers %d, recordThread %d, submitThread %d",
         result.samplerAnisotropy, result.samplerLodBias, result.msaaSamples, result.msaaForce ? 1 : 0,
         result.msaaScope == MsaaScope::All ? "all" : "geometry",
         result.sgssaa == SgssaaMode::Full ? "full" : result.sgssaa == SgssaaMode::Alpha ? "alpha" : "off",
         result.syncInterval, result.maxFrameLatency, result.asyncShaders ? 1 : 0, result.shaderPrecompile ? 1 : 0,
         result.upscaler, result.upscalerSharpness, static_cast<unsigned long long>(result.upscalerShader),
         result.upscalerAuto ? 1 : 0, result.spatialUpscale ? 1 : 0, result.spatialSharpness, result.renderScale,
-        result.relaxedUavBarriers ? 1 : 0, result.recordThread ? 1 : 0);
+        result.relaxedUavBarriers ? 1 : 0, result.recordThread ? 1 : 0, result.submitThread ? 1 : 0);
 #ifdef _WIN32
       if (result.spoofVendorId || result.spoofDeviceId || !result.spoofDescription.empty()) {
         char description[128] = {};

@@ -180,6 +180,8 @@ namespace dxup {
     }
 
     waitForWorker();
+    // Jobs of the submit thread that count frames refer to this context.
+    m_real->waitForQueue();
     {
       std::lock_guard<std::mutex> lock(m_queueMutex);
       m_stopping = true;
@@ -390,7 +392,7 @@ namespace dxup {
   uint64_t CsThreadContext::getStreamOutputFilledSize(IBackendBuffer* buffer) {
     if (m_recording)
       return 0;
-    waitForWorker();
+    waitForQueue();
     return m_real->getStreamOutputFilledSize(buffer);
   }
 
@@ -631,7 +633,7 @@ namespace dxup {
         // maps the resource and touches no recording state. Other buffers
         // reflect every queued command.
         if (buffer->getDesc().usage != ResourceUsage::Staging)
-          waitForWorker();
+          waitForQueue();
         return m_real->mapBuffer(buffer, mode);
 
       case MapMode::WriteDiscard: {
@@ -1211,7 +1213,7 @@ namespace dxup {
         flush();
       return false;
     }
-    waitForWorker();
+    waitForQueue();
     return m_real->waitForGpuUse(use, false);
   }
 
@@ -1228,21 +1230,21 @@ namespace dxup {
     HitchScope hitch("app synchronize");
     if (m_recording)
       return;
-    waitForWorker();
+    waitForQueue();
     m_real->synchronize();
   }
 
   void CsThreadContext::closeForSubmission() {
     if (m_recording)
       return;
-    waitForWorker();
+    waitForQueue();
     m_real->closeForSubmission();
   }
 
   void CsThreadContext::submitRecordedCommands() {
     if (m_recording)
       return;
-    waitForWorker();
+    waitForQueue();
     m_real->submitRecordedCommands();
   }
 
@@ -1260,6 +1262,13 @@ namespace dxup {
     });
     submitChunk();
     m_presents++;
+  }
+
+  void CsThreadContext::waitForQueue() {
+    if (m_recording)
+      return;
+    waitForWorker();
+    m_real->waitForQueue();
   }
 
   void CsThreadContext::waitForFrames(uint64_t frames) {

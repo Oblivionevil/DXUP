@@ -21,6 +21,7 @@
 #include <dxgi1_4.h>
 #include "../util/com_ptr.h"
 #include "d3d12_placed_allocator.h"
+#include "d3d12_submit_queue.h"
 #include "d3d12_shared_sync.h"
 
 #endif
@@ -1093,6 +1094,8 @@ namespace dxup::d3d12 {
 #ifdef _WIN32
     ID3D12Device* getDevice() const { return m_device.Get(); }
     ID3D12CommandQueue* getCommandQueue() const { return m_commandQueue.Get(); }
+    // Every call on the queue that orders work goes through it.
+    SubmitQueue& submitQueue() { return m_submitQueue; }
   IDXGIFactory4* getDxgiFactory() const { return m_dxgiFactory.Get(); }
   IDXGIAdapter1* getAdapter() const { return m_adapter.Get(); }
     void* getNativeCommandQueue() override { return m_commandQueue.Get(); }
@@ -1136,6 +1139,8 @@ namespace dxup::d3d12 {
     ComPtr<ID3D12Fence>          m_fence;
     uint64_t                     m_fenceValue = 0;
     HANDLE                       m_fenceEvent = nullptr;
+    // Stopped before the queue and the fences go.
+    SubmitQueue                  m_submitQueue;
 
     ComPtr<ID3D12RootSignature>  m_graphicsRootSignature;
     ComPtr<ID3D12Resource>       m_zeroConstantBuffer;

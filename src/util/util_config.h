@@ -68,6 +68,10 @@ namespace dxup {
   //                                  command list that the first prepares
   //                                  (about 4% slower on NVIDIA in DXUP's
   //                                  benchmarks, see CommandListRecorder)
+  //   d3d12.submitThread = true      command lists reach the GPU queue on a
+  //                                  thread of their own while DXUP's worker
+  //                                  records the next (for games DXUP's
+  //                                  worker thread limits; see SubmitQueue)
   class Config {
   public:
     static const Config& get();
@@ -147,6 +151,9 @@ namespace dxup {
     // The CS worker's calls on the command list are made by a thread of
     // their own (d3d12.recordThread, see CommandListRecorder).
     bool     recordThread     = false;
+    // Command lists, initial data and Present reach the GPU queue on a
+    // thread of their own (d3d12.submitThread, see SubmitQueue).
+    bool     submitThread     = false;
     // Pixel shader writes no render target takes leave the shader, as
     // Direct3D 11 drivers compile it for the bound targets
     // (d3d12.pixelOutputMasks).

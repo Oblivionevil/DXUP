@@ -1849,6 +1849,8 @@ namespace dxup::d3d12 {
 
   D3D12BackendDevice::~D3D12BackendDevice() {
 #ifdef _WIN32
+    // What is queued runs; from here on jobs run where they are handed in.
+    m_submitQueue.stop();
     stopCompileThreads();
     // Its destructor waits for its uploads.
     m_initDataContext = nullptr;
@@ -2176,8 +2178,11 @@ namespace dxup::d3d12 {
     region.NumTiles = tiles;
     const D3D12_TILE_RANGE_FLAGS flags = D3D12_TILE_RANGE_FLAG_NONE;
     const UINT heapStart = 0, rangeTiles = tiles;
-    m_commandQueue->UpdateTileMappings(image->getResource(), 1, &start, &region, heap.Get(), 1, &flags, &heapStart,
-      &rangeTiles, D3D12_TILE_MAPPING_FLAG_NONE);
+    ComPtr<ID3D12Resource> resource = image->getResource();
+    m_submitQueue.enqueue([resource, heap, start, region, flags, heapStart, rangeTiles](ID3D12CommandQueue* queue) {
+      queue->UpdateTileMappings(resource.Get(), 1, &start, &region, heap.Get(), 1, &flags, &heapStart,
+        &rangeTiles, D3D12_TILE_MAPPING_FLAG_NONE);
+    });
     // The heap lives as long as the resource.
     image->getResource()->SetPrivateDataInterface(kLazyHeapGuid, heap.Get());
     memstats::track(heap.Get(), memstats::TargetTexture);
@@ -2194,6 +2199,7 @@ namespace dxup::d3d12 {
     HRESULT hr = m_device->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(&m_commandQueue));
     if (FAILED(hr))
       throw std::runtime_error("Failed to create command queue");
+    m_submitQueue.init(m_device.Get(), m_commandQueue.Get());
   }
 
   void D3D12BackendDevice::createFence() {
@@ -2567,7 +2573,9 @@ namespace dxup::d3d12 {
       return;
 
     m_fenceValue++;
-    m_commandQueue->Signal(m_fence.Get(), m_fenceValue);
+    ID3D12Fence* fence = m_fence.Get();
+    const uint64_t value = m_fenceValue;
+    m_submitQueue.enqueue([fence, value](ID3D12CommandQueue* queue) { queue->Signal(fence, value); });
 
     if (m_fence->GetCompletedValue() < m_fenceValue) {
       m_fence->SetEventOnCompletion(m_fenceValue, m_fenceEvent);
@@ -2580,7 +2588,12 @@ namespace dxup::d3d12 {
       return S_OK;
 
     m_fenceValue++;
-    HRESULT hr = m_commandQueue->Signal(m_fence.Get(), m_fenceValue);
+    HRESULT hr = S_OK;
+    ID3D12Fence* fence = m_fence.Get();
+    const uint64_t value = m_fenceValue;
+    m_submitQueue.waitFor(m_submitQueue.enqueue([fence, value, &hr](ID3D12CommandQueue* queue) {
+      hr = queue->Signal(fence, value);
+    }), true);
     if (FAILED(hr)) {
       logMessage(LogLevel::Error, "GPU-SYNC [%s]: Signal failed hr=0x%08X", tag, hr);
       HRESULT reason = m_device->GetDeviceRemovedReason();

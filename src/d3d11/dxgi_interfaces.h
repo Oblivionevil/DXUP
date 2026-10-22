@@ -1605,10 +1605,11 @@ namespace dxup {
     // What the last present the worker made returned.
     std::atomic<HRESULT>         m_lastPresentResult{ S_OK };
 
-    // The swap chain changes only once no present is queued on the worker.
+    // The swap chain changes only once no present is queued on the worker
+    // (and the submit thread handed its command lists over).
     void waitForPresents() {
       if (IBackendContext* ctx = backendContext())
-        ctx->waitForWorker();
+        ctx->waitForQueue();
     }
 
     bool presentOnWorker() {
@@ -1796,6 +1797,10 @@ namespace dxup {
         const UINT workerFlags = flags & ~UINT(DXGI_PRESENT_DO_NOT_WAIT);
         ctx->executeOnBackend([this, syncInterval, flags = workerFlags, present1, parameters, hasParameters](IBackendContext* backend) {
           preparePresent(backend);
+          // With the submit thread (d3d12.submitThread) the frame's lists
+          // reach the queue first. Present stays here: on the submit thread
+          // NVIDIA's Present spun and held the next frame's lists back.
+          backend->waitForQueue();
           DXGI_PRESENT_PARAMETERS copy = parameters->get();
           const int64_t start = hitchTraceEnabled() ? hitchTimestamp() : 0;
           const HRESULT hr = present1
@@ -1816,7 +1821,7 @@ namespace dxup {
       if (ctx) {
         if (!(flags & DXGI_PRESENT_TEST))
           ctx->executeOnBackend([this](IBackendContext* backend) { preparePresent(backend); });
-        ctx->waitForWorker();
+        ctx->waitForQueue();
       }
 
       HRESULT hr = present1

@@ -3628,7 +3628,8 @@ namespace dxup {
       DXUP_CONTEXT_MT_GUARD;
       flushPendingBufferUpdates();
       m_backendCtx->flush();
-      m_backendCtx->executeOnBackend([fn = std::move(fn)](IBackendContext*) { fn(); });
+      // With the submit thread, once that thread handed the work over.
+      m_backendCtx->executeOnBackend([fn = std::move(fn)](IBackendContext* backend) { backend->afterSubmitted(fn); });
     }
 
     HRESULT STDMETHODCALLTYPE FinishCommandList(

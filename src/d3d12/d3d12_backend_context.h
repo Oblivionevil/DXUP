@@ -347,6 +347,10 @@ namespace dxup::d3d12 {
     // d3d12.recordThread.
     void setExternallySynchronized(bool enabled);
 
+    void afterSubmitted(std::function<void()> fn) override;
+    void waitForQueue() override;
+    bool submitsAsync() const override;
+
   private:
     D3D12BackendDevice* m_device;
 
@@ -421,6 +425,14 @@ namespace dxup::d3d12 {
     // or with d3d12.recordThread to a thread of its own, drained before
     // the list is closed and wherever a CPU descriptor it reads changes.
     CommandListRecorder m_cmdList;
+    // With the submit thread, the lists it executes while the next records:
+    // a list is reset once the job of its ticket ran (nextCommandList).
+    static constexpr uint32_t kCommandListPoolSize = 3;
+    std::array<ComPtr<ID3D12GraphicsCommandList>, kCommandListPoolSize> m_commandLists;
+    std::array<uint64_t, kCommandListPoolSize> m_commandListTickets = {};
+    uint32_t m_commandListCount = 1;
+    uint32_t m_currentCommandList = 0;
+    void nextCommandList();
     // D3D11 orders unordered access between draws and dispatches: one sees
     // what the previous wrote. Each resource accessed through a UAV since its
     // last UAV barrier keeps how it was accessed (dxbc::UavAccess bits);

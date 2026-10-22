@@ -315,6 +315,8 @@ namespace dxup {
     void endFrame() override;
     void executeOnBackend(std::function<void(IBackendContext*)> fn) override;
     void waitForWorker() override;
+    void waitForQueue() override;
+    bool submitsAsync() const override { return m_real && m_real->submitsAsync(); }
     bool flushPending() const override { return flushQueued(); }
     Rc<IBackendCommandList> finishCommandList() override;
     void executeCommandList(const Rc<IBackendCommandList>& list) override;

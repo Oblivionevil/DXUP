@@ -482,6 +482,7 @@ void main(uint2 id : SV_DispatchThreadID) {
         {"forced_sgssaa_uav", &Dx11TestApp::testForcedSgssaaUav},
         {"relaxed_uav_barriers", &Dx11TestApp::testRelaxedUavBarriers},
         {"record_thread", &Dx11TestApp::testRecordThread},
+        {"submit_thread", &Dx11TestApp::testSubmitThread},
         {"native_fallback", &Dx11TestApp::testNativeFallback},
         {"fullscreen_swap_chain", &Dx11TestApp::testFullscreenSwapChain},
         {"window_ghosting", &Dx11TestApp::testWindowGhosting},
@@ -9287,6 +9288,14 @@ float4 main(float4 position : SV_Position, float4 t0 : TEXCOORD0, float4 t : TEX
     // and copies come out as without it (see runRecordThreadChild).
     bool testRecordThread(std::string& error) {
       return runChildWithConfig("d3d12.recordThread = true\n", "--record-thread-child", error);
+    }
+
+    // d3d12.submitThread: command lists reach the queue on a thread of their
+    // own. Swap chains drawing into the real buffers and through a copy, a
+    // resize midway, readbacks of what frames drew and an event after the
+    // presents work (see runSubmitThreadChild).
+    bool testSubmitThread(std::string& error) {
+      return runChildWithConfig("d3d12.submitThread = true\n", "--submit-thread-child", error);
     }
 
     // A pixel shader that writes an unordered access view runs once per
@@ -23031,6 +23040,113 @@ float4 main() : SV_Target { return color; }
     return result;
   }
 
+  // See testSubmitThread. Returns 0 or the failed check.
+  int runSubmitThreadChild() {
+    WNDCLASSA windowClass = {};
+    windowClass.lpfnWndProc = DefWindowProcA;
+    windowClass.hInstance = GetModuleHandleA(nullptr);
+    windowClass.lpszClassName = "Dx11TestSubmitThread";
+    RegisterClassA(&windowClass);
+    HWND window = CreateWindowExA(0, windowClass.lpszClassName, "submit thread", WS_OVERLAPPEDWINDOW,
+      CW_USEDEFAULT, CW_USEDEFAULT, 200, 200, nullptr, nullptr, windowClass.hInstance, nullptr);
+    if (!window)
+      return 2;
+    int result = 0;
+    {
+      ComPtr<ID3D11Device> device;
+      ComPtr<ID3D11DeviceContext> context;
+      D3D_FEATURE_LEVEL level = D3D_FEATURE_LEVEL_11_0;
+      ComPtr<IDXGIDevice> dxgiDevice;
+      ComPtr<IDXGIAdapter> adapter;
+      ComPtr<IDXGIFactory2> factory;
+      if (FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, &level, 1, D3D11_SDK_VERSION,
+            device.GetAddressOf(), nullptr, context.GetAddressOf()))
+       || FAILED(device.As(&dxgiDevice)) || FAILED(dxgiDevice->GetAdapter(adapter.GetAddressOf()))
+       || FAILED(adapter->GetParent(IID_PPV_ARGS(factory.GetAddressOf())))) {
+        DestroyWindow(window);
+        return 3;
+      }
+      // Pass 0 draws into the real buffers; unordered access keeps a copy
+      // that Present copies (pass 1).
+      for (int pass = 0; pass < 2 && !result; pass++) {
+        DXGI_SWAP_CHAIN_DESC1 desc = {};
+        desc.Width = 64;
+        desc.Height = 48;
+        desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        desc.SampleDesc.Count = 1;
+        desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT | (pass ? DXGI_USAGE_UNORDERED_ACCESS : 0);
+        desc.BufferCount = 3;
+        desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+        ComPtr<IDXGISwapChain1> swapChain;
+        if (FAILED(factory->CreateSwapChainForHwnd(device.Get(), window, &desc, nullptr, nullptr, swapChain.GetAddressOf()))) {
+          result = 10 + pass;
+          break;
+        }
+        for (UINT frame = 0; frame < 150 && !result; frame++) {
+          // The buffers, and the count of the one Present shows, start over.
+          if (frame == 75 && FAILED(swapChain->ResizeBuffers(0, 80, 60, DXGI_FORMAT_UNKNOWN, 0))) {
+            result = 20 + pass;
+            break;
+          }
+          ComPtr<ID3D11Texture2D> back;
+          ComPtr<ID3D11RenderTargetView> rtv;
+          if (FAILED(swapChain->GetBuffer(0, IID_PPV_ARGS(back.GetAddressOf())))
+           || FAILED(device->CreateRenderTargetView(back.Get(), nullptr, rtv.GetAddressOf()))) {
+            result = 30 + pass;
+            break;
+          }
+          const float color[4] = { float(frame % 7) / 6.0f, float(frame % 5) / 4.0f, float(frame % 3) / 2.0f, 1.0f };
+          context->ClearRenderTargetView(rtv.Get(), color);
+          if (frame % 10 == 9) {
+            // What the frame drew reads back.
+            D3D11_TEXTURE2D_DESC stagingDesc;
+            back->GetDesc(&stagingDesc);
+            stagingDesc.Usage = D3D11_USAGE_STAGING;
+            stagingDesc.BindFlags = 0;
+            stagingDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+            stagingDesc.MiscFlags = 0;
+            ComPtr<ID3D11Texture2D> staging;
+            D3D11_MAPPED_SUBRESOURCE mapped = {};
+            if (FAILED(device->CreateTexture2D(&stagingDesc, nullptr, staging.GetAddressOf()))) {
+              result = 40 + pass;
+              break;
+            }
+            context->CopyResource(staging.Get(), back.Get());
+            if (FAILED(context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped))) {
+              result = 42 + pass;
+              break;
+            }
+            const auto* pixel = static_cast<const uint8_t*>(mapped.pData) + mapped.RowPitch + 4;
+            for (int c = 0; c < 4; c++) {
+              if (std::abs(int(pixel[c]) - int(color[c] * 255.0f + 0.5f)) > 1)
+                result = 44 + pass;
+            }
+            context->Unmap(staging.Get(), 0);
+          }
+          context->OMSetRenderTargets(0, nullptr, nullptr);
+          if (!result && FAILED(swapChain->Present(0, 0)))
+            result = 50 + pass;
+        }
+        // An event after the presents completes.
+        D3D11_QUERY_DESC queryDesc = { D3D11_QUERY_EVENT, 0 };
+        ComPtr<ID3D11Query> event;
+        if (!result && SUCCEEDED(device->CreateQuery(&queryDesc, event.GetAddressOf()))) {
+          context->End(event.Get());
+          BOOL done = FALSE;
+          const ULONGLONG start = GetTickCount64();
+          while (context->GetData(event.Get(), &done, sizeof(done), 0) != S_OK) {
+            if (GetTickCount64() - start > 5000) {
+              result = 60 + pass;
+              break;
+            }
+          }
+        }
+      }
+    }
+    DestroyWindow(window);
+    return result;
+  }
+
   // See testRecordThread. Returns 0 or the failed check.
   int runRecordThreadChild() {
     ComPtr<ID3D11Device> device;
@@ -23429,6 +23545,8 @@ int main(int argc, char** argv) {
     return runRelaxedUavChild();
   if (argc > 1 && std::strcmp(argv[1], "--record-thread-child") == 0)
     return runRecordThreadChild();
+  if (argc > 1 && std::strcmp(argv[1], "--submit-thread-child") == 0)
+    return runSubmitThreadChild();
   if (argc > 1 && std::strcmp(argv[1], "--native-fallback-child") == 0)
     return runNativeFallbackChild();
   if (argc > 1 && std::strcmp(argv[1], "--lazy-render-targets-child") == 0)

@@ -680,6 +680,39 @@ namespace dxup::d3d12 {
       }
     }
 
+    // safeCloseAndExecute's halves with the submit thread: the list closes
+    // on the thread that recorded it, the thread executes it.
+    __declspec(noinline)
+    bool safeClose(CommandListRecorder* cmdList, int flushCount, int64_t* closedAt) {
+      __try {
+        HRESULT hr = cmdList->Close();
+        if (closedAt)
+          *closedAt = hitchTimestamp();
+        if (FAILED(hr)) {
+          logMessage(LogLevel::Error, "safeClose: Close failed hr=0x%08x flush=%d", hr, flushCount);
+          return false;
+        }
+        return true;
+      } __except (EXCEPTION_EXECUTE_HANDLER) {
+        logMessage(LogLevel::Error, "safeClose CRASHED (SEH=0x%08X) flush=%d", GetExceptionCode(), flushCount);
+        return false;
+      }
+    }
+
+    __declspec(noinline)
+    void safeExecuteAndSignal(ID3D12CommandQueue* queue, ID3D12CommandList* list, ID3D12Fence* fence, uint64_t value,
+                              SubmitQueue* submit) {
+      HRESULT hr = E_FAIL;
+      __try {
+        queue->ExecuteCommandLists(1, &list);
+        hr = queue->Signal(fence, value);
+      } __except (EXCEPTION_EXECUTE_HANDLER) {
+        logMessage(LogLevel::Error, "submit thread: ExecuteCommandLists CRASHED (SEH=0x%08X)", GetExceptionCode());
+      }
+      submit->checkResult(hr, "ExecuteCommandLists/Signal");
+      submit->checkDevice("ExecuteCommandLists");
+    }
+
     __declspec(noinline)
     bool safeCloseAndExecute(
         CommandListRecorder*       cmdList,
@@ -811,6 +844,7 @@ namespace dxup::d3d12 {
       logMessage(LogLevel::Error, "Failed to create command list (hr=0x%08x)", hr);
       throw std::runtime_error("Failed to create command list");
     }
+    m_commandLists[0] = cmdList;
     m_cmdList.setList(std::move(cmdList));
 
     { HRESULT chk = d3d12Device->GetDeviceRemovedReason();
@@ -4026,8 +4060,11 @@ namespace dxup::d3d12 {
     for (auto* buffer : m_sharedBuffersInBatch)
       collect(buffer->getSharedSync());
     for (const auto& wait : waits) {
-      if (wait.first->GetCompletedValue() < wait.second)
-        m_device->getCommandQueue()->Wait(wait.first.Get(), wait.second);
+      if (wait.first->GetCompletedValue() >= wait.second)
+        continue;
+      ComPtr<ID3D12Fence> fence = wait.first;
+      const uint64_t value = wait.second;
+      m_device->submitQueue().enqueue([fence, value](ID3D12CommandQueue* queue) { queue->Wait(fence.Get(), value); });
     }
 #endif
   }
@@ -6262,7 +6299,7 @@ namespace dxup::d3d12 {
     if (m_copyOnly || !fence || FAILED(fence->QueryInterface(IID_PPV_ARGS(&nativeFence))))
       return;
     flush();
-    m_device->getCommandQueue()->Signal(nativeFence.Get(), value);
+    m_device->submitQueue().enqueue([nativeFence, value](ID3D12CommandQueue* queue) { queue->Signal(nativeFence.Get(), value); });
 #else
     (void)fence; (void)value;
 #endif
@@ -6276,7 +6313,7 @@ namespace dxup::d3d12 {
       return;
     // Only the commands recorded after the wait have to wait.
     flush();
-    m_device->getCommandQueue()->Wait(nativeFence.Get(), value);
+    m_device->submitQueue().enqueue([nativeFence, value](ID3D12CommandQueue* queue) { queue->Wait(nativeFence.Get(), value); });
 #else
     (void)fence; (void)value;
 #endif
@@ -6342,8 +6379,10 @@ namespace dxup::d3d12 {
       return;
     auto* pool = static_cast<D3D12BackendBuffer*>(update.tilePool);
 
-    // Commands recorded so far use the previous mappings.
+    // Commands recorded so far use the previous mappings: after them in
+    // queue order (the submit thread's jobs first).
     flush();
+    m_device->submitQueue().drain(false);
     ID3D12CommandQueue* queue = m_device->getCommandQueue();
 
     const UINT regionCount = static_cast<UINT>(update.coordinates.size());
@@ -6462,6 +6501,7 @@ namespace dxup::d3d12 {
     if (!dstResource || !srcResource || m_copyOnly || m_deviceRemoved)
       return;
     flush();
+    m_device->submitQueue().drain(false);
     m_device->getCommandQueue()->CopyTileMappings(dstResource,
       reinterpret_cast<const D3D12_TILED_RESOURCE_COORDINATE*>(&dstCoordinate), srcResource,
       reinterpret_cast<const D3D12_TILED_RESOURCE_COORDINATE*>(&srcCoordinate),
@@ -6589,9 +6629,63 @@ namespace dxup::d3d12 {
 #endif
   }
 
+  void D3D12BackendContext::nextCommandList() {
+#ifdef _WIN32
+    // The pool, made closed (no allocator) the first time.
+    if (m_commandListCount < kCommandListPoolSize) {
+      ComPtr<ID3D12Device4> device4;
+      if (SUCCEEDED(m_device->getDevice()->QueryInterface(IID_PPV_ARGS(&device4)))) {
+        while (m_commandListCount < kCommandListPoolSize
+            && SUCCEEDED(device4->CreateCommandList1(0, D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_COMMAND_LIST_FLAG_NONE,
+                 IID_PPV_ARGS(&m_commandLists[m_commandListCount]))))
+          m_commandListTickets[m_commandListCount++] = 0;
+      }
+    }
+    SubmitQueue& submit = m_device->submitQueue();
+    if (m_commandListCount < 2) {
+      // One list: it resets once the thread executed it.
+      submit.waitFor(m_commandListTickets[m_currentCommandList], false);
+      return;
+    }
+    m_currentCommandList = (m_currentCommandList + 1) % m_commandListCount;
+    submit.waitFor(m_commandListTickets[m_currentCommandList], false);
+    m_cmdList.setList(m_commandLists[m_currentCommandList]);
+#endif
+  }
+
+  void D3D12BackendContext::afterSubmitted(std::function<void()> fn) {
+#ifdef _WIN32
+    m_device->submitQueue().enqueue([fn = std::move(fn)](ID3D12CommandQueue*) { fn(); });
+#else
+    fn();
+#endif
+  }
+
+  void D3D12BackendContext::waitForQueue() {
+#ifdef _WIN32
+    m_device->submitQueue().drain(true);
+#endif
+  }
+
+  bool D3D12BackendContext::submitsAsync() const {
+#ifdef _WIN32
+    return m_device->submitQueue().threaded();
+#else
+    return false;
+#endif
+  }
+
   void D3D12BackendContext::setExternallySynchronized(bool enabled) {
     m_externallySynchronized = enabled;
 #ifdef _WIN32
+    // d3d12.submitThread: the immediate context's lists and the initial
+    // data reach the queue on a thread of their own (SubmitQueue).
+    if (enabled && !m_copyOnly && UserOverrides::get().submitThread && !m_gpuProfiler.enabled() && !m_breadcrumbList
+     && !m_device->submitQueue().threaded()) {
+      m_device->submitQueue().start();
+      if (m_device->submitQueue().threaded())
+        logMessage(LogLevel::Info, "D3D12BackendContext: submit thread on (d3d12.submitThread)");
+    }
     // The CS worker is then the only thread that records. The GPU profiler
     // and DRED breadcrumbs record into the list themselves.
     if (enabled && !m_copyOnly && UserOverrides::get().recordThread && !m_gpuProfiler.enabled() && !m_breadcrumbList) {
@@ -6972,9 +7066,12 @@ namespace dxup::d3d12 {
     steps.mark(5);
     if (collectTiming)
       QueryPerformanceCounter(&timingStart);
-    bool closeOk = safeCloseAndExecute(
-      &m_cmdList, m_device->getCommandQueue(), flushCount - 1, collectFlushTiming,
-      steps.trace ? &steps.closed : nullptr);
+    SubmitQueue& submit = m_device->submitQueue();
+    const bool threaded = submit.threaded();
+    bool closeOk = threaded
+      ? safeClose(&m_cmdList, flushCount - 1, steps.trace ? &steps.closed : nullptr)
+      : safeCloseAndExecute(&m_cmdList, m_device->getCommandQueue(), flushCount - 1, collectFlushTiming,
+          steps.trace ? &steps.closed : nullptr);
     steps.mark(6);
     if (m_gpuProfiler.enabled()) {
       HMODULE module = nullptr;
@@ -7063,8 +7160,10 @@ namespace dxup::d3d12 {
       // Reset allocator (safe — previous GPU work is done, failed batch was never executed)
       m_currentAllocator->Reset();
 
-      // Release broken command list and create a fresh one
+      // Release broken command list and create a fresh one (the submit
+      // thread is done with it: it never got it).
       m_cmdList.setList(nullptr);
+      m_commandLists[m_currentCommandList] = nullptr;
       ComPtr<ID3D12GraphicsCommandList> freshList;
       HRESULT createHr = m_device->getDevice()->CreateCommandList(0,
         D3D12_COMMAND_LIST_TYPE_DIRECT,
@@ -7075,6 +7174,7 @@ namespace dxup::d3d12 {
         m_deviceRemoved = true;
         return;
       }
+      m_commandLists[m_currentCommandList] = freshList;
       m_cmdList.setList(std::move(freshList));
 
       // Re-bind state on the fresh command list
@@ -7147,7 +7247,13 @@ namespace dxup::d3d12 {
       // The lost batch's fence value still comes: the uploads tagged with
       // it are released and the waits for its work (Map, queries) end.
       m_fenceValue++;
-      if (SUCCEEDED(m_device->getCommandQueue()->Signal(m_fence.Get(), m_fenceValue))) {
+      {
+        ID3D12Fence* fence = m_fence.Get();
+        const uint64_t value = m_fenceValue;
+        SubmitQueue* owner = &m_device->submitQueue();
+        owner->enqueue([fence, value, owner](ID3D12CommandQueue* queue) {
+          owner->checkResult(queue->Signal(fence, value), "Signal");
+        });
         m_lastSignaledFenceValue = m_fenceValue;
         m_submittedFence->store(m_fenceValue, std::memory_order_release);
       }
@@ -7168,7 +7274,8 @@ namespace dxup::d3d12 {
     if (collectTiming)
       QueryPerformanceCounter(&timingStart);
     {
-      HRESULT removedHr = m_device->getDevice()->GetDeviceRemovedReason();
+      // The submit thread executes later: what earlier submissions found.
+      HRESULT removedHr = threaded ? submit.lostReason() : m_device->getDevice()->GetDeviceRemovedReason();
       if (FAILED(removedHr)) {
         m_deviceRemoved = true;
         logMessage(LogLevel::Error, "flush() #%d: DEVICE REMOVED after Execute (hr=0x%08x)",
@@ -7212,7 +7319,18 @@ namespace dxup::d3d12 {
     m_fenceValue++;
     if (collectTiming)
       QueryPerformanceCounter(&timingStart);
-    HRESULT signalHr = m_device->getCommandQueue()->Signal(m_fence.Get(), m_fenceValue);
+    HRESULT signalHr = S_OK;
+    if (threaded) {
+      ID3D12CommandList* list = m_cmdList.raw();
+      ID3D12Fence* fence = m_fence.Get();
+      const uint64_t value = m_fenceValue;
+      SubmitQueue* owner = &submit;
+      m_commandListTickets[m_currentCommandList] = submit.enqueue([list, fence, value, owner](ID3D12CommandQueue* queue) {
+        safeExecuteAndSignal(queue, list, fence, value, owner);
+      });
+    } else {
+      signalHr = m_device->getCommandQueue()->Signal(m_fence.Get(), m_fenceValue);
+    }
     if (FAILED(signalHr)) {
       logMessage(LogLevel::Error, "Command queue Signal() failed (hr=0x%08x)", signalHr);
       logDeviceRemovedReason(m_device, "Signal");
@@ -7339,13 +7457,17 @@ namespace dxup::d3d12 {
       closeForSubmission();
     }
 
-    // Submit the closed command list
-    ID3D12CommandList* cmdLists[] = { m_cmdList.raw() };
-    m_device->getCommandQueue()->ExecuteCommandLists(1, cmdLists);
-
-    // Signal and wait for completion
+    // Submit the closed command list, signal and wait for completion
     m_fenceValue++;
-    m_device->getCommandQueue()->Signal(m_fence.Get(), m_fenceValue);
+    {
+      ID3D12CommandList* list = m_cmdList.raw();
+      ID3D12Fence* fence = m_fence.Get();
+      const uint64_t value = m_fenceValue;
+      SubmitQueue* owner = &m_device->submitQueue();
+      owner->enqueue([list, fence, value, owner](ID3D12CommandQueue* queue) {
+        safeExecuteAndSignal(queue, list, fence, value, owner);
+      });
+    }
     m_submittedFence->store(m_fenceValue, std::memory_order_release);
     m_fence->SetEventOnCompletion(m_fenceValue, m_fenceEvent);
     WaitForSingleObject(m_fenceEvent, INFINITE);
@@ -9362,6 +9484,8 @@ namespace dxup::d3d12 {
     m_pendingUploads.clear();
     m_pendingUploadBytes = 0;
 
+    if (m_device->submitQueue().threaded())
+      nextCommandList();
     m_cmdList.ResetAllocator(m_currentAllocator.Get());
     HRESULT cmdListResetHr = m_cmdList->Reset(m_currentAllocator.Get(), nullptr);
     if (m_gpuProfiler.capturing())
