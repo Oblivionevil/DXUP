@@ -941,6 +941,8 @@ namespace dxup::d3d12 {
   // stream output queries that stay active across a command list
   // submission are split into segments whose results are summed.
   // ============================================================
+  class CommandListRecorder;
+
   class D3D12BackendQuery : public IBackendQuery {
     friend class D3D12BackendContext;
   public:
@@ -962,9 +964,9 @@ namespace dxup::d3d12 {
     D3D12_QUERY_HEAP_TYPE heapType() const;
     D3D12_QUERY_TYPE gpuQueryType(uint32_t slotInSegment) const;
     uint32_t slotsPerSegment() const;
-    bool beginSegment(ID3D12GraphicsCommandList* list);
-    void endSegment(ID3D12GraphicsCommandList* list, std::vector<D3D12QueryResolve>& resolves);
-    bool writeTimestamp(ID3D12GraphicsCommandList* list, std::vector<D3D12QueryResolve>& resolves);
+    bool beginSegment(CommandListRecorder* list);
+    void endSegment(CommandListRecorder* list, std::vector<D3D12QueryResolve>& resolves);
+    bool writeTimestamp(CommandListRecorder* list, std::vector<D3D12QueryResolve>& resolves);
     ID3D12Resource* predicateBuffer();
 
     // Recording state, owned by the recording thread.

@@ -4,6 +4,7 @@ d3d12_backend_src = files([
   'd3d12_backend_upscale.cpp',
   'd3d12_backend_scale.cpp',
   'd3d12_cs_thread.cpp',
+  'd3d12_command_recorder.cpp',
   'd3d12_pipeline_cache.cpp',
 ])
 

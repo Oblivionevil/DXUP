@@ -401,7 +401,7 @@ namespace dxup::d3d12 {
     }
 
     bool safeSetGraphicsRootDescriptorTable(
-        ID3D12GraphicsCommandList*   cmdList,
+        CommandListRecorder*         cmdList,
         UINT                         rootIndex,
         D3D12_GPU_DESCRIPTOR_HANDLE  gpuHandle) {
       __try {
@@ -418,7 +418,7 @@ namespace dxup::d3d12 {
     }
 
     bool safeSetComputeRootDescriptorTable(
-        ID3D12GraphicsCommandList*   cmdList,
+        CommandListRecorder*         cmdList,
         UINT                         rootIndex,
         D3D12_GPU_DESCRIPTOR_HANDLE  gpuHandle) {
       __try {
@@ -452,7 +452,7 @@ namespace dxup::d3d12 {
     }
 
     bool safeCopyTextureRegion(
-        ID3D12GraphicsCommandList*              cmdList,
+        CommandListRecorder*                    cmdList,
         const D3D12_TEXTURE_COPY_LOCATION*      dstLoc,
         UINT                                    dstX,
         UINT                                    dstY,
@@ -505,7 +505,7 @@ namespace dxup::d3d12 {
     }
 
     __declspec(noinline) void safeCopyTextureRegionSimple(
-        ID3D12GraphicsCommandList*              cmdList,
+        CommandListRecorder*                    cmdList,
         const D3D12_TEXTURE_COPY_LOCATION*      dstLoc,
         UINT                                    dstX,
         UINT                                    dstY,
@@ -631,7 +631,7 @@ namespace dxup::d3d12 {
     }
 
     bool safeResourceBarrier(
-        ID3D12GraphicsCommandList*              cmdList,
+        CommandListRecorder*                    cmdList,
         UINT                                    barrierCount,
         const D3D12_RESOURCE_BARRIER*           barriers) {
       __try {
@@ -682,7 +682,7 @@ namespace dxup::d3d12 {
 
     __declspec(noinline)
     bool safeCloseAndExecute(
-        ID3D12GraphicsCommandList* cmdList,
+        CommandListRecorder*       cmdList,
         ID3D12CommandQueue* cmdQueue,
         int flushCount,
         bool collectTiming,
@@ -702,7 +702,7 @@ namespace dxup::d3d12 {
           logMessage(LogLevel::Error, "safeCloseAndExecute: Close failed hr=0x%08x flush=%d", hr, flushCount);
           return false;
         }
-        ID3D12CommandList* cmdLists[] = { cmdList };
+        ID3D12CommandList* cmdLists[] = { cmdList->raw() };
         cmdQueue->ExecuteCommandLists(1, cmdLists);
         if (collectTiming) {
           QueryPerformanceCounter(&execEnd);
@@ -722,7 +722,7 @@ namespace dxup::d3d12 {
     }
 
     bool safeOMSetRenderTargets(
-        ID3D12GraphicsCommandList*              cmdList,
+        CommandListRecorder*                    cmdList,
         UINT                                    renderTargetCount,
         const D3D12_CPU_DESCRIPTOR_HANDLE*      rtvHandles,
         BOOL                                    rtvSingleHandle,
@@ -802,14 +802,16 @@ namespace dxup::d3d12 {
     }
 
     // Create command list
+    ComPtr<ID3D12GraphicsCommandList> cmdList;
     HRESULT hr = d3d12Device->CreateCommandList(0,
       D3D12_COMMAND_LIST_TYPE_DIRECT,
       m_currentAllocator.Get(), nullptr,
-      IID_PPV_ARGS(&m_cmdList));
+      IID_PPV_ARGS(&cmdList));
     if (FAILED(hr)) {
       logMessage(LogLevel::Error, "Failed to create command list (hr=0x%08x)", hr);
       throw std::runtime_error("Failed to create command list");
     }
+    m_cmdList.setList(std::move(cmdList));
 
     { HRESULT chk = d3d12Device->GetDeviceRemovedReason();
       if (FAILED(chk)) logMessage(LogLevel::Error, "Device hung after CreateCommandList! reason=0x%08X", chk); }
@@ -901,6 +903,7 @@ namespace dxup::d3d12 {
 
   D3D12BackendContext::~D3D12BackendContext() {
 #ifdef _WIN32
+    m_cmdList.stopThread();
     // With ring allocator, GPU may still be executing command lists using our
     // allocators even when upload lists are empty. Must always sync before
     // destroying allocators, since all contexts share one command queue.
@@ -1726,7 +1729,7 @@ namespace dxup::d3d12 {
             return;
           if (perfStatsEnabled() && !m_copyOnly)
             m_perfIntervalRootTableSets++;
-          if (!safeSetComputeRootDescriptorTable(m_cmdList.Get(), rootIndex, gpuHandle)) {
+          if (!safeSetComputeRootDescriptorTable(&m_cmdList, rootIndex, gpuHandle)) {
             logMessage(LogLevel::Error,
               "commitUavBindings: compute root table fault at stage=%u root=%u gpu=%p",
               stageIdx,
@@ -1740,7 +1743,7 @@ namespace dxup::d3d12 {
             return;
           if (perfStatsEnabled() && !m_copyOnly)
             m_perfIntervalRootTableSets++;
-          if (!safeSetGraphicsRootDescriptorTable(m_cmdList.Get(), rootIndex, gpuHandle)) {
+          if (!safeSetGraphicsRootDescriptorTable(&m_cmdList, rootIndex, gpuHandle)) {
             logMessage(LogLevel::Error,
               "commitUavBindings: graphics root table fault at stage=%u root=%u gpu=%p",
               stageIdx,
@@ -2792,12 +2795,12 @@ namespace dxup::d3d12 {
     if (!effectiveCount && !hasDsv) {
       bool omSetSucceeded = true;
       if (m_trackedRTVCount || m_trackedDSVBound)
-        omSetSucceeded = safeOMSetRenderTargets(m_cmdList.Get(), 0, nullptr, FALSE, nullptr);
+        omSetSucceeded = safeOMSetRenderTargets(&m_cmdList, 0, nullptr, FALSE, nullptr);
       m_trackedRTVCount = 0;
       m_trackedDSVBound = false;
       m_trackedOmBindingValid = omSetSucceeded;
     } else if (!safeOMSetRenderTargets(
-        m_cmdList.Get(),
+        &m_cmdList,
         effectiveCount,
         effectiveCount ? rtvHandles : nullptr,
         FALSE,
@@ -2857,7 +2860,7 @@ namespace dxup::d3d12 {
 
     bool omSetSucceeded = true;
     if (m_trackedRTVCount || m_trackedDSVBound)
-      omSetSucceeded = safeOMSetRenderTargets(m_cmdList.Get(), 0, nullptr, FALSE, nullptr);
+      omSetSucceeded = safeOMSetRenderTargets(&m_cmdList, 0, nullptr, FALSE, nullptr);
 
     resetBindingTracking();
     m_trackedOmBindingValid = omSetSucceeded;
@@ -3177,7 +3180,7 @@ namespace dxup::d3d12 {
     if (accessTracking())
       trackCommand(false);
     if (m_gpuProfiler.capturing())
-      m_gpuProfiler.onDraw(m_cmdList.Get());
+      m_gpuProfiler.onDraw(m_cmdList.raw());
     prepareShaderAccess(false);
     const bool infoDiagnostics = m_infoDiagnosticsEnabled;
     if (infoDiagnostics) {
@@ -3260,7 +3263,7 @@ namespace dxup::d3d12 {
     if (accessTracking())
       trackCommand(false);
     if (m_gpuProfiler.capturing())
-      m_gpuProfiler.onDraw(m_cmdList.Get());
+      m_gpuProfiler.onDraw(m_cmdList.raw());
     prepareShaderAccess(false);
     const bool infoDiagnostics = m_infoDiagnosticsEnabled;
     if (infoDiagnostics) {
@@ -3340,7 +3343,7 @@ namespace dxup::d3d12 {
     if (accessTracking())
       trackCommand(true);
     if (m_gpuProfiler.capturing())
-      m_gpuProfiler.onDispatch(m_cmdList.Get(), m_computeShaderHash);
+      m_gpuProfiler.onDispatch(m_cmdList.raw(), m_computeShaderHash);
     prepareShaderAccess(true);
     if (m_recentOpsEnabled)
       DXUP_RECENT_OP("Dispatch(%u,%u,%u)", x, y, z);
@@ -3393,7 +3396,7 @@ namespace dxup::d3d12 {
     if (accessTracking())
       trackCommand(false);
     if (m_gpuProfiler.capturing())
-      m_gpuProfiler.onDraw(m_cmdList.Get());
+      m_gpuProfiler.onDraw(m_cmdList.raw());
     prepareShaderAccess(false);
     if (!buffer) return;
     auto* d3d12Buffer = static_cast<D3D12BackendBuffer*>(buffer);
@@ -3425,7 +3428,7 @@ namespace dxup::d3d12 {
     if (accessTracking())
       trackCommand(false);
     if (m_gpuProfiler.capturing())
-      m_gpuProfiler.onDraw(m_cmdList.Get());
+      m_gpuProfiler.onDraw(m_cmdList.raw());
     prepareShaderAccess(false);
     if (!buffer) return;
     auto* d3d12Buffer = static_cast<D3D12BackendBuffer*>(buffer);
@@ -3465,7 +3468,7 @@ namespace dxup::d3d12 {
     if (FAILED(d3d12Device->CreateCommittedResource(&heapProps, D3D12_HEAP_FLAG_NONE, &desc,
           D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&m_breadcrumbBuffer)))
      || FAILED(m_breadcrumbBuffer->Map(0, nullptr, &mapped))
-     || FAILED(m_cmdList.As(&m_breadcrumbList))) {
+     || FAILED(m_cmdList.raw()->QueryInterface(IID_PPV_ARGS(&m_breadcrumbList)))) {
       m_breadcrumbBuffer = nullptr;
       m_breadcrumbList = nullptr;
       return;
@@ -3559,7 +3562,7 @@ namespace dxup::d3d12 {
     if (accessTracking())
       trackCommand(true);
     if (m_gpuProfiler.capturing())
-      m_gpuProfiler.onDispatch(m_cmdList.Get(), m_computeShaderHash);
+      m_gpuProfiler.onDispatch(m_cmdList.raw(), m_computeShaderHash);
     prepareShaderAccess(true);
     if (!buffer) return;
     auto* d3d12Buffer = static_cast<D3D12BackendBuffer*>(buffer);
@@ -3667,10 +3670,9 @@ namespace dxup::d3d12 {
     }
 
     if (counterWriteCount) {
-      ComPtr<ID3D12GraphicsCommandList2> cmdList2;
       flushBarriers();
-      if (SUCCEEDED(m_cmdList.As(&cmdList2)) && cmdList2)
-        cmdList2->WriteBufferImmediate(counterWriteCount, counterWrites, nullptr);
+      if (m_cmdList.hasList2())
+        m_cmdList->WriteBufferImmediate(counterWriteCount, counterWrites, nullptr);
     }
 
     for (uint32_t i = 0; i < m_soBufferCount; i++) {
@@ -3744,7 +3746,7 @@ namespace dxup::d3d12 {
     if (accessTracking())
       trackCommand(false);
     if (m_gpuProfiler.capturing())
-      m_gpuProfiler.onDraw(m_cmdList.Get());
+      m_gpuProfiler.onDraw(m_cmdList.raw());
     prepareShaderAccess(false);
     if (!vertexBuffer || !stride)
       return;
@@ -3973,7 +3975,7 @@ namespace dxup::d3d12 {
       srcBoxPtr = &srcBox;
     }
 
-    safeCopyTextureRegionSimple(m_cmdList.Get(), &dstLoc, dstX, dstY, dstZ, &srcLoc, srcBoxPtr, m_device);
+    safeCopyTextureRegionSimple(&m_cmdList, &dstLoc, dstX, dstY, dstZ, &srcLoc, srcBoxPtr, m_device);
     // The second plane too (D3D11 copies both): depth/stencil copies are of
     // whole subresources; the chroma of video images is subsampled, its
     // region and offset scaled (NV11: a quarter of the width; else halves).
@@ -4784,7 +4786,7 @@ namespace dxup::d3d12 {
     }
 
     bool copyOk = safeCopyTextureRegion(
-      m_cmdList.Get(), &dstLoc, copyRegion.x, copyRegion.y, copyRegion.z,
+      &m_cmdList, &dstLoc, copyRegion.x, copyRegion.y, copyRegion.z,
       &srcLoc, srcBoxPtr, d3d12Src, &copyRegion, subresourceIdx, numRows, rowSizeBytes);
 
     if (!copyOk) {
@@ -5979,8 +5981,7 @@ namespace dxup::d3d12 {
       }
 
       if (canUseImmediate && dwordCount) {
-        ComPtr<ID3D12GraphicsCommandList2> cmdList2;
-        if (SUCCEEDED(m_cmdList.As(&cmdList2)) && cmdList2) {
+        if (m_cmdList.hasList2()) {
           std::vector<D3D12_WRITEBUFFERIMMEDIATE_PARAMETER> params;
           params.reserve(static_cast<size_t>(dwordCount));
 
@@ -6004,7 +6005,7 @@ namespace dxup::d3d12 {
           transitionResource(d3d12Buffer, D3D12_RESOURCE_STATE_COPY_DEST);
           holdBatchResource(d3d12Buffer->getResource());
           flushBarriers();
-          cmdList2->WriteBufferImmediate(static_cast<UINT>(params.size()), params.data(), nullptr);
+          m_cmdList->WriteBufferImmediate(static_cast<UINT>(params.size()), params.data(), nullptr);
           restoreBoundBufferState(d3d12Buffer);
           if (perfStatsEnabled() && !m_copyOnly)
             m_perfIntervalImmediateBufferUpdateCalls += validRegionCount;
@@ -6119,7 +6120,7 @@ namespace dxup::d3d12 {
 
     // Beginning again discards the running segment.
     if (q->m_active.load(std::memory_order_relaxed) && q->m_context == this) {
-      q->endSegment(m_cmdList.Get(), m_pendingQueryResolves);
+      q->endSegment(&m_cmdList, m_pendingQueryResolves);
       m_activeQueries.erase(std::remove(m_activeQueries.begin(), m_activeQueries.end(), q), m_activeQueries.end());
     }
 
@@ -6131,7 +6132,7 @@ namespace dxup::d3d12 {
     q->m_segments = 0;
     q->m_issued.store(false, std::memory_order_relaxed);
     q->m_active.store(true, std::memory_order_release);
-    if (!q->beginSegment(m_cmdList.Get())) {
+    if (!q->beginSegment(&m_cmdList)) {
       q->m_active.store(false, std::memory_order_release);
       return;
     }
@@ -6162,7 +6163,7 @@ namespace dxup::d3d12 {
     switch (q->getType()) {
       case QueryType::Timestamp:
         q->m_segments = 0;
-        if (!q->writeTimestamp(m_cmdList.Get(), m_pendingQueryResolves))
+        if (!q->writeTimestamp(&m_cmdList, m_pendingQueryResolves))
           return;
         break;
 
@@ -6179,7 +6180,7 @@ namespace dxup::d3d12 {
         if (!q->m_active.load(std::memory_order_relaxed) || q->m_context != this)
           return;
 
-        q->endSegment(m_cmdList.Get(), m_pendingQueryResolves);
+        q->endSegment(&m_cmdList, m_pendingQueryResolves);
         m_activeQueries.erase(std::remove(m_activeQueries.begin(), m_activeQueries.end(), q), m_activeQueries.end());
 
         // Occlusion predicates also resolve into a buffer SetPredication
@@ -6588,6 +6589,28 @@ namespace dxup::d3d12 {
 #endif
   }
 
+  void D3D12BackendContext::setExternallySynchronized(bool enabled) {
+    m_externallySynchronized = enabled;
+#ifdef _WIN32
+    // The CS worker is then the only thread that records. The GPU profiler
+    // and DRED breadcrumbs record into the list themselves.
+    if (enabled && !m_copyOnly && UserOverrides::get().recordThread && !m_gpuProfiler.enabled() && !m_breadcrumbList) {
+      m_cmdList.startThread();
+      if (m_cmdList.deferred())
+        logMessage(LogLevel::Info, "D3D12BackendContext: record thread on (d3d12.recordThread)");
+    }
+#endif
+  }
+
+  void D3D12BackendContext::retargetBufferViews(IBackendBuffer* buffer, const std::vector<IBackendBufferView*>& views) {
+#ifdef _WIN32
+    // Unordered access views are rewritten, which clears read.
+    if (buffer && static_cast<uint32_t>(buffer->getDesc().bindFlags & BindFlags::UnorderedAccess))
+      m_cmdList.drain();
+#endif
+    IBackendContext::retargetBufferViews(buffer, views);
+  }
+
   void D3D12BackendContext::retargetImage(IBackendImage* image, IUnknown* resource) {
 #ifdef _WIN32
     ContextLock ctxLock(*this);
@@ -6600,6 +6623,8 @@ namespace dxup::d3d12 {
       return;
     flushBarriers();
     ID3D12Resource* previous = d3d12Image->getResource();
+    // The views' render target descriptors are rewritten.
+    m_cmdList.drain();
     std::lock_guard<std::mutex> lock(d3d12Image->m_srvViewMutex);
     d3d12Image->retarget(std::move(d3d12Resource), D3D12_RESOURCE_STATE_PRESENT);
     ID3D12Resource* current = d3d12Image->getResource();
@@ -6684,7 +6709,7 @@ namespace dxup::d3d12 {
       // results are nobody's.
       if (!m_deviceRemoved && !m_closedForSubmission && m_cmdList) {
         std::vector<D3D12QueryResolve> unused;
-        query->endSegment(m_cmdList.Get(), unused);
+        query->endSegment(&m_cmdList, unused);
       }
       m_activeQueries.erase(active);
     }
@@ -6701,7 +6726,7 @@ namespace dxup::d3d12 {
 #ifdef _WIN32
   void D3D12BackendContext::suspendActiveQueries() {
     for (auto* query : m_activeQueries)
-      query->endSegment(m_cmdList.Get(), m_pendingQueryResolves);
+      query->endSegment(&m_cmdList, m_pendingQueryResolves);
     resolvePendingQueries();
   }
 
@@ -6738,7 +6763,7 @@ namespace dxup::d3d12 {
 
   void D3D12BackendContext::resumeActiveQueries() {
     for (auto* query : m_activeQueries)
-      query->beginSegment(m_cmdList.Get());
+      query->beginSegment(&m_cmdList);
   }
 
   void D3D12BackendContext::transitionPredicateBuffer(D3D12BackendQuery* query, D3D12_RESOURCE_STATES state) {
@@ -6942,13 +6967,13 @@ namespace dxup::d3d12 {
     }
 
     if (m_gpuProfiler.enabled())
-      m_gpuProfiler.beforeClose(m_cmdList.Get());
+      m_gpuProfiler.beforeClose(m_cmdList.raw());
     // Close and execute command list (SEH-protected)
     steps.mark(5);
     if (collectTiming)
       QueryPerformanceCounter(&timingStart);
     bool closeOk = safeCloseAndExecute(
-      m_cmdList.Get(), m_device->getCommandQueue(), flushCount - 1, collectFlushTiming,
+      &m_cmdList, m_device->getCommandQueue(), flushCount - 1, collectFlushTiming,
       steps.trace ? &steps.closed : nullptr);
     steps.mark(6);
     if (m_gpuProfiler.enabled()) {
@@ -7039,16 +7064,18 @@ namespace dxup::d3d12 {
       m_currentAllocator->Reset();
 
       // Release broken command list and create a fresh one
-      m_cmdList.Reset();
+      m_cmdList.setList(nullptr);
+      ComPtr<ID3D12GraphicsCommandList> freshList;
       HRESULT createHr = m_device->getDevice()->CreateCommandList(0,
         D3D12_COMMAND_LIST_TYPE_DIRECT,
         m_currentAllocator.Get(), nullptr,
-        IID_PPV_ARGS(&m_cmdList));
+        IID_PPV_ARGS(&freshList));
       if (FAILED(createHr)) {
         logMessage(LogLevel::Error, "flush() recovery: CreateCommandList failed (hr=0x%08x) — setting deviceRemoved", createHr);
         m_deviceRemoved = true;
         return;
       }
+      m_cmdList.setList(std::move(freshList));
 
       // Re-bind state on the fresh command list
       if (m_shaderVisibleCbvSrvUavHeap && m_shaderVisibleSamplerHeap) {
@@ -7297,7 +7324,7 @@ namespace dxup::d3d12 {
     }
 
     if (m_gpuProfiler.enabled())
-      m_gpuProfiler.beforeClose(m_cmdList.Get());
+      m_gpuProfiler.beforeClose(m_cmdList.raw());
     m_cmdList->Close();
     m_closedForSubmission = true;
 #endif
@@ -7313,7 +7340,7 @@ namespace dxup::d3d12 {
     }
 
     // Submit the closed command list
-    ID3D12CommandList* cmdLists[] = { m_cmdList.Get() };
+    ID3D12CommandList* cmdLists[] = { m_cmdList.raw() };
     m_device->getCommandQueue()->ExecuteCommandLists(1, cmdLists);
 
     // Signal and wait for completion
@@ -7342,7 +7369,7 @@ namespace dxup::d3d12 {
     m_currentPSO = nullptr;  // PSO might have been freed
 
     // Reset for potential reuse
-    m_currentAllocator->Reset();
+    m_cmdList.ResetAllocator(m_currentAllocator.Get());
     m_cmdList->Reset(m_currentAllocator.Get(), nullptr);
     m_closedForSubmission = false;
     m_predicationApplied = false;
@@ -7385,7 +7412,7 @@ namespace dxup::d3d12 {
 #ifdef _WIN32
     ContextLock ctxLock(*this);
     if (m_gpuProfiler.enabled() && !m_closedForSubmission) {
-      m_gpuProfiler.onPresent(m_cmdList.Get(), m_fenceValue + 1);
+      m_gpuProfiler.onPresent(m_cmdList.raw(), m_fenceValue + 1);
       if (m_gpuProfiler.wantsResults())
         m_gpuProfiler.writeResults(m_fence->GetCompletedValue());
     }
@@ -8099,6 +8126,7 @@ namespace dxup::d3d12 {
             rtvDesc.Texture3D.WSize = 1;
           }
           // Render target views are read when bound: one descriptor serves all.
+          m_cmdList.drain();
           device->CreateRenderTargetView(d3d12Image->getResource(), &rtvDesc, m_mipGenRtv);
           m_cmdList->OMSetRenderTargets(1, &m_mipGenRtv, FALSE, nullptr);
 
@@ -8222,7 +8250,7 @@ namespace dxup::d3d12 {
     if (m_gpuProfiler.capturing()) {
       static const char* const names[] = { "upsample color", "upsample depth", "resolve depth", "resolve color",
                                            "resolve finite" };
-      m_gpuProfiler.onInternal(m_cmdList.Get(), names[(std::min)(static_cast<uint32_t>(pass), 4u)],
+      m_gpuProfiler.onInternal(m_cmdList.raw(), names[(std::min)(static_cast<uint32_t>(pass), 4u)],
         (pass == MsaaPass::UpsampleColor || pass == MsaaPass::UpsampleDepth ? dst : src)->getResource(), format);
     }
     holdBatchResource(dst->getResource());
@@ -8255,6 +8283,7 @@ namespace dxup::d3d12 {
       D3D12_DEPTH_STENCIL_VIEW_DESC dsvDesc = {};
       dsvDesc.Format = format;
       dsvDesc.ViewDimension = dstDesc.sampleCount > 1 ? D3D12_DSV_DIMENSION_TEXTURE2DMS : D3D12_DSV_DIMENSION_TEXTURE2D;
+      m_cmdList.drain();
       device->CreateDepthStencilView(dst->getResource(), &dsvDesc, m_msaaPassDsv);
       m_cmdList->OMSetRenderTargets(0, nullptr, FALSE, &m_msaaPassDsv);
     } else {
@@ -8263,6 +8292,7 @@ namespace dxup::d3d12 {
       D3D12_RENDER_TARGET_VIEW_DESC rtvDesc = {};
       rtvDesc.Format = format;
       rtvDesc.ViewDimension = dstDesc.sampleCount > 1 ? D3D12_RTV_DIMENSION_TEXTURE2DMS : D3D12_RTV_DIMENSION_TEXTURE2D;
+      m_cmdList.drain();
       device->CreateRenderTargetView(dst->getResource(), &rtvDesc, m_mipGenRtv);
       m_cmdList->OMSetRenderTargets(1, &m_mipGenRtv, FALSE, nullptr);
     }
@@ -8459,7 +8489,7 @@ namespace dxup::d3d12 {
     }
 
     if (m_gpuProfiler.capturing())
-      m_gpuProfiler.onInternal(m_cmdList.Get(), "resolve stencil", src->getResource(), dstDesc.Format);
+      m_gpuProfiler.onInternal(m_cmdList.raw(), "resolve stencil", src->getResource(), dstDesc.Format);
     ensureDescriptorHeapSpace();
     holdBatchResource(dst->getResource());
     holdBatchResource(src->getResource());
@@ -8544,7 +8574,7 @@ namespace dxup::d3d12 {
         return;
     }
     if (m_gpuProfiler.capturing())
-      m_gpuProfiler.onInternal(m_cmdList.Get(), msSource ? "resolve stencil" : "upsample stencil",
+      m_gpuProfiler.onInternal(m_cmdList.raw(), msSource ? "resolve stencil" : "upsample stencil",
         (msSource ? src : dst)->getResource(), format);
     holdBatchResource(dst->getResource());
     holdBatchResource(src->getResource());
@@ -8577,6 +8607,7 @@ namespace dxup::d3d12 {
     D3D12_DEPTH_STENCIL_VIEW_DESC dsvDesc = {};
     dsvDesc.Format = format;
     dsvDesc.ViewDimension = samples > 1 ? D3D12_DSV_DIMENSION_TEXTURE2DMS : D3D12_DSV_DIMENSION_TEXTURE2D;
+    m_cmdList.drain();
     device->CreateDepthStencilView(dst->getResource(), &dsvDesc, m_msaaPassDsv);
     m_cmdList->OMSetRenderTargets(0, nullptr, FALSE, &m_msaaPassDsv);
     m_cmdList->ClearDepthStencilView(m_msaaPassDsv, D3D12_CLEAR_FLAG_STENCIL, 0.0f, 0, 0, nullptr);
@@ -8651,7 +8682,7 @@ namespace dxup::d3d12 {
     auto* d3d12Dst = static_cast<D3D12BackendImage*>(dst);
     auto* d3d12Src = static_cast<D3D12BackendImage*>(src);
     if (m_gpuProfiler.capturing())
-      m_gpuProfiler.onInternal(m_cmdList.Get(), "resolve", d3d12Src->getResource(), format);
+      m_gpuProfiler.onInternal(m_cmdList.raw(), "resolve", d3d12Src->getResource(), format);
 
     DXUP_RECENT_OP("ResolveSubresource dst=%p src=%p fmt=%u dstSub=%u srcSub=%u dstSamples=%u srcSamples=%u",
       d3d12Dst,
@@ -8859,6 +8890,7 @@ namespace dxup::d3d12 {
     rtvDesc.Format = format;
     rtvDesc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
     // The descriptor is read when the clear is recorded: one serves all.
+    m_cmdList.drain();
     m_device->getDevice()->CreateRenderTargetView(resource, &rtvDesc, m_lazyClearRtv);
     const float zero[4] = {};
     const bool paused = pausePredication();
@@ -9188,7 +9220,7 @@ namespace dxup::d3d12 {
           m_emittedBarriers.end(), m_pendingBarriers.begin(), m_pendingBarriers.end());
       recordBarrierBatchStats(m_pendingBarriers);
       safeResourceBarrier(
-        m_cmdList.Get(),
+        &m_cmdList,
         static_cast<UINT>(m_pendingBarriers.size()),
         m_pendingBarriers.data());
       m_pendingBarriers.clear();
@@ -9235,7 +9267,7 @@ namespace dxup::d3d12 {
             if (m_recentOpsEnabled)
               m_emittedBarriers.insert(m_emittedBarriers.end(), currentBatch.begin(), currentBatch.end());
             recordBarrierBatchStats(currentBatch);
-            safeResourceBarrier(m_cmdList.Get(),
+            safeResourceBarrier(&m_cmdList,
               static_cast<UINT>(currentBatch.size()),
               currentBatch.data());
               currentBatch.clear();
@@ -9254,7 +9286,7 @@ namespace dxup::d3d12 {
         if (m_recentOpsEnabled)
           m_emittedBarriers.insert(m_emittedBarriers.end(), currentBatch.begin(), currentBatch.end());
         recordBarrierBatchStats(currentBatch);
-        safeResourceBarrier(m_cmdList.Get(),
+        safeResourceBarrier(&m_cmdList,
           static_cast<UINT>(currentBatch.size()),
           currentBatch.data());
       }
@@ -9327,10 +9359,10 @@ namespace dxup::d3d12 {
     m_pendingUploads.clear();
     m_pendingUploadBytes = 0;
 
-    m_currentAllocator->Reset();
+    m_cmdList.ResetAllocator(m_currentAllocator.Get());
     HRESULT cmdListResetHr = m_cmdList->Reset(m_currentAllocator.Get(), nullptr);
     if (m_gpuProfiler.capturing())
-      m_gpuProfiler.onListBegin(m_cmdList.Get());
+      m_gpuProfiler.onListBegin(m_cmdList.raw());
     if (FAILED(cmdListResetHr)) {
       logMessage(LogLevel::Error, "Command list Reset() failed (hr=0x%08x)", cmdListResetHr);
       logDeviceRemovedReason(m_device, "CommandList::Reset");

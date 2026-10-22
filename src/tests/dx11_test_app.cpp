@@ -481,6 +481,7 @@ void main(uint2 id : SV_DispatchThreadID) {
         {"forced_sgssaa_alpha", &Dx11TestApp::testForcedSgssaaAlpha},
         {"forced_sgssaa_uav", &Dx11TestApp::testForcedSgssaaUav},
         {"relaxed_uav_barriers", &Dx11TestApp::testRelaxedUavBarriers},
+        {"record_thread", &Dx11TestApp::testRecordThread},
         {"native_fallback", &Dx11TestApp::testNativeFallback},
         {"fullscreen_swap_chain", &Dx11TestApp::testFullscreenSwapChain},
         {"window_ghosting", &Dx11TestApp::testWindowGhosting},
@@ -9278,6 +9279,14 @@ float4 main(float4 position : SV_Position, float4 t0 : TEXCOORD0, float4 t : TEX
     // still see every write.
     bool testRelaxedUavBarriers(std::string& error) {
       return runChildWithConfig("d3d11.relaxedUavBarriers = true\n", "--relaxed-uav-child", error);
+    }
+
+    // d3d12.recordThread: a second thread makes the calls on the command
+    // list. Draws with constant buffer updates and scissor rectangles between
+    // flushes, mipmaps, an occlusion query, an unordered access view clear
+    // and copies come out as without it (see runRecordThreadChild).
+    bool testRecordThread(std::string& error) {
+      return runChildWithConfig("d3d12.recordThread = true\n", "--record-thread-child", error);
     }
 
     // A pixel shader that writes an unordered access view runs once per
@@ -23022,6 +23031,162 @@ float4 main() : SV_Target { return color; }
     return result;
   }
 
+  // See testRecordThread. Returns 0 or the failed check.
+  int runRecordThreadChild() {
+    ComPtr<ID3D11Device> device;
+    ComPtr<ID3D11DeviceContext> context;
+    D3D_FEATURE_LEVEL level = D3D_FEATURE_LEVEL_11_0;
+    if (FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, &level, 1, D3D11_SDK_VERSION,
+          device.GetAddressOf(), nullptr, context.GetAddressOf())))
+      return 2;
+    static const char* kColorPs = R"(
+cbuffer Color : register(b0) { float4 color; };
+float4 main(float4 position : SV_Position) : SV_Target { return color; }
+)";
+    ShaderCompiler compiler;
+    ComPtr<ID3DBlob> vsBlob, psBlob;
+    ComPtr<ID3D11VertexShader> vs;
+    ComPtr<ID3D11PixelShader> ps;
+    std::string compileError;
+    if (!compiler.compile(kFullscreenTriangleVs, "main", "vs_5_0", vsBlob, compileError)
+     || !compiler.compile(kColorPs, "main", "ps_5_0", psBlob, compileError)
+     || FAILED(device->CreateVertexShader(vsBlob->GetBufferPointer(), vsBlob->GetBufferSize(), nullptr, vs.GetAddressOf()))
+     || FAILED(device->CreatePixelShader(psBlob->GetBufferPointer(), psBlob->GetBufferSize(), nullptr, ps.GetAddressOf())))
+      return 3;
+
+    const UINT size = 64, blocks = 16, block = size / blocks;
+    D3D11_TEXTURE2D_DESC targetDesc = { size, size, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, { 1, 0 }, D3D11_USAGE_DEFAULT,
+      D3D11_BIND_RENDER_TARGET, 0, 0 };
+    D3D11_TEXTURE2D_DESC stagingDesc = targetDesc;
+    stagingDesc.Usage = D3D11_USAGE_STAGING;
+    stagingDesc.BindFlags = 0;
+    stagingDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    ComPtr<ID3D11Texture2D> target, staging;
+    ComPtr<ID3D11RenderTargetView> rtv;
+    D3D11_BUFFER_DESC cbDesc = { 16, D3D11_USAGE_DEFAULT, D3D11_BIND_CONSTANT_BUFFER, 0, 0, 0 };
+    ComPtr<ID3D11Buffer> cb;
+    D3D11_RASTERIZER_DESC rasterDesc = {};
+    rasterDesc.FillMode = D3D11_FILL_SOLID;
+    rasterDesc.CullMode = D3D11_CULL_NONE;
+    rasterDesc.DepthClipEnable = TRUE;
+    rasterDesc.ScissorEnable = TRUE;
+    ComPtr<ID3D11RasterizerState> scissored;
+    if (FAILED(device->CreateTexture2D(&targetDesc, nullptr, target.GetAddressOf()))
+     || FAILED(device->CreateTexture2D(&stagingDesc, nullptr, staging.GetAddressOf()))
+     || FAILED(device->CreateRenderTargetView(target.Get(), nullptr, rtv.GetAddressOf()))
+     || FAILED(device->CreateBuffer(&cbDesc, nullptr, cb.GetAddressOf()))
+     || FAILED(device->CreateRasterizerState(&rasterDesc, scissored.GetAddressOf())))
+      return 4;
+
+    // Each 4x4 block its own color, from a constant buffer updated between
+    // the draws; flushes in between.
+    const float black[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+    context->ClearRenderTargetView(rtv.Get(), black);
+    ID3D11RenderTargetView* rtvs[1] = { rtv.Get() };
+    context->OMSetRenderTargets(1, rtvs, nullptr);
+    const D3D11_VIEWPORT viewport = { 0.0f, 0.0f, float(size), float(size), 0.0f, 1.0f };
+    context->RSSetViewports(1, &viewport);
+    context->RSSetState(scissored.Get());
+    context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    context->VSSetShader(vs.Get(), nullptr, 0);
+    context->PSSetShader(ps.Get(), nullptr, 0);
+    context->PSSetConstantBuffers(0, 1, cb.GetAddressOf());
+    for (UINT i = 0; i < blocks * blocks; i++) {
+      const float color[4] = { float(i % blocks) / 15.0f, float(i / blocks) / 15.0f, 0.5f, 1.0f };
+      context->UpdateSubresource(cb.Get(), 0, nullptr, color, 0, 0);
+      const D3D11_RECT rect = { LONG(i % blocks * block), LONG(i / blocks * block),
+                                LONG((i % blocks + 1) * block), LONG((i / blocks + 1) * block) };
+      context->RSSetScissorRects(1, &rect);
+      context->Draw(3, 0);
+      if (i % 37 == 36)
+        context->Flush();
+    }
+    context->CopyResource(staging.Get(), target.Get());
+    D3D11_MAPPED_SUBRESOURCE mapped = {};
+    if (FAILED(context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped)))
+      return 5;
+    int result = 0;
+    for (UINT i = 0; i < blocks * blocks && !result; i++) {
+      const auto* row = static_cast<const uint8_t*>(mapped.pData) + (i / blocks * block + 1) * mapped.RowPitch;
+      const uint8_t* pixel = row + (i % blocks * block + 1) * 4;
+      const int expected[4] = { int(i % blocks * 17), int(i / blocks * 17), 128, 255 };
+      for (int c = 0; c < 4; c++) {
+        if (std::abs(pixel[c] - expected[c]) > 1)
+          result = 6;
+      }
+    }
+    context->Unmap(staging.Get(), 0);
+    if (result)
+      return result;
+
+    // An occlusion query around a draw over the whole target.
+    context->RSSetState(nullptr);
+    D3D11_QUERY_DESC queryDesc = { D3D11_QUERY_OCCLUSION, 0 };
+    ComPtr<ID3D11Query> occlusion;
+    if (FAILED(device->CreateQuery(&queryDesc, occlusion.GetAddressOf())))
+      return 7;
+    context->Begin(occlusion.Get());
+    context->Draw(3, 0);
+    context->End(occlusion.Get());
+    UINT64 samples = 0;
+    while (context->GetData(occlusion.Get(), &samples, sizeof(samples), 0) != S_OK) {}
+    if (samples != size * size)
+      return 8;
+
+    // Mipmaps of one color down to 1x1.
+    D3D11_TEXTURE2D_DESC mipDesc = { size, size, 0, 1, DXGI_FORMAT_R8G8B8A8_UNORM, { 1, 0 }, D3D11_USAGE_DEFAULT,
+      D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE, 0, D3D11_RESOURCE_MISC_GENERATE_MIPS };
+    D3D11_TEXTURE2D_DESC tinyDesc = stagingDesc;
+    tinyDesc.Width = tinyDesc.Height = 1;
+    ComPtr<ID3D11Texture2D> mipped, tiny;
+    ComPtr<ID3D11ShaderResourceView> mipSrv;
+    if (FAILED(device->CreateTexture2D(&mipDesc, nullptr, mipped.GetAddressOf()))
+     || FAILED(device->CreateShaderResourceView(mipped.Get(), nullptr, mipSrv.GetAddressOf()))
+     || FAILED(device->CreateTexture2D(&tinyDesc, nullptr, tiny.GetAddressOf())))
+      return 9;
+    std::vector<uint32_t> texels(size * size, 0x80402010u);
+    context->UpdateSubresource(mipped.Get(), 0, nullptr, texels.data(), size * 4, 0);
+    context->GenerateMips(mipSrv.Get());
+    context->CopySubresourceRegion(tiny.Get(), 0, 0, 0, 0, mipped.Get(), 6, nullptr);
+    if (FAILED(context->Map(tiny.Get(), 0, D3D11_MAP_READ, 0, &mapped)))
+      return 10;
+    const auto* texel = static_cast<const uint8_t*>(mapped.pData);
+    const int expectedTexel[4] = { 0x10, 0x20, 0x40, 0x80 };
+    for (int c = 0; c < 4; c++) {
+      if (std::abs(texel[c] - expectedTexel[c]) > 1)
+        result = 11;
+    }
+    context->Unmap(tiny.Get(), 0);
+    if (result)
+      return result;
+
+    // An unordered access view clear, copied out.
+    D3D11_BUFFER_DESC bufferDesc = { 256 * 4, D3D11_USAGE_DEFAULT, D3D11_BIND_UNORDERED_ACCESS, 0, 0, 0 };
+    D3D11_BUFFER_DESC readDesc = { 256 * 4, D3D11_USAGE_STAGING, 0, D3D11_CPU_ACCESS_READ, 0, 0 };
+    ComPtr<ID3D11Buffer> buffer, readback;
+    ComPtr<ID3D11UnorderedAccessView> uav;
+    D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc = {};
+    uavDesc.Format = DXGI_FORMAT_R32_UINT;
+    uavDesc.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
+    uavDesc.Buffer.NumElements = 256;
+    if (FAILED(device->CreateBuffer(&bufferDesc, nullptr, buffer.GetAddressOf()))
+     || FAILED(device->CreateBuffer(&readDesc, nullptr, readback.GetAddressOf()))
+     || FAILED(device->CreateUnorderedAccessView(buffer.Get(), &uavDesc, uav.GetAddressOf())))
+      return 12;
+    const UINT values[4] = { 7, 7, 7, 7 };
+    context->ClearUnorderedAccessViewUint(uav.Get(), values);
+    context->CopyResource(readback.Get(), buffer.Get());
+    if (FAILED(context->Map(readback.Get(), 0, D3D11_MAP_READ, 0, &mapped)))
+      return 13;
+    const auto* words = static_cast<const uint32_t*>(mapped.pData);
+    for (UINT i = 0; i < 256; i++) {
+      if (words[i] != 7)
+        result = 14;
+    }
+    context->Unmap(readback.Get(), 0);
+    return result;
+  }
+
   // See testRelaxedUavBarriers. Returns 0 or the failed check.
   int runRelaxedUavChild() {
     ComPtr<ID3D11Device> device;
@@ -23262,6 +23427,8 @@ int main(int argc, char** argv) {
     return runGpuSpoofChild();
   if (argc > 1 && std::strcmp(argv[1], "--relaxed-uav-child") == 0)
     return runRelaxedUavChild();
+  if (argc > 1 && std::strcmp(argv[1], "--record-thread-child") == 0)
+    return runRecordThreadChild();
   if (argc > 1 && std::strcmp(argv[1], "--native-fallback-child") == 0)
     return runNativeFallbackChild();
   if (argc > 1 && std::strcmp(argv[1], "--lazy-render-targets-child") == 0)

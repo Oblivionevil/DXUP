@@ -167,6 +167,7 @@ namespace dxup::d3d12 {
     D3D12_RENDER_TARGET_VIEW_DESC rtvDesc = {};
     rtvDesc.Format = dstFormat;
     rtvDesc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+    m_cmdList.drain();
     device->CreateRenderTargetView(dst->getResource(), &rtvDesc, m_mipGenRtv);
     m_cmdList->OMSetRenderTargets(1, &m_mipGenRtv, FALSE, nullptr);
 
@@ -237,7 +238,7 @@ namespace dxup::d3d12 {
     }
 
     if (m_gpuProfiler.capturing())
-      m_gpuProfiler.onInternal(m_cmdList.Get(), "spatial upscale", dst->getResource(), dstFormat);
+      m_gpuProfiler.onInternal(m_cmdList.raw(), "spatial upscale", dst->getResource(), dstFormat);
     drawScalePass(scalePso, scaled, dstFormat, src, srcFormat, 0);
     if (sharpen) {
       uint32_t bits;

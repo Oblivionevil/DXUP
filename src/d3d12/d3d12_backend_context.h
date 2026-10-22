@@ -2,6 +2,7 @@
 
 #include "d3d12_backend_device.h"
 #include "d3d12_gpu_profiler.h"
+#include "d3d12_command_recorder.h"
 #include "../upscale/upscaler.h"
 #include "../util/util_config.h"
 #include <future>
@@ -258,6 +259,7 @@ namespace dxup::d3d12 {
     void resumePredication(bool paused);
     void setImageMinLod(IBackendImage* image, float minLod) override;
     void retargetImage(IBackendImage* image, IUnknown* resource) override;
+    void retargetBufferViews(IBackendBuffer* buffer, const std::vector<IBackendBufferView*>& views) override;
     void trackSwapChainBuffer(IUnknown* resource) override;
     void signalFence(IUnknown* fence, uint64_t value) override;
     void waitFence(IUnknown* fence, uint64_t value) override;
@@ -341,7 +343,9 @@ namespace dxup::d3d12 {
     // and serializes every other access; recording then skips the mutex.
     // Retired backend objects then also outlive the GPU work (see
     // retireAfterGpu), so bound resources need no references of their own.
-    void setExternallySynchronized(bool enabled) { m_externallySynchronized = enabled; }
+    // The immediate context then records on a thread of its own with
+    // d3d12.recordThread.
+    void setExternallySynchronized(bool enabled);
 
   private:
     D3D12BackendDevice* m_device;
@@ -413,7 +417,10 @@ namespace dxup::d3d12 {
     uint32_t m_currentAllocatorIndex = 0;
     ComPtr<ID3D12CommandAllocator> m_currentAllocator;
 
-    ComPtr<ID3D12GraphicsCommandList> m_cmdList;
+    // Every call on the command list goes through it: straight to D3D12,
+    // or with d3d12.recordThread to a thread of its own, drained before
+    // the list is closed and wherever a CPU descriptor it reads changes.
+    CommandListRecorder m_cmdList;
     // D3D11 orders unordered access between draws and dispatches: one sees
     // what the previous wrote. Each resource accessed through a UAV since its
     // last UAV barrier keeps how it was accessed (dxbc::UavAccess bits);

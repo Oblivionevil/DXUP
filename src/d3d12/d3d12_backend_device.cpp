@@ -1,4 +1,5 @@
 #include "d3d12_backend_device.h"
+#include "d3d12_command_recorder.h"
 #include "d3d12_backend_context.h"
 #include "d3d12_cs_thread.h"
 #include "d3d12_dxbc.h"
@@ -1547,7 +1548,7 @@ namespace dxup::d3d12 {
     return m_desc.type == QueryType::StreamOutputStatistics && m_desc.stream == QueryDesc::kAllStreams ? 4u : 1u;
   }
 
-  bool D3D12BackendQuery::beginSegment(ID3D12GraphicsCommandList* list) {
+  bool D3D12BackendQuery::beginSegment(CommandListRecorder* list) {
     const uint32_t perSegment = slotsPerSegment();
     const uint32_t first = m_segments * perSegment;
     while (m_slots.size() < first + perSegment) {
@@ -1563,7 +1564,7 @@ namespace dxup::d3d12 {
     return true;
   }
 
-  void D3D12BackendQuery::endSegment(ID3D12GraphicsCommandList* list, std::vector<D3D12QueryResolve>& resolves) {
+  void D3D12BackendQuery::endSegment(CommandListRecorder* list, std::vector<D3D12QueryResolve>& resolves) {
     if (!m_segments)
       return;
     const uint32_t perSegment = slotsPerSegment();
@@ -1575,7 +1576,7 @@ namespace dxup::d3d12 {
     }
   }
 
-  bool D3D12BackendQuery::writeTimestamp(ID3D12GraphicsCommandList* list, std::vector<D3D12QueryResolve>& resolves) {
+  bool D3D12BackendQuery::writeTimestamp(CommandListRecorder* list, std::vector<D3D12QueryResolve>& resolves) {
     if (m_slots.empty()) {
       D3D12QuerySlot slot;
       if (!m_device->getQueryPool().allocate(m_device->getDevice(), heapType(), slot))

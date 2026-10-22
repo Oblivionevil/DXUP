@@ -1016,7 +1016,7 @@ namespace dxup::d3d12 {
       return false;
 
     if (m_gpuProfiler.capturing())
-      m_gpuProfiler.onDispatch(m_cmdList.Get(), m_computeShaderHash);
+      m_gpuProfiler.onDispatch(m_cmdList.raw(), m_computeShaderHash);
     if (m_recentOpsEnabled)
       DXUP_RECENT_OP("Upscale %s %ux%u -> %ux%u", upscale::kindName(request.kind), renderWidth, renderHeight,
         outputDesc.width, outputDesc.height);
@@ -1107,7 +1107,7 @@ namespace dxup::d3d12 {
     frame.sharpness = request.sharpness;
     frame.frameTimeMs = frameTimeMs;
     frame.reset = m_upscalerReset;
-    const bool evaluated = m_upscaler->evaluate(m_cmdList.Get(), frame);
+    const bool evaluated = m_upscaler->evaluate(m_cmdList.raw(), frame);
     m_upscalerReset = false;
 
     for (uint32_t i = 0; i < 2; i++)

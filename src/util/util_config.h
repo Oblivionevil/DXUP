@@ -63,6 +63,11 @@ namespace dxup {
   //   dxgi.customVendorId = 10de     the ids (hex) and name the application
   //   dxgi.customDeviceId = 2503     sees, over those of spoofVendor
   //   dxgi.customDeviceDesc = ...
+  //   d3d12.recordThread = true      experimental: a second worker thread
+  //                                  makes the calls on the Direct3D 12
+  //                                  command list that the first prepares
+  //                                  (about 4% slower on NVIDIA in DXUP's
+  //                                  benchmarks, see CommandListRecorder)
   class Config {
   public:
     static const Config& get();
@@ -139,6 +144,9 @@ namespace dxup {
     // Barrier batches that wait for nothing move to an earlier batch
     // (d3d12.barrierHoisting, see D3D12BackendContext).
     bool     barrierHoisting  = true;
+    // The CS worker's calls on the command list are made by a thread of
+    // their own (d3d12.recordThread, see CommandListRecorder).
+    bool     recordThread     = false;
     // Pixel shader writes no render target takes leave the shader, as
     // Direct3D 11 drivers compile it for the bound targets
     // (d3d12.pixelOutputMasks).
