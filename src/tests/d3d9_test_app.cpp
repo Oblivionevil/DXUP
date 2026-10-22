@@ -1745,6 +1745,57 @@ PO main(float4 c : COLOR0) { PO o; o.c0 = c; o.c1 = c.gbra * 0.8; return o; }
     return true;
   }
 
+  // Dot products with an infinite or NaN factor where the other is 0 give 0
+  // on NVIDIA's Direct3D 9. DXUP emulates that only for draws whose
+  // shaders read such a constant: the same shaders draw with finite
+  // constants, then an infinite pixel shader constant, then a NaN vertex
+  // shader constant reaching the pixel shader through a texture
+  // coordinate, then finite constants again. Every strip is gray (0.5);
+  // a draw that missed the switch gives NaN, black.
+  bool sceneFiniteSwitch(IDirect3DDevice9* d) {
+    d->Clear(0, nullptr, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, 0xff336699u, 1.0f, 0);
+    d->SetRenderState(D3DRS_LIGHTING, FALSE);
+    d->SetRenderState(D3DRS_ZENABLE, FALSE);
+    d->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+    const auto vsCode = assemble("vs_2_0\ndcl_position v0\nmov oPos, v0\nmov oT0, c4\n");
+    const auto constantCode = assemble("ps_2_0\nmov r1, c1\ndp3 r0, c0, r1\nmov oC0, r0\n");
+    const auto varyingCode = assemble("ps_2_0\ndcl t0\ndp3 r0, t0, c0\nmov oC0, r0\n");
+    IDirect3DVertexShader9* vs = nullptr;
+    IDirect3DPixelShader9* constantPs = nullptr;
+    IDirect3DPixelShader9* varyingPs = nullptr;
+    if (vsCode.empty() || constantCode.empty() || varyingCode.empty() || FAILED(d->CreateVertexShader(vsCode.data(), &vs))
+     || FAILED(d->CreatePixelShader(constantCode.data(), &constantPs))
+     || FAILED(d->CreatePixelShader(varyingCode.data(), &varyingPs)))
+      return false;
+    d->SetVertexShader(vs);
+    d->SetFVF(D3DFVF_XYZ);
+    const float inf = std::numeric_limits<float>::infinity(), nan = std::numeric_limits<float>::quiet_NaN();
+    const float weights[4] = { 0.0f, 0.5f, 0.0f, 0.0f };
+    const float ones[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+    const float infinite[4] = { inf, 1.0f, 0.0f, 1.0f };
+    const float nanCoord[4] = { nan, 1.0f, 0.0f, 1.0f };
+    d->SetPixelShaderConstantF(0, weights, 1);
+    struct Case { IDirect3DPixelShader9* ps; const float* c1; const float* c4; };
+    const Case cases[4] = {
+      { constantPs, ones, ones }, { constantPs, infinite, ones }, { varyingPs, infinite, nanCoord }, { constantPs, ones, ones },
+    };
+    for (int i = 0; i < 4; i++) {
+      d->SetPixelShader(cases[i].ps);
+      d->SetPixelShaderConstantF(1, cases[i].c1, 1);
+      d->SetVertexShaderConstantF(4, cases[i].c4, 1);
+      const float x0 = -0.95f + 0.5f * float(i), x1 = x0 + 0.4f;
+      const float quad[12] = { x0, 0.8f, 0.5f, x1, 0.8f, 0.5f, x0, -0.8f, 0.5f, x1, -0.8f, 0.5f };
+      d->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, quad, 3 * sizeof(float));
+    }
+    d->SetVertexShader(nullptr);
+    d->SetPixelShader(nullptr);
+    d->SetRenderState(D3DRS_ZENABLE, TRUE);
+    vs->Release();
+    constantPs->Release();
+    varyingPs->Release();
+    return true;
+  }
+
   // A view-projection matrix whose z column is NaN (Mirror's Edge in some
   // frames), so every vertex gets a NaN depth. From the left: depth test
   // LESSEQUAL, depth test ALWAYS, depth test off, and finite depth.
@@ -2694,6 +2745,7 @@ float4 main(float2 t : TEXCOORD0) : COLOR {
     { "cube_volume_shader", sceneCubeVolumeShader },
     { "point_sprites", scenePointSprites },
     { "float_specials", sceneFloatSpecials },
+    { "finite_switch", sceneFiniteSwitch },
     { "ati_lock", sceneAtiLock },
     { "nan_depth", sceneNanDepth },
     { "clip_planes", sceneClipPlanes },

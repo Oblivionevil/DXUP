@@ -156,7 +156,9 @@ namespace dxup {
     int32_t  lazyTargets      = -1;
     // 0 times infinity or NaN in Direct3D 9 shaders (d3d9.floatEmulation;
     // Mirror's Edge has NaN in its data): -1 auto, 0 in the dot products
-    // (as NVIDIA's and Intel's drivers), mul and mad IEEE (as Intel's; DXVK
+    // (as NVIDIA's and Intel's drivers; in pixel shaders only for draws whose
+    // shaders read a NaN or infinite constant, see Shader::variant), mul and
+    // mad IEEE (as Intel's; DXVK
     // too where the GPU has no such multiply: emulating it in mul and mad
     // nearly doubles what shaders cost to compile, see d3d9_shader_test
     // --compile-records), and rcp, rsq, log of 0 finite, so the shader makes

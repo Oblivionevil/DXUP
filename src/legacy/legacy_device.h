@@ -714,6 +714,10 @@ namespace dxup::legacy {
     InputModes m_inputModes[256];
     // Float constants the application set: those below this, ever.
     uint32_t m_constantsWritten[2] = {};
+    // Groups of 4 float constants holding NaN or infinity, per stage: pixel
+    // shaders keep the 0 times infinity of their dot products only while
+    // their draw reads such a constant (selectShaders).
+    uint64_t m_nonFiniteGroups[2] = {};
     // The float constants of a draw's shader: relative reads find no more
     // than the application set and one zero constant past them (DXVK too
     // uploads no more than the highest constant set).

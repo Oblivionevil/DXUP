@@ -922,6 +922,8 @@ namespace dxup::legacy {
           + floatLiteral(i.literal[2]) + ", " + floatLiteral(i.literal[3]) + ")";
         if (index < 256)
           w.floatDefBits[index] = { i.literal[0], i.literal[1], i.literal[2], i.literal[3] };
+        for (int k = 0; k < 4; k++)
+          info.nonFiniteDefs |= (i.literal[k] & 0x7f800000u) == 0x7f800000u;
         if (layout)
           layout->floatDefs[index] = { i.literal[0], i.literal[1], i.literal[2], i.literal[3] };
       } else if (i.opcode == OpDefI) {

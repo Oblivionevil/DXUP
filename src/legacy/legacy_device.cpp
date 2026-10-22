@@ -1325,7 +1325,7 @@ namespace dxup::legacy {
         uint64_t shader;
         uint32_t minVaryings;
         uint16_t projected, reserved1, shadowSamplers, reserved2;
-        uint8_t  clipPlanes, typed, reserved[2];
+        uint8_t  clipPlanes, typed, flags, reserved;   // flags: 1 finite inputs
         uint8_t  types[16];
       };
       static_assert(sizeof(Record) == 40, "record layout");
@@ -1343,6 +1343,7 @@ namespace dxup::legacy {
         record.shadowSamplers = options.shadowSamplers;
         record.projected = options.projected;
         record.clipPlanes = options.clipPlanes;
+        record.flags = options.finiteInputs ? 1 : 0;
         if (options.boundSamplerTypes) {
           record.typed = 1;
           std::memcpy(record.types, options.boundSamplerTypes, sizeof(record.types));
@@ -1388,6 +1389,7 @@ namespace dxup::legacy {
         options.shadowSamplers = record.shadowSamplers;
         options.projected = record.projected;
         options.clipPlanes = record.clipPlanes;
+        options.finiteInputs = (record.flags & 1) != 0;
         options.boundSamplerTypes = record.typed ? record.types : nullptr;
       }
 
@@ -1593,6 +1595,8 @@ namespace dxup::legacy {
       hash = fnv64Multiply(hash ^ tokens[i]);
     TranslateOptions9 options;
     driverBehavior(options);
+    // Pixel shaders draw with finite constants nearly always.
+    options.finiteInputs = true;
     // Drawn in an earlier run: compiled since the device was made.
     std::shared_ptr<Shader> shader = device->takeWarmShader(hash, tokens, count);
     if (!shader)
@@ -1700,6 +1704,7 @@ namespace dxup::legacy {
         if (shader) {
           TranslateOptions9 options;
           driverBehavior(options);
+          options.finiteInputs = true;
           shader->variant(options, false);
           for (const VariantRecords::Record& record : VariantRecords::instance().find(hash)) {
             if (warmup->cancelled)
@@ -1786,6 +1791,14 @@ namespace dxup::legacy {
     options.clipPlanes = in.clipPlanes;
     options.projected = in.projected;
     driverBehavior(options);
+    // d3d9.floatEmulation auto: a pixel shader whose constants are finite
+    // gets plain dot products (the emulation costs heavy shaders about a
+    // fifth of their time). NaN or infinity from textures or vertices is
+    // not looked for.
+    options.finiteInputs = in.finiteInputs && !vertex() && !m_info.nonFiniteDefs
+                        && UserOverrides::get().d3d9FloatEmulation < 0;
+    if (options.finiteInputs)
+      options.dotEmulation = false;
     if (vertex())
       options.minVaryings = (std::max)(options.minVaryings, m_info.varyingCount);
     else
@@ -2174,6 +2187,7 @@ namespace dxup::legacy {
     std::memset(m_constants, 0, sizeof(m_constants));
     m_constants[0].limits[0] = m_constants[1].limits[0] = 255;
     m_constantsWritten[0] = m_constantsWritten[1] = 0;
+    m_nonFiniteGroups[0] = m_nonFiniteGroups[1] = 0;
     m_changedConstants[0] = m_changedConstants[1] = ~0ull;
     m_shaderConstantsDirty[0] = m_shaderConstantsDirty[1] = true;
     m_shaderIntsDirty[0] = m_shaderIntsDirty[1] = true;
@@ -2548,12 +2562,17 @@ namespace dxup::legacy {
     // Copied in one pass that notes the groups of 4 registers whose bits
     // changed: the same values again (games set their camera for every
     // draw) need no upload, and uploads pass only changed groups.
+    // The same pass notes NaN or infinity among the new values (exponent
+    // all ones).
     float (*target)[4] = m_constants[pixel].f;
     uint64_t changed = 0;
+    const __m128i exponent = _mm_set1_epi32(0x7f800000);
+    __m128i special = _mm_setzero_si128();
     auto copy = [&](uint32_t i) {
       const __m128i value = _mm_loadu_si128(reinterpret_cast<const __m128i*>(data + size_t(i) * 4));
       const __m128i old = _mm_loadu_si128(reinterpret_cast<const __m128i*>(target[start + i]));
       _mm_storeu_si128(reinterpret_cast<__m128i*>(target[start + i]), value);
+      special = _mm_or_si128(special, _mm_cmpeq_epi32(_mm_and_si128(value, exponent), exponent));
       return _mm_cmpeq_epi32(value, old);
     };
     uint32_t i = 0;
@@ -2569,6 +2588,26 @@ namespace dxup::legacy {
       return;
     m_shaderConstantsDirty[pixel] = true;
     m_changedConstants[pixel] |= changed;
+    // Only finite values into groups that held none: nothing else to do.
+    if (!_mm_movemask_epi8(special) && !(m_nonFiniteGroups[pixel] & changed))
+      return;
+    // Else the groups that changed are looked at whole.
+    uint64_t nonFinite = m_nonFiniteGroups[pixel] & ~changed;
+    for (uint64_t bits = changed; bits; bits &= bits - 1) {
+      const uint32_t low = uint32_t(bits);
+      const uint32_t group = low ? lowestBit(low) : 32 + lowestBit(uint32_t(bits >> 32));
+      __m128i groupSpecial = _mm_setzero_si128();
+      for (uint32_t r = 0; r < 4; r++) {
+        const __m128i value = _mm_loadu_si128(reinterpret_cast<const __m128i*>(target[group * 4 + r]));
+        groupSpecial = _mm_or_si128(groupSpecial, _mm_cmpeq_epi32(_mm_and_si128(value, exponent), exponent));
+      }
+      if (_mm_movemask_epi8(groupSpecial))
+        nonFinite |= 1ull << group;
+    }
+    if (nonFinite != m_nonFiniteGroups[pixel]) {
+      m_nonFiniteGroups[pixel] = nonFinite;
+      m_dirty |= DirtyShaders;   // the pixel shader's variant may change
+    }
   }
 
   uint32_t Device::shaderFloats(bool pixel, const ShaderInfo9& info) const {
@@ -4142,8 +4181,16 @@ namespace dxup::legacy {
     uint32_t projectedStages = 0;
     for (uint32_t stage = 0; stage < 4; stage++)
       projectedStages |= (m_stageStates[stage][TssTextureTransformFlags] & 256) ? 1u << stage : 0u;
+    // Pixel shaders' dot products skip the 0 times infinity emulation while
+    // no float constant the draw's shaders read is NaN or infinite.
+    bool finite = true;
+    if (m_pixelShader && (m_nonFiniteGroups[0] | m_nonFiniteGroups[1])) {
+      auto groups = [](uint32_t floats) { return floats >= 256 ? ~0ull : (1ull << ((floats + 3) / 4)) - 1; };
+      finite = !(m_nonFiniteGroups[1] & groups(shaderFloats(true, m_pixelShader->info())))
+            && !(m_vertexShader && (m_nonFiniteGroups[0] & groups(shaderFloats(false, m_vertexShader->info()))));
+    }
     const uint32_t states = (m_shadowMask & 0xffffu) | uint32_t(m_renderStates[RsClipPlaneEnable] & 0x3f) << 16
-                          | projectedStages << 22;
+                          | projectedStages << 22 | uint32_t(finite) << 26;
     const uint32_t generation = g_shaderObjectGeneration.load(std::memory_order_acquire);
     if (generation != m_selectionGeneration) {
       for (ShaderSelection& selection : m_selections)
@@ -4195,6 +4242,7 @@ namespace dxup::legacy {
           shadow |= uint16_t(1u << i);
       }
       options.shadowSamplers = shadow;
+      options.finiteInputs = finite;
       // Pixel shaders 1.1 to 1.3 project t# as the stage's D3DTTFF_PROJECTED
       // says, by w whatever D3DTTFF_COUNTn says (Windows' NVIDIA Direct3D 9;
       // w is 1 for fewer coordinates).
@@ -4250,6 +4298,7 @@ namespace dxup::legacy {
       uint32_t stateMask = 0, psTypes = 0;
       if (m_pixelShader) {
         stateMask |= m_pixelShader->info().major == 1 ? 0xffffu : uint32_t(m_pixelShader->m_usedSamplers);
+        stateMask |= 1u << 26;
         if (m_pixelShader->info().major == 1) {
           psTypes = m_psTextureTypes | 0x80000000u;   // never 0: compared
           if (m_pixelShader->info().minor < 4)

@@ -58,6 +58,7 @@ namespace dxup::legacy {
     std::vector<std::pair<uint32_t, std::array<uint32_t, 4>>> relativeDefs;
     bool     writesDepth = false;
     uint32_t colorOutputs = 0;         // bitmask of oC0-3
+    bool     nonFiniteDefs = false;    // a def constant is NaN or infinite
   };
 
   struct TranslateOptions9 {
@@ -79,6 +80,10 @@ namespace dxup::legacy {
     // (dotEmulation); IEEE gives NaN.
     bool floatEmulation = false;
     bool dotEmulation = false;
+    // Pixel shaders, d3d9.floatEmulation auto: the float constants the
+    // draw's shaders read are finite, so the dot products need no 0 times
+    // infinity (Shader::variant turns dotEmulation off).
+    bool finiteInputs = false;
     // Vertex shaders: a NaN depth becomes 0 (drawn at depth 0, as Intel's
     // driver does; Direct3D 11 and NVIDIA's Direct3D 9 drop the primitive).
     bool nanDepthZero = false;
