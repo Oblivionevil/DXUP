@@ -94,6 +94,17 @@ Trotzdem hinzufügen?</sys:String>
   <sys:String x:Key="ColGame">Spiel</sys:String>
   <sys:String x:Key="ColSource">Quelle</sys:String>
   <sys:String x:Key="ColExe">Programm, neben das DXUP kommt</sys:String>
+  <sys:String x:Key="SectionMemory">Speicher</sys:String>
+  <sys:String x:Key="AddressSpace">Adressraum</sys:String>
+  <sys:String x:Key="LaaOn">4 GB statt 2 GB (32-bit-Spiel)</sys:String>
+  <sys:String x:Key="LaaHint">Für 32-bit-Spiele mit Grafikfehlern oder Abstürzen durch Speichermangel. DXUP Manager markiert dafür die EXE des Spiels als „large address aware“; das Original bleibt als .dxup-laa-backup daneben und kommt zurück, wenn DXUP aus dem Spiel entfernt wird. Nach einem Update oder einer Dateiprüfung des Spiels setzt „Aktualisieren“ die Markierung neu. Startet das Spiel danach nicht mehr (Kopierschutz), den Schalter wieder ausschalten.</sys:String>
+  <sys:String x:Key="LaaOwn">Das Spiel nutzt schon 4 GB.</sys:String>
+  <sys:String x:Key="LaaSteamDrm">Nicht möglich: Die EXE ist mit Steam-DRM geschützt und startet geändert nicht mehr (Steam meldet „Application load error 3:0000065432“).</sys:String>
+  <sys:String x:Key="LaaAntiCheat">Nicht bei Spielen mit Anti-Cheat: Eine geänderte EXE kann gemeldet werden.</sys:String>
+  <sys:String x:Key="ErrLaa">Die EXE des Spiels ließ sich nicht ändern:
+{0}
+
+Läuft das Spiel noch?</sys:String>
   <sys:String x:Key="SectionDiagnostics">Diagnose</sys:String>
   <sys:String x:Key="DiagIntro">Für Fehlerberichte: „Fehler aufzeichnen“ drücken, das Spiel starten, den Fehler nachstellen und das Spiel beenden. Dann „Diagnosepaket erstellen“: Das ZIP landet auf dem Desktop, die Aufzeichnung geht wieder aus.</sys:String>
   <sys:String x:Key="DiagRecord">Fehler aufzeichnen</sys:String>

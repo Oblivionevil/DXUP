@@ -97,6 +97,13 @@ zip and in [`src/util/util_config.h`](src/util/util_config.h).
   the same scenes.
 - `dxgi.renderScale` speeds up only games that size their rendering by the
   swap chain.
+- **32-bit games** have 2 GB of address space, and Direct3D 12's runtime and
+  driver take more of it than Direct3D 9 did. A game that came close to the
+  limit natively can run out (missing or broken textures). DXUP Manager's
+  **Memory: 4 GB instead of 2 GB** marks the game's EXE as large address
+  aware (the original is kept and comes back when DXUP is removed). That
+  is not possible for games with Steam's DRM wrapper (Overlord II): they
+  do not start with a changed EXE.
 - **Online games with anti-cheat:** replacing a game's DLLs can look like
   tampering to anti-cheat software. Use DXUP with such games at your own
   risk.

@@ -123,6 +123,9 @@ namespace Dxup.Shared
         public string Exe = "";
         public string AppId = "";
         public bool Enabled;
+        // 32-bit games: the executable large address aware (4 GB) while DXUP
+        // is in the folder (see LargeAddressAware).
+        public bool LargeAddressAware;
         public GameSettings Settings = new GameSettings();
         // Lines DXUP or a newer manager knows, kept as they are.
         public List<KeyValuePair<string, string>> Extra = new List<KeyValuePair<string, string>>();
@@ -168,6 +171,7 @@ namespace Dxup.Shared
                     case "exe": current.Exe = value; break;
                     case "appid": current.AppId = value; break;
                     case "enabled": current.Enabled = value.Equals("true", StringComparison.OrdinalIgnoreCase) || value == "1"; break;
+                    case "largeaddressaware": current.LargeAddressAware = value.Equals("true", StringComparison.OrdinalIgnoreCase) || value == "1"; break;
                     default:
                         if (!current.Settings.Set(key, value))
                             current.Extra.Add(new KeyValuePair<string, string>(key, value));
@@ -192,6 +196,8 @@ namespace Dxup.Shared
                 if (game.AppId.Length != 0)
                     Line(text, "appid", game.AppId);
                 Line(text, "enabled", game.Enabled ? "true" : "false");
+                if (game.LargeAddressAware)
+                    Line(text, "largeAddressAware", "true");
                 foreach (var entry in game.Settings.Entries())
                     Line(text, entry.Key, entry.Value);
                 foreach (var entry in game.Extra)

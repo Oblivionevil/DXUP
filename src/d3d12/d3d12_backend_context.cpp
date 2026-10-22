@@ -7403,8 +7403,11 @@ namespace dxup::d3d12 {
       if (static_cast<char*>(mbi.BaseAddress) + mbi.RegionSize < p)
         break;
     }
-    logMessage(LogLevel::Warn, "glitch: address space low: %llu MB of %llu MB free, largest free block %zu MB (32-bit process)",
-      static_cast<unsigned long long>(freeMb), static_cast<unsigned long long>(status.ullTotalVirtual >> 20), largest >> 20);
+    // 2 GB in all: the executable is not large address aware.
+    const bool twoGb = status.ullTotalVirtual < (3ull << 30);
+    logMessage(LogLevel::Warn, "glitch: address space low: %llu MB of %llu MB free, largest free block %zu MB (32-bit process%s)",
+      static_cast<unsigned long long>(freeMb), static_cast<unsigned long long>(status.ullTotalVirtual >> 20), largest >> 20,
+      twoGb ? "; DXUP Manager: Memory, Address space, 4 GB instead of 2 GB" : "");
 #endif
   }
 

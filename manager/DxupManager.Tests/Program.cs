@@ -26,6 +26,7 @@ namespace Dxup.Tests
             SteamFiles();
             BattleNet();
             PeHeaders();
+            LargeAddress();
             Deployer();
             DiagnosticsChecks();
             Console.WriteLine(s_failed == 0 ? "All passed" : s_failed + " failed");
@@ -165,6 +166,94 @@ namespace Dxup.Tests
                 File.WriteAllBytes(old, System.Text.Encoding.ASCII.GetBytes("MZ....dxup_info_log.txt...."));
                 Check(DxupInstall.IsDxupFile(old), "an old DXUP build is recognised by its log marker");
                 Check(!DxupInstall.IsDxupFile(Path.Combine(system, "d3d11.dll")), "Windows' d3d11.dll is not DXUP's");
+            }
+            finally
+            {
+                Directory.Delete(dir, true);
+            }
+        }
+
+        [System.Runtime.InteropServices.DllImport("imagehlp.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
+        static extern uint MapFileAndCheckSumW(string file, out uint headerSum, out uint checkSum);
+
+        // The large address aware bit: set with the checksum Windows computes,
+        // cleared to the original bytes; a game's own bit stays.
+        static void LargeAddress()
+        {
+            string dir = Path.Combine(Path.GetTempPath(), "dxup_laa_test_" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(dir);
+            try
+            {
+                string wow = Environment.GetFolderPath(Environment.SpecialFolder.SystemX86);
+                string original = Path.Combine(wow, "cmd.exe");
+                string exe = Path.Combine(dir, "game.exe");
+                File.Copy(original, exe);
+                Check(LargeAddressAware.Get(exe) == false && !LargeAddressAware.SetByDxup(exe), "a 32-bit executable without the bit");
+                Check(LargeAddressAware.Get(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), "notepad.exe")) == null,
+                    "64-bit executables have no choice");
+                LargeAddressAware.Enable(exe);
+                Check(LargeAddressAware.Get(exe) == true && LargeAddressAware.SetByDxup(exe)
+                    && LargeAddressAware.SameContent(exe + LargeAddressAware.BackupSuffix, original), "the bit is set, the original kept");
+                Check(MapFileAndCheckSumW(exe, out uint headerSum, out uint checkSum) == 0 && headerSum == checkSum && checkSum != 0,
+                    "the header checksum is Windows' sum");
+                LargeAddressAware.Enable(exe);
+                Check(LargeAddressAware.SameContent(exe + LargeAddressAware.BackupSuffix, original), "setting it again keeps the original");
+                LargeAddressAware.Disable(exe);
+                Check(LargeAddressAware.Get(exe) == false && !LargeAddressAware.SetByDxup(exe) && LargeAddressAware.SameContent(exe, original),
+                    "clearing it gives the original back");
+
+                // A checksum that was wrong (signed after linking, as Just Cause 2's)
+                // stays as it was; clearing in place (an update replaced the
+                // executable) gives the original bytes as well.
+                byte[] stale = File.ReadAllBytes(original);
+                int peStale = BitConverter.ToInt32(stale, 0x3c);
+                BitConverter.GetBytes(0x12345678u).CopyTo(stale, peStale + 24 + 64);
+                string staleExe = Path.Combine(dir, "stale.exe");
+                string staleOriginal = Path.Combine(dir, "stale_original.bin");
+                File.WriteAllBytes(staleExe, stale);
+                File.WriteAllBytes(staleOriginal, stale);
+                LargeAddressAware.Enable(staleExe);
+                bool kept = BitConverter.ToUInt32(File.ReadAllBytes(staleExe), peStale + 24 + 64) == 0x12345678u;
+                LargeAddressAware.Disable(staleExe);
+                bool exact = LargeAddressAware.SameContent(staleExe, staleOriginal);
+                LargeAddressAware.Enable(staleExe);
+                // The backup is of an older version: the bit is cleared in place.
+                File.WriteAllBytes(staleExe + LargeAddressAware.BackupSuffix, stale.Concat(new byte[] { 1 }).ToArray());
+                LargeAddressAware.Disable(staleExe);
+                Check(kept && exact && LargeAddressAware.SameContent(staleExe, staleOriginal),
+                    "a wrong checksum stays; the original comes back exactly");
+
+                // The game has the bit itself: no backup, and it stays.
+                LargeAddressAware.Enable(exe);
+                File.Delete(exe + LargeAddressAware.BackupSuffix);
+                LargeAddressAware.Enable(exe);
+                LargeAddressAware.Disable(exe);
+                Check(LargeAddressAware.Get(exe) == true && !LargeAddressAware.SetByDxup(exe), "a game's own bit stays");
+
+                // games.cfg keeps the choice; the deployer sets and clears the bit.
+                var game = new GameEntry { Name = "Game", Dir = dir, Exe = "laa.exe", Enabled = true, LargeAddressAware = true };
+                var parsed = GamesConfig.Parse(GamesConfig.Format(new[] { game }));
+                Check(parsed.Count == 1 && parsed[0].LargeAddressAware, "games.cfg keeps largeAddressAware");
+                File.Copy(original, game.ExePath);
+                var deployer = new GameDeployer(new DxupInstall(Path.Combine(dir, "install")));
+                Check(deployer.Install(game, out string error) && LargeAddressAware.Get(game.ExePath) == true,
+                    "activating sets the bit " + error);
+                Check(deployer.Remove(game, new[] { game }, out error) && LargeAddressAware.SameContent(game.ExePath, original)
+                    && !LargeAddressAware.SetByDxup(game.ExePath), "removing DXUP restores the executable " + error);
+
+                // Steam's DRM wrapper (a .bind section): the executable stays as it is.
+                byte[] bytes = File.ReadAllBytes(original);
+                int pe = BitConverter.ToInt32(bytes, 0x3c);
+                int sections = pe + 24 + BitConverter.ToUInt16(bytes, pe + 20);
+                int count = BitConverter.ToUInt16(bytes, pe + 6);
+                System.Text.Encoding.ASCII.GetBytes(".bind\0\0\0").CopyTo(bytes, sections + 40 * (count - 1));
+                string drm = Path.Combine(dir, "drm.exe");
+                File.WriteAllBytes(drm, bytes);
+                bool refused = false;
+                try { LargeAddressAware.Enable(drm); } catch (InvalidOperationException) { refused = true; }
+                var drmGame = new GameEntry { Name = "Drm", Dir = dir, Exe = "drm.exe", Enabled = true, LargeAddressAware = true };
+                Check(LargeAddressAware.SteamDrm(drm) && refused && !LargeAddressAware.Wanted(drmGame) && deployer.Install(drmGame, out error)
+                    && LargeAddressAware.Get(drm) == false && !LargeAddressAware.SetByDxup(drm), "Steam DRM: the executable stays " + error);
             }
             finally
             {

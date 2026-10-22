@@ -94,6 +94,17 @@ Add it anyway?</sys:String>
   <sys:String x:Key="ColGame">Game</sys:String>
   <sys:String x:Key="ColSource">Source</sys:String>
   <sys:String x:Key="ColExe">Program DXUP goes next to</sys:String>
+  <sys:String x:Key="SectionMemory">Memory</sys:String>
+  <sys:String x:Key="AddressSpace">Address space</sys:String>
+  <sys:String x:Key="LaaOn">4 GB instead of 2 GB (32-bit game)</sys:String>
+  <sys:String x:Key="LaaHint">For 32-bit games with graphics errors or crashes from running out of memory. DXUP Manager marks the game's EXE as large address aware; the original stays next to it as .dxup-laa-backup and comes back when DXUP is removed from the game. After an update or a file check of the game, Update sets the mark again. If the game no longer starts (copy protection), switch it off again.</sys:String>
+  <sys:String x:Key="LaaOwn">The game uses 4 GB already.</sys:String>
+  <sys:String x:Key="LaaSteamDrm">Not possible: the EXE is protected by Steam DRM and does not start once changed (Steam reports "Application load error 3:0000065432").</sys:String>
+  <sys:String x:Key="LaaAntiCheat">Not for games with anti-cheat: a changed EXE can get the game flagged.</sys:String>
+  <sys:String x:Key="ErrLaa">The game's EXE could not be changed:
+{0}
+
+Is the game still running?</sys:String>
   <sys:String x:Key="SectionDiagnostics">Diagnostics</sys:String>
   <sys:String x:Key="DiagIntro">For bug reports: press "Record a problem", start the game, reproduce the problem and quit the game. Then "Create diagnostic package": the zip goes to the desktop and the recording goes off again.</sys:String>
   <sys:String x:Key="DiagRecord">Record a problem</sys:String>

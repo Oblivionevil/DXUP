@@ -235,6 +235,25 @@
                 <TextBlock Grid.Row="3" Grid.Column="1" Text="{DynamicResource AsyncHint}" Foreground="{DynamicResource Muted}" FontSize="11" Margin="0,4,0,0" TextWrapping="Wrap" />
               </Grid>
 
+              <StackPanel x:Name="MemorySection">
+                <TextBlock Text="{DynamicResource SectionMemory}" Style="{StaticResource Section}" />
+                <Grid>
+                  <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="230" />
+                    <ColumnDefinition Width="*" />
+                  </Grid.ColumnDefinitions>
+                  <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                  </Grid.RowDefinitions>
+                  <TextBlock Text="{DynamicResource AddressSpace}" Style="{StaticResource Caption}" />
+                  <CheckBox x:Name="LaaBox" Grid.Column="1" Checked="OnLaaChanged" Unchecked="OnLaaChanged">
+                    <TextBlock Text="{DynamicResource LaaOn}" TextWrapping="Wrap" />
+                  </CheckBox>
+                  <TextBlock x:Name="LaaHint" Grid.Row="1" Grid.Column="1" Foreground="{DynamicResource Muted}" FontSize="11" Margin="0,4,0,0" TextWrapping="Wrap" />
+                </Grid>
+              </StackPanel>
+
               <TextBlock Text="{DynamicResource SectionDiagnostics}" Style="{StaticResource Section}" />
               <TextBlock Text="{DynamicResource DiagIntro}" Foreground="{DynamicResource Muted}" FontSize="11" TextWrapping="Wrap" />
               <WrapPanel Margin="0,10,0,0">

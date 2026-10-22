@@ -250,6 +250,7 @@ namespace Dxup.Manager
             Select(FramesBox, settings.MaxFrameLatency);
             AsyncBox.IsChecked = settings.AsyncShaders;
             PrecompileBox.IsChecked = settings.ShaderPrecompile;
+            ShowLargeAddress(item);
             ShowDiagnostics(item);
             UpdateEnabledControls();
             ShowWarnings(item);
@@ -275,6 +276,55 @@ namespace Dxup.Manager
                 AddWarning(Loc.T("WarnRunning"));
             if (entry.Enabled && Directory.Exists(entry.Dir) && DiagnosticMarkers.AnyOn(entry.Dir))
                 AddWarning(Loc.T("WarnDiagnostics"));
+        }
+
+        // ---- Address space of 32-bit games ----
+
+        void ShowLargeAddress(GameItem item)
+        {
+            var entry = item.Entry;
+            bool? bit = LargeAddressAware.Get(entry.ExePath);
+            MemorySection.Visibility = bit.HasValue ? Visibility.Visible : Visibility.Collapsed;
+            if (!bit.HasValue)
+                return;
+            // The game's executable has the bit itself: nothing to choose.
+            bool own = bit == true && !LargeAddressAware.SetByDxup(entry.ExePath);
+            bool drm = !own && LargeAddressAware.SteamDrm(entry.ExePath);
+            bool antiCheat = GameDeployer.AntiCheat(entry) != null;
+            LaaBox.IsChecked = own || (entry.LargeAddressAware && !drm);
+            LaaBox.IsEnabled = !own && !drm && (!antiCheat || entry.LargeAddressAware);
+            LaaHint.Text = Loc.T(own ? "LaaOwn" : drm ? "LaaSteamDrm" : antiCheat ? "LaaAntiCheat" : "LaaHint");
+        }
+
+        // While DXUP is in the game's folder the executable changes at once;
+        // else when DXUP goes in.
+        void OnLaaChanged(object sender, RoutedEventArgs e)
+        {
+            if (m_loading || Selected == null)
+                return;
+            var entry = Selected.Entry;
+            bool on = LaaBox.IsChecked == true;
+            if (entry.Enabled)
+            {
+                try
+                {
+                    if (on)
+                        LargeAddressAware.Enable(entry.ExePath);
+                    else
+                        LargeAddressAware.Disable(entry.ExePath);
+                }
+                catch (Exception ex)
+                {
+                    m_loading = true;
+                    LaaBox.IsChecked = !on;
+                    m_loading = false;
+                    Error(Loc.F("ErrLaa", ex.Message));
+                    return;
+                }
+            }
+            entry.LargeAddressAware = on;
+            Save();
+            RefreshAll();
         }
 
         // ---- Diagnostics ----

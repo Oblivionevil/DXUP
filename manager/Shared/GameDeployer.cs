@@ -11,7 +11,8 @@ namespace Dxup.Shared
     {
         Inactive,      // DXUP is not in the game's folder
         Active,        // DXUP's current DLLs are in the folder
-        Outdated,      // DXUP's DLLs in the folder differ from the installed ones
+        Outdated,      // DXUP's DLLs in the folder differ from the installed ones (or the
+                       // executable lost the large address aware bit, e.g. to an update)
         Missing,       // set up, but DXUP's DLLs are gone (e.g. the launcher repaired the game)
     }
 
@@ -51,6 +52,8 @@ namespace Dxup.Shared
                 return GameState.Inactive;
             if (!any)
                 return GameState.Missing;
+            if (LargeAddressAware.Wanted(game) && LargeAddressAware.Get(game.ExePath) == false)
+                current = false;
             return all && current ? GameState.Active : GameState.Outdated;
         }
 
@@ -244,6 +247,8 @@ namespace Dxup.Shared
                     }
                     File.Copy(source, target, false);
                 }
+                if (LargeAddressAware.Wanted(game))
+                    LargeAddressAware.Enable(game.ExePath);
                 return true;
             }
             catch (Exception e)
@@ -258,6 +263,16 @@ namespace Dxup.Shared
         public bool Remove(GameEntry game, IEnumerable<GameEntry> allGames, out string error)
         {
             error = null;
+            // The executable as the game brought it (the bit is this game's own).
+            if (!string.IsNullOrEmpty(game.Exe))
+            {
+                try { LargeAddressAware.Disable(game.ExePath); }
+                catch (Exception e)
+                {
+                    error = e.Message;
+                    return false;
+                }
+            }
             if (allGames.Any(other => other != game && other.Enabled && SameFolder(other.Dir, game.Dir)))
                 return true;
             try
