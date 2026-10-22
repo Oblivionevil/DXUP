@@ -507,14 +507,28 @@ namespace dxup::d3d12 {
     uint8_t* mapStaging(uint32_t subresource, MapMode mode, ImageSubresourceLayout& layout) override;
     void unmapStaging(uint32_t subresource) override;
 
+    // Subresource 0's state; every one's when hasUniformState().
     D3D12_RESOURCE_STATES getCurrentState() const { return m_currentState; }
     void setCurrentState(D3D12_RESOURCE_STATES state) {
       m_currentState = state;
       m_isUniformState = true;
+      m_uniformKnown = true;
       for (auto& subresourceState : m_subresourceStates)
         subresourceState = state;
     }
-    bool hasUniformState() const { return m_isUniformState; }
+    bool hasUniformState() const {
+      if (!m_uniformKnown) {
+        m_isUniformState = true;
+        for (auto subresourceState : m_subresourceStates) {
+          if (subresourceState != m_currentState) {
+            m_isUniformState = false;
+            break;
+          }
+        }
+        m_uniformKnown = true;
+      }
+      return m_isUniformState;
+    }
     uint32_t getSubresourceCount() const { return static_cast<uint32_t>(m_subresourceStates.size()); }
     uint32_t getMipLevelCount() const { return m_desc.mipLevels ? m_desc.mipLevels : 1u; }
     uint32_t getArraySubresourceCount() const {
@@ -538,30 +552,19 @@ namespace dxup::d3d12 {
         m_currentState = state;
         return;
       }
-
+      if (m_uniformKnown && m_isUniformState && state == m_currentState)
+        return;
       m_subresourceStates[subresource] = state;
-      updateUniformState();
+      if (subresource == 0)
+        m_currentState = state;
+      // Whether they are alike again is found out when asked: transitions
+      // of every subresource in turn would scan them all for each one.
+      m_uniformKnown = false;
     }
 #endif
 
   private:
 #ifdef _WIN32
-    void updateUniformState() {
-      if (m_subresourceStates.empty()) {
-        m_isUniformState = true;
-        return;
-      }
-
-      m_currentState = m_subresourceStates[0];
-      m_isUniformState = true;
-
-      for (auto subresourceState : m_subresourceStates) {
-        if (subresourceState != m_currentState) {
-          m_isUniformState = false;
-          break;
-        }
-      }
-    }
 
     ComPtr<ID3D12Resource>    m_resource;
     std::shared_ptr<D3D12BackendBuffer> m_stagingBuffer;
@@ -585,7 +588,8 @@ namespace dxup::d3d12 {
     D3D12_RESOURCE_STATES     m_currentState = D3D12_RESOURCE_STATE_COMMON;
     std::vector<D3D12_RESOURCE_STATES> m_subresourceStates;
     uint32_t                  m_planeCount = 1;
-    bool                      m_isUniformState = true;
+    mutable bool              m_isUniformState = true;
+    mutable bool              m_uniformKnown = true;     // m_isUniformState is current
     bool                      m_simultaneousAccess = false;
     bool                      m_retargetable = false;
     std::shared_ptr<D3D12SharedSync> m_sharedSync;
@@ -1180,6 +1184,13 @@ namespace dxup::d3d12 {
     // byte of it is address space (2 GB without large-address awareness).
     static constexpr uint64_t kMaxRecycledBytes = kSmallAddressSpace ? (32ull << 20) : (256ull << 20);
     std::atomic<uint64_t> m_recycledBufferBytes{ 0 };   // written under the mutex
+    // Under the mutex: plain loads and stores, no locked instruction (a
+    // dynamic buffer's rename recycles one); trimRecycledBuffers reads it
+    // without the mutex.
+    void adjustRecycledBytes(int64_t delta) {
+      m_recycledBufferBytes.store(m_recycledBufferBytes.load(std::memory_order_relaxed) + uint64_t(delta),
+                                  std::memory_order_relaxed);
+    }
     uint64_t m_recycleSequence = 0;
     uint64_t m_recycleTrimMark = 0;          // buffers back before the last trim
     std::atomic<uint64_t> m_lastRecycleTrim{ 0 };

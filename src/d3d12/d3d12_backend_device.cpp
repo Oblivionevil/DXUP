@@ -2654,7 +2654,7 @@ namespace dxup::d3d12 {
     auto buffer = std::move(it->second.back().buffer);
     it->second.pop_back();
     m_recycledBufferCount--;
-    m_recycledBufferBytes -= desc.size;
+    adjustRecycledBytes(-int64_t(desc.size));
     if (it->second.empty())
       m_recycledBuffers.erase(it);
 
@@ -2692,12 +2692,12 @@ namespace dxup::d3d12 {
       evicted = std::move(oldest->second.front().buffer);
       oldest->second.erase(oldest->second.begin());
       m_recycledBufferCount--;
-      m_recycledBufferBytes -= oldest->first.size;
+      adjustRecycledBytes(-int64_t(oldest->first.size));
     }
 
     bucket.push_back({ std::move(buffer), ++m_recycleSequence });
     m_recycledBufferCount++;
-    m_recycledBufferBytes += desc.size;
+    adjustRecycledBytes(int64_t(desc.size));
     return true;
   }
 
@@ -2733,7 +2733,7 @@ namespace dxup::d3d12 {
         if (idle) {
           bucket.erase(bucket.begin(), bucket.begin() + idle);
           m_recycledBufferCount -= idle;
-          m_recycledBufferBytes -= idle * it->first.size;
+          adjustRecycledBytes(-int64_t(idle * it->first.size));
         }
         it = bucket.empty() ? m_recycledBuffers.erase(it) : std::next(it);
       }
@@ -2746,7 +2746,7 @@ namespace dxup::d3d12 {
       released.push_back(std::move(oldest->second.front().buffer));
       oldest->second.erase(oldest->second.begin());
       m_recycledBufferCount--;
-      m_recycledBufferBytes -= oldest->first.size;
+      adjustRecycledBytes(-int64_t(oldest->first.size));
       if (oldest->second.empty())
         m_recycledBuffers.erase(oldest);
     }
