@@ -26,6 +26,20 @@ namespace Dxup.Shared
         public int? RenderScale;         // percent of the asked back buffer size (33-99), null = all
         public string Adapter;           // part of the GPU's name in lower case, "warp"; null = the game's choice
         public string SpoofVendor;       // nvidia, amd, intel: the GPU the game sees; null = the real one
+        public float? SpatialSharpness;  // sharpening of DXUP's upscale at Present (0-1); null = DXUP's 0.2
+        public string CustomVendorId;    // hex ids and name the game sees, over SpoofVendor's; null = none
+        public string CustomDeviceId;
+        public string CustomDeviceDesc;
+        public bool DirectBackBuffer = true; // flip model games draw into the real swap chain buffers
+        public string FloatEmulation;    // Direct3D 7-9 shaders' 0 * inf: strict, off; null = auto
+        public string NanDepth;          // Direct3D 7-9 vertices with NaN depth: discard, zero; null = auto
+        public bool FxcCompiler;         // Direct3D 7-9 shaders through Microsoft's compiler instead of DXUP's
+        public bool SubmitThread;        // command lists go to the GPU on a thread of their own
+        public bool RecordThread;        // command lists are recorded on a second thread
+        public bool PixelOutputMasks = true; // pixel shader outputs no target takes leave the shader
+        public bool BarrierHoisting = true;  // barriers that wait for nothing move earlier
+        public bool? RelaxedUavBarriers; // no barriers between draws of a pipeline into its UAVs; null = DXUP's choice
+        public bool? LazyTargets;        // render targets get memory when first written; null = on NVIDIA
 
         public GameSettings Clone() => (GameSettings)MemberwiseClone();
 
@@ -64,6 +78,39 @@ namespace Dxup.Shared
                     string vendor = value.Trim().ToLowerInvariant();
                     SpoofVendor = vendor == "nvidia" || vendor == "amd" || vendor == "intel" ? vendor : null;
                     return true;
+                case "dxgi.upscalesharpness":
+                    float? sharpness = ParseFloat(value);
+                    SpatialSharpness = sharpness.HasValue ? (float?)Math.Min(Math.Max(sharpness.Value, 0.0f), 1.0f) : null;
+                    return true;
+                case "dxgi.customvendorid": CustomVendorId = ParseHex(value); return true;
+                case "dxgi.customdeviceid": CustomDeviceId = ParseHex(value); return true;
+                case "dxgi.customdevicedesc":
+                    CustomDeviceDesc = value.Trim().Length > 0 ? value.Trim() : null;
+                    return true;
+                case "dxgi.directbackbuffer": DirectBackBuffer = ParseBool(value) ?? true; return true;
+                case "d3d9.floatemulation":
+                    switch (value.Trim().ToLowerInvariant())
+                    {
+                        case "strict": case "true": case "on": case "1": FloatEmulation = "strict"; break;
+                        case "false": case "off": case "0": FloatEmulation = "off"; break;
+                        default: FloatEmulation = null; break;
+                    }
+                    return true;
+                case "d3d9.nandepth":
+                    switch (value.Trim().ToLowerInvariant())
+                    {
+                        case "zero": case "true": case "1": NanDepth = "zero"; break;
+                        case "discard": case "false": case "0": NanDepth = "discard"; break;
+                        default: NanDepth = null; break;
+                    }
+                    return true;
+                case "d3d9.shadercompiler": FxcCompiler = value.Trim().Equals("fxc", StringComparison.OrdinalIgnoreCase); return true;
+                case "d3d12.submitthread": SubmitThread = ParseBool(value) ?? false; return true;
+                case "d3d12.recordthread": RecordThread = ParseBool(value) ?? false; return true;
+                case "d3d12.pixeloutputmasks": PixelOutputMasks = ParseBool(value) ?? true; return true;
+                case "d3d12.barrierhoisting": BarrierHoisting = ParseBool(value) ?? true; return true;
+                case "d3d11.relaxeduavbarriers": RelaxedUavBarriers = ParseBool(value); return true;
+                case "d3d12.lazytargets": LazyTargets = ParseBool(value); return true;
                 case "dxgi.renderscale":
                     float? scale = ParseFloat(value);
                     RenderScale = scale.HasValue && scale.Value < 1.0f ? (int?)Math.Max(33, (int)Math.Round(scale.Value * 100.0f)) : null;
@@ -93,6 +140,21 @@ namespace Dxup.Shared
                 yield return Entry("dxgi.renderScale", (RenderScale.Value / 100.0f).ToString("0.##", CultureInfo.InvariantCulture));
             if (!string.IsNullOrEmpty(Adapter)) yield return Entry("dxgi.adapter", Adapter);
             if (!string.IsNullOrEmpty(SpoofVendor)) yield return Entry("dxgi.spoofVendor", SpoofVendor);
+            if (SpatialSharpness.HasValue)
+                yield return Entry("dxgi.upscaleSharpness", SpatialSharpness.Value.ToString("0.##", CultureInfo.InvariantCulture));
+            if (!string.IsNullOrEmpty(CustomVendorId)) yield return Entry("dxgi.customVendorId", CustomVendorId);
+            if (!string.IsNullOrEmpty(CustomDeviceId)) yield return Entry("dxgi.customDeviceId", CustomDeviceId);
+            if (!string.IsNullOrEmpty(CustomDeviceDesc)) yield return Entry("dxgi.customDeviceDesc", CustomDeviceDesc);
+            if (!DirectBackBuffer) yield return Entry("dxgi.directBackBuffer", "false");
+            if (!string.IsNullOrEmpty(FloatEmulation)) yield return Entry("d3d9.floatEmulation", FloatEmulation);
+            if (!string.IsNullOrEmpty(NanDepth)) yield return Entry("d3d9.nanDepth", NanDepth);
+            if (FxcCompiler) yield return Entry("d3d9.shaderCompiler", "fxc");
+            if (SubmitThread) yield return Entry("d3d12.submitThread", "true");
+            if (RecordThread) yield return Entry("d3d12.recordThread", "true");
+            if (!PixelOutputMasks) yield return Entry("d3d12.pixelOutputMasks", "false");
+            if (!BarrierHoisting) yield return Entry("d3d12.barrierHoisting", "false");
+            if (RelaxedUavBarriers.HasValue) yield return Entry("d3d11.relaxedUavBarriers", RelaxedUavBarriers.Value ? "true" : "false");
+            if (LazyTargets.HasValue) yield return Entry("d3d12.lazyTargets", LazyTargets.Value ? "true" : "false");
         }
 
         static KeyValuePair<string, string> Entry(string key, string value) => new KeyValuePair<string, string>(key, value);
@@ -102,6 +164,17 @@ namespace Dxup.Shared
 
         static float? ParseFloat(string value) =>
             float.TryParse(value.Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out float parsed) ? parsed : (float?)null;
+
+        // 1-4 hex digits (0x allowed) in lower case, as DXUP reads them; null otherwise.
+        public static string ParseHex(string value)
+        {
+            string hex = value.Trim().ToLowerInvariant();
+            if (hex.StartsWith("0x", StringComparison.Ordinal))
+                hex = hex.Substring(2);
+            if (hex.Length == 0 || hex.Length > 4 || !int.TryParse(hex, NumberStyles.AllowHexSpecifier, CultureInfo.InvariantCulture, out int id) || id == 0)
+                return null;
+            return hex;
+        }
 
         static bool? ParseBool(string value)
         {

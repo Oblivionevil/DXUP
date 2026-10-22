@@ -58,6 +58,20 @@ namespace Dxup.Tests
             game.Settings.RenderScale = 75;
             game.Settings.Adapter = "intel(r) uhd graphics 770";
             game.Settings.SpoofVendor = "amd";
+            game.Settings.SpatialSharpness = 0.5f;
+            game.Settings.CustomVendorId = GameSettings.ParseHex(" 0x10DE ");
+            game.Settings.CustomDeviceId = "2684";
+            game.Settings.CustomDeviceDesc = "NVIDIA GeForce RTX 4090";
+            game.Settings.DirectBackBuffer = false;
+            game.Settings.FloatEmulation = "strict";
+            game.Settings.NanDepth = "zero";
+            game.Settings.FxcCompiler = true;
+            game.Settings.SubmitThread = true;
+            game.Settings.RecordThread = true;
+            game.Settings.PixelOutputMasks = false;
+            game.Settings.BarrierHoisting = false;
+            game.Settings.RelaxedUavBarriers = false;
+            game.Settings.LazyTargets = true;
             game.Extra.Add(new KeyValuePair<string, string>("d3d11.future", "x"));
             string text = GamesConfig.Format(new[] { game, new GameEntry { Name = "Bar", Dir = @"C:\Bar", Exe = "bar.exe" } });
             var parsed = GamesConfig.Parse(text);
@@ -72,14 +86,28 @@ namespace Dxup.Tests
                && back.Settings.RenderScale == 75 && back.Settings.Adapter == "intel(r) uhd graphics 770"
                && back.Settings.SpoofVendor == "amd" && !back.Settings.SyncInterval.HasValue && !back.Settings.MsaaScopeAll,
                 "games.cfg keeps the settings");
+            var more = back.Settings;
+            Check(more.SpatialSharpness == 0.5f && more.CustomVendorId == "10de" && more.CustomDeviceId == "2684"
+               && more.CustomDeviceDesc == "NVIDIA GeForce RTX 4090" && !more.DirectBackBuffer && more.FloatEmulation == "strict"
+               && more.NanDepth == "zero" && more.FxcCompiler && more.SubmitThread && more.RecordThread && !more.PixelOutputMasks
+               && !more.BarrierHoisting && more.RelaxedUavBarriers == false && more.LazyTargets == true,
+                "games.cfg keeps the advanced and Direct3D 7-9 settings");
             Check(back.Extra.Count == 1 && back.Extra[0].Key == "d3d11.future", "games.cfg keeps unknown settings");
             Check(!parsed[1].Enabled && parsed[1].Settings.Entries().Count() == 0 && parsed[1].Settings.ShaderPrecompile,
                 "a game without settings writes none and precompiles");
             Check(text.Contains("d3d11.sgssaa = alpha") && text.Contains("dxgi.maxFrameLatency = 1") && text.Contains("d3d11.asyncShaders = true")
                && text.Contains("d3d11.upscaler = xess") && text.Contains("d3d11.upscalerAuto = true")
                && text.Contains("dxgi.upscale = spatial") && text.Contains("dxgi.renderScale = 0.75")
-               && text.Contains("dxgi.spoofVendor = amd"),
+               && text.Contains("dxgi.spoofVendor = amd") && text.Contains("dxgi.upscaleSharpness = 0.5")
+               && text.Contains("dxgi.customVendorId = 10de") && text.Contains("dxgi.customDeviceDesc = NVIDIA GeForce RTX 4090")
+               && text.Contains("dxgi.directBackBuffer = false") && text.Contains("d3d9.floatEmulation = strict")
+               && text.Contains("d3d9.nanDepth = zero") && text.Contains("d3d9.shaderCompiler = fxc")
+               && text.Contains("d3d12.submitThread = true") && text.Contains("d3d12.recordThread = true")
+               && text.Contains("d3d12.pixelOutputMasks = false") && text.Contains("d3d12.barrierHoisting = false")
+               && text.Contains("d3d11.relaxedUavBarriers = false") && text.Contains("d3d12.lazyTargets = true"),
                 "settings use DXUP's keys");
+            Check(GameSettings.ParseHex("xyz") == null && GameSettings.ParseHex("12345") == null && GameSettings.ParseHex("0") == null
+               && GameSettings.ParseHex("0x8086") == "8086", "GPU ids are 1-4 hex digits");
 
             string path = Path.Combine(Path.GetTempPath(), "dxup_test_games.cfg");
             GamesConfig.Save(path, parsed);
@@ -96,6 +124,10 @@ namespace Dxup.Tests
             GamesConfig.Import(game, "d3d11.msaaSamples = 4  # comment\r\nd3d11.msaaForce = yes\r\ndxgi.syncInterval=0\r\nfoo.bar = 1\r\n");
             Check(game.Settings.MsaaSamples == 4 && game.Settings.MsaaForce && game.Settings.SyncInterval == 0 && game.Extra.Count == 1,
                 "dxup.conf imports");
+            var legacy = new GameEntry { Dir = @"C:\Y", Exe = "y.exe" };
+            GamesConfig.Import(legacy, "d3d9.nanDepth = discard\nd3d9.floatEmulation = off\nd3d12.lazyTargets = auto\nd3d11.relaxedUavBarriers = on\n");
+            Check(legacy.Settings.NanDepth == "discard" && legacy.Settings.FloatEmulation == "off" && !legacy.Settings.LazyTargets.HasValue
+               && legacy.Settings.RelaxedUavBarriers == true && legacy.Extra.Count == 0, "dxup.conf imports the advanced settings");
         }
 
         static void SteamFiles()

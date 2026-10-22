@@ -157,7 +157,7 @@
                 </Grid.RowDefinitions>
                 <TextBlock Text="{DynamicResource MsaaSamples}" Style="{StaticResource Caption}" />
                 <ComboBox x:Name="MsaaBox" Grid.Column="1" HorizontalAlignment="Left" DisplayMemberPath="Text" SelectionChanged="OnSettingChanged" />
-                <CheckBox x:Name="ForceBox" Grid.Row="1" Grid.Column="1" Margin="0,10,0,0" Click="OnSettingChanged">
+                <CheckBox x:Name="ForceBox" Grid.Row="1" Grid.Column="1" Margin="0,10,0,0" Checked="OnSettingChanged" Unchecked="OnSettingChanged">
                   <TextBlock Text="{DynamicResource MsaaForce}" TextWrapping="Wrap" />
                 </CheckBox>
                 <TextBlock Grid.Row="2" Text="{DynamicResource MsaaScope}" Style="{StaticResource Caption}" Margin="0,10,12,0" />
@@ -168,10 +168,10 @@
                 <TextBlock x:Name="UpscalerCaption" Grid.Row="5" Text="{DynamicResource Upscaler}" Style="{StaticResource Caption}" Margin="0,10,12,0" />
                 <ComboBox x:Name="UpscalerBox" Grid.Row="5" Grid.Column="1" HorizontalAlignment="Left" Margin="0,10,0,0" DisplayMemberPath="Text" SelectionChanged="OnSettingChanged" />
                 <TextBlock x:Name="UpscalerHintText" Grid.Row="6" Grid.Column="1" Text="{DynamicResource UpscalerHint}" Foreground="{DynamicResource Muted}" FontSize="11" Margin="0,4,0,0" TextWrapping="Wrap" />
-                <CheckBox x:Name="UpscalerAutoBox" Grid.Row="7" Grid.Column="1" Margin="0,8,0,0" Click="OnSettingChanged">
+                <CheckBox x:Name="UpscalerAutoBox" Grid.Row="7" Grid.Column="1" Margin="0,8,0,0" Checked="OnSettingChanged" Unchecked="OnSettingChanged">
                   <TextBlock Text="{DynamicResource UpscalerAuto}" TextWrapping="Wrap" />
                 </CheckBox>
-                <CheckBox x:Name="UpscalerInjectBox" Grid.Row="8" Grid.Column="1" Margin="0,8,0,0" Click="OnSettingChanged">
+                <CheckBox x:Name="UpscalerInjectBox" Grid.Row="8" Grid.Column="1" Margin="0,8,0,0" Checked="OnSettingChanged" Unchecked="OnSettingChanged">
                   <TextBlock Text="{DynamicResource UpscalerInject}" TextWrapping="Wrap" />
                 </CheckBox>
               </Grid>
@@ -192,23 +192,51 @@
                   <RowDefinition Height="Auto" />
                   <RowDefinition Height="Auto" />
                   <RowDefinition Height="Auto" />
+                  <RowDefinition Height="Auto" />
+                  <RowDefinition Height="Auto" />
+                  <RowDefinition Height="Auto" />
                 </Grid.RowDefinitions>
                 <TextBlock Text="{DynamicResource VSync}" Style="{StaticResource Caption}" />
                 <ComboBox x:Name="VSyncBox" Grid.Column="1" HorizontalAlignment="Left" DisplayMemberPath="Text" SelectionChanged="OnSettingChanged" />
                 <TextBlock Grid.Row="1" Text="{DynamicResource Frames}" Style="{StaticResource Caption}" Margin="0,10,12,0" />
                 <ComboBox x:Name="FramesBox" Grid.Row="1" Grid.Column="1" HorizontalAlignment="Left" Margin="0,10,0,0" DisplayMemberPath="Text" SelectionChanged="OnSettingChanged" />
-                <CheckBox x:Name="SpatialBox" Grid.Row="2" Grid.Column="1" Margin="0,10,0,0" Click="OnSettingChanged">
+                <CheckBox x:Name="SpatialBox" Grid.Row="2" Grid.Column="1" Margin="0,10,0,0" Checked="OnSettingChanged" Unchecked="OnSettingChanged">
                   <TextBlock Text="{DynamicResource SpatialUpscale}" TextWrapping="Wrap" />
                 </CheckBox>
                 <TextBlock Grid.Row="3" Text="{DynamicResource RenderScale}" Style="{StaticResource Caption}" Margin="0,10,12,0" />
                 <ComboBox x:Name="RenderScaleBox" Grid.Row="3" Grid.Column="1" HorizontalAlignment="Left" Margin="0,10,0,0" DisplayMemberPath="Text" SelectionChanged="OnSettingChanged" />
                 <TextBlock Grid.Row="4" Grid.Column="1" Text="{DynamicResource RenderScaleHint}" Foreground="{DynamicResource Muted}" FontSize="11" Margin="0,4,0,0" TextWrapping="Wrap" />
-                <TextBlock Grid.Row="5" Text="{DynamicResource Adapter}" Style="{StaticResource Caption}" Margin="0,10,12,0" />
-                <ComboBox x:Name="AdapterBox" Grid.Row="5" Grid.Column="1" HorizontalAlignment="Left" Margin="0,10,0,0" DisplayMemberPath="Text" SelectionChanged="OnSettingChanged" />
-                <TextBlock Grid.Row="6" Grid.Column="1" Text="{DynamicResource AdapterHint}" Foreground="{DynamicResource Muted}" FontSize="11" Margin="0,4,0,0" TextWrapping="Wrap" />
-                <TextBlock Grid.Row="7" Text="{DynamicResource SpoofVendor}" Style="{StaticResource Caption}" Margin="0,10,12,0" />
-                <ComboBox x:Name="SpoofBox" Grid.Row="7" Grid.Column="1" HorizontalAlignment="Left" Margin="0,10,0,0" DisplayMemberPath="Text" SelectionChanged="OnSettingChanged" />
-                <TextBlock Grid.Row="8" Grid.Column="1" Text="{DynamicResource SpoofVendorHint}" Foreground="{DynamicResource Muted}" FontSize="11" Margin="0,4,0,0" TextWrapping="Wrap" />
+                <TextBlock Grid.Row="5" Text="{DynamicResource Sharpness}" Style="{StaticResource Caption}" Margin="0,10,12,0" />
+                <StackPanel Grid.Row="5" Grid.Column="1" Orientation="Horizontal" Margin="0,10,0,0">
+                  <Slider x:Name="SharpnessSlider" Width="200" Minimum="0" Maximum="1" TickFrequency="0.05" IsSnapToTickEnabled="True"
+                          VerticalAlignment="Center" ValueChanged="OnSharpnessChanged" />
+                  <TextBlock x:Name="SharpnessText" Width="110" Margin="10,0,0,0" VerticalAlignment="Center" />
+                </StackPanel>
+                <TextBlock Grid.Row="6" Text="{DynamicResource Adapter}" Style="{StaticResource Caption}" Margin="0,10,12,0" />
+                <ComboBox x:Name="AdapterBox" Grid.Row="6" Grid.Column="1" HorizontalAlignment="Left" Margin="0,10,0,0" DisplayMemberPath="Text" SelectionChanged="OnSettingChanged" />
+                <TextBlock Grid.Row="7" Grid.Column="1" Text="{DynamicResource AdapterHint}" Foreground="{DynamicResource Muted}" FontSize="11" Margin="0,4,0,0" TextWrapping="Wrap" />
+                <TextBlock Grid.Row="8" Text="{DynamicResource SpoofVendor}" Style="{StaticResource Caption}" Margin="0,10,12,0" />
+                <ComboBox x:Name="SpoofBox" Grid.Row="8" Grid.Column="1" HorizontalAlignment="Left" Margin="0,10,0,0" DisplayMemberPath="Text" SelectionChanged="OnSettingChanged" />
+                <TextBlock Grid.Row="9" Grid.Column="1" Text="{DynamicResource SpoofVendorHint}" Foreground="{DynamicResource Muted}" FontSize="11" Margin="0,4,0,0" TextWrapping="Wrap" />
+                <TextBlock Grid.Row="10" Text="{DynamicResource CustomGpu}" Style="{StaticResource Caption}" Margin="0,10,12,0" />
+                <WrapPanel Grid.Row="10" Grid.Column="1" Margin="0,10,0,0">
+                  <StackPanel Orientation="Horizontal" Margin="0,0,14,4">
+                    <TextBlock Text="{DynamicResource CustomVendor}" VerticalAlignment="Center" Margin="0,0,6,0" />
+                    <TextBox x:Name="VendorIdBox" Width="56" MaxLength="6" LostFocus="OnSettingChanged" KeyDown="OnSettingKeyDown"
+                             AutomationProperties.Name="{DynamicResource CustomVendor}" />
+                  </StackPanel>
+                  <StackPanel Orientation="Horizontal" Margin="0,0,14,4">
+                    <TextBlock Text="{DynamicResource CustomDevice}" VerticalAlignment="Center" Margin="0,0,6,0" />
+                    <TextBox x:Name="DeviceIdBox" Width="56" MaxLength="6" LostFocus="OnSettingChanged" KeyDown="OnSettingKeyDown"
+                             AutomationProperties.Name="{DynamicResource CustomDevice}" />
+                  </StackPanel>
+                  <StackPanel Orientation="Horizontal" Margin="0,0,0,4">
+                    <TextBlock Text="{DynamicResource CustomDesc}" VerticalAlignment="Center" Margin="0,0,6,0" />
+                    <TextBox x:Name="DeviceDescBox" Width="200" MaxLength="100" LostFocus="OnSettingChanged" KeyDown="OnSettingKeyDown"
+                             AutomationProperties.Name="{DynamicResource CustomDesc}" />
+                  </StackPanel>
+                </WrapPanel>
+                <TextBlock Grid.Row="11" Grid.Column="1" Text="{DynamicResource CustomGpuHint}" Foreground="{DynamicResource Muted}" FontSize="11" Margin="0,0,0,0" TextWrapping="Wrap" />
               </Grid>
 
               <TextBlock Text="{DynamicResource SectionShaders}" Style="{StaticResource Section}" />
@@ -224,15 +252,91 @@
                   <RowDefinition Height="Auto" />
                 </Grid.RowDefinitions>
                 <TextBlock Text="{DynamicResource Precompile}" Style="{StaticResource Caption}" />
-                <CheckBox x:Name="PrecompileBox" Grid.Column="1" Click="OnSettingChanged">
+                <CheckBox x:Name="PrecompileBox" Grid.Column="1" Checked="OnSettingChanged" Unchecked="OnSettingChanged">
                   <TextBlock Text="{DynamicResource PrecompileOn}" TextWrapping="Wrap" />
                 </CheckBox>
                 <TextBlock Grid.Row="1" Grid.Column="1" Text="{DynamicResource PrecompileHint}" Foreground="{DynamicResource Muted}" FontSize="11" Margin="0,4,0,0" TextWrapping="Wrap" />
                 <TextBlock Grid.Row="2" Text="{DynamicResource AsyncShaders}" Style="{StaticResource Caption}" Margin="0,10,12,0" />
-                <CheckBox x:Name="AsyncBox" Grid.Row="2" Grid.Column="1" Click="OnSettingChanged" Margin="0,10,0,0">
+                <CheckBox x:Name="AsyncBox" Grid.Row="2" Grid.Column="1" Checked="OnSettingChanged" Unchecked="OnSettingChanged" Margin="0,10,0,0">
                   <TextBlock Text="{DynamicResource AsyncOn}" TextWrapping="Wrap" />
                 </CheckBox>
                 <TextBlock Grid.Row="3" Grid.Column="1" Text="{DynamicResource AsyncHint}" Foreground="{DynamicResource Muted}" FontSize="11" Margin="0,4,0,0" TextWrapping="Wrap" />
+              </Grid>
+
+              <StackPanel x:Name="LegacySection">
+                <TextBlock Text="{DynamicResource SectionLegacy}" Style="{StaticResource Section}" />
+                <TextBlock Text="{DynamicResource LegacyHint}" Foreground="{DynamicResource Muted}" FontSize="11" Margin="0,0,0,8" TextWrapping="Wrap" />
+                <Grid>
+                  <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="230" />
+                    <ColumnDefinition Width="*" />
+                  </Grid.ColumnDefinitions>
+                  <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                  </Grid.RowDefinitions>
+                  <TextBlock Text="{DynamicResource FloatEmulation}" Style="{StaticResource Caption}" />
+                  <ComboBox x:Name="FloatBox" Grid.Column="1" HorizontalAlignment="Left" DisplayMemberPath="Text" SelectionChanged="OnSettingChanged" />
+                  <TextBlock Grid.Row="1" Grid.Column="1" Text="{DynamicResource FloatEmulationHint}" Foreground="{DynamicResource Muted}" FontSize="11" Margin="0,4,0,0" TextWrapping="Wrap" />
+                  <TextBlock Grid.Row="2" Text="{DynamicResource NanDepth}" Style="{StaticResource Caption}" Margin="0,10,12,0" />
+                  <ComboBox x:Name="NanDepthBox" Grid.Row="2" Grid.Column="1" HorizontalAlignment="Left" Margin="0,10,0,0" DisplayMemberPath="Text" SelectionChanged="OnSettingChanged" />
+                  <TextBlock Grid.Row="3" Text="{DynamicResource ShaderCompiler}" Style="{StaticResource Caption}" Margin="0,10,12,0" />
+                  <ComboBox x:Name="CompilerBox" Grid.Row="3" Grid.Column="1" HorizontalAlignment="Left" Margin="0,10,0,0" DisplayMemberPath="Text" SelectionChanged="OnSettingChanged" />
+                </Grid>
+              </StackPanel>
+
+              <TextBlock Text="{DynamicResource SectionAdvanced}" Style="{StaticResource Section}" />
+              <TextBlock Text="{DynamicResource AdvancedHint}" Foreground="{DynamicResource Muted}" FontSize="11" Margin="0,0,0,8" TextWrapping="Wrap" />
+              <Grid>
+                <Grid.ColumnDefinitions>
+                  <ColumnDefinition Width="230" />
+                  <ColumnDefinition Width="*" />
+                </Grid.ColumnDefinitions>
+                <Grid.RowDefinitions>
+                  <RowDefinition Height="Auto" />
+                  <RowDefinition Height="Auto" />
+                  <RowDefinition Height="Auto" />
+                  <RowDefinition Height="Auto" />
+                  <RowDefinition Height="Auto" />
+                  <RowDefinition Height="Auto" />
+                  <RowDefinition Height="Auto" />
+                  <RowDefinition Height="Auto" />
+                  <RowDefinition Height="Auto" />
+                  <RowDefinition Height="Auto" />
+                  <RowDefinition Height="Auto" />
+                  <RowDefinition Height="Auto" />
+                </Grid.RowDefinitions>
+                <TextBlock Text="{DynamicResource SubmitThread}" Style="{StaticResource Caption}" />
+                <CheckBox x:Name="SubmitThreadBox" Grid.Column="1" Checked="OnSettingChanged" Unchecked="OnSettingChanged">
+                  <TextBlock Text="{DynamicResource SubmitThreadOn}" TextWrapping="Wrap" />
+                </CheckBox>
+                <TextBlock Grid.Row="1" Grid.Column="1" Text="{DynamicResource SubmitThreadHint}" Foreground="{DynamicResource Muted}" FontSize="11" Margin="0,4,0,0" TextWrapping="Wrap" />
+                <TextBlock Grid.Row="2" Text="{DynamicResource RecordThread}" Style="{StaticResource Caption}" Margin="0,10,12,0" />
+                <CheckBox x:Name="RecordThreadBox" Grid.Row="2" Grid.Column="1" Margin="0,10,0,0" Checked="OnSettingChanged" Unchecked="OnSettingChanged">
+                  <TextBlock Text="{DynamicResource RecordThreadOn}" TextWrapping="Wrap" />
+                </CheckBox>
+                <TextBlock Grid.Row="3" Grid.Column="1" Text="{DynamicResource RecordThreadHint}" Foreground="{DynamicResource Muted}" FontSize="11" Margin="0,4,0,0" TextWrapping="Wrap" />
+                <TextBlock Grid.Row="4" Text="{DynamicResource BackBuffer}" Style="{StaticResource Caption}" Margin="0,10,12,0" />
+                <CheckBox x:Name="DirectBackBufferBox" Grid.Row="4" Grid.Column="1" Margin="0,10,0,0" Checked="OnSettingChanged" Unchecked="OnSettingChanged">
+                  <TextBlock Text="{DynamicResource DirectBackBufferOn}" TextWrapping="Wrap" />
+                </CheckBox>
+                <TextBlock Grid.Row="5" Grid.Column="1" Text="{DynamicResource DirectBackBufferHint}" Foreground="{DynamicResource Muted}" FontSize="11" Margin="0,4,0,0" TextWrapping="Wrap" />
+                <TextBlock Grid.Row="6" Text="{DynamicResource OutputMasks}" Style="{StaticResource Caption}" Margin="0,10,12,0" />
+                <CheckBox x:Name="OutputMasksBox" Grid.Row="6" Grid.Column="1" Margin="0,10,0,0" Checked="OnSettingChanged" Unchecked="OnSettingChanged">
+                  <TextBlock Text="{DynamicResource OutputMasksOn}" TextWrapping="Wrap" />
+                </CheckBox>
+                <TextBlock Grid.Row="7" Text="{DynamicResource BarrierHoisting}" Style="{StaticResource Caption}" Margin="0,10,12,0" />
+                <CheckBox x:Name="HoistingBox" Grid.Row="7" Grid.Column="1" Margin="0,10,0,0" Checked="OnSettingChanged" Unchecked="OnSettingChanged">
+                  <TextBlock Text="{DynamicResource BarrierHoistingOn}" TextWrapping="Wrap" />
+                </CheckBox>
+                <TextBlock Grid.Row="8" Text="{DynamicResource RelaxedUav}" Style="{StaticResource Caption}" Margin="0,10,12,0" />
+                <ComboBox x:Name="UavBox" Grid.Row="8" Grid.Column="1" HorizontalAlignment="Left" Margin="0,10,0,0" DisplayMemberPath="Text" SelectionChanged="OnSettingChanged" />
+                <TextBlock Grid.Row="9" Grid.Column="1" Text="{DynamicResource RelaxedUavHint}" Foreground="{DynamicResource Muted}" FontSize="11" Margin="0,4,0,0" TextWrapping="Wrap" />
+                <TextBlock Grid.Row="10" Text="{DynamicResource LazyTargets}" Style="{StaticResource Caption}" Margin="0,10,12,0" />
+                <ComboBox x:Name="LazyBox" Grid.Row="10" Grid.Column="1" HorizontalAlignment="Left" Margin="0,10,0,0" DisplayMemberPath="Text" SelectionChanged="OnSettingChanged" />
+                <TextBlock Grid.Row="11" Grid.Column="1" Text="{DynamicResource LazyTargetsHint}" Foreground="{DynamicResource Muted}" FontSize="11" Margin="0,4,0,0" TextWrapping="Wrap" />
               </Grid>
 
               <StackPanel x:Name="MemorySection">

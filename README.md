@@ -44,7 +44,10 @@ signed, so Windows SmartScreen may ask for confirmation.
 
 The manager writes each game's settings to `C:\Program Files\DXUP\games.cfg`.
 Without the manager, put a `dxup.conf` next to the DLLs (it takes precedence
-over `games.cfg`). One `key = value` per line, `#` starts a comment:
+over `games.cfg`). The manager offers these per game, and under
+**Direct3D 7-9** and **Advanced** the rarer ones (shader float rules, NaN
+depth, threads, barriers, the GPU identity). One `key = value` per line, `#`
+starts a comment:
 
 ```ini
 d3d11.samplerAnisotropy = 16   # force anisotropic filtering (0 turns it off)

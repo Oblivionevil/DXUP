@@ -18,6 +18,8 @@ namespace Dxup.Manager
         public GameState State { get; private set; }
         // False until the first check of the game's folder is done.
         public bool Known { get; private set; }
+        // The game gets DXUP's Direct3D 7-9 DLLs (true until checked).
+        public bool UsesLegacy { get; private set; } = true;
 
         public GameItem(GameEntry entry)
         {
@@ -60,9 +62,10 @@ namespace Dxup.Manager
             }
         }
 
-        public void SetState(GameState state)
+        public void SetState(GameState state, bool usesLegacy)
         {
             State = state;
+            UsesLegacy = usesLegacy;
             Known = true;
             Notify();
         }

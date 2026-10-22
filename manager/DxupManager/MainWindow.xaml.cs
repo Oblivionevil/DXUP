@@ -98,6 +98,16 @@ namespace Dxup.Manager
             SpoofBox.ItemsSource = new[] {
                 new Option(Loc.T("OptRealGpu"), null), new Option("NVIDIA", "nvidia"), new Option("AMD", "amd"),
                 new Option("Intel", "intel") };
+            FloatBox.ItemsSource = new[] {
+                new Option(Loc.T("OptAuto"), null), new Option(Loc.T("OptFloatStrict"), "strict"), new Option(Loc.T("OptFloatIeee"), "off") };
+            NanDepthBox.ItemsSource = new[] {
+                new Option(Loc.T("OptNanAuto"), null), new Option(Loc.T("OptNanDiscard"), "discard"), new Option(Loc.T("OptNanZero"), "zero") };
+            CompilerBox.ItemsSource = new[] {
+                new Option(Loc.T("OptCompilerDxup"), false), new Option(Loc.T("OptCompilerFxc"), true) };
+            UavBox.ItemsSource = new[] {
+                new Option(Loc.T("OptAuto"), null), new Option(Loc.T("OptUavRelaxed"), true), new Option(Loc.T("OptUavStrict"), false) };
+            LazyBox.ItemsSource = new[] {
+                new Option(Loc.T("OptLazyAuto"), null), new Option(Loc.T("OptLazyOn"), true), new Option(Loc.T("OptLazyOff"), false) };
         }
 
         // The graphics cards Windows knows (WMI takes a moment: they come in
@@ -164,6 +174,7 @@ namespace Dxup.Manager
 
         static T Value<T>(ComboBox box) => box.SelectedItem is Option option && option.Value is T value ? value : default(T);
         static int? IntValue(ComboBox box) => (box.SelectedItem as Option)?.Value as int?;
+        static bool? BoolValue(ComboBox box) => (box.SelectedItem as Option)?.Value as bool?;
 
         GameItem Selected => GameList.SelectedItem as GameItem;
 
@@ -175,11 +186,12 @@ namespace Dxup.Manager
             int refresh = ++m_refresh;
             UpdateEmptyText();
             var items = m_games.ToList();
-            var states = await Task.Run(() => items.Select(item => m_deployer.State(item.Entry)).ToList());
+            var states = await Task.Run(() => items.Select(item => (state: m_deployer.State(item.Entry),
+                legacy: GameDeployer.DllsFor(item.Entry).Count > DxupInstall.Dlls.Length)).ToList());
             if (refresh != m_refresh)
                 return;
             for (int i = 0; i < items.Count; i++)
-                items[i].SetState(states[i]);
+                items[i].SetState(states[i].state, states[i].legacy);
             int outdated = m_games.Count(item => item.Known && item.State == GameState.Outdated);
             OutdatedBanner.Visibility = outdated != 0 ? Visibility.Visible : Visibility.Collapsed;
             OutdatedText.Text = Loc.F("OutdatedBanner", outdated);
@@ -246,6 +258,22 @@ namespace Dxup.Manager
                 AdapterBox.ItemsSource = AdapterOptions(settings.Adapter);
             Select(AdapterBox, settings.Adapter);
             Select(SpoofBox, settings.SpoofVendor);
+            SharpnessSlider.Value = settings.SpatialSharpness ?? DefaultSharpness;
+            UpdateSharpnessText();
+            VendorIdBox.Text = settings.CustomVendorId ?? "";
+            DeviceIdBox.Text = settings.CustomDeviceId ?? "";
+            DeviceDescBox.Text = settings.CustomDeviceDesc ?? "";
+            Select(FloatBox, settings.FloatEmulation);
+            Select(NanDepthBox, settings.NanDepth);
+            Select(CompilerBox, settings.FxcCompiler);
+            LegacySection.Visibility = item.UsesLegacy ? Visibility.Visible : Visibility.Collapsed;
+            SubmitThreadBox.IsChecked = settings.SubmitThread;
+            RecordThreadBox.IsChecked = settings.RecordThread;
+            DirectBackBufferBox.IsChecked = settings.DirectBackBuffer;
+            OutputMasksBox.IsChecked = settings.PixelOutputMasks;
+            HoistingBox.IsChecked = settings.BarrierHoisting;
+            Select(UavBox, settings.RelaxedUavBarriers);
+            Select(LazyBox, settings.LazyTargets);
             Select(VSyncBox, settings.SyncInterval.HasValue ? (object)(settings.SyncInterval.Value == 0 ? 0 : 1) : null);
             Select(FramesBox, settings.MaxFrameLatency);
             AsyncBox.IsChecked = settings.AsyncShaders;
@@ -510,11 +538,21 @@ namespace Dxup.Manager
             ScopeBox.IsEnabled = force;
             UpscalerAutoBox.IsEnabled = (Value<string>(UpscalerBox) ?? "off") != "off";
             UpscalerInjectBox.IsEnabled = UpscalerAutoBox.IsEnabled;
+            // The sharpening of DXUP's upscale at Present.
+            SharpnessSlider.IsEnabled = SpatialBox.IsChecked == true || IntValue(RenderScaleBox).HasValue;
         }
 
         void UpdateLodText()
         {
             LodText.Text = LodSlider.Value == 0.0 ? Loc.T("OptGame") : LodSlider.Value.ToString("+0.00;-0.00", CultureInfo.CurrentCulture);
+        }
+
+        // DXUP's sharpening when dxgi.upscaleSharpness is not set.
+        const double DefaultSharpness = 0.2;
+
+        void UpdateSharpnessText()
+        {
+            SharpnessText.Text = SharpnessSlider.Value == 0.0 ? Loc.T("OptOff") : SharpnessSlider.Value.ToString("0.00", CultureInfo.CurrentCulture);
         }
 
         // ---- Editing ----
@@ -537,6 +575,20 @@ namespace Dxup.Manager
             settings.RenderScale = IntValue(RenderScaleBox);
             settings.Adapter = Value<string>(AdapterBox);
             settings.SpoofVendor = Value<string>(SpoofBox);
+            // Ids DXUP cannot read are left out (the box shows what is kept).
+            settings.CustomVendorId = GameSettings.ParseHex(VendorIdBox.Text);
+            settings.CustomDeviceId = GameSettings.ParseHex(DeviceIdBox.Text);
+            settings.CustomDeviceDesc = DeviceDescBox.Text.Trim().Length > 0 ? DeviceDescBox.Text.Trim() : null;
+            settings.FloatEmulation = Value<string>(FloatBox);
+            settings.NanDepth = Value<string>(NanDepthBox);
+            settings.FxcCompiler = Value<bool>(CompilerBox);
+            settings.SubmitThread = SubmitThreadBox.IsChecked == true;
+            settings.RecordThread = RecordThreadBox.IsChecked == true;
+            settings.DirectBackBuffer = DirectBackBufferBox.IsChecked == true;
+            settings.PixelOutputMasks = OutputMasksBox.IsChecked == true;
+            settings.BarrierHoisting = HoistingBox.IsChecked == true;
+            settings.RelaxedUavBarriers = BoolValue(UavBox);
+            settings.LazyTargets = BoolValue(LazyBox);
             settings.SyncInterval = IntValue(VSyncBox);
             settings.MaxFrameLatency = IntValue(FramesBox);
             settings.AsyncShaders = AsyncBox.IsChecked == true;
@@ -549,6 +601,28 @@ namespace Dxup.Manager
                 Select(MsaaBox, 4);
                 m_loading = false;
             }
+            m_loading = true;
+            VendorIdBox.Text = settings.CustomVendorId ?? "";
+            DeviceIdBox.Text = settings.CustomDeviceId ?? "";
+            m_loading = false;
+            Save();
+        }
+
+        void OnSettingKeyDown(object sender, KeyEventArgs e)
+        {
+            if (e.Key == Key.Enter)
+                OnSettingChanged(sender, e);
+        }
+
+        void OnSharpnessChanged(object sender, RoutedPropertyChangedEventArgs<double> e)
+        {
+            if (SharpnessText == null)
+                return;
+            UpdateSharpnessText();
+            if (m_loading || Selected == null)
+                return;
+            Selected.Entry.Settings.SpatialSharpness = Math.Abs(SharpnessSlider.Value - DefaultSharpness) < 0.001
+                ? (float?)null : (float)SharpnessSlider.Value;
             Save();
         }
 
