@@ -1216,7 +1216,7 @@ namespace dxup::legacy {
     // DLL, records of hash, size and DXBC appended as they compile.
     // Changes whenever the translator's output changes (the HLSL path's;
     // DXUP's compiler is not cached, it is faster than reading the cache).
-    constexpr uint64_t kTranslatorVersion = 9;
+    constexpr uint64_t kTranslatorVersion = 10;
 
     // dxup_pso_cache\d3d9_shaders.bin: fxc's code of translated variants. A
     // header with the translator version (another one: started anew), then

@@ -2137,6 +2137,15 @@ static int dumpRecord(const char* path, const char* hashText) {
   ShaderInfo9 info;
   if (!translateShader9(tokens.data(), tokens.size(), options, hlsl, info, error)) { std::printf("%s\n", error.c_str()); return 1; }
   std::printf("%s\n", hlsl.c_str());
+  // What DXUP's own compiler makes of it, with the products of a default
+  // device (dot products as Direct3D 9 forms them).
+  options.dotEmulation = true;
+  std::vector<uint8_t> dxbc;
+  ShaderInfo9 info2;
+  if (compileShader9(tokens.data(), tokens.size(), options, dxbc, info2, error))
+    disassemble("emitter", dxbc);
+  else
+    std::printf("emitter: %s\n", error.c_str());
   return 0;
 }
 

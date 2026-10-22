@@ -611,8 +611,17 @@ namespace dxup::legacy {
         return comp(temp(s), 0);
       }
 
+      static bool sameOperand(const Op& a, const Op& b) {
+        return a.type == b.type && a.comps == b.comps && a.mode == b.mode && a.sel == b.sel && a.dims == b.dims
+            && a.index[0] == b.index[0] && a.index[1] == b.index[1] && a.relDim == b.relDim && a.relImm == b.relImm
+            && a.relReg == b.relReg && a.relComp == b.relComp && a.mod == b.mod
+            && std::memcmp(a.imm, b.imm, sizeof(a.imm)) == 0;
+      }
+
       Op dot(Op a, Op b, uint32_t width) {
-        if (options.dotEmulation)
+        // A square (dp3 r, x, x: lengths) is Direct3D 9's product as it is:
+        // 0 * 0 = 0, inf * inf = inf, NaN stays NaN.
+        if (options.dotEmulation && !sameOperand(a, b))
           return legacyDot(a, b, width);
         const uint32_t s = scratch();
         emit(width == 4 ? DxDp4 : width == 3 ? DxDp3 : DxDp2, { tempDst(s, 1), a, b });

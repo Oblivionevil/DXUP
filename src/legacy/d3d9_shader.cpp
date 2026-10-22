@@ -525,18 +525,20 @@ namespace dxup::legacy {
         auto src = [&](size_t i) { return i < s.size() ? source(s[i]) : std::string("float4(0, 0, 0, 0)"); };
         // Products as Direct3D 9 forms them (TranslateOptions9::floatEmulation
         // and dotEmulation).
-        const bool legacy = options.dotEmulation;
+        // A square (dp3 r, x, x: lengths) is Direct3D 9's product as it is.
         auto mul = [&](const std::string& a, const std::string& b) {
           return options.floatEmulation ? "dxup_mul(" + a + ", " + b + ")" : a + " * " + b;
         };
         auto dot4 = [&](const std::string& a, const std::string& b) {
-          return legacy ? "dxup_dot4(" + a + ", " + b + ")" : "dot(" + a + ", " + b + ")";
+          return options.dotEmulation && a != b ? "dxup_dot4(" + a + ", " + b + ")" : "dot(" + a + ", " + b + ")";
         };
         auto dot3 = [&](const std::string& a, const std::string& b) {
-          return legacy ? "dxup_dot4(float4((" + a + ").xyz, 0.0f), " + b + ")" : "dot((" + a + ").xyz, (" + b + ").xyz)";
+          return options.dotEmulation && a != b ? "dxup_dot4(float4((" + a + ").xyz, 0.0f), " + b + ")"
+                                                : "dot((" + a + ").xyz, (" + b + ").xyz)";
         };
         auto dot2 = [&](const std::string& a, const std::string& b) {
-          return legacy ? "dxup_dot4(float4((" + a + ").xy, 0.0f, 0.0f), " + b + ")" : "dot((" + a + ").xy, (" + b + ").xy)";
+          return options.dotEmulation && a != b ? "dxup_dot4(float4((" + a + ").xy, 0.0f, 0.0f), " + b + ")"
+                                                : "dot((" + a + ").xy, (" + b + ").xy)";
         };
         auto one = [&](size_t i) { return i < s.size() ? scalar(s[i]) : std::string("0.0f"); };
         const uint32_t reg = ins.dst.empty() ? 0 : ins.dst[0].index;
