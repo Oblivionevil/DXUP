@@ -246,9 +246,7 @@ namespace dxup {
     return now.QuadPart;
   }
 
-  HitchScope::~HitchScope() {
-    if (!m_name)
-      return;
+  void HitchScope::finish() {
     LARGE_INTEGER frequency;
     QueryPerformanceFrequency(&frequency);
     const double ms = double(hitchTimestamp() - m_start) * 1000.0 / double(frequency.QuadPart);

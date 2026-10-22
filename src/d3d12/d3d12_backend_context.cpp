@@ -9858,10 +9858,15 @@ namespace dxup::d3d12 {
   }
 
   void D3D12BackendContext::ensureDescriptorHeapSpace() {
-    HitchScope hitch("backend ensureDescriptorHeapSpace");
     // Worst case per draw: CBV 70 + SRV 640 + UAV 320 = 1030, Sampler 80
     // Flush mid-frame if heaps are too full to avoid out-of-bounds descriptors.
     constexpr uint32_t kCbvSrvUavReserve = 1100;
+    // Called for most draws: the usual case without a hitch scope (its
+    // check and destructor were 2 % of the worker in draw-heavy work).
+    if (m_samplerDescriptorsInBatch <= kShaderVisibleSamplerHeapSize / 2
+     && m_cbvSrvUavHeapOffset + kCbvSrvUavReserve < cbvSrvUavPartitionEnd())
+      return;
+    HitchScope hitch("backend ensureDescriptorHeapSpace");
     // Sampler tables of the open command list stay until it completes:
     // submit it before they could fill the heap.
     if (m_samplerDescriptorsInBatch > kShaderVisibleSamplerHeapSize / 2)

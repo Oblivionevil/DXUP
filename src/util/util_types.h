@@ -116,7 +116,11 @@ namespace dxup {
       if (m_name)
         m_start = hitchTimestamp();
     }
-    ~HitchScope();
+    // Inline: without the trace nothing is called.
+    ~HitchScope() {
+      if (m_name)
+        finish();
+    }
     HitchScope(const HitchScope&) = delete;
     // What the hitch line names, once the scope knows which way it went.
     void rename(const char* name) {
@@ -126,6 +130,8 @@ namespace dxup {
     HitchScope& operator=(const HitchScope&) = delete;
 
   private:
+    void finish();
+
     const char* m_name;
     uint64_t    m_detail;
     int64_t     m_start = 0;
