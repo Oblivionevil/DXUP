@@ -515,8 +515,12 @@ namespace dxup::d3d12 {
 
     void publish() {
       m_unpublishedBytes = 0;
-      m_published.store(m_produced, std::memory_order_release);
-      if (m_sleeping.load(std::memory_order_relaxed))
+      // Sequentially consistent with the record thread's store to
+      // m_sleeping and its load of m_published: one of the two sees the
+      // other, or the thread sleeps with calls pending until the next
+      // drain. On x86 an xchg instead of a mov, once per batch.
+      m_published.store(m_produced, std::memory_order_seq_cst);
+      if (m_sleeping.load(std::memory_order_seq_cst))
         wake();
     }
 

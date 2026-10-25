@@ -38,6 +38,34 @@ namespace dxup {
     std::vector<CsChunk*>  g_freeChunks;
     // Enough for a few frames of commands; more are freed.
     constexpr size_t       kMaxPooledChunks = 512;
+
+    // An auto-reset event for each thread that waits for a worker.
+    struct ThreadWaitEvent {
+      HANDLE handle = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+      ~ThreadWaitEvent() {
+        if (handle)
+          CloseHandle(handle);
+      }
+    };
+
+    HANDLE threadWaitEvent() {
+      static thread_local ThreadWaitEvent event;
+      return event.handle;
+    }
+
+    // Takes the messages sent to this thread, as a native Present would,
+    // then waits for the event (none: only for the time) at most timeout ms
+    // or until another message is sent; callers loop. The worker's DXGI
+    // Present can send messages to the window, whose thread may be the
+    // waiting one. Posted messages stay for the application.
+    void waitTakingSentMessages(HANDLE event, DWORD timeout) {
+      MSG msg;
+      PeekMessageW(&msg, nullptr, 0, 0, PM_NOREMOVE | PM_QS_SENDMESSAGE);
+      // MWMO_INPUTAVAILABLE: also for a message that arrived before the
+      // wait and was seen without being taken.
+      MsgWaitForMultipleObjectsEx(event ? 1 : 0, event ? &event : nullptr, timeout, QS_SENDMESSAGE,
+        MWMO_INPUTAVAILABLE);
+    }
   }
 
   // Slices taken from the allocator at once: one lock for this many maps.
@@ -91,28 +119,36 @@ namespace dxup {
     delete chunk;
   }
 
+  CsCommand* CsChunk::skipFailedCommand(CsCommand* cmd, const char* what) {
+    static std::atomic<uint32_t> s_reported{ 0 };
+    if (s_reported.fetch_add(1) < 8)
+      logMessage(LogLevel::Error, "CS worker: command %p threw (%s); skipped", reinterpret_cast<void*>(cmd->invoke), what);
+    CsCommand* next = cmd->next;
+    cmd->invoke(cmd, nullptr, CsOp::Destroy);
+    return next;
+  }
+
   CsCommandList::CsCommandList(
       std::vector<CsChunk*>               chunks,
       std::vector<IBackendQuery*>         queries,
       std::vector<BackendGpuUse*>         gpuUses,
-      std::shared_ptr<BackendRetireQueue> retireQueue,
-      bool                                hasHold,
-      uint64_t                            hold)
+      std::vector<std::shared_ptr<void>>  objects,
+      std::shared_ptr<BackendRetireQueue> retireQueue)
   : m_chunks(std::move(chunks))
   , m_queries(std::move(queries))
   , m_gpuUses(std::move(gpuUses))
-  , m_retireQueue(std::move(retireQueue))
-  , m_hasHold(hasHold)
-  , m_hold(hold) {
+  , m_objects(std::move(objects))
+  , m_retireQueue(std::move(retireQueue)) {
   }
 
   CsCommandList::~CsCommandList() {
-    // Destroying the commands drops the references they captured; the
-    // objects they point to may go once the hold is released.
+    // Destroying the commands drops the references they captured. The GPU
+    // may still run what the worker recorded from them: the objects retire
+    // like released ones.
     for (CsChunk* chunk : m_chunks)
       freeCsChunk(chunk);
-    if (m_hasHold && m_retireQueue)
-      m_retireQueue->releaseHold(m_hold);
+    if (m_retireQueue)
+      m_retireQueue->retire(m_objects);
   }
 
   void CsCommandList::replay(CsWorkerState& state) const {
@@ -125,10 +161,13 @@ namespace dxup {
         logMessage(LogLevel::Error, "CS command list %p nested %u deep: not replayed", static_cast<const void*>(this), s_depth);
       return;
     }
-    s_depth++;
+    // Also when a command throws.
+    struct Depth {
+      Depth() { s_depth++; }
+      ~Depth() { s_depth--; }
+    } depth;
     for (CsChunk* chunk : m_chunks)
       chunk->replay(state);
-    s_depth--;
   }
 
   void replayCsCommandList(IBackendContext* ctx, const Rc<IBackendCommandList>& list) {
@@ -190,7 +229,11 @@ namespace dxup {
     if (m_worker.joinable())
       m_worker.join();
 
-    // Nothing is queued any more; later releases can destroy right away.
+    // Nothing is queued any more; later releases can destroy right away,
+    // once the GPU is through as well: the real context keeps no
+    // references of its own to what the last frames use.
+    if (!processExiting())
+      m_real->synchronize();
     if (m_retireQueue)
       m_retireQueue->setDeferred(false);
     if (m_sliceCache && m_sliceCache->owner) {
@@ -212,9 +255,24 @@ namespace dxup {
     m_recordedQueries.clear();
     m_recordedGpuUses.clear();
     m_stagedMaps.clear();
-    if (m_hasHold && m_retireQueue)
-      m_retireQueue->releaseHold(m_hold);
-    m_hasHold = false;
+    m_keptObjects.clear();
+    if (m_retireQueue)
+      m_retireQueue->retire(m_recordedObjects);
+    m_recordedObjects.clear();
+  }
+
+  void CsThreadContext::keepObject(const BackendRetirable* object) {
+    if (!object)
+      return;
+    auto [entry, added] = m_keptObjects.insert(object);
+    if (!added)
+      return;
+    // Objects without an owner are left out: one may go, and another take
+    // its address.
+    if (std::shared_ptr<void> owner = object->retireOwner())
+      m_recordedObjects.push_back(std::move(owner));
+    else
+      m_keptObjects.erase(entry);
   }
 
   void CsThreadContext::workerMain() {
@@ -249,20 +307,38 @@ namespace dxup {
         m_queuedChunks.fetch_sub(1, std::memory_order_relaxed);
       }
 
-      chunk->executeAll(m_workerState);
-      // The GPU may still use what these commands referenced.
-      if (!chunk->retired.empty())
-        m_real->retireAfterGpu(chunk->retired);
+      try {
+        chunk->executeAll(m_workerState);
+        // The GPU may still use what these commands referenced.
+        if (!chunk->retired.empty())
+          m_real->retireAfterGpu(chunk->retired);
+      } catch (const std::exception& e) {
+        logMessage(LogLevel::Error, "CS worker: retiring a chunk's objects failed (%s)", e.what());
+      }
       freeCsChunk(chunk);
 
-      bool wake;
       {
         std::lock_guard<std::mutex> lock(m_syncMutex);
-        wake = m_chunksExecuted.fetch_add(1, std::memory_order_release) + 1 >= m_syncTarget;
+        const uint64_t executed = m_chunksExecuted.fetch_add(1, std::memory_order_release) + 1;
+        if (executed >= m_syncTarget)
+          wakeSyncWaiters(executed);
       }
-      if (wake)
-        m_syncCv.notify_all();
     }
+  }
+
+  void CsThreadContext::wakeSyncWaiters(uint64_t executed) {
+    uint64_t next = UINT64_MAX;
+    for (size_t i = 0; i < m_syncWaiters.size();) {
+      if (m_syncWaiters[i].target <= executed) {
+        SetEvent(m_syncWaiters[i].event);
+        m_syncWaiters[i] = m_syncWaiters.back();
+        m_syncWaiters.pop_back();
+      } else {
+        next = (std::min)(next, m_syncWaiters[i].target);
+        i++;
+      }
+    }
+    m_syncTarget = next;
   }
 
   void CsThreadContext::submitChunk() {
@@ -311,13 +387,41 @@ namespace dxup {
     // The worker is gone once the process exits.
     if (processExiting())
       return;
-    std::unique_lock<std::mutex> lock(m_syncMutex);
-    // Threads waiting for different chunks are woken from the earliest on.
-    m_syncWaiters++;
-    m_syncTarget = (std::min)(m_syncTarget, target);
-    m_syncCv.wait(lock, [this, target] { return m_chunksExecuted.load(std::memory_order_acquire) >= target; });
-    if (!--m_syncWaiters)
-      m_syncTarget = UINT64_MAX;
+    void* event = threadWaitEvent();
+    {
+      std::lock_guard<std::mutex> lock(m_syncMutex);
+      if (m_chunksExecuted.load(std::memory_order_acquire) >= target)
+        return;
+      m_syncWaiters.push_back({ target, event });
+      m_syncTarget = (std::min)(m_syncTarget, target);
+    }
+    while (m_chunksExecuted.load(std::memory_order_acquire) < target && !processExiting()) {
+      // The worker presents, and a present can wait for the window's
+      // thread, which may be this one: its messages are taken while the
+      // worker runs such a callback. Not otherwise: they would run the
+      // window procedure in the middle of a D3D11 call, which native D3D11
+      // does not do.
+      if (m_workerInCallback.load(std::memory_order_acquire))
+        waitTakingSentMessages(event, 100);
+      else if (event)
+        WaitForSingleObject(event, 100);
+      else
+        Sleep(1);
+    }
+
+    // The worker removes the entry when the chunk has run; it is left when
+    // the process exits.
+    std::lock_guard<std::mutex> lock(m_syncMutex);
+    for (size_t i = 0; i < m_syncWaiters.size(); i++) {
+      if (m_syncWaiters[i].event == event && m_syncWaiters[i].target == target) {
+        m_syncWaiters[i] = m_syncWaiters.back();
+        m_syncWaiters.pop_back();
+        m_syncTarget = UINT64_MAX;
+        for (const SyncWaiter& waiter : m_syncWaiters)
+          m_syncTarget = (std::min)(m_syncTarget, waiter.target);
+        break;
+      }
+    }
   }
 
   // ============================================================
@@ -325,45 +429,55 @@ namespace dxup {
   // ============================================================
 
   void CsThreadContext::bindVertexBuffer(uint32_t slot, IBackendBuffer* buffer, uint32_t offset, uint32_t stride) {
+    keep(buffer);
     emit([=](CsWorkerState& s) { s.ctx->bindVertexBuffer(slot, buffer, offset, stride); });
   }
 
   void CsThreadContext::bindIndexBuffer(IBackendBuffer* buffer, uint32_t offset, IndexType type) {
+    keep(buffer);
     emit([=](CsWorkerState& s) { s.ctx->bindIndexBuffer(buffer, offset, type); });
   }
 
   void CsThreadContext::bindConstantBuffer(ShaderStage stage, uint32_t slot, IBackendBuffer* buffer) {
+    keep(buffer);
     emit([=](CsWorkerState& s) { s.ctx->bindConstantBuffer(stage, slot, buffer); });
   }
 
   void CsThreadContext::bindConstantBufferRange(ShaderStage stage, uint32_t slot, IBackendBuffer* buffer,
                                                 uint32_t firstConstant, uint32_t numConstants) {
+    keep(buffer);
     emit([=](CsWorkerState& s) {
       s.ctx->bindConstantBufferRange(stage, slot, buffer, firstConstant, numConstants);
     });
   }
 
   void CsThreadContext::bindShaderResource(ShaderStage stage, uint32_t slot, IBackendImageView* view) {
+    keep(view);
     emit([=](CsWorkerState& s) { s.ctx->bindShaderResource(stage, slot, view); });
   }
 
   void CsThreadContext::bindShaderResource(ShaderStage stage, uint32_t slot, IBackendBufferView* view) {
+    keep(view);
     emit([=](CsWorkerState& s) { s.ctx->bindShaderResource(stage, slot, view); });
   }
 
   void CsThreadContext::bindUnorderedAccess(ShaderStage stage, uint32_t slot, IBackendImageView* view) {
+    keep(view);
     emit([=](CsWorkerState& s) { s.ctx->bindUnorderedAccess(stage, slot, view); });
   }
 
   void CsThreadContext::bindUnorderedAccess(ShaderStage stage, uint32_t slot, IBackendBufferView* view) {
+    keep(view);
     emit([=](CsWorkerState& s) { s.ctx->bindUnorderedAccess(stage, slot, view); });
   }
 
   void CsThreadContext::setUnorderedAccessCounter(IBackendBufferView* view, uint32_t value) {
+    keep(view);
     emit([=](CsWorkerState& s) { s.ctx->setUnorderedAccessCounter(view, value); });
   }
 
   void CsThreadContext::bindSampler(ShaderStage stage, uint32_t slot, IBackendSampler* sampler) {
+    keep(sampler);
     emit([=](CsWorkerState& s) { s.ctx->bindSampler(stage, slot, sampler); });
   }
 
@@ -378,6 +492,7 @@ namespace dxup {
     for (uint32_t i = 0; i < clamped; i++) {
       bufferCopy[i] = buffers ? buffers[i] : nullptr;
       offsetCopy[i] = offsets ? offsets[i] : 0;
+      keep(bufferCopy[i]);
     }
     const bool hasBuffers = buffers != nullptr;
     const bool hasOffsets = offsets != nullptr;
@@ -397,6 +512,7 @@ namespace dxup {
   }
 
   void CsThreadContext::drawAuto(IBackendBuffer* vertexBuffer, uint32_t stride) {
+    keep(vertexBuffer);
     // Counts what stream output wrote when the draw is recorded, also for
     // command lists.
     emit([=](CsWorkerState& s) {
@@ -412,8 +528,11 @@ namespace dxup {
   void CsThreadContext::bindRenderTargets(uint32_t count, IBackendImageView** rtvs, IBackendImageView* dsv) {
     std::array<IBackendImageView*, 8> rtvCopy = {};
     const uint32_t clamped = count < 8 ? count : 8;
-    for (uint32_t i = 0; i < clamped && rtvs; i++)
+    for (uint32_t i = 0; i < clamped && rtvs; i++) {
       rtvCopy[i] = rtvs[i];
+      keep(rtvCopy[i]);
+    }
+    keep(dsv);
     emit([=](CsWorkerState& s) mutable {
       s.rtCount = clamped;
       for (uint32_t i = 0; i < 8; i++)
@@ -543,6 +662,7 @@ namespace dxup {
 
   void CsThreadContext::copyBuffer(IBackendBuffer* dst, uint64_t dstOffset,
                                    IBackendBuffer* src, uint64_t srcOffset, uint64_t size) {
+    keep(dst, src);
     noteBufferGpuWrite(dst);
     BackendGpuUse* dstUse = trackGpuUse(stagingGpuUse(dst));
     BackendGpuUse* srcUse = trackGpuUse(stagingGpuUse(src));
@@ -555,6 +675,7 @@ namespace dxup {
 
   void CsThreadContext::copyImage(IBackendImage* dst, const ImageSubresource& dstSubres,
                                   IBackendImage* src, const ImageSubresource& srcSubres) {
+    keep(dst, src);
     BackendGpuUse* dstUse = trackGpuUse(stagingGpuUse(dst));
     BackendGpuUse* srcUse = trackGpuUse(stagingGpuUse(src));
     emit([=](CsWorkerState& s) {
@@ -568,6 +689,7 @@ namespace dxup {
                                         uint32_t dstX, uint32_t dstY, uint32_t dstZ,
                                         IBackendImage* src, const ImageSubresource& srcSubres,
                                         const ImageCopyRegion* srcRegion) {
+    keep(dst, src);
     const bool hasRegion = srcRegion != nullptr;
     const ImageCopyRegion region = hasRegion ? *srcRegion : ImageCopyRegion{};
     BackendGpuUse* dstUse = trackGpuUse(stagingGpuUse(dst));
@@ -582,6 +704,7 @@ namespace dxup {
   void CsThreadContext::copyBufferToImage(IBackendImage* dst, const ImageSubresource& dstSubres,
                                           IBackendBuffer* src, uint64_t srcOffset,
                                           const ImageCopyRegion* region) {
+    keep(dst, src);
     const bool hasRegion = region != nullptr;
     const ImageCopyRegion regionCopy = hasRegion ? *region : ImageCopyRegion{};
     BackendGpuUse* dstUse = trackGpuUse(stagingGpuUse(dst));
@@ -595,6 +718,7 @@ namespace dxup {
 
   void CsThreadContext::copyImageToBuffer(IBackendBuffer* dst, uint64_t dstOffset,
                                           IBackendImage* src, const ImageSubresource& srcSubres) {
+    keep(dst, src);
     noteBufferGpuWrite(dst);
     BackendGpuUse* dstUse = trackGpuUse(stagingGpuUse(dst));
     BackendGpuUse* srcUse = trackGpuUse(stagingGpuUse(src));
@@ -606,6 +730,7 @@ namespace dxup {
   }
 
   void CsThreadContext::copyStructureCount(IBackendBuffer* dst, uint64_t dstOffset, IBackendBufferView* view) {
+    keep(dst, view);
     noteBufferGpuWrite(dst);
     BackendGpuUse* dstUse = trackGpuUse(stagingGpuUse(dst));
     emit([=](CsWorkerState& s) {
@@ -749,6 +874,7 @@ namespace dxup {
       m_stagedMaps.erase(m_stagedMaps.begin() + i);
 
       unmapDirect(staged.staging.get());
+      keep(staged.target);
       // Commands of command lists run again: keep the references.
       emit([target = staged.target, staging = std::move(staged.staging), size = staged.size](CsWorkerState& s) {
         s.ctx->copyBuffer(target, 0, staging.get(), 0, size);
@@ -761,6 +887,7 @@ namespace dxup {
   }
 
   void CsThreadContext::updateBuffer(IBackendBuffer* buffer, uint64_t offset, uint64_t size, const void* data) {
+    keep(buffer);
     if (data && size) {
       BufferUpdateRegion region = {};
       region.offset = offset;
@@ -787,6 +914,7 @@ namespace dxup {
       return;
     if (renameConstantBuffer(buffer, regions, regionCount))
       return;
+    keep(buffer);
 
     // One block: the region table followed by the data of every region.
     size_t total = sizeof(BufferUpdateRegion) * regionCount;
@@ -836,6 +964,9 @@ namespace dxup {
   void CsThreadContext::retargetBufferViews(IBackendBuffer* buffer, const std::vector<IBackendBufferView*>& views) {
     if (views.empty())
       return;
+    keep(buffer);
+    for (IBackendBufferView* view : views)
+      keep(view);
     emit([buffer, views](CsWorkerState& s) { s.ctx->retargetBufferViews(buffer, views); });
   }
 
@@ -1047,6 +1178,7 @@ namespace dxup {
     if (!query)
       return;
     if (m_recording) {
+      keep(query);
       m_recordedQueries.push_back(query);
       emit([=](CsWorkerState& s) {
         s.ctx->beginQuery(query);
@@ -1067,6 +1199,7 @@ namespace dxup {
     if (!query)
       return;
     if (m_recording) {
+      keep(query);
       m_recordedQueries.push_back(query);
       emit([=](CsWorkerState& s) {
         s.ctx->endQuery(query);
@@ -1082,6 +1215,7 @@ namespace dxup {
   }
 
   void CsThreadContext::setPredication(IBackendQuery* predicate, bool value) {
+    keep(predicate);
     emit([=](CsWorkerState& s) { s.ctx->setPredication(predicate, value); });
   }
 
@@ -1113,17 +1247,23 @@ namespace dxup {
   }
 
   void CsThreadContext::updateTileMappings(const TileMappingUpdate& update) {
+    keepTiled(update.resource);
+    keep(update.tilePool);
     emit([update](CsWorkerState& s) { s.ctx->updateTileMappings(update); });
   }
 
   void CsThreadContext::copyTileMappings(TiledResourceRef dst, const TileCoordinate& dstCoordinate,
                                          TiledResourceRef src, const TileCoordinate& srcCoordinate,
                                          const TileRegionSize& size, uint32_t flags) {
+    keepTiled(dst);
+    keepTiled(src);
     emit([=](CsWorkerState& s) { s.ctx->copyTileMappings(dst, dstCoordinate, src, srcCoordinate, size, flags); });
   }
 
   void CsThreadContext::copyTiles(TiledResourceRef resource, const TileCoordinate& coordinate, const TileRegionSize& size,
                                   IBackendBuffer* buffer, uint64_t bufferOffset, uint32_t flags) {
+    keepTiled(resource);
+    keep(buffer);
     BackendGpuUse* bufferUse = trackGpuUse(stagingGpuUse(buffer));
     emit([=](CsWorkerState& s) {
       s.ctx->copyTiles(resource, coordinate, size, buffer, bufferOffset, flags);
@@ -1138,6 +1278,7 @@ namespace dxup {
       return;
     const auto* bytes = static_cast<const uint8_t*>(data);
     std::vector<uint8_t> copy(bytes, bytes + size_t(tiles) * kTileSizeInBytes);
+    keepTiled(resource);
     emit([resource, coordinate, size, flags, copy = std::move(copy)](CsWorkerState& s) {
       s.ctx->updateTiles(resource, coordinate, size, copy.data(), flags);
     });
@@ -1155,6 +1296,7 @@ namespace dxup {
     if (FAILED(hr))
       return false;
     if (hr == S_OK) {
+      keep(tilePool);
       auto shared = std::make_shared<d3d12::D3D12BackendBuffer::TileHeap>(std::move(heap));
       emit([pool, shared](CsWorkerState&) { pool->appendTileHeap(*shared); });
     }
@@ -1166,6 +1308,7 @@ namespace dxup {
   }
 
   void CsThreadContext::setImageMinLod(IBackendImage* image, float minLod) {
+    keep(image);
     emit([=](CsWorkerState& s) { s.ctx->setImageMinLod(image, minLod); });
   }
 
@@ -1278,15 +1421,9 @@ namespace dxup {
       YieldProcessor();
     }
     // The worker presents, and a present can wait for the window's thread,
-    // which may be this one: take the messages sent to it meanwhile, as a
-    // native Present would, and leave posted ones to the application.
-    while (m_framesExecuted.load(std::memory_order_acquire) < frames && !processExiting()) {
-      const DWORD result = MsgWaitForMultipleObjects(1, &m_frameEvent, FALSE, 100, QS_SENDMESSAGE);
-      if (result == WAIT_OBJECT_0 + 1) {
-        MSG msg;
-        PeekMessageW(&msg, nullptr, 0, 0, PM_NOREMOVE | PM_QS_SENDMESSAGE);
-      }
-    }
+    // which may be this one.
+    while (m_framesExecuted.load(std::memory_order_acquire) < frames && !processExiting())
+      waitTakingSentMessages(m_frameEvent, 100);
   }
 
   void CsThreadContext::waitForFrameLatency(uint32_t maxLatency) {
@@ -1309,7 +1446,25 @@ namespace dxup {
   }
 
   void CsThreadContext::executeOnBackend(std::function<void(IBackendContext*)> fn) {
-    emit([fn = std::move(fn)](CsWorkerState& s) { fn(s.ctx); });
+    if (m_recording) {
+      emit([fn = std::move(fn)](CsWorkerState& s) { fn(s.ctx); });
+      return;
+    }
+    emit([this, fn = std::move(fn)](CsWorkerState& s) {
+      // DXGI's Present runs in these and can wait for the window's thread:
+      // threads waiting for the worker take sent messages meanwhile.
+      struct InCallback {
+        std::atomic<bool>& flag;
+        explicit InCallback(std::atomic<bool>& f) : flag(f) { flag.store(true, std::memory_order_seq_cst); }
+        ~InCallback() { flag.store(false, std::memory_order_release); }
+      } inCallback(m_workerInCallback);
+      {
+        std::lock_guard<std::mutex> lock(m_syncMutex);
+        for (const SyncWaiter& waiter : m_syncWaiters)
+          SetEvent(waiter.event);
+      }
+      fn(s.ctx);
+    });
     submitChunk();
   }
 
@@ -1320,12 +1475,13 @@ namespace dxup {
     submitChunk();
     auto list = std::make_shared<CsCommandList>(
       std::move(m_recordedChunks), std::move(m_recordedQueries), std::move(m_recordedGpuUses),
-      m_retireQueue, m_hasHold, m_hold);
+      std::move(m_recordedObjects), m_retireQueue);
     m_recordedChunks.clear();
     m_recordedQueries.clear();
     m_recordedGpuUses.clear();
+    m_recordedObjects.clear();
+    m_keptObjects.clear();
     m_stagedMaps.clear();
-    m_hasHold = false;
     return list;
   }
 
@@ -1360,36 +1516,43 @@ namespace dxup {
   // ============================================================
 
   void CsThreadContext::clearRenderTarget(IBackendImageView* rtv, const float color[4]) {
+    keep(rtv);
     std::array<float, 4> copy = { color[0], color[1], color[2], color[3] };
     emit([=](CsWorkerState& s) { s.ctx->clearRenderTarget(rtv, copy.data()); });
   }
 
   void CsThreadContext::clearDepthStencil(IBackendImageView* dsv, float depth, uint8_t stencil, uint32_t flags) {
+    keep(dsv);
     emit([=](CsWorkerState& s) { s.ctx->clearDepthStencil(dsv, depth, stencil, flags); });
   }
 
   void CsThreadContext::clearUnorderedAccessViewUint(IBackendImageView* view, const uint32_t values[4]) {
+    keep(view);
     std::array<uint32_t, 4> copy = { values[0], values[1], values[2], values[3] };
     emit([=](CsWorkerState& s) { s.ctx->clearUnorderedAccessViewUint(view, copy.data()); });
   }
 
   void CsThreadContext::clearUnorderedAccessViewUint(IBackendBufferView* view, const uint32_t values[4]) {
+    keep(view);
     std::array<uint32_t, 4> copy = { values[0], values[1], values[2], values[3] };
     emit([=](CsWorkerState& s) { s.ctx->clearUnorderedAccessViewUint(view, copy.data()); });
   }
 
   void CsThreadContext::clearUnorderedAccessViewFloat(IBackendImageView* view, const float values[4]) {
+    keep(view);
     std::array<float, 4> copy = { values[0], values[1], values[2], values[3] };
     emit([=](CsWorkerState& s) { s.ctx->clearUnorderedAccessViewFloat(view, copy.data()); });
   }
 
   void CsThreadContext::clearUnorderedAccessViewFloat(IBackendBufferView* view, const float values[4]) {
+    keep(view);
     std::array<float, 4> copy = { values[0], values[1], values[2], values[3] };
     emit([=](CsWorkerState& s) { s.ctx->clearUnorderedAccessViewFloat(view, copy.data()); });
   }
 
   void CsThreadContext::clearBufferView(IBackendBufferView* view, const float color[4], uint32_t rectCount,
                                         const Rect* rects) {
+    keep(view);
     std::array<float, 4> colorCopy = { color[0], color[1], color[2], color[3] };
     emitArray(rects, rectCount, [view, colorCopy](CsWorkerState& s, const Rect* data, size_t count) {
       s.ctx->clearBufferView(view, colorCopy.data(), static_cast<uint32_t>(count), data);
@@ -1398,6 +1561,7 @@ namespace dxup {
 
   void CsThreadContext::clearView(IBackendImageView* view, bool renderTarget, const float color[4],
                                   uint32_t rectCount, const Rect* rects) {
+    keep(view);
     std::array<float, 4> colorCopy = { color[0], color[1], color[2], color[3] };
     emitArray(rects, rectCount, [view, renderTarget, colorCopy](CsWorkerState& s, const Rect* data, size_t count) {
       s.ctx->clearView(view, renderTarget, colorCopy.data(), static_cast<uint32_t>(count), data);
@@ -1409,29 +1573,35 @@ namespace dxup {
   // ============================================================
 
   void CsThreadContext::generateMips(IBackendImageView* srv) {
+    keep(srv);
     emit([=](CsWorkerState& s) { s.ctx->generateMips(srv); });
   }
 
   void CsThreadContext::resolveSubresource(IBackendImage* dst, uint32_t dstSubres,
                                            IBackendImage* src, uint32_t srcSubres, DXGI_FORMAT format) {
+    keep(dst, src);
     emit([=](CsWorkerState& s) { s.ctx->resolveSubresource(dst, dstSubres, src, srcSubres, format); });
   }
 
   void CsThreadContext::upsampleImage(IBackendImage* dst, IBackendImage* src, DXGI_FORMAT format,
                                       DXGI_FORMAT readFormat) {
+    keep(dst, src);
     emit([=](CsWorkerState& s) { s.ctx->upsampleImage(dst, src, format, readFormat); });
   }
 
   void CsThreadContext::resolveSampleZero(IBackendImage* dst, IBackendImage* src, DXGI_FORMAT format,
                                      DXGI_FORMAT readFormat) {
+    keep(dst, src);
     emit([=](CsWorkerState& s) { s.ctx->resolveSampleZero(dst, src, format, readFormat); });
   }
 
   void CsThreadContext::resolveFinite(IBackendImage* dst, IBackendImage* src, DXGI_FORMAT format) {
+    keep(dst, src);
     emit([=](CsWorkerState& s) { s.ctx->resolveFinite(dst, src, format); });
   }
 
   void CsThreadContext::copyStencil(IBackendImage* dst, IBackendImage* src, DXGI_FORMAT format, DXGI_FORMAT readFormat) {
+    keep(dst, src);
     emit([=](CsWorkerState& s) { s.ctx->copyStencil(dst, src, format, readFormat); });
   }
 

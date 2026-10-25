@@ -130,12 +130,19 @@ namespace dxup::d3d12 {
   }
 
   __declspec(noinline) void CommandListRecorder::releaseBlock(Block* block) {
+    bool pooled = false;
     if (block->capacity == kBlockSize) {
-      std::lock_guard<std::mutex> lock(m_freeMutex);
-      m_freeBlocks.push_back(block);
-    } else {
-      std::free(block);
+      // Out of memory the block is freed: the record thread must not throw
+      // (replayUntil would take it for a faulting call).
+      try {
+        std::lock_guard<std::mutex> lock(m_freeMutex);
+        m_freeBlocks.push_back(block);
+        pooled = true;
+      } catch (const std::exception&) {
+      }
     }
+    if (!pooled)
+      std::free(block);
     m_blocksReleased.store(m_blocksReleased.load(std::memory_order_relaxed) + 1, std::memory_order_release);
   }
 

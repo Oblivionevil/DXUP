@@ -20,9 +20,16 @@ namespace dxup::d3d12 {
   void SubmitQueue::start() {
     if (threaded() || !m_queue)
       return;
+    // Jobs running on other threads finish first; later ones are queued.
+    std::unique_lock<std::shared_mutex> lock(m_modeMutex);
+    if (threaded())
+      return;
     try {
-      m_stopping = false;
-      m_exited = false;
+      {
+        std::lock_guard<std::mutex> stateLock(m_mutex);
+        m_stopping = false;
+        m_exited = false;
+      }
       m_thread = dxup::Thread([this] { threadMain(); });
     } catch (const std::exception& e) {
       logMessage(LogLevel::Warn, "submit thread not started (%s)", e.what());
@@ -58,16 +65,17 @@ namespace dxup::d3d12 {
   }
 
   uint64_t SubmitQueue::enqueue(Job job) {
-    if (!threaded())
-      return runHere(job);
+    if (!threaded()) {
+      std::shared_lock<std::shared_mutex> lock(m_modeMutex);
+      if (!threaded())
+        return runHere(job);
+    }
     uint64_t ticket = 0;
     {
       std::lock_guard<std::mutex> lock(m_mutex);
       // A job handed in while stop() ends the thread runs here: queued, it
-      // would never run.
+      // would never run. The thread has run every job by then.
       if (!m_exited) {
-        // fetch_add as runHere's: callers running jobs here while start()
-        // turns the thread on get tickets of their own.
         ticket = m_issued.fetch_add(1, std::memory_order_acq_rel) + 1;
         m_jobs.emplace_back(ticket, std::move(job));
       }
@@ -86,10 +94,12 @@ namespace dxup::d3d12 {
         return;
       YieldProcessor();
     }
+    // Sequentially consistent with the thread's update of m_done and its
+    // check of m_waiters: one of the two sees the other.
     m_waiters.fetch_add(1, std::memory_order_seq_cst);
     {
       std::unique_lock<std::mutex> lock(m_doneMutex);
-      while (!done(ticket) && !processExiting())
+      while (m_done.load(std::memory_order_seq_cst) < ticket && !processExiting())
         m_doneCv.wait_for(lock, std::chrono::milliseconds(10));
     }
     m_waiters.fetch_sub(1, std::memory_order_acq_rel);
@@ -120,6 +130,13 @@ namespace dxup::d3d12 {
     checkResult(DXGI_ERROR_DRIVER_INTERNAL_ERROR, what);
   }
 
+  void SubmitQueue::jobFailed(const char* what) {
+    logMessage(LogLevel::Error, "submit thread: a job threw (%s)", what);
+    // Its Execute or Signal may be missing: waits for its fence value
+    // would never end.
+    removeDevice("a job threw");
+  }
+
   void SubmitQueue::threadMain() {
     SetThreadDescription(GetCurrentThread(), L"dxup-submit");
     std::deque<std::pair<uint64_t, Job>> jobs;
@@ -136,10 +153,18 @@ namespace dxup::d3d12 {
         jobs.swap(m_jobs);
       }
       for (auto& job : jobs) {
-        job.second(m_queue);
+        // The job counts as done all the same: its waiters must not hang.
+        try {
+          job.second(m_queue);
+        } catch (const std::exception& e) {
+          jobFailed(e.what());
+        } catch (...) {
+          jobFailed("unknown exception");
+        }
         job.second = nullptr;
-        // Only ever up: a job run on its caller's thread (while start() or
-        // stop() switched) may have finished a later ticket.
+        // Only ever up, as in runHere. Jobs run on their callers' threads
+        // only before start() and once the thread took its last jobs, so
+        // the tickets done here are in order.
         uint64_t done = m_done.load(std::memory_order_relaxed);
         while (done < job.first && !m_done.compare_exchange_weak(done, job.first, std::memory_order_seq_cst)) { }
         if (m_waiters.load(std::memory_order_seq_cst)) {

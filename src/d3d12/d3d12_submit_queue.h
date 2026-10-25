@@ -10,6 +10,7 @@
 #include <deque>
 #include <functional>
 #include <mutex>
+#include <shared_mutex>
 
 #include <d3d12.h>
 
@@ -68,11 +69,18 @@ namespace dxup::d3d12 {
 
   private:
     uint64_t runHere(Job& job);
+    // A job threw on the thread: its queue calls may be missing.
+    void jobFailed(const char* what);
     void threadMain();
 
     ID3D12Device*         m_device = nullptr;
     ID3D12CommandQueue*   m_queue = nullptr;
     std::atomic<bool>     m_threaded{false};
+    // Held shared by jobs running on their caller's thread, and exclusively
+    // by start() while it turns the thread on: tickets count as done in
+    // order, so the thread must not run later jobs while an earlier one
+    // still runs elsewhere.
+    std::shared_mutex     m_modeMutex;
 
     std::mutex            m_mutex;
     std::condition_variable m_wake;

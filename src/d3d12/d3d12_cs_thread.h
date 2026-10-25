@@ -7,10 +7,12 @@
 #include <condition_variable>
 #include <cstring>
 #include <deque>
+#include <exception>
 #include <mutex>
 #include <new>
 #include <thread>
 #include <type_traits>
+#include <unordered_set>
 #include <vector>
 
 namespace dxup::d3d12 {
@@ -106,13 +108,23 @@ namespace dxup {
     bool empty() const { return !m_head; }
 
     // Objects retired while these commands were queued stay in retired for
-    // the caller to hand on.
+    // the caller to hand on. A command that throws is logged and skipped,
+    // as the record thread skips a call that faults: the worker has to go
+    // on, or the application waits for it forever.
     void executeAll(CsWorkerState& state) {
       CsCommand* cmd = m_head;
       while (cmd) {
-        CsCommand* next = cmd->next;
-        cmd->invoke(cmd, &state, CsOp::RunAndDestroy);
-        cmd = next;
+        try {
+          while (cmd) {
+            CsCommand* next = cmd->next;
+            cmd->invoke(cmd, &state, CsOp::RunAndDestroy);
+            cmd = next;
+          }
+        } catch (const std::exception& e) {
+          cmd = skipFailedCommand(cmd, e.what());
+        } catch (...) {
+          cmd = skipFailedCommand(cmd, "unknown exception");
+        }
       }
       m_head = nullptr;
       m_tail = nullptr;
@@ -144,6 +156,9 @@ namespace dxup {
     bool inUse = false;
 
   private:
+    // Logs the exception, destroys the command and returns the next one.
+    static CsCommand* skipFailedCommand(CsCommand* cmd, const char* what);
+
     alignas(64) unsigned char m_data[kSize];
     size_t      m_used = 0;
     CsCommand*  m_head = nullptr;
@@ -154,17 +169,18 @@ namespace dxup {
   CsChunk* allocCsChunk();
   void freeCsChunk(CsChunk* chunk);
 
-  // Commands recorded by a deferred context. Objects retired while the
-  // list was recorded or while it exists are kept alive by its hold.
+  // Commands recorded by a deferred context. It keeps references to the
+  // backend objects its commands use, which the application may release
+  // while it still executes the list; when the list goes, they retire
+  // behind the commands queued so far.
   class CsCommandList final : public IBackendCommandList {
   public:
     CsCommandList(
       std::vector<CsChunk*>               chunks,
       std::vector<IBackendQuery*>         queries,
       std::vector<BackendGpuUse*>         gpuUses,
-      std::shared_ptr<BackendRetireQueue> retireQueue,
-      bool                                hasHold,
-      uint64_t                            hold);
+      std::vector<std::shared_ptr<void>>  objects,
+      std::shared_ptr<BackendRetireQueue> retireQueue);
     ~CsCommandList() override;
 
     void replay(CsWorkerState& state) const;
@@ -176,9 +192,8 @@ namespace dxup {
     std::vector<CsChunk*>               m_chunks;
     std::vector<IBackendQuery*>         m_queries;
     std::vector<BackendGpuUse*>         m_gpuUses;
+    std::vector<std::shared_ptr<void>>  m_objects;
     std::shared_ptr<BackendRetireQueue> m_retireQueue;
-    bool                                m_hasHold;
-    uint64_t                            m_hold;
   };
 
   // Executes a command list directly on a context that records on the
@@ -363,8 +378,10 @@ namespace dxup {
     std::vector<CsChunk*>       m_recordedChunks;
     std::vector<IBackendQuery*> m_recordedQueries;
     std::vector<BackendGpuUse*> m_recordedGpuUses;
-    bool                        m_hasHold = false;
-    uint64_t                    m_hold = 0;
+    // References to the objects the recorded commands use, and those
+    // objects, once each.
+    std::vector<std::shared_ptr<void>>          m_recordedObjects;
+    std::unordered_set<const BackendRetirable*> m_keptObjects;
 
     // Application thread
     CsChunk*                m_chunk = nullptr;
@@ -385,13 +402,20 @@ namespace dxup {
     bool                    m_stopping = false;
 
     // Worker progress
+    struct SyncWaiter {
+      uint64_t target;
+      void*    event;
+    };
     std::mutex              m_syncMutex;
-    std::condition_variable m_syncCv;
     std::atomic<uint64_t>   m_chunksExecuted{0};
-    // The chunk the application waits for (guarded by m_syncMutex); the
-    // worker wakes it once that one ran, not after every chunk.
+    // Threads waiting for a chunk, with an event each, and the earliest of
+    // their chunks (guarded by m_syncMutex): the worker wakes a thread once
+    // its chunk ran, not after every chunk.
+    std::vector<SyncWaiter> m_syncWaiters;
     uint64_t                m_syncTarget = UINT64_MAX;
-    uint32_t                m_syncWaiters = 0;
+    // The worker runs a callback of executeOnBackend, such as DXGI's
+    // Present; it wakes the waiting threads when it starts one.
+    std::atomic<bool>       m_workerInCallback{false};
 
     // Frames: ended by the application thread, and done on the worker,
     // which stores the fence value each frame's GPU work completes with
@@ -403,6 +427,8 @@ namespace dxup {
     void*                   m_frameEvent = nullptr;
     void waitForChunk(uint64_t chunk);
     void waitForFrames(uint64_t frames);
+    // Worker: wakes the threads whose chunk ran.
+    void wakeSyncWaiters(uint64_t executed);
 
     CsWorkerState           m_workerState;
     Thread                  m_worker;
@@ -427,17 +453,19 @@ namespace dxup {
         use->queuedOps.fetch_sub(1, std::memory_order_release);
     }
     void discardRecording();
+    // Deferred contexts: the command list keeps these objects alive.
+    template<typename... Objects>
+    void keep(const Objects*... objects) {
+      if (m_recording)
+        (keepObject(objects), ...);
+    }
+    void keepObject(const BackendRetirable* object);
+    void keepTiled(const TiledResourceRef& ref) { keep(ref.buffer, ref.image); }
     void* mapDirect(IBackendBuffer* buffer, MapMode mode);
     void unmapDirect(IBackendBuffer* buffer);
 
     template<typename Fn>
     void emit(Fn&& fn) {
-      // A deferred context holds retired objects from its first command
-      // on, since the command list keeps raw pointers to them.
-      if (m_recording && !m_hasHold && m_retireQueue) {
-        m_hold = m_retireQueue->acquireHold();
-        m_hasHold = true;
-      }
       if (!m_chunk->push(std::forward<Fn>(fn))) {
         submitChunk();
         m_chunk->push(std::forward<Fn>(fn));
@@ -456,10 +484,6 @@ namespace dxup {
           fn(state, static_cast<const uint8_t*>(copy.data()), copy.size());
         });
         return;
-      }
-      if (m_recording && !m_hasHold && m_retireQueue) {
-        m_hold = m_retireQueue->acquireHold();
-        m_hasHold = true;
       }
       if (m_chunk->remaining() < bytes + sizeof(Fn) + 256)
         submitChunk();
@@ -492,10 +516,6 @@ namespace dxup {
       }
 
       // Room for the data, the command and alignment padding.
-      if (m_recording && !m_hasHold && m_retireQueue) {
-        m_hold = m_retireQueue->acquireHold();
-        m_hasHold = true;
-      }
       if (m_chunk->remaining() < bytes + sizeof(Fn) + 256)
         submitChunk();
 

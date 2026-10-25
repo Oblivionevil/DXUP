@@ -416,6 +416,8 @@ void main(uint2 id : SV_DispatchThreadID) {
         {"deferred_context_command_list", &Dx11TestApp::testDeferredContextCommandList},
         {"deferred_command_list_semantics", &Dx11TestApp::testDeferredCommandListSemantics},
         {"deferred_discard_isolation", &Dx11TestApp::testDeferredDiscardIsolation},
+        {"command_list_keeps_objects", &Dx11TestApp::testCommandListKeepsObjects},
+        {"command_list_retirement", &Dx11TestApp::testCommandListRetirement},
         {"texture_creation_validation", &Dx11TestApp::testTextureCreationValidation},
         {"buffer_creation_validation", &Dx11TestApp::testBufferCreationValidation},
         {"view_creation_validation", &Dx11TestApp::testViewCreationValidation},
@@ -11387,6 +11389,177 @@ float4 main(float4 position : SV_Position) : SV_Target { return value; }
       }
       m_context->ClearState();
       return true;
+    }
+
+    // A command list keeps the objects its commands use alive, as on
+    // Windows: the application may release them right after recording, and
+    // objects made later must not take their place.
+    bool testCommandListKeepsObjects(std::string& error) {
+      static const char* kTintedTexturePs = R"(
+cbuffer tint : register(b0) { float4 value; };
+Texture2D<float4> tex : register(t0);
+SamplerState samp : register(s0);
+float4 main(float4 position : SV_Position) : SV_Target {
+  return value * tex.SampleLevel(samp, float2(0.5f, 0.5f), 0.0f);
+}
+)";
+      TextureTarget target;
+      ComPtr<ID3D11VertexShader> vertexShader;
+      ComPtr<ID3DBlob> vertexBytecode;
+      ComPtr<ID3D11PixelShader> pixelShader;
+      if (!createColorTarget(8, 8, D3D11_BIND_RENDER_TARGET, target, error)
+       || !createVertexShader(kFullscreenTriangleVs, "main", vertexShader, vertexBytecode, error)
+       || !createPixelShader(kTintedTexturePs, "main", pixelShader, error))
+        return false;
+
+      // A texture of one color, a constant buffer with the tint, a sampler
+      // (the bias makes samplers distinct objects).
+      auto makeObjects = [&](uint32_t texel, const float* tint, float bias, ComPtr<ID3D11ShaderResourceView>& srv,
+                             ComPtr<ID3D11Buffer>& cb, ComPtr<ID3D11SamplerState>& sampler) {
+        std::array<uint32_t, 16> texels;
+        texels.fill(texel);
+        const D3D11_TEXTURE2D_DESC desc = { 4, 4, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, { 1, 0 }, D3D11_USAGE_IMMUTABLE,
+          D3D11_BIND_SHADER_RESOURCE, 0, 0 };
+        const D3D11_SUBRESOURCE_DATA data = { texels.data(), 16, 0 };
+        const D3D11_BUFFER_DESC cbDesc = { 16, D3D11_USAGE_IMMUTABLE, D3D11_BIND_CONSTANT_BUFFER, 0, 0, 0 };
+        const D3D11_SUBRESOURCE_DATA cbData = { tint, 0, 0 };
+        D3D11_SAMPLER_DESC samplerDesc = {};
+        samplerDesc.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
+        samplerDesc.AddressU = samplerDesc.AddressV = samplerDesc.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+        samplerDesc.MipLODBias = bias;
+        samplerDesc.ComparisonFunc = D3D11_COMPARISON_NEVER;
+        samplerDesc.MaxLOD = D3D11_FLOAT32_MAX;
+        ComPtr<ID3D11Texture2D> texture;
+        return SUCCEEDED(m_device->CreateTexture2D(&desc, &data, texture.GetAddressOf()))
+            && SUCCEEDED(m_device->CreateShaderResourceView(texture.Get(), nullptr, srv.ReleaseAndGetAddressOf()))
+            && SUCCEEDED(m_device->CreateBuffer(&cbDesc, &cbData, cb.ReleaseAndGetAddressOf()))
+            && SUCCEEDED(m_device->CreateSamplerState(&samplerDesc, sampler.ReleaseAndGetAddressOf()));
+      };
+
+      ComPtr<ID3D11CommandList> list;
+      {
+        ComPtr<ID3D11DeviceContext> deferred;
+        ComPtr<ID3D11ShaderResourceView> srv;
+        ComPtr<ID3D11Buffer> cb;
+        ComPtr<ID3D11SamplerState> sampler;
+        const float tint[4] = { 1.0f, 0.5f, 1.0f, 1.0f };
+        if (FAILED(m_device->CreateDeferredContext(0, deferred.GetAddressOf()))
+         || !makeObjects(0xffffff00u, tint, 0.0f, srv, cb, sampler)) {
+          error = "creating the deferred context or the objects failed";
+          return false;
+        }
+        ID3D11RenderTargetView* rtv = target.rtv.Get();
+        const D3D11_VIEWPORT viewport = { 0.0f, 0.0f, 8.0f, 8.0f, 0.0f, 1.0f };
+        deferred->OMSetRenderTargets(1, &rtv, nullptr);
+        deferred->RSSetViewports(1, &viewport);
+        deferred->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        deferred->VSSetShader(vertexShader.Get(), nullptr, 0);
+        deferred->PSSetShader(pixelShader.Get(), nullptr, 0);
+        deferred->PSSetShaderResources(0, 1, srv.GetAddressOf());
+        deferred->PSSetConstantBuffers(0, 1, cb.GetAddressOf());
+        deferred->PSSetSamplers(0, 1, sampler.GetAddressOf());
+        deferred->Draw(3, 0);
+        const HRESULT hr = deferred->FinishCommandList(FALSE, list.GetAddressOf());
+        if (FAILED(hr)) {
+          error = "FinishCommandList failed: " + formatHResult(hr);
+          return false;
+        }
+      }
+
+      // Objects made and dropped meanwhile may take the memory and the
+      // addresses of the released ones.
+      const float zero[4] = {};
+      for (int i = 0; i < 32; i++) {
+        ComPtr<ID3D11ShaderResourceView> srv;
+        ComPtr<ID3D11Buffer> cb;
+        ComPtr<ID3D11SamplerState> sampler;
+        if (!makeObjects(0xff0000ffu, zero, 0.25f * float(i + 1), srv, cb, sampler)) {
+          error = "creating other objects failed";
+          return false;
+        }
+        m_context->Flush();
+      }
+      const float clear[4] = {};
+      m_context->ClearRenderTargetView(target.rtv.Get(), clear);
+      if (!expectTexturePixel(target.texture.Get(), 4, 4, { 0, 0, 0, 0 }, 0, error))
+        return false;
+
+      for (int pass = 0; pass < 2; pass++) {
+        m_context->ClearRenderTargetView(target.rtv.Get(), clear);
+        m_context->ExecuteCommandList(list.Get(), FALSE);
+        if (!expectTexturePixel(target.texture.Get(), 4, 4, { 0, 128, 255, 255 }, 2, error)) {
+          error = formatString("execution %d: ", pass + 1) + error;
+          return false;
+        }
+      }
+      return true;
+    }
+
+    // Objects released while a command list exists, or while a deferred
+    // context records one, go once the GPU is through with them: a list
+    // kept and executed every frame must not keep everything released
+    // after it alive.
+    bool testCommandListRetirement(std::string& error) {
+      ComPtr<IDXGIDevice> dxgiDevice;
+      ComPtr<IDXGIAdapter> adapter;
+      ComPtr<IDXGIAdapter3> adapter3;
+      if (FAILED(m_device.As(&dxgiDevice)) || FAILED(dxgiDevice->GetAdapter(adapter.GetAddressOf()))
+       || FAILED(adapter.As(&adapter3))) {
+        error = "SKIP: no IDXGIAdapter3";
+        return false;
+      }
+      TextureTarget target;
+      ComPtr<ID3D11DeviceContext> deferred, recording;
+      ComPtr<ID3D11CommandList> list;
+      ComPtr<ID3D11Query> event;
+      if (!createColorTarget(8, 8, D3D11_BIND_RENDER_TARGET, target, error)
+       || !createQueryObject(D3D11_QUERY_EVENT, event, error))
+        return false;
+      if (FAILED(m_device->CreateDeferredContext(0, deferred.GetAddressOf()))
+       || FAILED(m_device->CreateDeferredContext(0, recording.GetAddressOf()))) {
+        error = "CreateDeferredContext failed";
+        return false;
+      }
+      const float green[4] = { 0.0f, 1.0f, 0.0f, 1.0f };
+      deferred->ClearRenderTargetView(target.rtv.Get(), green);
+      HRESULT hr = deferred->FinishCommandList(FALSE, list.GetAddressOf());
+      if (FAILED(hr)) {
+        error = "FinishCommandList failed: " + formatHResult(hr);
+        return false;
+      }
+      // Left in the middle of a command list.
+      recording->ClearRenderTargetView(target.rtv.Get(), green);
+
+      auto usageMb = [&] {
+        // The objects retire behind the work queued with them.
+        for (int i = 0; i < 3; i++) {
+          m_context->End(event.Get());
+          m_context->Flush();
+          while (m_context->GetData(event.Get(), nullptr, 0, 0) != S_OK)
+            Sleep(1);
+        }
+        DXGI_QUERY_VIDEO_MEMORY_INFO info = {};
+        adapter3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &info);
+        return int64_t(info.CurrentUsage >> 20);
+      };
+      const int64_t before = usageMb();
+      // Buffers this large get memory of their own, which goes with them.
+      const D3D11_BUFFER_DESC desc = { 64u << 20, D3D11_USAGE_DEFAULT, D3D11_BIND_VERTEX_BUFFER, 0, 0, 0 };
+      for (int i = 0; i < 16; i++) {
+        ComPtr<ID3D11Buffer> buffer;
+        if (!createBuffer(desc, nullptr, 0, buffer, error))
+          return false;
+        buffer.Reset();
+        m_context->ExecuteCommandList(list.Get(), FALSE);
+        m_context->Flush();
+      }
+      const int64_t after = usageMb();
+      if (after - before > 256) {
+        error = formatString("1024 MB of released buffers: video memory %lld -> %lld MB", static_cast<long long>(before),
+          static_cast<long long>(after));
+        return false;
+      }
+      return expectTexturePixel(target.texture.Get(), 4, 4, { 0, 255, 0, 255 }, 0, error);
     }
 
     bool testDeferredCommandListSemantics(std::string& error) {

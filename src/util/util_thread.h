@@ -1,5 +1,7 @@
 #pragma once
 
+#include "util_types.h"
+
 #include <exception>
 #include <functional>
 #include <memory>
@@ -65,9 +67,19 @@ namespace dxup {
     }
 
   private:
+    // An exception that leaves the thread function ends the thread, not
+    // the process (std::thread would call std::terminate). The functions
+    // catch what their owners have to learn of themselves; this is the
+    // last resort.
     static DWORD WINAPI entry(void* parameter) {
       std::unique_ptr<std::function<void()>> task(static_cast<std::function<void()>*>(parameter));
-      (*task)();
+      try {
+        (*task)();
+      } catch (const std::exception& e) {
+        logMessage(LogLevel::Error, "thread %lu ended by an exception: %s", GetCurrentThreadId(), e.what());
+      } catch (...) {
+        logMessage(LogLevel::Error, "thread %lu ended by an unknown exception", GetCurrentThreadId());
+      }
       return 0;
     }
 

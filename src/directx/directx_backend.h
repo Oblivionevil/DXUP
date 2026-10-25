@@ -10,6 +10,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <type_traits>
 #include <vector>
 #include "../util/util_types.h"
 
@@ -50,21 +51,50 @@ namespace dxup {
   template<typename T>
   using Rc = std::shared_ptr<T>;
 
-  // Defers the destruction of backend objects while commands that reference
-  // them may still run: commands queued for a worker thread, and command
-  // lists recorded by deferred contexts. Objects handed out by wrap() retire
-  // here when their last reference is dropped.
+  // Backend objects handed out by BackendRetireQueue::wrap know the
+  // reference the queue retires, so that command lists of deferred contexts
+  // can keep the objects their commands use alive, as native command lists
+  // reference what they use.
+  class BackendRetirable {
+  public:
+    // Null for objects not made by wrap().
+    std::shared_ptr<void> retireOwner() const { return m_retireOwner.lock(); }
+
+  private:
+    friend class BackendRetireQueue;
+    std::weak_ptr<void> m_retireOwner;
+  };
+
+  // Defers the destruction of backend objects while commands queued for a
+  // worker thread may still use them. Objects handed out by wrap() retire
+  // here when their last reference is dropped. Command lists of deferred
+  // contexts hold references of their own and retire them here as well.
   class BackendRetireQueue {
   public:
     void retire(std::shared_ptr<void> object) {
       std::unique_lock<std::mutex> lock(m_mutex);
-      if (m_deferred || !m_holds.empty()) {
+      if (m_deferred) {
         m_objects.push_back(std::move(object));
-        m_sequence++;
         return;
       }
       lock.unlock();
       object.reset();
+    }
+
+    // Retires every object and leaves objects empty.
+    void retire(std::vector<std::shared_ptr<void>>& objects) {
+      if (objects.empty())
+        return;
+      std::unique_lock<std::mutex> lock(m_mutex);
+      if (m_deferred) {
+        if (m_objects.empty())
+          m_objects.swap(objects);
+        else
+          m_objects.insert(m_objects.end(), std::make_move_iterator(objects.begin()),
+            std::make_move_iterator(objects.end()));
+      }
+      lock.unlock();
+      objects.clear();
     }
 
     // A worker thread takes the retired objects with each command chunk and
@@ -75,36 +105,23 @@ namespace dxup {
         std::lock_guard<std::mutex> lock(m_mutex);
         m_deferred = deferred;
         if (!deferred)
-          takeReleasable(released);
+          released.swap(m_objects);
       }
     }
 
-    // Moves the objects no hold protects into out. Returns whether any
-    // were taken.
+    // Moves the retired objects into out. Returns whether there were any.
     bool takeRetired(std::vector<std::shared_ptr<void>>& out) {
       std::lock_guard<std::mutex> lock(m_mutex);
-      return takeReleasable(out);
-    }
-
-    // Keeps every object retired from now on until the hold is released.
-    // Deferred contexts hold while they record a command list, which then
-    // holds until it is destroyed.
-    uint64_t acquireHold() {
-      std::lock_guard<std::mutex> lock(m_mutex);
-      m_holds.insert(m_sequence);
-      return m_sequence;
-    }
-
-    void releaseHold(uint64_t hold) {
-      std::vector<std::shared_ptr<void>> released;
-      {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        auto it = m_holds.find(hold);
-        if (it != m_holds.end())
-          m_holds.erase(it);
-        if (!m_deferred)
-          takeReleasable(released);
+      if (m_objects.empty())
+        return false;
+      if (out.empty()) {
+        out.swap(m_objects);
+        return true;
       }
+      out.insert(out.end(), std::make_move_iterator(m_objects.begin()),
+        std::make_move_iterator(m_objects.end()));
+      m_objects.clear();
+      return true;
     }
 
     template<typename Interface, typename Object>
@@ -112,38 +129,19 @@ namespace dxup {
       if (!queue || !object)
         return object;
       Interface* raw = object.get();
+      std::shared_ptr<void> owner(std::move(object));
+      if constexpr (std::is_base_of_v<BackendRetirable, Interface>)
+        static_cast<BackendRetirable*>(raw)->m_retireOwner = owner;
       return Rc<Interface>(raw,
-        [queue, owner = std::shared_ptr<void>(std::move(object))](Interface*) mutable {
+        [queue, owner = std::move(owner)](Interface*) mutable {
           queue->retire(std::move(owner));
         });
     }
 
   private:
-    bool takeReleasable(std::vector<std::shared_ptr<void>>& out) {
-      const uint64_t limit = m_holds.empty() ? UINT64_MAX : *m_holds.begin();
-      // Objects are numbered in retirement order: m_objects[i] is number
-      // first + i, and only those below the oldest hold may go.
-      const uint64_t first = m_sequence - m_objects.size();
-      const uint64_t allowed = limit > first ? limit - first : 0;
-      const size_t count = allowed < m_objects.size() ? size_t(allowed) : m_objects.size();
-      if (!count)
-        return false;
-      // Usually all of them, without holds: handed over whole.
-      if (count == m_objects.size() && out.empty()) {
-        out.swap(m_objects);
-        return true;
-      }
-      out.insert(out.end(), std::make_move_iterator(m_objects.begin()),
-        std::make_move_iterator(m_objects.begin() + count));
-      m_objects.erase(m_objects.begin(), m_objects.begin() + count);
-      return true;
-    }
-
     std::mutex                m_mutex;
     // A vector: a deque of these allocates a block per element on MSVC.
     std::vector<std::shared_ptr<void>> m_objects;
-    std::multiset<uint64_t>   m_holds;
-    uint64_t                  m_sequence = 0;
     bool                      m_deferred = false;
   };
 
@@ -837,7 +835,7 @@ namespace dxup {
     std::atomic<uint64_t> writeFenceValue{0};
   };
 
-  class IBackendBuffer {
+  class IBackendBuffer : public BackendRetirable {
   public:
     virtual ~IBackendBuffer() = default;
     virtual const BufferDesc& getDesc() const = 0;
@@ -855,7 +853,7 @@ namespace dxup {
     uint32_t depthPitch = 0;
   };
 
-  class IBackendImage {
+  class IBackendImage : public BackendRetirable {
   public:
     virtual ~IBackendImage() = default;
     virtual const ImageDesc& getDesc() const = 0;
@@ -888,7 +886,7 @@ namespace dxup {
     return image && image->getDesc().usage == ResourceUsage::Staging ? &image->gpuUse : nullptr;
   }
 
-  class IBackendBufferView {
+  class IBackendBufferView : public BackendRetirable {
   public:
     virtual ~IBackendBufferView() = default;
     virtual const BufferViewDesc& getDesc() const = 0;
@@ -898,7 +896,7 @@ namespace dxup {
     virtual uint64_t getDescriptorVersion() const { return 0; }
   };
 
-  class IBackendImageView {
+  class IBackendImageView : public BackendRetirable {
   public:
     virtual ~IBackendImageView() = default;
     virtual const ImageViewDesc& getDesc() const = 0;
@@ -907,7 +905,7 @@ namespace dxup {
     virtual uint64_t getDescriptorVersion() const { return 0; }
   };
 
-  class IBackendSampler {
+  class IBackendSampler : public BackendRetirable {
   public:
     virtual ~IBackendSampler() = default;
     virtual const SamplerDesc& getDesc() const = 0;
@@ -958,7 +956,7 @@ namespace dxup {
     virtual ~IBackendCommandList() = default;
   };
 
-  class IBackendQuery {
+  class IBackendQuery : public BackendRetirable {
   public:
     virtual ~IBackendQuery() = default;
     virtual QueryType getType() const = 0;
