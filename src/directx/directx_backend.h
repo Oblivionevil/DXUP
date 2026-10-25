@@ -1355,6 +1355,11 @@ namespace dxup {
     // Native queue access for swap chain creation
     virtual void* getNativeCommandQueue() { return nullptr; }
 
+    // Work DXUP could not hand to the GPU left the device unusable, while
+    // the native device may report nothing (S_OK otherwise): applications
+    // learn it as a removed device (GetDeviceRemovedReason, Present).
+    virtual HRESULT lostReason() const { return S_OK; }
+
     // Set when objects must outlive the commands a worker thread has queued.
     virtual std::shared_ptr<BackendRetireQueue> getRetireQueue() const { return nullptr; }
   };

@@ -5389,7 +5389,14 @@ namespace dxup {
     // their device anew.
     HRESULT STDMETHODCALLTYPE GetDeviceRemovedReason() override {
       ID3D12Device* device = nativeDevice();
-      return device ? device->GetDeviceRemovedReason() : S_OK;
+      HRESULT hr = device ? device->GetDeviceRemovedReason() : S_OK;
+      // Work DXUP could not submit counts too (IBackendDevice::lostReason).
+      if (IBackendDevice* backend = SUCCEEDED(hr) ? GetBackend() : nullptr) {
+        const HRESULT lost = backend->lostReason();
+        if (FAILED(lost))
+          hr = lost;
+      }
+      return hr;
     }
 
     // Only D3D11_RAISE_FLAG_DRIVER_INTERNAL_ERROR exists; DXUP raises no

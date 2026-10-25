@@ -1099,6 +1099,7 @@ namespace dxup::d3d12 {
   IDXGIFactory4* getDxgiFactory() const { return m_dxgiFactory.Get(); }
   IDXGIAdapter1* getAdapter() const { return m_adapter.Get(); }
     void* getNativeCommandQueue() override { return m_commandQueue.Get(); }
+    HRESULT lostReason() const override { return m_submitQueue.lostReason(); }
     std::shared_ptr<BackendRetireQueue> getRetireQueue() const override { return m_retireQueue; }
     ID3D12RootSignature* getCommonRootSignature() const { return m_graphicsRootSignature.Get(); }
     ID3D12RootSignature* getGraphicsRootSignature() const { return m_graphicsRootSignature.Get(); }

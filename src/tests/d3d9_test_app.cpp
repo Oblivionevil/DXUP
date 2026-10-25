@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cfloat>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -1752,8 +1753,7 @@ PO main(float4 c : COLOR0) { PO o; o.c0 = c; o.c1 = c.gbra * 0.8; return o; }
   // shader constant reaching the pixel shader through a texture
   // coordinate, then finite constants again. Below, an infinite vertex
   // shader constant in c253 (the last group of four a shader can read),
-  // then an infinite def constant a vertex shader reads relatively (DXUP
-  // makes it the largest float, as a def read directly).
+  // then an infinite def constant a vertex shader reads relatively.
   // Every strip is gray (0.5); a draw that missed the switch gives NaN,
   // black.
   bool sceneFiniteSwitch(IDirect3DDevice9* d) {
@@ -1832,6 +1832,47 @@ PO main(float4 c : COLOR0) { PO o; o.c0 = c; o.c1 = c.gbra * 0.8; return o; }
     defVs->Release();
     constantPs->Release();
     varyingPs->Release();
+    return true;
+  }
+
+  // A def constant read relatively stays infinite, as Direct3D 9 has it: a
+  // vertex shader compares the largest float with it (less than infinity:
+  // red) and a NaN def (not less: no green). Red with alpha 1.
+  bool sceneRelativeDef(IDirect3DDevice9* d) {
+    d->Clear(0, nullptr, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, 0xff336699u, 1.0f, 0);
+    d->SetRenderState(D3DRS_LIGHTING, FALSE);
+    d->SetRenderState(D3DRS_ZENABLE, FALSE);
+    d->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+    // The assembler takes no infinity or NaN: 12345 and 23456 are patched.
+    auto vsCode = assemble("vs_2_0\ndef c10, 12345, 23456, 0, 1\ndcl_position v0\nmova a0.x, c11.x\nmov oPos, v0\n"
+                           "mov r1, c12\nslt r0, r1, c10[a0.x]\nmov oD0, r0\n");
+    int patched = 0;
+    for (DWORD& token : vsCode) {
+      if (token == 0x4640e400u || token == 0x46b74000u) {
+        token = token == 0x4640e400u ? 0x7f800000u : 0x7fc00000u;
+        patched++;
+      }
+    }
+    const auto psCode = assemble("ps_2_0\ndcl v0\nmov oC0, v0\n");
+    IDirect3DVertexShader9* vs = nullptr;
+    IDirect3DPixelShader9* ps = nullptr;
+    if (patched != 2 || psCode.empty() || FAILED(d->CreateVertexShader(vsCode.data(), &vs))
+     || FAILED(d->CreatePixelShader(psCode.data(), &ps)))
+      return false;
+    d->SetVertexShader(vs);
+    d->SetPixelShader(ps);
+    d->SetFVF(D3DFVF_XYZ);
+    const float zero[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    const float largest[4] = { FLT_MAX, -1.0f, 0.0f, 0.0f };
+    d->SetVertexShaderConstantF(11, zero, 1);
+    d->SetVertexShaderConstantF(12, largest, 1);
+    const float quad[12] = { -0.8f, 0.8f, 0.5f, 0.8f, 0.8f, 0.5f, -0.8f, -0.8f, 0.5f, 0.8f, -0.8f, 0.5f };
+    d->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, quad, 3 * sizeof(float));
+    d->SetVertexShader(nullptr);
+    d->SetPixelShader(nullptr);
+    d->SetRenderState(D3DRS_ZENABLE, TRUE);
+    vs->Release();
+    ps->Release();
     return true;
   }
 
@@ -2785,6 +2826,7 @@ float4 main(float2 t : TEXCOORD0) : COLOR {
     { "point_sprites", scenePointSprites },
     { "float_specials", sceneFloatSpecials },
     { "finite_switch", sceneFiniteSwitch },
+    { "relative_def", sceneRelativeDef },
     { "ati_lock", sceneAtiLock },
     { "nan_depth", sceneNanDepth },
     { "clip_planes", sceneClipPlanes },

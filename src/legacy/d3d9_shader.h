@@ -58,6 +58,9 @@ namespace dxup::legacy {
     std::vector<std::pair<uint32_t, std::array<uint32_t, 4>>> relativeDefs;
     bool     writesDepth = false;
     uint32_t colorOutputs = 0;         // bitmask of oC0-3
+    // A def constant read relatively (from the constant buffer, as it is) is
+    // NaN or infinite; read directly they are made finite.
+    bool     nonFiniteRelativeDefs = false;
   };
 
   struct TranslateOptions9 {

@@ -1263,16 +1263,14 @@ namespace dxup::legacy {
     info.floatConstantCount = info.relativeConstants ? 256 : (std::min)(w.maxConst, 256u);
     info.directConstantCount = (std::min)(w.maxConst, 256u);
     if (info.relativeConstants) {
-      // Read from the constant buffer, as the literals are: infinity the
-      // largest float, NaN 0. Defs then never bring NaN or infinity into a
-      // shader (the finite pixel shader variants rely on that).
+      // Read from the constant buffer as they are (comparisons with an
+      // infinite def give what Direct3D 9 gives); NaN or infinity among them
+      // keeps the draw's pixel shader on emulated dot products.
       info.relativeDefs.assign(w.floatDefBits.begin(), w.floatDefBits.end());
-      for (auto& def : info.relativeDefs) {
-        for (uint32_t& bits : def.second) {
-          if ((bits & 0x7f800000u) == 0x7f800000u)
-            bits = (bits & 0x007fffffu) ? 0u : (bits & 0x80000000u) | 0x7f7fffffu;
-        }
+      for (const auto& def : info.relativeDefs) {
         info.directConstantCount = (std::max)(info.directConstantCount, (std::min)(def.first + 1, 256u));
+        for (uint32_t bits : def.second)
+          info.nonFiniteRelativeDefs |= (bits & 0x7f800000u) == 0x7f800000u;
       }
     }
     hlsl = std::move(s);

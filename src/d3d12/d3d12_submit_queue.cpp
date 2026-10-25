@@ -115,8 +115,9 @@ namespace dxup::d3d12 {
       device5->RemoveDevice();
       checkDevice(what);
     }
-    // Without ID3D12Device5 DXUP stops rendering at least.
-    checkResult(DXGI_ERROR_DEVICE_REMOVED, what);
+    // Without ID3D12Device5 the D3D11 device reports it
+    // (IBackendDevice::lostReason).
+    checkResult(DXGI_ERROR_DRIVER_INTERNAL_ERROR, what);
   }
 
   void SubmitQueue::threadMain() {

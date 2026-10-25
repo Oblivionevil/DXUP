@@ -1695,6 +1695,12 @@ namespace dxup {
 
     HRESULT presentFrame(UINT syncInterval, UINT flags, const DXGI_PRESENT_PARAMETERS* params, bool present1) {
       HitchScope hitch("present", syncInterval);
+      // A device DXUP lost without the system knowing (IBackendDevice::
+      // lostReason): the application recreates it as after a GPU fault.
+      if (IBackendDevice* backend = m_d3d11Device ? m_d3d11Device->GetBackend() : nullptr) {
+        if (FAILED(backend->lostReason()))
+          return DXGI_ERROR_DEVICE_REMOVED;
+      }
       overrideSyncInterval(syncInterval, flags);
       if (hitchTraceEnabled()) {
         // Frames that took long, to line the operations above up with.
