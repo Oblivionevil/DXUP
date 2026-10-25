@@ -480,6 +480,7 @@ void main(uint2 id : SV_DispatchThreadID) {
         {"user_overrides", &Dx11TestApp::testUserOverrides},
         {"forced_msaa_samples", &Dx11TestApp::testForcedMsaaSamples},
         {"games_config", &Dx11TestApp::testGamesConfig},
+        {"games_config_alias", &Dx11TestApp::testGamesConfigAlias},
         {"gpu_spoof", &Dx11TestApp::testGpuSpoof},
         {"forced_sgssaa", &Dx11TestApp::testForcedSgssaa},
         {"forced_msaa_targets", &Dx11TestApp::testForcedMsaaTargets},
@@ -9297,6 +9298,71 @@ float4 main(float4 position : SV_Position, float4 t0 : TEXCOORD0, float4 t : TEX
       DeleteFileA(configPath.c_str());
       RemoveDirectoryA(installDir.c_str());
       return passed;
+    }
+
+    // games.cfg names the folder otherwise than the game runs from it:
+    // through a junction of the same name (as a library folder linked to
+    // another drive), and by its short (8.3) name where the volume has
+    // them. DXUP compares the folders as the file system names them.
+    bool testGamesConfigAlias(std::string& error) {
+      char exePath[MAX_PATH] = {};
+      GetModuleFileNameA(nullptr, exePath, MAX_PATH);
+      std::string exeDir = exePath;
+      exeDir.resize(exeDir.find_last_of('\\'));
+      char tempPath[MAX_PATH] = {};
+      GetTempPathA(MAX_PATH, tempPath);
+      const std::string installDir = std::string(tempPath) + "dxup_games_alias_test";
+      const std::string links = std::string(tempPath) + "dxup_games_alias_links";
+      const std::string junction = links + exeDir.substr(exeDir.find_last_of('\\'));
+      CreateDirectoryA(installDir.c_str(), nullptr);
+      CreateDirectoryA(links.c_str(), nullptr);
+      // A junction an earlier run left (RemoveDirectory takes the link only).
+      RemoveDirectoryA(junction.c_str());
+      std::vector<std::string> aliases;
+      // mklink /J needs no administrator rights.
+      std::string command = "cmd.exe /c mklink /J \"" + junction + "\" \"" + exeDir + "\" >nul";
+      STARTUPINFOA startup = { sizeof(startup) };
+      PROCESS_INFORMATION process = {};
+      if (CreateProcessA(nullptr, command.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &startup, &process)) {
+        WaitForSingleObject(process.hProcess, 10000);
+        CloseHandle(process.hThread);
+        CloseHandle(process.hProcess);
+      }
+      const DWORD junctionAttributes = GetFileAttributesA(junction.c_str());
+      if (junctionAttributes != INVALID_FILE_ATTRIBUTES && (junctionAttributes & FILE_ATTRIBUTE_REPARSE_POINT))
+        aliases.push_back(junction);
+      char shortPath[MAX_PATH] = {};
+      const DWORD shortLength = GetShortPathNameA(exeDir.c_str(), shortPath, MAX_PATH);
+      if (shortLength && shortLength < MAX_PATH && _stricmp(shortPath, exeDir.c_str()) != 0)
+        aliases.push_back(shortPath);
+      bool passed = true;
+      const std::string configPath = installDir + "\\games.cfg";
+      for (const std::string& alias : aliases) {
+        FILE* file = nullptr;
+        if (fopen_s(&file, configPath.c_str(), "wb") || !file) {
+          error = "cannot write " + configPath;
+          passed = false;
+          break;
+        }
+        const std::string text = "[game]\ndir = " + alias + "\nexe = dx11_test_app.exe\nd3d11.msaaSamples = 8\n";
+        std::fputs(text.c_str(), file);
+        std::fclose(file);
+        SetEnvironmentVariableA("DXUP_INSTALL_DIR", installDir.c_str());
+        passed = runChildProcess("--msaa-child edge", error);
+        SetEnvironmentVariableA("DXUP_INSTALL_DIR", nullptr);
+        if (!passed) {
+          error = alias + ": " + error;
+          break;
+        }
+      }
+      DeleteFileA(configPath.c_str());
+      RemoveDirectoryA(installDir.c_str());
+      if (junctionAttributes != INVALID_FILE_ATTRIBUTES && (junctionAttributes & FILE_ATTRIBUTE_REPARSE_POINT))
+        RemoveDirectoryA(junction.c_str());
+      RemoveDirectoryA(links.c_str());
+      if (passed && aliases.empty())
+        error = "SKIP: no junction or short name for the folder";
+      return passed && !aliases.empty();
     }
 
     // dxup.conf shows the application an AMD GPU with a device id of its

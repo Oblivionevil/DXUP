@@ -100,6 +100,79 @@ namespace dxup {
       return CompareStringOrdinal(a.data(), static_cast<int>(a.size()), b.data(), static_cast<int>(b.size()), TRUE) == CSTR_EQUAL;
     }
 
+    // The folder as the file system names it: long names instead of 8.3
+    // ones, subst and mapped drives and junctions resolved. Empty when it
+    // cannot be opened.
+    std::wstring canonicalFolder(const std::wstring& folder) {
+      HANDLE handle = CreateFileW(folder.c_str(), FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+      if (handle == INVALID_HANDLE_VALUE)
+        return {};
+      std::wstring path(MAX_PATH, L'\0');
+      DWORD length = GetFinalPathNameByHandleW(handle, &path[0], static_cast<DWORD>(path.size()), FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+      if (length >= path.size()) {
+        path.resize(length + 1);
+        length = GetFinalPathNameByHandleW(handle, &path[0], static_cast<DWORD>(path.size()), FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+      }
+      CloseHandle(handle);
+      if (!length || length >= path.size())
+        return {};
+      path.resize(length);
+      if (path.compare(0, 8, L"\\\\?\\UNC\\") == 0)
+        path = L"\\\\" + path.substr(8);
+      else if (path.compare(0, 4, L"\\\\?\\") == 0)
+        path.erase(0, 4);
+      return path;
+    }
+
+    // The last part of a path, without separators at its end.
+    std::wstring lastPart(std::wstring path) {
+      while (!path.empty() && (path.back() == L'\\' || path.back() == L'/'))
+        path.pop_back();
+      const size_t slash = path.find_last_of(L"\\/");
+      return slash == std::wstring::npos ? path : path.substr(slash + 1);
+    }
+
+    // Whether a dir of games.cfg names the folder the DLL is in: as text,
+    // or as the file system names both (an 8.3 name, a subst or mapped
+    // drive, a junction: the manager stores the path the user picked, the
+    // game may run from another). Other games' folders are only opened when
+    // their last part matches (or is an 8.3 name): a block of every game
+    // would wake sleeping disks and wait for unreachable network drives.
+    class FolderMatch {
+    public:
+      explicit FolderMatch(const std::wstring& dllFolder) : m_folder(dllFolder) {}
+
+      bool operator () (const std::wstring& dir) {
+        if (sameFolder(dir, m_folder))
+          return true;
+        // Only absolute paths: a relative one would be opened from the
+        // game's current folder.
+        const bool drive = dir.size() >= 3 && dir[1] == L':' && (dir[2] == L'\\' || dir[2] == L'/');
+        const bool network = dir.size() >= 3 && (dir[0] == L'\\' || dir[0] == L'/') && (dir[1] == L'\\' || dir[1] == L'/');
+        if (!drive && !network)
+          return false;
+        if (!m_resolved) {
+          m_resolved = true;
+          m_canonical = canonicalFolder(m_folder);
+        }
+        if (m_canonical.empty())
+          return false;
+        if (sameFolder(dir, m_canonical))
+          return true;
+        const std::wstring part = lastPart(dir);
+        if (part.find(L'~') == std::wstring::npos && !sameFolder(part, lastPart(m_folder)) && !sameFolder(part, lastPart(m_canonical)))
+          return false;
+        const std::wstring canonical = canonicalFolder(dir);
+        return !canonical.empty() && sameFolder(canonical, m_canonical);
+      }
+
+    private:
+      std::wstring m_folder;
+      std::wstring m_canonical;
+      bool         m_resolved = false;
+    };
+
     bool readFile(const std::wstring& path, std::string& text) {
       HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
         nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -167,8 +240,9 @@ namespace dxup {
           blocks.back().settings += key + " = " + value + "\n";
       }
       const Block* best = nullptr;
+      FolderMatch matches(dllFolder);
       for (const auto& block : blocks) {
-        if (!sameFolder(widen(block.dir), dllFolder))
+        if (!matches(widen(block.dir)))
           continue;
         const std::wstring exe = widen(block.exe);
         if (!exe.empty() && CompareStringOrdinal(exe.data(), static_cast<int>(exe.size()), exeName.data(),

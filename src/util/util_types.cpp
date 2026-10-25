@@ -7,6 +7,7 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#include <share.h>
 #endif
 
 namespace dxup {
@@ -42,39 +43,26 @@ namespace dxup {
     g_logInitialized = true;
 
 #ifdef _WIN32
-    // Place logdxup.log next to the DLL
-    char dllPath[MAX_PATH] = {};
-    HMODULE hModule = nullptr;
-    GetModuleHandleExA(
-      GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-      reinterpret_cast<LPCSTR>(&initLogFile),
-      &hModule);
+    // logdxup.log next to the DLL, by its wide path: the game's folder may
+    // hold characters the ANSI code page has not, and be longer than
+    // MAX_PATH. Each DLL has its own log state, so the others (dxgi.dll,
+    // ddraw.dll) write files of their own instead of truncating d3d11's:
+    // logdxup_dxgi.log, logdxup_ddraw.log.
+    const std::wstring dllPath = dxupModulePathW();
+    const size_t slash = dllPath.find_last_of(L"\\/");
+    std::wstring stem = slash == std::wstring::npos ? dllPath : dllPath.substr(slash + 1);
+    const size_t dot = stem.find_last_of(L'.');
+    if (dot != std::wstring::npos)
+      stem.resize(dot);
+    const bool isD3D11 = stem.empty() || _wcsicmp(stem.c_str(), L"d3d11") == 0;
+    std::wstring logPath = slash == std::wstring::npos ? std::wstring() : dllPath.substr(0, slash + 1);
+    logPath += L"logdxup";
+    if (!isD3D11)
+      logPath += L"_" + stem;
+    logPath += L".log";
 
-    if (hModule)
-      GetModuleFileNameA(hModule, dllPath, MAX_PATH);
-
-    // Strip filename, append logdxup.log. Each DLL has its own log state,
-    // so the others (dxgi.dll, ddraw.dll) write files of their own instead
-    // of truncating d3d11's: logdxup_dxgi.log, logdxup_ddraw.log.
-    char* lastSlash = strrchr(dllPath, '\\');
-    char stem[64] = {};
-    strncpy_s(stem, lastSlash ? lastSlash + 1 : dllPath, _TRUNCATE);
-    if (char* dot = strrchr(stem, '.'))
-      *dot = '\0';
-    const bool isD3D11 = !stem[0] || _stricmp(stem, "d3d11") == 0;
-    if (lastSlash) {
-      *(lastSlash + 1) = '\0';
-    } else {
-      dllPath[0] = '\0';
-    }
-    strncat_s(dllPath, MAX_PATH, "logdxup", _TRUNCATE);
-    if (!isD3D11) {
-      strncat_s(dllPath, MAX_PATH, "_", _TRUNCATE);
-      strncat_s(dllPath, MAX_PATH, stem, _TRUNCATE);
-    }
-    strncat_s(dllPath, MAX_PATH, ".log", _TRUNCATE);
-
-    g_logFile = fopen(dllPath, "w");
+    // Shared, as fopen opens it: the manager packs the log of a running game.
+    g_logFile = _wfsopen(logPath.c_str(), L"w", _SH_DENYNO);
 #else
     g_logFile = fopen("logdxup.log", "w");
 #endif
