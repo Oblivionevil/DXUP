@@ -2817,6 +2817,304 @@ float4 main(float2 t : TEXCOORD0) : COLOR {
     return ok;
   }
 
+  // Two dynamic streams of one draw where the second range no longer fits
+  // into the rest of DXUP's vertex ring (8 MB, filled by degenerate draws
+  // first): the ring wraps before the draw's first upload (a wrap between
+  // them discarded the first stream's positions).
+  bool sceneRingWrap(IDirect3DDevice9* d) {
+    d->Clear(0, nullptr, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, 0xff000000u, 1.0f, 0);
+    d->SetRenderState(D3DRS_LIGHTING, FALSE);
+    d->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+    d->SetRenderState(D3DRS_ZENABLE, D3DZB_FALSE);
+    const D3DMATRIX world = identity();
+    d->SetTransform(D3DTS_WORLD, &world);
+    d->SetTransform(D3DTS_VIEW, &world);
+    d->SetTransform(D3DTS_PROJECTION, &world);
+    const UINT ring = 8u << 20;
+    IDirect3DVertexBuffer9* filler = nullptr;
+    if (FAILED(d->CreateVertexBuffer(ring, D3DUSAGE_DYNAMIC | D3DUSAGE_WRITEONLY, 0, D3DPOOL_DEFAULT, &filler, nullptr)))
+      return false;
+    void* bytes = nullptr;
+    if (FAILED(filler->Lock(0, 0, &bytes, D3DLOCK_DISCARD)))
+      return false;
+    std::memset(bytes, 0, ring);   // every vertex at the origin
+    filler->Unlock();
+    d->SetFVF(D3DFVF_XYZ | D3DFVF_DIFFUSE);
+    d->SetStreamSource(0, filler, 0, 16);
+    // All of the ring, then all but 1536 bytes of it.
+    d->DrawPrimitive(D3DPT_TRIANGLELIST, 0, ring / 16 / 3);
+    d->DrawPrimitive(D3DPT_TRIANGLELIST, 0, 174730);
+    // 20 quads: positions (1440 bytes) and colors (480 bytes) in two buffers.
+    IDirect3DVertexBuffer9 *positions = nullptr, *colors = nullptr;
+    if (FAILED(d->CreateVertexBuffer(120 * 12, D3DUSAGE_DYNAMIC | D3DUSAGE_WRITEONLY, 0, D3DPOOL_DEFAULT, &positions, nullptr))
+     || FAILED(d->CreateVertexBuffer(120 * 4, D3DUSAGE_DYNAMIC | D3DUSAGE_WRITEONLY, 0, D3DPOOL_DEFAULT, &colors, nullptr)))
+      return false;
+    float* p = nullptr;
+    DWORD* c = nullptr;
+    positions->Lock(0, 0, reinterpret_cast<void**>(&p), D3DLOCK_DISCARD);
+    colors->Lock(0, 0, reinterpret_cast<void**>(&c), D3DLOCK_DISCARD);
+    for (int q = 0; q < 20; q++) {
+      const float x0 = -1.0f + 0.4f * (q % 5), y0 = -1.0f + 0.5f * (q / 5), x1 = x0 + 0.35f, y1 = y0 + 0.4f;
+      const float corners[6][2] = { { x0, y0 }, { x1, y0 }, { x0, y1 }, { x1, y0 }, { x1, y1 }, { x0, y1 } };
+      for (int i = 0; i < 6; i++) {
+        p[(q * 6 + i) * 3 + 0] = corners[i][0];
+        p[(q * 6 + i) * 3 + 1] = corners[i][1];
+        p[(q * 6 + i) * 3 + 2] = 0.5f;
+        c[q * 6 + i] = 0xff000000u | (q * 12u << 16) | ((255 - q * 12u) << 8) | (i * 40u);
+      }
+    }
+    positions->Unlock();
+    colors->Unlock();
+    const D3DVERTEXELEMENT9 elements[] = {
+      { 0, 0, D3DDECLTYPE_FLOAT3, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_POSITION, 0 },
+      { 1, 0, D3DDECLTYPE_D3DCOLOR, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_COLOR, 0 },
+      D3DDECL_END(),
+    };
+    IDirect3DVertexDeclaration9* decl = nullptr;
+    if (FAILED(d->CreateVertexDeclaration(elements, &decl)))
+      return false;
+    d->SetVertexDeclaration(decl);
+    d->SetStreamSource(0, positions, 0, 12);
+    d->SetStreamSource(1, colors, 0, 4);
+    d->DrawPrimitive(D3DPT_TRIANGLELIST, 0, 40);
+    d->SetStreamSource(0, nullptr, 0, 0);
+    d->SetStreamSource(1, nullptr, 0, 0);
+    d->SetVertexDeclaration(nullptr);
+    decl->Release();
+    positions->Release();
+    colors->Release();
+    filler->Release();
+    return true;
+  }
+
+  // Strips with 16-bit indices through vertex 65535: Direct3D 9 draws it,
+  // D3D11 would cut the strip there. A static index buffer, and indices
+  // from application memory.
+  bool sceneStripIndex65535(IDirect3DDevice9* d) {
+    d->Clear(0, nullptr, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, 0xff000000u, 1.0f, 0);
+    d->SetRenderState(D3DRS_LIGHTING, FALSE);
+    d->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+    d->SetRenderState(D3DRS_ZENABLE, D3DZB_FALSE);
+    d->SetFVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE);
+    const UINT count = 65536;
+    std::vector<TLVertex> vertices(count, TLVertex{ 0.0f, 0.0f, 0.5f, 1.0f, 0xffffffffu });
+    auto corners = [&](float x) {
+      vertices[0] = { x + 2.0f, 2.0f, 0.5f, 1.0f, 0xffff0000u };
+      vertices[1] = { x + 28.0f, 2.0f, 0.5f, 1.0f, 0xff00ff00u };
+      vertices[65535] = { x + 2.0f, 40.0f, 0.5f, 1.0f, 0xff0000ffu };
+      vertices[2] = { x + 28.0f, 40.0f, 0.5f, 1.0f, 0xffffff00u };
+      vertices[3] = { x + 16.0f, 46.0f, 0.5f, 1.0f, 0xffff00ffu };
+    };
+    const WORD indices[5] = { 0, 1, 65535, 2, 3 };
+    corners(0.0f);
+    IDirect3DVertexBuffer9* vb = nullptr;
+    IDirect3DIndexBuffer9* ib = nullptr;
+    if (FAILED(d->CreateVertexBuffer(count * sizeof(TLVertex), D3DUSAGE_WRITEONLY, D3DFVF_XYZRHW | D3DFVF_DIFFUSE,
+                                     D3DPOOL_MANAGED, &vb, nullptr))
+     || FAILED(d->CreateIndexBuffer(sizeof(indices), D3DUSAGE_WRITEONLY, D3DFMT_INDEX16, D3DPOOL_MANAGED, &ib, nullptr)))
+      return false;
+    void* data = nullptr;
+    vb->Lock(0, 0, &data, 0);
+    std::memcpy(data, vertices.data(), count * sizeof(TLVertex));
+    vb->Unlock();
+    ib->Lock(0, 0, &data, 0);
+    std::memcpy(data, indices, sizeof(indices));
+    ib->Unlock();
+    d->SetStreamSource(0, vb, 0, sizeof(TLVertex));
+    d->SetIndices(ib);
+    d->DrawIndexedPrimitive(D3DPT_TRIANGLESTRIP, 0, 0, count, 0, 3);
+    d->SetStreamSource(0, nullptr, 0, 0);
+    d->SetIndices(nullptr);
+    corners(32.0f);
+    d->DrawIndexedPrimitiveUP(D3DPT_TRIANGLESTRIP, 0, count, 3, indices, D3DFMT_INDEX16, vertices.data(), sizeof(TLVertex));
+    vb->Release();
+    ib->Release();
+    return true;
+  }
+
+  // A vertex shader's fog with the fixed-function pixel stage: Direct3D 9
+  // ignores D3DRS_FOGVERTEXMODE (and range fog) then and blends by oFog.
+  // The left half draws with the fixed-function vertex stage's linear fog
+  // first, the right half with the shader (and range fog on).
+  bool sceneShaderFogFixedPixels(IDirect3DDevice9* d) {
+    d->Clear(0, nullptr, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, 0xff000000u, 1.0f, 0);
+    const D3DMATRIX world = identity();
+    d->SetTransform(D3DTS_WORLD, &world);
+    d->SetTransform(D3DTS_VIEW, &world);
+    d->SetTransform(D3DTS_PROJECTION, &world);
+    d->SetRenderState(D3DRS_LIGHTING, FALSE);
+    d->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+    d->SetRenderState(D3DRS_ZENABLE, D3DZB_FALSE);
+    d->SetRenderState(D3DRS_FOGENABLE, TRUE);
+    d->SetRenderState(D3DRS_FOGCOLOR, 0xff20e040u);
+    d->SetRenderState(D3DRS_FOGVERTEXMODE, D3DFOG_LINEAR);
+    d->SetRenderState(D3DRS_FOGTABLEMODE, D3DFOG_NONE);
+    const float start = 0.0f, end = 2.0f;
+    d->SetRenderState(D3DRS_FOGSTART, *reinterpret_cast<const DWORD*>(&start));
+    d->SetRenderState(D3DRS_FOGEND, *reinterpret_cast<const DWORD*>(&end));
+    struct V { float x, y, z; DWORD c; };
+    const V left[4] = { { -1.0f, 1.0f, 0.2f, 0xffff0000u }, { 0.0f, 1.0f, 0.4f, 0xffff0000u },
+                        { -1.0f, -1.0f, 0.6f, 0xff0000ffu }, { 0.0f, -1.0f, 0.8f, 0xff0000ffu } };
+    d->SetFVF(D3DFVF_XYZ | D3DFVF_DIFFUSE);
+    d->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, left, sizeof(V));
+    const auto code = compile(R"(
+struct VO { float4 p : POSITION; float4 c : COLOR0; float f : FOG; };
+VO main(float4 p : POSITION, float4 c : COLOR0) { VO o; o.p = p; o.c = c; o.f = p.x * 0.8 + 0.1 + p.y * 0.05; return o; }
+)", "vs_2_0");
+    IDirect3DVertexShader9* vs = nullptr;
+    if (code.empty() || FAILED(d->CreateVertexShader(code.data(), &vs)))
+      return false;
+    d->SetVertexShader(vs);
+    d->SetRenderState(D3DRS_RANGEFOGENABLE, TRUE);
+    const V right[4] = { { 0.0f, 1.0f, 0.5f, 0xffff0000u }, { 1.0f, 1.0f, 0.5f, 0xffff8000u },
+                         { 0.0f, -1.0f, 0.5f, 0xff0000ffu }, { 1.0f, -1.0f, 0.5f, 0xff00ffffu } };
+    d->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, right, sizeof(V));
+    d->SetVertexShader(nullptr);
+    d->SetRenderState(D3DRS_FOGENABLE, FALSE);
+    d->SetRenderState(D3DRS_RANGEFOGENABLE, FALSE);
+    vs->Release();
+    return true;
+  }
+
+  // An INTZ texture bound as the depth buffer, depth writes off, and read
+  // by the draw it tests (soft particles): NVIDIA's and AMD's Direct3D 9
+  // sample what it holds.
+  bool sceneDepthReadWhileBound(IDirect3DDevice9* d) {
+    IDirect3D9* d3d = nullptr;
+    d->GetDirect3D(&d3d);
+    const D3DFORMAT intzFormat = D3DFORMAT(MAKEFOURCC('I', 'N', 'T', 'Z'));
+    const bool intz = SUCCEEDED(d3d->CheckDeviceFormat(0, D3DDEVTYPE_HAL, D3DFMT_X8R8G8B8, D3DUSAGE_DEPTHSTENCIL,
+                                                       D3DRTYPE_TEXTURE, intzFormat));
+    d3d->Release();
+    if (!intz)
+      return true;
+    IDirect3DTexture9* texture = nullptr;
+    if (FAILED(d->CreateTexture(kWidth, kHeight, 1, D3DUSAGE_DEPTHSTENCIL, intzFormat, D3DPOOL_DEFAULT, &texture, nullptr)))
+      return false;
+    IDirect3DSurface9 *depth = nullptr, *oldDepth = nullptr;
+    texture->GetSurfaceLevel(0, &depth);
+    d->GetDepthStencilSurface(&oldDepth);
+    d->SetDepthStencilSurface(depth);
+    d->Clear(0, nullptr, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, 0xff000000u, 1.0f, 0);
+    d->SetRenderState(D3DRS_LIGHTING, FALSE);
+    d->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+    d->SetRenderState(D3DRS_ZENABLE, D3DZB_TRUE);
+    d->SetRenderState(D3DRS_ZWRITEENABLE, TRUE);
+    d->SetRenderState(D3DRS_ZFUNC, D3DCMP_LESSEQUAL);
+    const TLVertex tri[3] = { { 0.0f, 0.0f, 0.2f, 1.0f, 0xffff0000u }, { 64.0f, 0.0f, 0.5f, 1.0f, 0xffff0000u },
+                              { 0.0f, 48.0f, 0.8f, 1.0f, 0xffff0000u } };
+    d->SetFVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE);
+    d->DrawPrimitiveUP(D3DPT_TRIANGLELIST, 1, tri, sizeof(TLVertex));
+    // Depth writes off: a quad at 0.45 shows the depth it reads where it
+    // passes the test against the same texture.
+    d->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
+    const auto code = compile(R"(
+sampler2D depth : register(s0);
+float4 main(float2 t : TEXCOORD0) : COLOR { float v = tex2D(depth, t).r; return float4(v, frac(v * 16.0), 0.5, 1); }
+)", "ps_2_0");
+    IDirect3DPixelShader9* ps = nullptr;
+    if (code.empty() || FAILED(d->CreatePixelShader(code.data(), &ps)))
+      return false;
+    d->SetPixelShader(ps);
+    d->SetTexture(0, texture);
+    d->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_POINT);
+    d->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
+    struct TLTex { float x, y, z, rhw; float u, v; };
+    const TLTex quad[4] = {
+      { -0.5f, -0.5f, 0.45f, 1.0f, 0.0f, 0.0f }, { kWidth - 0.5f, -0.5f, 0.45f, 1.0f, 1.0f, 0.0f },
+      { -0.5f, kHeight - 0.5f, 0.45f, 1.0f, 0.0f, 1.0f }, { kWidth - 0.5f, kHeight - 0.5f, 0.45f, 1.0f, 1.0f, 1.0f },
+    };
+    d->SetFVF(D3DFVF_XYZRHW | D3DFVF_TEX1);
+    d->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, quad, sizeof(TLTex));
+    d->SetPixelShader(nullptr);
+    d->SetTexture(0, nullptr);
+    d->SetRenderState(D3DRS_ZWRITEENABLE, TRUE);
+    d->SetDepthStencilSurface(oldDepth);
+    ps->Release();
+    depth->Release();
+    if (oldDepth) oldDepth->Release();
+    texture->Release();
+    return true;
+  }
+
+  // The depth bias scales with the depth buffer's format: a draw on D24S8
+  // after one on D16 with the same render states (green only where the
+  // bias, 1/10000, did not push it behind the red quad 1/20000 behind).
+  bool sceneDepthBiasFormats(IDirect3DDevice9* d) {
+    d->Clear(0, nullptr, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, 0xff000000u, 1.0f, 0);
+    d->SetRenderState(D3DRS_LIGHTING, FALSE);
+    d->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+    d->SetRenderState(D3DRS_ZENABLE, D3DZB_TRUE);
+    d->SetRenderState(D3DRS_ZWRITEENABLE, TRUE);
+    d->SetRenderState(D3DRS_ZFUNC, D3DCMP_LESS);
+    auto quad = [&](float x0, float x1, float z, DWORD color) {
+      const TLVertex v[4] = { { x0, -0.5f, z, 1.0f, color }, { x1, -0.5f, z, 1.0f, color },
+                              { x0, kHeight - 0.5f, z, 1.0f, color }, { x1, kHeight - 0.5f, z, 1.0f, color } };
+      d->SetFVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE);
+      d->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, v, sizeof(TLVertex));
+    };
+    quad(-0.5f, 31.5f, 0.50005f, 0xffff0000u);
+    IDirect3DSurface9 *d16 = nullptr, *oldDepth = nullptr;
+    if (FAILED(d->CreateDepthStencilSurface(kWidth, kHeight, D3DFMT_D16, D3DMULTISAMPLE_NONE, 0, FALSE, &d16, nullptr)))
+      return false;
+    d->GetDepthStencilSurface(&oldDepth);
+    d->SetDepthStencilSurface(d16);
+    d->Clear(0, nullptr, D3DCLEAR_ZBUFFER, 0, 1.0f, 0);
+    const float bias = 0.0001f;
+    d->SetRenderState(D3DRS_DEPTHBIAS, *reinterpret_cast<const DWORD*>(&bias));
+    d->SetRenderState(D3DRS_ZFUNC, D3DCMP_NEVER);
+    quad(-0.5f, kWidth - 0.5f, 0.5f, 0xffffffffu);
+    d->SetDepthStencilSurface(oldDepth);
+    d->SetRenderState(D3DRS_ZFUNC, D3DCMP_LESS);
+    quad(-0.5f, kWidth - 0.5f, 0.5f, 0xff00ff00u);
+    const float zero = 0.0f;
+    d->SetRenderState(D3DRS_DEPTHBIAS, *reinterpret_cast<const DWORD*>(&zero));
+    d16->Release();
+    if (oldDepth) oldDepth->Release();
+    return true;
+  }
+
+  // D3DTOP_MODULATEALPHA_ADDCOLOR to MODULATEINVCOLOR_ADDALPHA (18-21) as
+  // colour operations (top), and as alpha operations of stage 0 (middle)
+  // and 1 (bottom): Windows' NVIDIA Direct3D 9 keeps the current alpha.
+  bool sceneFfpAddOps(IDirect3DDevice9* d) {
+    d->Clear(0, nullptr, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, 0x00000000u, 1.0f, 0);
+    d->SetRenderState(D3DRS_LIGHTING, FALSE);
+    d->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+    d->SetRenderState(D3DRS_ZENABLE, D3DZB_FALSE);
+    d->SetRenderState(D3DRS_TEXTUREFACTOR, 0x60c08040u);
+    d->SetFVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE);
+    for (int row = 0; row < 3; row++) {
+      for (int i = 0; i < 4; i++) {
+        const DWORD op = D3DTOP_MODULATEALPHA_ADDCOLOR + i;
+        d->SetTextureStageState(0, D3DTSS_COLOROP, row ? D3DTOP_SELECTARG2 : op);
+        d->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TFACTOR);
+        d->SetTextureStageState(0, D3DTSS_COLORARG2, D3DTA_DIFFUSE);
+        d->SetTextureStageState(0, D3DTSS_ALPHAOP, row == 1 ? op : D3DTOP_SELECTARG1);
+        d->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_TFACTOR);
+        d->SetTextureStageState(0, D3DTSS_ALPHAARG2, D3DTA_DIFFUSE);
+        if (row == 2) {
+          d->SetTextureStageState(1, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
+          d->SetTextureStageState(1, D3DTSS_COLORARG1, D3DTA_CURRENT);
+          d->SetTextureStageState(1, D3DTSS_ALPHAOP, op);
+          d->SetTextureStageState(1, D3DTSS_ALPHAARG1, D3DTA_DIFFUSE);
+          d->SetTextureStageState(1, D3DTSS_ALPHAARG2, D3DTA_TFACTOR | D3DTA_COMPLEMENT);
+        }
+        const float x0 = i * 16.0f - 0.5f, y0 = row * 16.0f - 0.5f;
+        const TLVertex v[4] = { { x0, y0, 0.5f, 1.0f, 0x80ff2000u }, { x0 + 16.0f, y0, 0.5f, 1.0f, 0x4010ff40u },
+                                { x0, y0 + 16.0f, 0.5f, 1.0f, 0xff4020ffu }, { x0 + 16.0f, y0 + 16.0f, 0.5f, 1.0f, 0x20ffffffu } };
+        d->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, v, sizeof(TLVertex));
+      }
+    }
+    d->SetTextureStageState(1, D3DTSS_COLOROP, D3DTOP_DISABLE);
+    d->SetTextureStageState(1, D3DTSS_ALPHAOP, D3DTOP_DISABLE);
+    d->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_MODULATE);
+    d->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
+    d->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1);
+    d->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE);
+    return true;
+  }
+
   const Scene kScenes[] = {
     { "msaa_resolve", sceneMsaaResolve, 80 },   // edge coverage: NVIDIA's 4x pattern differs
     { "formats", sceneFormats },
@@ -2871,6 +3169,12 @@ float4 main(float2 t : TEXCOORD0) : COLOR {
     { "texture_memory", sceneTextureMemory },
     { "relocked_managed", sceneRelockedManaged },
     { "relocked_vertex_buffer", sceneRelockedVertexBuffer },
+    { "ring_wrap", sceneRingWrap },
+    { "strip_index_65535", sceneStripIndex65535 },
+    { "shader_fog_ffp_pixels", sceneShaderFogFixedPixels },
+    { "depth_read_bound", sceneDepthReadWhileBound },
+    { "depth_bias_formats", sceneDepthBiasFormats },
+    { "ffp_add_ops", sceneFfpAddOps, 3 },
   };
 
   // ---- Running ----

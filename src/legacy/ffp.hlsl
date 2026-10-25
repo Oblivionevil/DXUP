@@ -292,10 +292,11 @@ float4 combine(uint op, float4 a1, float4 a2, float4 a0, float4 diffuse, float4 
     case 14: return lerp(a2, a1, textureFactor.a);
     case 15: return a1 + a2 * (1.0f - texel.a);
     case 16: return lerp(a2, a1, current.a);
+    // Colour operations only (as alpha operations: ps_main).
     case 18: return float4(a1.rgb + a1.a * a2.rgb, a1.a);
-    case 19: return float4(a1.rgb * a2.rgb, a1.a + a2.a);
+    case 19: return float4(a1.rgb * a2.rgb + a1.a, a1.a);
     case 20: return float4(a1.rgb + (1.0f - a1.a) * a2.rgb, a1.a);
-    case 21: return float4((1.0f - a1.rgb) * a2.rgb, a1.a + a2.a);
+    case 21: return float4((1.0f - a1.rgb) * a2.rgb + a1.a, a1.a);
     case 24: return saturate(4.0f * dot(a1.rgb - 0.5f, a2.rgb - 0.5f)).xxxx;
     case 25: return a0 + a1 * a2;
     case 26: return lerp(a2, a1, a0);
@@ -374,7 +375,9 @@ float4 ps_main(PSInput input) : SV_Target {
     float alpha;
     if (ops.x == 24) {
       alpha = color.a;
-    } else if (ops.y == 1) {
+    } else if (ops.y == 1 || (ops.y >= 18 && ops.y <= 21)) {
+      // The colour-only operations 18-21 as alpha operations keep the
+      // current alpha too (Windows' NVIDIA Direct3D 9).
       alpha = current.a;
     } else {
       const float4 a1 = argument(args.w & 0xffu, diffuse, current, texel, specular, temp, constant);

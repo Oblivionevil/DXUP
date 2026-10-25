@@ -119,6 +119,8 @@ namespace dxup::legacy {
     ID3D11ShaderResourceView* copySrv(bool srgb);
     ID3D11RenderTargetView*   rtv(uint32_t subresource, bool srgb = false);
     ID3D11DepthStencilView*   dsv() const { return m_dsv.get(); }
+    // Depth and stencil read-only (depth textures shaders read), or null.
+    ID3D11DepthStencilView*   readOnlyDsv() const { return m_dsvReadOnly.get(); }
     DXGI_FORMAT dxgiFormat() const { return m_dxgiFormat; }
     bool nullTarget() const { return m_desc.format == FormatNULL; }
     // Depth textures sampled with a comparison.
@@ -174,6 +176,7 @@ namespace dxup::legacy {
     Ref<ID3D11ShaderResourceView> m_srv;
     Ref<ID3D11ShaderResourceView> m_srvSrgb;
     Ref<ID3D11DepthStencilView>   m_dsv;
+    Ref<ID3D11DepthStencilView>   m_dsvReadOnly;
     std::vector<ID3D11RenderTargetView*> m_rtvs;
     std::vector<ID3D11RenderTargetView*> m_rtvsSrgb;
     std::vector<ID3D11Texture2D*> m_staging;
@@ -522,11 +525,18 @@ namespace dxup::legacy {
     void bindTargets();
     void bindViewport();
     void bindTextures();
+    // Whether the depth buffer is bound read-only: a depth texture a sampler
+    // has, with neither depth nor stencil written.
+    bool depthReadOnly() const;
     // a: the caller's, changed here (no copy: its fields were just stored
     // one by one, and a wider copy would wait for them).
     void drawWith(DrawArgs& a);
     void widenVertexRange(DrawArgs& a);
-    // Uploads application data into the ring buffers; returns offsets.
+    // Uploads application data into the ring buffers; returns offsets
+    // (UINT32_MAX when it fails). A draw reserves room for all its vertex
+    // uploads first: a wrap discards the ring, earlier uploads with it, so
+    // uploadVertices writes into the reserved room only.
+    bool reserveVertices(uint64_t size);
     uint32_t uploadVertices(const void* data, uint32_t size);
     uint32_t uploadIndices(const void* data, uint32_t size);
     void drawQuad(ID3D11PixelShader* shader, const float rect[4], const float texRect[4], const float color[4],
@@ -576,7 +586,7 @@ namespace dxup::legacy {
       UINT flags = 0;
     };
     int m_tearing = -1;   // whether presents without VSync may tear (unknown: -1)
-    std::vector<uint32_t> m_fanIndices;   // triangle fans drawn as lists
+    std::vector<uint32_t> m_fanIndices;   // triangle fans drawn as lists, 16-bit strips widened
     std::vector<std::unique_ptr<SwapChain>> m_swapChains;
     Ref<ID3D11VertexShader>         m_ffpVs;
     Ref<ID3D11PixelShader>          m_ffpPs;
@@ -613,6 +623,7 @@ namespace dxup::legacy {
     Ref<ID3D11Buffer>               m_vertexRing;
     Ref<ID3D11Buffer>               m_indexRing;
     uint32_t                        m_vertexRingSize = 0, m_vertexRingOffset = 0;
+    bool                            m_vertexRingDiscard = false;   // the next upload maps it discarded
     uint32_t                        m_indexRingSize = 0, m_indexRingOffset = 0;
     Ref<ID3D11SamplerState>         m_pointSampler, m_linearSampler;
     Ref<ID3D11BlendState>           m_opaqueBlend;
@@ -700,7 +711,8 @@ namespace dxup::legacy {
       const Shader* vs = nullptr;
       const Shader* ps = nullptr;
       const VertexDecl* decl = nullptr;
-      uint32_t psTextureTypes = 0;   // when ps is shader model 1 (else 0)
+      uint32_t psTextureTypes = 0;   // when ps is shader model 1 (psTypesCompared)
+      bool psTypesCompared = false;
       uint32_t states = 0;           // of these:
       uint32_t stateMask = 0;        // shadow samplers ps reads, clip planes with vs, projection with ps 1.0-1.3
       const Shader::Variant* vsVariant = nullptr;
@@ -824,6 +836,7 @@ namespace dxup::legacy {
     ID3D11ShaderResourceView* m_samplerViews[kPixelSamplers] = {};   // shader stages: the views wanted
     ID3D11RenderTargetView*   m_boundRtvs[kMaxRenderTargets] = {};   // valid with m_targetsBound
     ID3D11DepthStencilView*   m_boundDsv = nullptr;
+    bool                      m_depthReadOnly = false;   // bindTargets binds the read-only view (depthReadOnly)
     bool                      m_targetsBound = false;
     D3D11_VIEWPORT            m_boundViewport = {};   // valid with m_viewportBound
     D3D11_RECT                m_boundScissor = {};

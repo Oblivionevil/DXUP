@@ -339,6 +339,38 @@ label l1
 add r0, r0, c10.y
 ret
 )", nullptr },
+    // Loops in subroutines called inside loops: each keeps its own counter
+    // (and aL its own value).
+    { "ps3_loop_call_loop", kVsPass, "vs_3_0", R"(ps_3_0
+defi i0, 3, 0, 0, 0
+defi i1, 2, 0, 0, 0
+defi i2, 2, 0, 1, 0
+def c10, 0.5, 0.125, 0.0625, 0.03125
+dcl_texcoord0 v0
+dcl_texcoord1 v1
+mov r0, c10.w
+rep i0
+  add r0.x, r0.x, c10.y
+  call l0
+endrep
+loop aL, i2
+  add r0.z, r0.z, v0[aL].x
+  call l1
+  add r0.z, r0.z, v0[aL].y
+endloop
+mov oC0, r0
+ret
+label l0
+rep i1
+  add r0.y, r0.y, c10.z
+endrep
+ret
+label l1
+loop aL, i2
+  mad r0.w, v0[aL].z, c10.y, r0.w
+endloop
+ret
+)", nullptr },
     { "ps3_breakp", kVsPass, "vs_3_0", R"(ps_3_0
 defi i0, 6, 0, 1, 0
 def c10, 0.5, 0.25, -1.0, 2.0

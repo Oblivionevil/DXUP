@@ -510,6 +510,81 @@ namespace {
     return expectPixel(c, 32, 32, 0x00ff00, "DXT1 texture", error);
   }
 
+  // A source colour key on a DXT1 texture: Windows' Direct3D 7 draws it as
+  // it is with colour keying on, whatever the key (as a 565 colour of its
+  // blocks or as RGB). The key comes after a first draw (in a 32-bit
+  // process the 32 KB copy went after the upload), and the blocks lock as
+  // written.
+  bool dxtColorKey(Context& c, std::string& error) {
+    DDSURFACEDESC2 desc = {};
+    desc.dwSize = sizeof(desc);
+    desc.dwFlags = DDSD_CAPS | DDSD_WIDTH | DDSD_HEIGHT | DDSD_PIXELFORMAT;
+    desc.dwWidth = desc.dwHeight = 256;
+    desc.ddsCaps.dwCaps = DDSCAPS_TEXTURE;
+    desc.ddsCaps.dwCaps2 = DDSCAPS2_TEXTUREMANAGE;
+    desc.ddpfPixelFormat.dwSize = sizeof(DDPIXELFORMAT);
+    desc.ddpfPixelFormat.dwFlags = DDPF_FOURCC;
+    desc.ddpfPixelFormat.dwFourCC = MAKEFOURCC('D', 'X', 'T', '1');
+    Com<IDirectDrawSurface7> texture;
+    HRESULT hr = c.dd->CreateSurface(&desc, texture.put(), nullptr);
+    if (FAILED(hr)) { error = format("DXT1 texture 0x%08lx", hr); return false; }
+    DDSURFACEDESC2 locked = {};
+    locked.dwSize = sizeof(locked);
+    if (FAILED(texture->Lock(nullptr, &locked, DDLOCK_WAIT, nullptr))) { error = "DXT1 Lock"; return false; }
+    // Left half magenta (565 0xf81f), right half magenta and blue texels
+    // alternating (4-colour blocks, indices 0 and 1).
+    auto block = [&](uint32_t bx, uint32_t by) { return static_cast<uint8_t*>(locked.lpSurface) + (by * 64 + bx) * 8; };
+    for (uint32_t by = 0; by < 64; by++)
+      for (uint32_t bx = 0; bx < 64; bx++) {
+        uint8_t* b = block(bx, by);
+        const uint8_t right = bx >= 32;
+        const uint8_t texels[8] = { 0x1f, 0xf8, uint8_t(right ? 0x1f : 0), 0, uint8_t(right ? 0x44 : 0),
+                                    uint8_t(right ? 0x44 : 0), uint8_t(right ? 0x44 : 0), uint8_t(right ? 0x44 : 0) };
+        std::memcpy(b, texels, 8);
+      }
+    texture->Unlock(nullptr);
+    c.device->SetTexture(0, texture.get());
+    c.device->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
+    c.device->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
+    c.device->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1);
+    c.device->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE);
+    c.device->SetTextureStageState(0, D3DTSS_MAGFILTER, D3DTFG_POINT);
+    c.device->SetTextureStageState(0, D3DTSS_MINFILTER, D3DTFN_POINT);
+    const DWORD keys[3] = { 0, 0xf81f, 0xff00ff };
+    for (int k = 0; k < 3; k++) {
+      DDCOLORKEY key = { keys[k], keys[k] };
+      if (k && FAILED(texture->SetColorKey(DDCKEY_SRCBLT, &key))) { error = "SetColorKey"; return false; }
+      c.device->SetRenderState(D3DRENDERSTATE_COLORKEYENABLE, k != 0);
+      c.device->Clear(0, nullptr, D3DCLEAR_TARGET, 0xff404040, 1.0f, 0);
+      // Texels 96 to 159 of each row, one per pixel (pixel 36: texel 132).
+      const TLVertex v[4] = { { -0.5f, -0.5f, 0.5f, 1.0f, 0xffffffff, 0.375f, 0.0f },
+                              { 63.5f, -0.5f, 0.5f, 1.0f, 0xffffffff, 0.625f, 0.0f },
+                              { -0.5f, 63.5f, 0.5f, 1.0f, 0xffffffff, 0.375f, 1.0f },
+                              { 63.5f, 63.5f, 0.5f, 1.0f, 0xffffffff, 0.625f, 1.0f } };
+      c.device->BeginScene();
+      c.device->DrawPrimitive(D3DPT_TRIANGLESTRIP, kTLFvf, const_cast<TLVertex*>(v), 4, 0);
+      c.device->EndScene();
+      const std::string what = format("key 0x%06lx", keys[k]);
+      if (!expectPixel(c, 10, 20, 0xff00ff, (what + " left").c_str(), error)
+       || !expectPixel(c, 36, 20, 0xff00ff, (what + " right, index 0").c_str(), error)
+       || !expectPixel(c, 37, 20, 0x0000ff, (what + " right, index 1").c_str(), error))
+        return false;
+    }
+    c.device->SetRenderState(D3DRENDERSTATE_COLORKEYENABLE, FALSE);
+    c.device->SetTexture(0, nullptr);
+    locked = {};
+    locked.dwSize = sizeof(locked);
+    if (FAILED(texture->Lock(nullptr, &locked, DDLOCK_WAIT | DDLOCK_READONLY, nullptr))) { error = "DXT1 Lock again"; return false; }
+    const uint8_t* b = block(40, 20);
+    const bool same = b[0] == 0x1f && b[1] == 0xf8 && b[2] == 0x1f && b[3] == 0 && b[4] == 0x44 && b[7] == 0x44;
+    texture->Unlock(nullptr);
+    if (!same) {
+      error = format("locked again: block %02x%02x %02x%02x %02x", b[0], b[1], b[2], b[3], b[4]);
+      return false;
+    }
+    return true;
+  }
+
   bool runningOnDxup() {
     HMODULE module = GetModuleHandleA("ddraw.dll");
     char path[MAX_PATH] = {}, exe[MAX_PATH] = {};
@@ -848,6 +923,7 @@ int main(int argc, char** argv) {
     { "fog_table", fogTable },
     { "blt_and_fill", bltAndFill },
     { "dxt_texture", dxtTexture },
+    { "dxt_color_key", dxtColorKey },
     { "directdraw_v1", directDrawV1 },
     { "foreign_surface_blt", foreignSurfaceBlt },
     { "directdraw1_interface", directDraw1Interface },

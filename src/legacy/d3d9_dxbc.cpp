@@ -233,7 +233,9 @@ namespace dxup::legacy {
       uint32_t A0 = 0, AL = 0, P0 = 0;
       uint32_t OPOS = 0, OFOG = 0, OPTS = 0, OD[2] = {};
       uint32_t OC[4] = {}, T[8] = {}, TC[8] = {}, TM[2] = {}, ODEPTH = 0, VPOS = 0, VFACE = 0;
-      std::vector<uint32_t> loopTemps;   // per depth: counter, count, step, saved aL
+      std::vector<uint32_t> loopTemps;   // per function and depth: counter, count, step, saved aL
+      std::vector<uint32_t> loopBases;   // per function: its first loopTemps entry
+      uint32_t function = 0;             // emitted: 0 main, then labels in order
       uint32_t scratchBase = 0, scratchNext = 0, maxTemps = 0;
 
       // Flow control.
@@ -301,16 +303,27 @@ namespace dxup::legacy {
           if (L.usedTm & 0xf0) TM[1] = allocate();
           ODEPTH = allocate(); VPOS = allocate(); VFACE = allocate();
         }
-        uint32_t depth = 0, maxDepth = 0;
+        // Loop registers per function (main, then each label's), apart from
+        // every other function's: a subroutine called inside a loop keeps
+        // the caller's counters.
+        std::vector<uint32_t> depths(1, 0);
+        uint32_t depth = 0;
         for (const auto& ins : L.instructions) {
-          if (ins.opcode == OpRep || ins.opcode == OpLoop) maxDepth = (std::max)(maxDepth, ++depth);
+          if (ins.opcode == OpLabel) {
+            depths.push_back(0);
+            depth = 0;
+          }
+          if (ins.opcode == OpRep || ins.opcode == OpLoop) depths.back() = (std::max)(depths.back(), ++depth);
           if ((ins.opcode == OpEndRep || ins.opcode == OpEndLoop) && depth) depth--;
           for (const auto* ops : { &ins.dst, &ins.src })
             for (const Operand& op : *ops)
               if (op.type == RegMisc && op.index == 0) readsVPos = true;
         }
-        for (uint32_t i = 0; i < maxDepth; i++)
-          loopTemps.push_back(allocate());
+        for (uint32_t functionDepth : depths) {
+          loopBases.push_back(uint32_t(loopTemps.size()));
+          for (uint32_t i = 0; i < functionDepth; i++)
+            loopTemps.push_back(allocate());
+        }
         scratchBase = scratchNext = maxTemps = nextTemp;
       }
 
@@ -1121,7 +1134,7 @@ namespace dxup::legacy {
             return true;
           case OpRep: {
             // for (counter = 0; counter < int(i.x); counter++)
-            const uint32_t lc = loopTemps[loopDepth++];
+            const uint32_t lc = loopTemps[loopBases[function] + loopDepth++];
             loopKinds.push_back(OpRep);
             emit(DxFtoI, { tempDst(lc, 2), one(ins, 0) });
             emit(DxMov, { tempDst(lc, 1), immU(0) });
@@ -1136,7 +1149,7 @@ namespace dxup::legacy {
               fail("unbalanced loop");
               return false;
             }
-            const uint32_t lc = loopTemps[--loopDepth];
+            const uint32_t lc = loopTemps[loopBases[function] + --loopDepth];
             const uint32_t kind = loopKinds.back();
             loopKinds.pop_back();
             emit(DxIAdd, { tempDst(lc, 1), comp(temp(lc), 0), immU(1) });
@@ -1149,7 +1162,7 @@ namespace dxup::legacy {
           }
           case OpLoop: {
             // loop aL, i#: count, start, step; aL restored after the loop.
-            const uint32_t lc = loopTemps[loopDepth++];
+            const uint32_t lc = loopTemps[loopBases[function] + loopDepth++];
             loopKinds.push_back(OpLoop);
             const uint32_t t = scratch();
             emit(DxFtoI, { tempDst(t, 7), src(ins, 1) });
@@ -1201,6 +1214,7 @@ namespace dxup::legacy {
               emit(DxRet, {});
             emit(DxLabel, { label(s[0].index) });
             inFunction = functionOpen = true;
+            function++;
             return true;
           default:
             fail("unsupported instruction " + std::to_string(ins.opcode));

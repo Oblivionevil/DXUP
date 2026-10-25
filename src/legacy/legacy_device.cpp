@@ -380,6 +380,12 @@ namespace dxup::legacy {
       }
       if (FAILED(m_device->d3d11()->CreateDepthStencilView(resource, &dd, m_dsv.put())))
         return;
+      // Depth textures shaders read: a read-only view too, bound while a
+      // draw samples the texture it tests against (Device::bindTargets).
+      if (sampledDepth) {
+        dd.Flags = D3D11_DSV_READ_ONLY_DEPTH | (dsvFormat == DXGI_FORMAT_D24_UNORM_S8_UINT ? D3D11_DSV_READ_ONLY_STENCIL : 0);
+        m_device->d3d11()->CreateDepthStencilView(resource, &dd, m_dsvReadOnly.put());
+      }
     }
     if (bind & D3D11_BIND_SHADER_RESOURCE) {
       if (!srv(false))
@@ -848,6 +854,13 @@ namespace dxup::legacy {
   }
 
   void Texture::setColorKey(bool enabled, uint32_t key) {
+    // Block-compressed textures are drawn as they are: Windows' Direct3D 7
+    // keys none of their texels (DXT1 has alpha of its own), and their
+    // blocks are no texels to compare with a key.
+    if (formatInfo(m_desc.format).block) {
+      enabled = false;
+      key = 0;
+    }
     if (m_colorKeyEnabled == enabled && m_colorKey == key)
       return;
     if (m_colorKeyEnabled != enabled)
@@ -2561,9 +2574,20 @@ namespace dxup::legacy {
     m_viewportDirty = true;
   }
 
+  namespace {
+    // Direct3D 9's depth bias is in depth units, D3D11's in steps of the
+    // depth buffer's format.
+    float depthBiasSteps(const Texture* depth) {
+      return depth && formatInfo(depth->desc().format).bytesPerBlock == 2 ? 65535.0f : 16777215.0f;
+    }
+  }
+
   void Device::setDepthStencil(Texture* depth) {
     if (m_depthStencil == depth)
       return;
+    // The rasterizer state scales the depth bias by the format's steps.
+    if (depthBiasSteps(depth) != depthBiasSteps(m_depthStencil))
+      m_dirty |= DirtyRaster;
     m_depthStencil = depth;
     m_targetsDirty = true;
     m_textureDirtyMask = (1u << kSamplerCount) - 1;
@@ -2575,6 +2599,10 @@ namespace dxup::legacy {
   void Device::setVertexShader(Shader* shader) {
     if (m_vertexShader == shader)
       return;
+    // The fixed-function pixel stage's fog takes the vertex mode without a
+    // vertex shader only.
+    if (!m_vertexShader != !shader)
+      m_pixelConstantsDirty = true;
     m_vertexShader = shader;
     m_dirty |= DirtyShaders | DirtyLayout;   // binds the floats again (bindShaderConstants)
   }
@@ -2921,8 +2949,7 @@ namespace dxup::legacy {
     desc.CullMode = rs[RsCullMode] == 2 ? D3D11_CULL_FRONT : rs[RsCullMode] == 3 ? D3D11_CULL_BACK : D3D11_CULL_NONE;
     desc.FrontCounterClockwise = FALSE;
     const float bias = asFloat(rs[RsDepthBias]);
-    // Direct3D 9's bias is in depth units; D3D11's in steps of the format.
-    const float steps = m_depthStencil && formatInfo(m_depthStencil->desc().format).bytesPerBlock == 2 ? 65535.0f : 16777215.0f;
+    const float steps = depthBiasSteps(m_depthStencil);
     // NaN or values past INT do nothing / saturate (D3D11 refuses NaN).
     const double depthBias = std::isfinite(bias) ? double(bias) * steps - double(INT(rs[RsZBias])) * 1000.0 : 0.0;
     desc.DepthBias = INT((std::max)(-2147483648.0, (std::min)(2147483647.0, depthBias)));
@@ -3452,10 +3479,11 @@ namespace dxup::legacy {
     c->fogTable[1] = asFloat(rs[RsFogEnd]);
     c->fogTable[2] = asFloat(rs[RsFogDensity]);
     // Fog per pixel: the table's, else the vertex mode's from the
-    // interpolated distance (pre-transformed vertices bring their factor).
+    // interpolated distance (pre-transformed vertices bring their factor,
+    // vertex shaders theirs: Direct3D 9 ignores the vertex mode with one).
     const uint32_t tableMode = rs[RsFogTableMode] <= 3 ? rs[RsFogTableMode] : 0;
     const bool transformed = (m_ffpFvf & FvfPositionMask) == FvfXyzRhw;
-    const uint32_t vertexMode = !transformed && rs[RsFogVertexMode] <= 3 ? rs[RsFogVertexMode] : 0;
+    const uint32_t vertexMode = !m_vertexShader && !transformed && rs[RsFogVertexMode] <= 3 ? rs[RsFogVertexMode] : 0;
     c->fogTable[3] = float(tableMode ? tableMode : vertexMode);
     c->alphaTest[0] = float(rs[RsAlphaRef] & 0xff) / 255.0f;
     c->alphaTest[1] = float(rs[RsAlphaFunc]);
@@ -4128,6 +4156,25 @@ namespace dxup::legacy {
     m_shaderFixedDirty = false;
   }
 
+  bool Device::depthReadOnly() const {
+    if (!m_depthStencil || !m_depthStencil->readOnlyDsv())
+      return false;
+    const auto& rs = m_renderStates;
+    if (rs[RsZEnable] && rs[RsZWriteEnable])
+      return false;
+    if (rs[RsStencilEnable] && formatInfo(m_depthStencil->desc().format).stencil && (rs[RsStencilWriteMask] & 0xff)) {
+      const auto writes = [](uint32_t op) { return stencilOp(op) != D3D11_STENCIL_OP_KEEP; };
+      if (writes(rs[RsStencilFail]) || writes(rs[RsStencilZFail]) || writes(rs[RsStencilPass]))
+        return false;
+      if (rs[RsTwoSidedStencilMode] && (writes(rs[RsCcwStencilFail]) || writes(rs[RsCcwStencilZFail]) || writes(rs[RsCcwStencilPass])))
+        return false;
+    }
+    for (Texture* texture : m_textures)
+      if (texture == m_depthStencil)
+        return true;
+    return false;
+  }
+
   void Device::bindTargets() {
     const bool srgb = m_renderStates[RsSrgbWriteEnable] != 0;
     ID3D11RenderTargetView* rtvs[kMaxRenderTargets] = {};
@@ -4140,6 +4187,8 @@ namespace dxup::legacy {
         count = i + 1;
     }
     ID3D11DepthStencilView* dsv = m_depthStencil ? m_depthStencil->dsv() : nullptr;
+    if (m_depthReadOnly)
+      dsv = m_depthStencil->readOnlyDsv();
     // The same views again (a state of the group changed back and forth):
     // nothing to do, the textures bound are no target's.
     m_targetsDirty = false;
@@ -4149,7 +4198,8 @@ namespace dxup::legacy {
     m_boundDsv = dsv;
     m_targetsBound = true;
     // Unbind the views of textures that are now targets (D3D11 would,
-    // behind the bindings kept here); the others stay bound.
+    // behind the bindings kept here); the others stay bound, a depth
+    // buffer bound read-only too.
     // Views bound are a texture's own (targets read copies, see bindTextures).
     ID3D11ShaderResourceView* targetViews[2 * (kMaxRenderTargets + 1)];
     uint32_t targetViewCount = 0;
@@ -4159,7 +4209,8 @@ namespace dxup::legacy {
         targetViews[targetViewCount++] = t->srgbSrv();
       }
     };
-    addViews(m_depthStencil);
+    if (!m_depthReadOnly)
+      addViews(m_depthStencil);
     for (Texture* t : m_renderTargets)
       addViews(t);
     auto target = [&](ID3D11ShaderResourceView* view) {
@@ -4244,7 +4295,7 @@ namespace dxup::legacy {
     ShaderSelection& selection = m_selections[(selectionHash * 0x9e3779b9u) >> 24];
     if (selection.valid && selection.vs == m_vertexShader && selection.ps == m_pixelShader && selection.decl == m_decl
      && (states & selection.stateMask) == selection.states
-     && (!selection.psTextureTypes || selection.psTextureTypes == m_psTextureTypes)) {
+     && (!selection.psTypesCompared || selection.psTextureTypes == m_psTextureTypes)) {
       m_psVariant = selection.psVariant;
       m_vsVariant = selection.vsVariant;
       if (m_vertexShader) {
@@ -4336,20 +4387,20 @@ namespace dxup::legacy {
     }
     {
       // What the variants depend on (the rest of the states may change).
-      uint32_t stateMask = 0, psTypes = 0;
+      uint32_t stateMask = 0;
+      // Shader model 1 variants depend on the texture types bound (all 32
+      // bits of them: a flag says they are compared).
+      const bool ps1 = m_pixelShader && m_pixelShader->info().major == 1;
       if (m_pixelShader) {
-        stateMask |= m_pixelShader->info().major == 1 ? 0xffffu : uint32_t(m_pixelShader->m_usedSamplers);
+        stateMask |= ps1 ? 0xffffu : uint32_t(m_pixelShader->m_usedSamplers);
         stateMask |= 1u << 26;
-        if (m_pixelShader->info().major == 1) {
-          psTypes = m_psTextureTypes | 0x80000000u;   // never 0: compared
-          if (m_pixelShader->info().minor < 4)
-            stateMask |= 0xfu << 22;
-        }
+        if (ps1 && m_pixelShader->info().minor < 4)
+          stateMask |= 0xfu << 22;
       }
       if (m_vertexShader)
         stateMask |= 0x3fu << 16;
-      selection = { m_vertexShader, m_pixelShader, m_decl, psTypes, states & stateMask, stateMask, m_vsVariant, m_psVariant,
-                    m_constants[0].limits[1], m_constants[0].limits[2], true };
+      selection = { m_vertexShader, m_pixelShader, m_decl, ps1 ? m_psTextureTypes : 0u, ps1, states & stateMask, stateMask,
+                    m_vsVariant, m_psVariant, m_constants[0].limits[1], m_constants[0].limits[2], true };
     }
     // The fixed-function pixel stage binds textures by type.
     const bool ffpPixel = !m_psVariant;
@@ -4368,9 +4419,18 @@ namespace dxup::legacy {
     // (m_feedbackMask binds them again every draw).
     m_textureDirtyMask |= m_feedbackMask;
     auto view = [&](uint32_t sampler, Texture* texture, bool read) -> ID3D11ShaderResourceView* {
-      if (!texture || texture == m_depthStencil)
+      if (!texture)
         return nullptr;
       const bool srgb = m_samplerStatesValues[sampler][SampSrgbTexture] != 0;
+      // The depth buffer: sampled as it is while bound read-only (NVIDIA's
+      // and AMD's Direct3D 9 let shaders read INTZ with depth writes off),
+      // else a copy as before the draw, as targets.
+      if (texture == m_depthStencil) {
+        if (m_depthReadOnly)
+          return texture->srv(srgb);
+        m_feedbackMask |= 1u << sampler;
+        return read ? texture->copySrv(srgb) : nullptr;
+      }
       for (Texture* target : m_renderTargets) {
         if (target != texture)
           continue;
@@ -4464,6 +4524,14 @@ namespace dxup::legacy {
   }
 
   void Device::applyState() {
+    // The depth buffer's view follows its writes and the textures sampled.
+    if ((m_dirty & DirtyDepth) || m_textureDirtyMask || m_targetsDirty) {
+      const bool readOnly = depthReadOnly();
+      if (readOnly != m_depthReadOnly) {
+        m_depthReadOnly = readOnly;
+        m_targetsDirty = true;
+      }
+    }
     if (m_targetsDirty) {
       bindTargets();
       m_texturesPending = true;
@@ -4615,19 +4683,25 @@ namespace dxup::legacy {
     return true;
   }
 
-  uint32_t Device::uploadVertices(const void* data, uint32_t size) {
-    if (((size + 63) & ~63u) > m_vertexRingSize
-     && !growRing(m_vertexRing, m_vertexRingSize, m_vertexRingOffset, (size + 63) & ~63u, D3D11_BIND_VERTEX_BUFFER))
-      return UINT32_MAX;
-    D3D11_MAP mode = D3D11_MAP_WRITE_NO_OVERWRITE;
-    if (m_vertexRingOffset + ((size + 63) & ~63u) > m_vertexRingSize) {
-      mode = D3D11_MAP_WRITE_DISCARD;
+  bool Device::reserveVertices(uint64_t size) {
+    if (size > m_vertexRingSize
+     && (size > UINT32_MAX || !growRing(m_vertexRing, m_vertexRingSize, m_vertexRingOffset, uint32_t(size), D3D11_BIND_VERTEX_BUFFER)))
+      return false;
+    if (m_vertexRingOffset + size > m_vertexRingSize) {
       m_vertexRingOffset = 0;
+      m_vertexRingDiscard = true;
     }
-    if (!writeBuffer(m_vertexRing.get(), m_vertexRingOffset, data, size, mode == D3D11_MAP_WRITE_DISCARD))
+    return true;
+  }
+
+  uint32_t Device::uploadVertices(const void* data, uint32_t size) {
+    const uint64_t aligned = (uint64_t(size) + 63) & ~63ull;
+    if (m_vertexRingOffset + aligned > m_vertexRingSize
+     || !writeBuffer(m_vertexRing.get(), m_vertexRingOffset, data, size, m_vertexRingDiscard))
       return UINT32_MAX;
+    m_vertexRingDiscard = false;
     const uint32_t offset = m_vertexRingOffset;
-    m_vertexRingOffset += (size + 63) & ~63u;
+    m_vertexRingOffset += uint32_t(aligned);
     return offset;
   }
 
@@ -4744,13 +4818,63 @@ namespace dxup::legacy {
     } probeAfter{ this };
     if (!m_decl)
       return dropDraw(DropDeclaration);
+
+    // Instances: stream 0 counts them, others step per instance.
+    uint32_t instances = 1;
+    if (a.indexed && (m_streams[0].frequency & kIndexedData))
+      instances = (std::max)(1u, m_streams[0].frequency & 0x3fffffffu);
+
+    // Streams: the ranges the draw reads uploaded, changed bindings set.
+    // Dynamic buffers put that range into the vertex ring; the draw is then
+    // rebased to its first vertex, and the other streams with it. Instance
+    // data of dynamic buffers goes through the ring too (StarCraft II
+    // appends each particle draw's instances): uploads into GPU memory
+    // between draws stall the GPU.
+    const uint32_t mask = m_decl->streamMask() & ((1u << kMaxStreams) - 1);
+    const int64_t firstVertex = a.indexed ? int64_t(a.baseVertex) + a.minIndex : int64_t(a.startVertex);
+    bool rebase = false;
+    if (!a.userVertices && firstVertex >= 0) {
+      for (uint32_t bits = mask; bits && !rebase; bits &= bits - 1) {
+        const Stream& s = m_streams[lowestBit(bits)];
+        rebase = s.buffer && s.buffer->dynamic() && !(s.frequency & kInstanceData);
+      }
+    }
+    // What goes through the vertex ring (application vertices, ranges of
+    // dynamic streams), reserved together before the first upload.
+    const uint64_t userBytes = a.userVertices
+      ? uint64_t(a.indexed ? uint64_t(a.minIndex) + a.vertexCount : a.vertexCount) * a.userStride : 0;
+    uint64_t ringBegins[kMaxStreams] = {};
+    uint32_t ringSizes[kMaxStreams] = {};
+    uint64_t reserved = (userBytes + 63) & ~63ull;
+    for (uint32_t bits = mask; bits; bits &= bits - 1) {
+      const uint32_t stream = lowestBit(bits);
+      const Stream& s = m_streams[stream];
+      if ((stream == 0 && a.userVertices) || !s.buffer || !s.buffer->dynamic())
+        continue;
+      uint64_t begin = 0, bytes = 0;
+      if (s.frequency & kInstanceData) {
+        const uint32_t divider = (std::max)(1u, s.frequency & 0x3fffffffu);
+        begin = s.offset;
+        bytes = uint64_t((instances + divider - 1) / divider) * s.stride;
+      } else if (rebase) {
+        begin = s.offset + uint64_t(firstVertex) * s.stride;
+        bytes = uint64_t(a.vertexCount) * s.stride;
+      }
+      if (!bytes || begin + bytes > s.buffer->size() || !s.buffer->data())
+        continue;
+      ringBegins[stream] = begin;
+      ringSizes[stream] = uint32_t(bytes);
+      reserved += (bytes + 63) & ~63ull;
+    }
+    // Uploads that find no room (too large) take the buffers' own memory.
+    if (reserved)
+      reserveVertices(reserved);
     // Application vertices into the ring first: its offset binds stream 0.
     uint32_t userOffset = 0;
     if (a.userVertices) {
-      const uint32_t vertices = a.indexed ? a.minIndex + a.vertexCount : a.vertexCount;
-      userOffset = uploadVertices(a.userVertices, vertices * a.userStride);
+      userOffset = userBytes <= UINT32_MAX ? uploadVertices(a.userVertices, uint32_t(userBytes)) : UINT32_MAX;
       if (userOffset == UINT32_MAX)
-        return dropDraw(DropUpload, vertices * a.userStride);
+        return dropDraw(DropUpload, clampBytes(userBytes));
     }
     markTargetsWritten();
     applyState();
@@ -4761,23 +4885,6 @@ namespace dxup::legacy {
     if (!m_boundLayout)
       return dropDraw(DropInputLayout);
 
-    // Instances: stream 0 counts them, others step per instance.
-    uint32_t instances = 1;
-    if (a.indexed && (m_streams[0].frequency & kIndexedData))
-      instances = (std::max)(1u, m_streams[0].frequency & 0x3fffffffu);
-
-    // Streams: the ranges the draw reads uploaded, changed bindings set.
-    // Dynamic buffers put that range into the vertex ring; the draw is then
-    // rebased to its first vertex, and the other streams with it.
-    const uint32_t mask = m_decl->streamMask() & ((1u << kMaxStreams) - 1);
-    const int64_t firstVertex = a.indexed ? int64_t(a.baseVertex) + a.minIndex : int64_t(a.startVertex);
-    bool rebase = false;
-    if (!a.userVertices && firstVertex >= 0) {
-      for (uint32_t bits = mask; bits && !rebase; bits &= bits - 1) {
-        const Stream& s = m_streams[lowestBit(bits)];
-        rebase = s.buffer && s.buffer->dynamic() && !(s.frequency & kInstanceData);
-      }
-    }
     for (uint32_t bits = mask; bits; bits &= bits - 1) {
       const uint32_t stream = lowestBit(bits);
       ID3D11Buffer* buffer = nullptr;
@@ -4791,14 +4898,9 @@ namespace dxup::legacy {
         offset = s.offset;
         stride = s.stride;
         const bool instanced = (s.frequency & kInstanceData) != 0;
+        const uint32_t ringOffset = ringSizes[stream]
+          ? uploadVertices(s.buffer->data() + ringBegins[stream], ringSizes[stream]) : UINT32_MAX;
         if (instanced) {
-          // Instance data of dynamic buffers goes through the ring too
-          // (StarCraft II appends each particle draw's instances): uploads
-          // into GPU memory between draws stall the GPU.
-          const uint32_t divider = (std::max)(1u, s.frequency & 0x3fffffffu);
-          const uint64_t bytes = uint64_t((instances + divider - 1) / divider) * stride;
-          const uint32_t ringOffset = s.buffer->dynamic() && bytes && uint64_t(s.offset) + bytes <= s.buffer->size()
-            ? uploadVertices(s.buffer->data() + s.offset, uint32_t(bytes)) : UINT32_MAX;
           if (ringOffset != UINT32_MAX) {
             s.buffer->noteStreamedDraw();
             buffer = m_vertexRing.get();
@@ -4810,8 +4912,6 @@ namespace dxup::legacy {
           s.buffer->noteStreamedDraw();
           const uint64_t begin = s.offset + uint64_t(firstVertex) * stride;
           const uint64_t bytes = uint64_t(a.vertexCount) * stride;
-          const uint32_t ringOffset = begin + bytes <= s.buffer->size() && bytes
-            ? uploadVertices(s.buffer->data() + begin, uint32_t(bytes)) : UINT32_MAX;
           if (ringOffset != UINT32_MAX) {
             buffer = m_vertexRing.get();
             offset = ringOffset;
@@ -4893,6 +4993,33 @@ namespace dxup::legacy {
     const INT baseVertex = rebase ? INT(int64_t(a.baseVertex) - firstVertex) : a.baseVertex;
     UINT startIndex = a.startIndex;
     const uint32_t indexSize = m_index32 ? 4 : 2;
+    // D3D11 cuts strips at index 0xFFFF, Direct3D 9 draws vertex 0xFFFF
+    // there (it has no cut index): such 16-bit strips take 32-bit indices
+    // (whose cut index 0xFFFFFFFF is past Direct3D 9's largest vertex index).
+    if ((a.type == PrimitiveTriangleStrip || a.type == PrimitiveLineStrip) && !(a.userIndices ? a.userIndex32 : m_index32)) {
+      const uint16_t* source = nullptr;
+      uint32_t lo = 0, hi = 0;
+      if (a.userIndices) {
+        const auto* indices = static_cast<const uint16_t*>(a.userIndices);
+        if (std::find(indices, indices + a.indexCount, uint16_t(0xffff)) != indices + a.indexCount)
+          source = indices;
+      } else if (m_indices && m_indices->indexRange(a.startIndex, a.indexCount, false, lo, hi) && hi == 0xffff) {
+        source = reinterpret_cast<const uint16_t*>(m_indices->data() + size_t(a.startIndex) * 2);
+      }
+      if (source) {
+        std::vector<uint32_t>& list = m_fanIndices;
+        list.assign(source, source + a.indexCount);
+        const uint32_t indexOffset = uploadIndices(list.data(), uint32_t(list.size() * 4));
+        if (indexOffset == UINT32_MAX)
+          return dropDraw(DropUpload, uint32_t(list.size() * 4));
+        m_context->IASetIndexBuffer(m_indexRing.get(), DXGI_FORMAT_R32_UINT, indexOffset);
+        if (instances > 1)
+          m_context->DrawIndexedInstanced(a.indexCount, instances, 0, baseVertex, 0);
+        else
+          m_context->DrawIndexed(a.indexCount, 0, baseVertex);
+        return;
+      }
+    }
     if (!a.userIndices && m_indices && m_indices->dynamic()
      && (uint64_t(a.startIndex) + a.indexCount) * indexSize <= m_indices->size()) {
       // Dynamic indices: the range drawn through the index ring.
