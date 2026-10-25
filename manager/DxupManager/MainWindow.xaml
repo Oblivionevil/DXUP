@@ -222,12 +222,12 @@
                 <WrapPanel Grid.Row="10" Grid.Column="1" Margin="0,10,0,0">
                   <StackPanel Orientation="Horizontal" Margin="0,0,14,4">
                     <TextBlock Text="{DynamicResource CustomVendor}" VerticalAlignment="Center" Margin="0,0,6,0" />
-                    <TextBox x:Name="VendorIdBox" Width="56" MaxLength="6" LostFocus="OnSettingChanged" KeyDown="OnSettingKeyDown"
+                    <TextBox x:Name="VendorIdBox" Width="56" MaxLength="10" LostFocus="OnSettingChanged" KeyDown="OnSettingKeyDown"
                              AutomationProperties.Name="{DynamicResource CustomVendor}" />
                   </StackPanel>
                   <StackPanel Orientation="Horizontal" Margin="0,0,14,4">
                     <TextBlock Text="{DynamicResource CustomDevice}" VerticalAlignment="Center" Margin="0,0,6,0" />
-                    <TextBox x:Name="DeviceIdBox" Width="56" MaxLength="6" LostFocus="OnSettingChanged" KeyDown="OnSettingKeyDown"
+                    <TextBox x:Name="DeviceIdBox" Width="56" MaxLength="10" LostFocus="OnSettingChanged" KeyDown="OnSettingKeyDown"
                              AutomationProperties.Name="{DynamicResource CustomDevice}" />
                   </StackPanel>
                   <StackPanel Orientation="Horizontal" Margin="0,0,0,4">

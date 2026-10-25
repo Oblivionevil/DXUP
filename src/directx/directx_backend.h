@@ -1210,17 +1210,13 @@ namespace dxup {
     // thread run it right away.
     virtual void executeOnBackend(std::function<void(IBackendContext*)> fn) { fn(this); }
 
-    // Blocks until every command issued so far has been recorded.
     // Runs fn once everything handed to the GPU queue so far was (D3D12
     // with d3d12.submitThread: queued on its thread, after those calls).
     virtual void afterSubmitted(std::function<void()> fn) { fn(); }
-    // On the application's thread: the worker and the queue's submissions
-    // are through (takes messages sent to the thread meanwhile: a Present
-    // may wait for them).
+    // The worker and the queue's submissions are through (d3d12.submitThread:
+    // its thread has made every queue call handed to it so far).
     virtual void waitForQueue() { waitForWorker(); }
-    // Whether Present and command lists reach the queue on a thread of
-    // their own (d3d12.submitThread).
-    virtual bool submitsAsync() const { return false; }
+    // Blocks until every command issued so far has been recorded.
     virtual void waitForWorker() {}
     // A flush not run yet submits everything issued so far.
     virtual bool flushPending() const { return false; }

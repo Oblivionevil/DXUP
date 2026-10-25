@@ -9,8 +9,6 @@ namespace dxup::d3d12 {
 
   SubmitQueue::~SubmitQueue() {
     stop();
-    if (m_doneEvent)
-      CloseHandle(m_doneEvent);
   }
 
   void SubmitQueue::init(ID3D12Device* device, ID3D12CommandQueue* queue) {
@@ -21,12 +19,9 @@ namespace dxup::d3d12 {
   void SubmitQueue::start() {
     if (threaded() || !m_queue)
       return;
-    if (!m_doneEvent)
-      m_doneEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    if (!m_doneEvent)
-      return;
     try {
       m_stopping = false;
+      m_exited = false;
       m_thread = dxup::Thread([this] { threadMain(); });
     } catch (const std::exception& e) {
       logMessage(LogLevel::Warn, "submit thread not started (%s)", e.what());
@@ -53,26 +48,35 @@ namespace dxup::d3d12 {
     m_threaded.store(false, std::memory_order_release);
   }
 
+  uint64_t SubmitQueue::runHere(Job& job) {
+    const uint64_t ticket = m_issued.fetch_add(1, std::memory_order_acq_rel) + 1;
+    job(m_queue);
+    uint64_t done = m_done.load(std::memory_order_relaxed);
+    while (done < ticket && !m_done.compare_exchange_weak(done, ticket, std::memory_order_release)) { }
+    return ticket;
+  }
+
   uint64_t SubmitQueue::enqueue(Job job) {
-    if (!threaded()) {
-      const uint64_t ticket = m_issued.fetch_add(1, std::memory_order_acq_rel) + 1;
-      job(m_queue);
-      uint64_t done = m_done.load(std::memory_order_relaxed);
-      while (done < ticket && !m_done.compare_exchange_weak(done, ticket, std::memory_order_release)) { }
-      return ticket;
-    }
-    uint64_t ticket;
+    if (!threaded())
+      return runHere(job);
+    uint64_t ticket = 0;
     {
       std::lock_guard<std::mutex> lock(m_mutex);
-      ticket = m_issued.load(std::memory_order_relaxed) + 1;
-      m_issued.store(ticket, std::memory_order_release);
-      m_jobs.emplace_back(ticket, std::move(job));
+      // A job handed in while stop() ends the thread runs here: queued, it
+      // would never run.
+      if (!m_exited) {
+        ticket = m_issued.load(std::memory_order_relaxed) + 1;
+        m_issued.store(ticket, std::memory_order_release);
+        m_jobs.emplace_back(ticket, std::move(job));
+      }
     }
+    if (!ticket)
+      return runHere(job);
     m_wake.notify_one();
     return ticket;
   }
 
-  void SubmitQueue::waitFor(uint64_t ticket, bool pumpMessages) {
+  void SubmitQueue::waitFor(uint64_t ticket) {
     if (done(ticket) || !threaded())
       return;
     for (uint32_t i = 0; i < 4096; i++) {
@@ -80,22 +84,8 @@ namespace dxup::d3d12 {
         return;
       YieldProcessor();
     }
-    m_waiters.fetch_add(1, std::memory_order_acq_rel);
-    if (pumpMessages) {
-      // A Present waits for the window's thread, which may be this one:
-      // take the messages sent to it meanwhile (as CsThreadContext's
-      // waitForFrames).
-      while (!done(ticket) && !processExiting()) {
-        ResetEvent(m_doneEvent);
-        if (done(ticket))
-          break;
-        const DWORD result = MsgWaitForMultipleObjects(1, &m_doneEvent, FALSE, 10, QS_SENDMESSAGE);
-        if (result == WAIT_OBJECT_0 + 1) {
-          MSG msg;
-          PeekMessageW(&msg, nullptr, 0, 0, PM_NOREMOVE | PM_QS_SENDMESSAGE);
-        }
-      }
-    } else {
+    m_waiters.fetch_add(1, std::memory_order_seq_cst);
+    {
       std::unique_lock<std::mutex> lock(m_doneMutex);
       while (!done(ticket) && !processExiting())
         m_doneCv.wait_for(lock, std::chrono::milliseconds(10));
@@ -125,8 +115,10 @@ namespace dxup::d3d12 {
       {
         std::unique_lock<std::mutex> lock(m_mutex);
         m_wake.wait(lock, [this] { return m_stopping || !m_jobs.empty(); });
-        if (m_jobs.empty())
+        if (m_jobs.empty()) {
+          m_exited = true;
           return;
+        }
         jobs.swap(m_jobs);
       }
       for (auto& job : jobs) {
@@ -136,7 +128,6 @@ namespace dxup::d3d12 {
         if (m_waiters.load(std::memory_order_seq_cst)) {
           { std::lock_guard<std::mutex> lock(m_doneMutex); }
           m_doneCv.notify_all();
-          SetEvent(m_doneEvent);
         }
       }
       jobs.clear();

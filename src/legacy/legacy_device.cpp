@@ -1031,25 +1031,38 @@ namespace dxup::legacy {
   }
 
   void Buffer::restoreCopy() {
-    // Back from the GPU, as uploaded; kept from now on.
+    // Back from the GPU, as uploaded; kept from now on. Read in pieces
+    // through a small staging buffer: the copy went for want of address
+    // space, which a staging buffer of the whole size would take again.
+    constexpr uint32_t kPiece = 1u << 20;
     m_dropped = false;
     m_keptCopy = true;
     m_data.resize(m_size);
     D3D11_BUFFER_DESC bd = {};
     m_buffer->GetDesc(&bd);
+    bd.ByteWidth = (std::min)(bd.ByteWidth, kPiece);
     bd.Usage = D3D11_USAGE_STAGING;
     bd.BindFlags = 0;
     bd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
     bd.MiscFlags = 0;
-    Ref<ID3D11Buffer> copy;
-    if (FAILED(m_device->d3d11()->CreateBuffer(&bd, nullptr, copy.put())))
-      return;
-    m_device->context()->CopyResource(copy.get(), m_buffer.get());
-    D3D11_MAPPED_SUBRESOURCE mapped = {};
-    if (FAILED(m_device->context()->Map(copy.get(), 0, D3D11_MAP_READ, 0, &mapped)))
-      return;
-    std::memcpy(m_data.data(), mapped.pData, m_size);
-    m_device->context()->Unmap(copy.get(), 0);
+    bd.StructureByteStride = 0;
+    Ref<ID3D11Buffer> staging;
+    bool read = SUCCEEDED(m_device->d3d11()->CreateBuffer(&bd, nullptr, staging.put()));
+    for (uint32_t done = 0; read && done < m_size; done += kPiece) {
+      const uint32_t piece = (std::min)(m_size - done, kPiece);
+      const D3D11_BOX box = { done, 0, 0, done + piece, 1, 1 };
+      m_device->context()->CopySubresourceRegion(staging.get(), 0, 0, 0, 0, m_buffer.get(), 0, &box);
+      D3D11_MAPPED_SUBRESOURCE mapped = {};
+      read = SUCCEEDED(m_device->context()->Map(staging.get(), 0, D3D11_MAP_READ, 0, &mapped));
+      if (read) {
+        std::memcpy(m_data.data() + done, mapped.pData, piece);
+        m_device->context()->Unmap(staging.get(), 0);
+      }
+    }
+    // The GPU keeps the contents; reads of the copy see zeros.
+    if (!read)
+      logMessage(LogLevel::Error, "d3d9: vertex buffer %p (%u bytes): its contents could not be read back from the GPU",
+        static_cast<void*>(this), m_size);
   }
 
   // ============================================================
@@ -4185,7 +4198,11 @@ namespace dxup::legacy {
     // no float constant the draw's shaders read is NaN or infinite.
     bool finite = true;
     if (m_pixelShader && (m_nonFiniteGroups[0] | m_nonFiniteGroups[1])) {
-      auto groups = [](uint32_t floats) { return floats >= 256 ? ~0ull : (1ull << ((floats + 3) / 4)) - 1; };
+      // Groups of 4 registers: 253 floats and more are all 64.
+      auto groups = [](uint32_t floats) {
+        const uint32_t count = (floats + 3) / 4;
+        return count >= 64 ? ~0ull : (1ull << count) - 1;
+      };
       finite = !(m_nonFiniteGroups[1] & groups(shaderFloats(true, m_pixelShader->info())))
             && !(m_vertexShader && (m_nonFiniteGroups[0] & groups(shaderFloats(false, m_vertexShader->info()))));
     }

@@ -106,8 +106,13 @@ namespace Dxup.Tests
                && text.Contains("d3d12.pixelOutputMasks = false") && text.Contains("d3d12.barrierHoisting = false")
                && text.Contains("d3d11.relaxedUavBarriers = false") && text.Contains("d3d12.lazyTargets = true"),
                 "settings use DXUP's keys");
-            Check(GameSettings.ParseHex("xyz") == null && GameSettings.ParseHex("12345") == null && GameSettings.ParseHex("0") == null
-               && GameSettings.ParseHex("0x8086") == "8086", "GPU ids are 1-4 hex digits");
+            Check(GameSettings.ParseHex("xyz") == null && GameSettings.ParseHex("0") == null && GameSettings.ParseHex("0x10000") == null
+               && GameSettings.ParseHex("0x8086") == "8086" && GameSettings.ParseHex("0x000010DE") == "10de"
+               && GameSettings.ParseHex("12345") == "2345" && GameSettings.ParseHex("123456789abcdef01") == "ffff",
+                "GPU ids as DXUP reads them (low 16 bits)");
+            var lazy = new GameSettings();
+            lazy.Set("d3d12.lazyTargets", "yes");
+            Check(!lazy.LazyTargets.HasValue, "d3d12.lazyTargets = yes is DXUP's automatic choice");
 
             string path = Path.Combine(Path.GetTempPath(), "dxup_test_games.cfg");
             GamesConfig.Save(path, parsed);
@@ -248,12 +253,15 @@ namespace Dxup.Tests
                 bool kept = BitConverter.ToUInt32(File.ReadAllBytes(staleExe), peStale + 24 + 64) == 0x12345678u;
                 LargeAddressAware.Disable(staleExe);
                 bool exact = LargeAddressAware.SameContent(staleExe, staleOriginal);
+                Check(kept && exact, "a wrong checksum stays; the original comes back exactly");
+                // The backup is of an older version: an update brought an
+                // executable with the bit of its own, which stays.
                 LargeAddressAware.Enable(staleExe);
-                // The backup is of an older version: the bit is cleared in place.
-                File.WriteAllBytes(staleExe + LargeAddressAware.BackupSuffix, stale.Concat(new byte[] { 1 }).ToArray());
+                byte[] updated = File.ReadAllBytes(staleExe).Concat(new byte[] { 1 }).ToArray();
+                File.WriteAllBytes(staleExe, updated);
                 LargeAddressAware.Disable(staleExe);
-                Check(kept && exact && LargeAddressAware.SameContent(staleExe, staleOriginal),
-                    "a wrong checksum stays; the original comes back exactly");
+                Check(LargeAddressAware.Get(staleExe) == true && !LargeAddressAware.SetByDxup(staleExe)
+                    && File.ReadAllBytes(staleExe).SequenceEqual(updated), "an update's own bit stays");
 
                 // The game has the bit itself: no backup, and it stays.
                 LargeAddressAware.Enable(exe);
@@ -272,6 +280,18 @@ namespace Dxup.Tests
                     "activating sets the bit " + error);
                 Check(deployer.Remove(game, new[] { game }, out error) && LargeAddressAware.SameContent(game.ExePath, original)
                     && !LargeAddressAware.SetByDxup(game.ExePath), "removing DXUP restores the executable " + error);
+                // The executable cannot change (the game runs): nothing does.
+                foreach (string bin in new[] { "bin", "bin32" })
+                {
+                    Directory.CreateDirectory(Path.Combine(dir, "install", bin));
+                    File.WriteAllBytes(Path.Combine(dir, "install", bin, "d3d11.dll"), new byte[] { 1, 2, 3 });
+                }
+                using (new FileStream(game.ExePath, FileMode.Open, FileAccess.Read, FileShare.Read))
+                    Check(!deployer.Install(game, out error) && !File.Exists(Path.Combine(dir, "d3d11.dll"))
+                        && !LargeAddressAware.SetByDxup(game.ExePath), "a locked executable: nothing is installed");
+                Check(deployer.Install(game, out error) && File.Exists(Path.Combine(dir, "d3d11.dll"))
+                    && LargeAddressAware.Get(game.ExePath) == true, "then it installs " + error);
+                deployer.Remove(game, new[] { game }, out error);
 
                 // Steam's DRM wrapper (a .bind section): the executable stays as it is.
                 byte[] bytes = File.ReadAllBytes(original);

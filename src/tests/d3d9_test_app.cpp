@@ -1750,20 +1750,25 @@ PO main(float4 c : COLOR0) { PO o; o.c0 = c; o.c1 = c.gbra * 0.8; return o; }
   // shaders read such a constant: the same shaders draw with finite
   // constants, then an infinite pixel shader constant, then a NaN vertex
   // shader constant reaching the pixel shader through a texture
-  // coordinate, then finite constants again. Every strip is gray (0.5);
-  // a draw that missed the switch gives NaN, black.
+  // coordinate, then finite constants again. Below, an infinite vertex
+  // shader constant in c253 (the last group of four a shader can read).
+  // Every strip is gray (0.5); a draw that missed the switch gives NaN,
+  // black.
   bool sceneFiniteSwitch(IDirect3DDevice9* d) {
     d->Clear(0, nullptr, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, 0xff336699u, 1.0f, 0);
     d->SetRenderState(D3DRS_LIGHTING, FALSE);
     d->SetRenderState(D3DRS_ZENABLE, FALSE);
     d->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
     const auto vsCode = assemble("vs_2_0\ndcl_position v0\nmov oPos, v0\nmov oT0, c4\n");
+    const auto highVsCode = assemble("vs_2_0\ndcl_position v0\nmov oPos, v0\nmov oT0, c253\n");
     const auto constantCode = assemble("ps_2_0\nmov r1, c1\ndp3 r0, c0, r1\nmov oC0, r0\n");
     const auto varyingCode = assemble("ps_2_0\ndcl t0\ndp3 r0, t0, c0\nmov oC0, r0\n");
     IDirect3DVertexShader9* vs = nullptr;
+    IDirect3DVertexShader9* highVs = nullptr;
     IDirect3DPixelShader9* constantPs = nullptr;
     IDirect3DPixelShader9* varyingPs = nullptr;
-    if (vsCode.empty() || constantCode.empty() || varyingCode.empty() || FAILED(d->CreateVertexShader(vsCode.data(), &vs))
+    if (vsCode.empty() || highVsCode.empty() || constantCode.empty() || varyingCode.empty()
+     || FAILED(d->CreateVertexShader(vsCode.data(), &vs)) || FAILED(d->CreateVertexShader(highVsCode.data(), &highVs))
      || FAILED(d->CreatePixelShader(constantCode.data(), &constantPs))
      || FAILED(d->CreatePixelShader(varyingCode.data(), &varyingPs)))
       return false;
@@ -1784,13 +1789,19 @@ PO main(float4 c : COLOR0) { PO o; o.c0 = c; o.c1 = c.gbra * 0.8; return o; }
       d->SetPixelShaderConstantF(1, cases[i].c1, 1);
       d->SetVertexShaderConstantF(4, cases[i].c4, 1);
       const float x0 = -0.95f + 0.5f * float(i), x1 = x0 + 0.4f;
-      const float quad[12] = { x0, 0.8f, 0.5f, x1, 0.8f, 0.5f, x0, -0.8f, 0.5f, x1, -0.8f, 0.5f };
+      const float quad[12] = { x0, 0.8f, 0.5f, x1, 0.8f, 0.5f, x0, -0.4f, 0.5f, x1, -0.4f, 0.5f };
       d->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, quad, 3 * sizeof(float));
     }
+    d->SetVertexShader(highVs);
+    d->SetPixelShader(varyingPs);
+    d->SetVertexShaderConstantF(253, infinite, 1);
+    const float strip[12] = { -0.95f, -0.5f, 0.5f, 0.95f, -0.5f, 0.5f, -0.95f, -0.8f, 0.5f, 0.95f, -0.8f, 0.5f };
+    d->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, strip, 3 * sizeof(float));
     d->SetVertexShader(nullptr);
     d->SetPixelShader(nullptr);
     d->SetRenderState(D3DRS_ZENABLE, TRUE);
     vs->Release();
+    highVs->Release();
     constantPs->Release();
     varyingPs->Release();
     return true;

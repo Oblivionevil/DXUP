@@ -219,6 +219,22 @@ namespace Dxup.Shared
         public bool Install(GameEntry game, out string error)
         {
             error = null;
+            // The executable first (locked while the game runs): when it
+            // cannot change, nothing else does.
+            bool laaSet = false;
+            try
+            {
+                if (LargeAddressAware.Wanted(game) && LargeAddressAware.Get(game.ExePath) == false)
+                {
+                    LargeAddressAware.Enable(game.ExePath);
+                    laaSet = true;
+                }
+            }
+            catch (Exception e)
+            {
+                error = e.Message;
+                return false;
+            }
             try
             {
                 foreach (string dll in DllsFor(game))
@@ -247,13 +263,16 @@ namespace Dxup.Shared
                     }
                     File.Copy(source, target, false);
                 }
-                if (LargeAddressAware.Wanted(game))
-                    LargeAddressAware.Enable(game.ExePath);
                 return true;
             }
             catch (Exception e)
             {
                 error = e.Message;
+                // DXUP did not get into the folder: the executable as it was.
+                if (laaSet)
+                {
+                    try { LargeAddressAware.Disable(game.ExePath); } catch (Exception) { }
+                }
                 return false;
             }
         }

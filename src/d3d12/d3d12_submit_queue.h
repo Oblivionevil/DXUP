@@ -26,8 +26,8 @@ namespace dxup::d3d12 {
   //
   // Jobs hand in fence values ahead: a wait for a value signaled by a job
   // still queued returns once the thread ran it and the GPU got there. The
-  // thread never waits for the worker or the application, so such waits
-  // end.
+  // thread never waits for the worker, the application or a window, so
+  // such waits end, and waiting for jobs takes no window messages.
   class SubmitQueue {
   public:
     using Job = std::function<void(ID3D12CommandQueue* queue)>;
@@ -40,8 +40,8 @@ namespace dxup::d3d12 {
 
     void init(ID3D12Device* device, ID3D12CommandQueue* queue);
 
-    // The thread; stop() runs what is queued first. Without it, jobs run
-    // on the caller's thread.
+    // The thread; stop() runs what is queued first. Without it, and once
+    // it has ended, jobs run on the caller's thread.
     void start();
     void stop();
     bool threaded() const { return m_threaded.load(std::memory_order_acquire); }
@@ -50,10 +50,9 @@ namespace dxup::d3d12 {
     uint64_t enqueue(Job job);
 
     bool done(uint64_t ticket) const { return m_done.load(std::memory_order_acquire) >= ticket; }
-    // Waits until the job of the ticket ran. pumpMessages: the caller may
-    // be a window's thread, which a Present waits for.
-    void waitFor(uint64_t ticket, bool pumpMessages);
-    void drain(bool pumpMessages) { waitFor(m_issued.load(std::memory_order_acquire), pumpMessages); }
+    // Waits until the job of the ticket ran.
+    void waitFor(uint64_t ticket);
+    void drain() { waitFor(m_issued.load(std::memory_order_acquire)); }
 
     // A job's ExecuteCommandLists or Signal failed, or the device was
     // removed after it: the first such result (S_OK while none).
@@ -64,6 +63,7 @@ namespace dxup::d3d12 {
     void checkDevice(const char* what);
 
   private:
+    uint64_t runHere(Job& job);
     void threadMain();
 
     ID3D12Device*         m_device = nullptr;
@@ -74,14 +74,13 @@ namespace dxup::d3d12 {
     std::condition_variable m_wake;
     std::deque<std::pair<uint64_t, Job>> m_jobs;
     bool                  m_stopping = false;
+    bool                  m_exited = false;     // the thread took its last jobs
     std::atomic<uint64_t> m_issued{0};
     std::atomic<uint64_t> m_done{0};
     std::atomic<HRESULT>  m_lostReason{S_OK};
 
-    // Waiters: a condition variable, and an event for those that pump.
     std::mutex            m_doneMutex;
     std::condition_variable m_doneCv;
-    HANDLE                m_doneEvent = nullptr;
     std::atomic<uint32_t> m_waiters{0};
 
     dxup::Thread          m_thread;

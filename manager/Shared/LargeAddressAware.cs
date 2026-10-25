@@ -82,21 +82,18 @@ namespace Dxup.Shared
             }
         }
 
-        // Clears the bit DXUP set and removes the backup: the backup goes
-        // back when the executable is still DXUP's change of it, else (an
-        // update replaced it, DXUP set the bit again) the bit is cleared.
+        // Undoes the bit DXUP set and removes the backup: the backup goes
+        // back when the executable is still DXUP's change of it. Enable
+        // backs up whatever executable it changes, so another executable
+        // with the bit came with it (an update made it large address
+        // aware): it stays as it is.
         public static void Disable(string exe)
         {
             string backup = exe + BackupSuffix;
             if (!File.Exists(backup))
                 return;
-            if (File.Exists(exe) && Get(exe) == true && Get(backup) != true)
-            {
-                if (ChangedHeaderOnly(exe, backup))
-                    File.Copy(backup, exe, true);
-                else
-                    Write(exe, false);
-            }
+            if (File.Exists(exe) && Get(exe) == true && Get(backup) != true && ChangedHeaderOnly(exe, backup))
+                File.Copy(backup, exe, true);
             File.Delete(backup);
         }
 

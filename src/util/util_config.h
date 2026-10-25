@@ -151,8 +151,9 @@ namespace dxup {
     // The CS worker's calls on the command list are made by a thread of
     // their own (d3d12.recordThread, see CommandListRecorder).
     bool     recordThread     = false;
-    // Command lists, initial data and Present reach the GPU queue on a
-    // thread of their own (d3d12.submitThread, see SubmitQueue).
+    // Command lists (and the other calls on the GPU queue) reach the queue
+    // on a thread of their own; Present stays on the CS worker
+    // (d3d12.submitThread, see SubmitQueue).
     bool     submitThread     = false;
     // Pixel shader writes no render target takes leave the shader, as
     // Direct3D 11 drivers compile it for the bound targets

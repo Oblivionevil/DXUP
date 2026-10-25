@@ -699,17 +699,24 @@ namespace dxup::d3d12 {
       }
     }
 
+    // A list that faults in ExecuteCommandLists is lost, but its fence value
+    // still comes (as flush()'s recovery signals a lost batch's): waits for
+    // it end. Only a failed Signal or a removed device count as lost.
     __declspec(noinline)
     void safeExecuteAndSignal(ID3D12CommandQueue* queue, ID3D12CommandList* list, ID3D12Fence* fence, uint64_t value,
                               SubmitQueue* submit) {
-      HRESULT hr = E_FAIL;
       __try {
         queue->ExecuteCommandLists(1, &list);
+      } __except (EXCEPTION_EXECUTE_HANDLER) {
+        logMessage(LogLevel::Error, "submit thread: ExecuteCommandLists CRASHED (SEH=0x%08X); the list is lost", GetExceptionCode());
+      }
+      HRESULT hr = E_FAIL;
+      __try {
         hr = queue->Signal(fence, value);
       } __except (EXCEPTION_EXECUTE_HANDLER) {
-        logMessage(LogLevel::Error, "submit thread: ExecuteCommandLists CRASHED (SEH=0x%08X)", GetExceptionCode());
+        logMessage(LogLevel::Error, "submit thread: Signal CRASHED (SEH=0x%08X)", GetExceptionCode());
       }
-      submit->checkResult(hr, "ExecuteCommandLists/Signal");
+      submit->checkResult(hr, "Signal");
       submit->checkDevice("ExecuteCommandLists");
     }
 
@@ -6065,8 +6072,11 @@ namespace dxup::d3d12 {
           void* ptr = nullptr;
           // May submit the command list when the slot is full: the copies
           // before stay in order.
-          if (!allocateUploadScratch(piece, kUploadAlignment, &upload, &offset, &ptr))
+          if (!allocateUploadScratch(piece, kUploadAlignment, &upload, &offset, &ptr)) {
+            // Pieces before may have moved the buffer to COPY_DEST.
+            restoreBoundBufferState(d3d12Buffer);
             return;
+          }
           std::memcpy(ptr, static_cast<const uint8_t*>(regions[i].data) + done, static_cast<size_t>(piece));
           transitionResource(d3d12Buffer, D3D12_RESOURCE_STATE_COPY_DEST);
           holdBatchResource(d3d12Buffer->getResource());
@@ -6382,7 +6392,7 @@ namespace dxup::d3d12 {
     // Commands recorded so far use the previous mappings: after them in
     // queue order (the submit thread's jobs first).
     flush();
-    m_device->submitQueue().drain(false);
+    m_device->submitQueue().drain();
     ID3D12CommandQueue* queue = m_device->getCommandQueue();
 
     const UINT regionCount = static_cast<UINT>(update.coordinates.size());
@@ -6501,7 +6511,7 @@ namespace dxup::d3d12 {
     if (!dstResource || !srcResource || m_copyOnly || m_deviceRemoved)
       return;
     flush();
-    m_device->submitQueue().drain(false);
+    m_device->submitQueue().drain();
     m_device->getCommandQueue()->CopyTileMappings(dstResource,
       reinterpret_cast<const D3D12_TILED_RESOURCE_COORDINATE*>(&dstCoordinate), srcResource,
       reinterpret_cast<const D3D12_TILED_RESOURCE_COORDINATE*>(&srcCoordinate),
@@ -6631,8 +6641,10 @@ namespace dxup::d3d12 {
 
   void D3D12BackendContext::nextCommandList() {
 #ifdef _WIN32
-    // The pool, made closed (no allocator) the first time.
-    if (m_commandListCount < kCommandListPoolSize) {
+    // The pool, made closed (no allocator) the first time (what fails then
+    // is not tried again: one list).
+    if (!m_commandListPoolMade) {
+      m_commandListPoolMade = true;
       ComPtr<ID3D12Device4> device4;
       if (SUCCEEDED(m_device->getDevice()->QueryInterface(IID_PPV_ARGS(&device4)))) {
         while (m_commandListCount < kCommandListPoolSize
@@ -6644,11 +6656,11 @@ namespace dxup::d3d12 {
     SubmitQueue& submit = m_device->submitQueue();
     if (m_commandListCount < 2) {
       // One list: it resets once the thread executed it.
-      submit.waitFor(m_commandListTickets[m_currentCommandList], false);
+      submit.waitFor(m_commandListTickets[m_currentCommandList]);
       return;
     }
     m_currentCommandList = (m_currentCommandList + 1) % m_commandListCount;
-    submit.waitFor(m_commandListTickets[m_currentCommandList], false);
+    submit.waitFor(m_commandListTickets[m_currentCommandList]);
     m_cmdList.setList(m_commandLists[m_currentCommandList]);
 #endif
   }
@@ -6663,15 +6675,7 @@ namespace dxup::d3d12 {
 
   void D3D12BackendContext::waitForQueue() {
 #ifdef _WIN32
-    m_device->submitQueue().drain(true);
-#endif
-  }
-
-  bool D3D12BackendContext::submitsAsync() const {
-#ifdef _WIN32
-    return m_device->submitQueue().threaded();
-#else
-    return false;
+    m_device->submitQueue().drain();
 #endif
   }
 
@@ -7175,6 +7179,9 @@ namespace dxup::d3d12 {
         return;
       }
       m_commandLists[m_currentCommandList] = freshList;
+      // DRED's markers go into the new list.
+      if (m_breadcrumbList && FAILED(freshList.As(&m_breadcrumbList)))
+        m_breadcrumbList = nullptr;
       m_cmdList.setList(std::move(freshList));
 
       // Re-bind state on the fresh command list
@@ -7513,10 +7520,12 @@ namespace dxup::d3d12 {
     if (!GlobalMemoryStatusEx(&status))
       return;
     const uint64_t freeMb = status.ullAvailVirtual >> 20;
-    static uint64_t s_warnedBelow = 384;
-    if (freeMb >= s_warnedBelow)
+    // Process-wide (every device's worker checks): the one that lowers the
+    // mark warns.
+    static std::atomic<uint64_t> s_warnedBelow{ 384 };
+    uint64_t mark = s_warnedBelow.load(std::memory_order_relaxed);
+    if (freeMb >= mark || !s_warnedBelow.compare_exchange_strong(mark, freeMb / 128 * 128, std::memory_order_relaxed))
       return;
-    s_warnedBelow = freeMb / 128 * 128;
     size_t largest = 0;
     MEMORY_BASIC_INFORMATION mbi;
     for (char* p = nullptr; VirtualQuery(p, &mbi, sizeof(mbi)); p = static_cast<char*>(mbi.BaseAddress) + mbi.RegionSize) {

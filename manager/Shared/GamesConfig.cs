@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
+using System.Linq;
 using System.Text;
 
 namespace Dxup.Shared
@@ -110,7 +111,15 @@ namespace Dxup.Shared
                 case "d3d12.pixeloutputmasks": PixelOutputMasks = ParseBool(value) ?? true; return true;
                 case "d3d12.barrierhoisting": BarrierHoisting = ParseBool(value) ?? true; return true;
                 case "d3d11.relaxeduavbarriers": RelaxedUavBarriers = ParseBool(value); return true;
-                case "d3d12.lazytargets": LazyTargets = ParseBool(value); return true;
+                case "d3d12.lazytargets":
+                    // As DXUP reads it: anything else is its automatic choice.
+                    switch (value.Trim().ToLowerInvariant())
+                    {
+                        case "true": case "on": case "1": LazyTargets = true; break;
+                        case "false": case "off": case "0": LazyTargets = false; break;
+                        default: LazyTargets = null; break;
+                    }
+                    return true;
                 case "dxgi.renderscale":
                     float? scale = ParseFloat(value);
                     RenderScale = scale.HasValue && scale.Value < 1.0f ? (int?)Math.Max(33, (int)Math.Round(scale.Value * 100.0f)) : null;
@@ -165,15 +174,20 @@ namespace Dxup.Shared
         static float? ParseFloat(string value) =>
             float.TryParse(value.Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out float parsed) ? parsed : (float?)null;
 
-        // 1-4 hex digits (0x allowed) in lower case, as DXUP reads them; null otherwise.
+        // A GPU id as DXUP reads it: hex digits (0x allowed), the low 16 bits
+        // (strtoul: too many digits give all ones), in lower case; null for
+        // none or 0.
         public static string ParseHex(string value)
         {
             string hex = value.Trim().ToLowerInvariant();
             if (hex.StartsWith("0x", StringComparison.Ordinal))
                 hex = hex.Substring(2);
-            if (hex.Length == 0 || hex.Length > 4 || !int.TryParse(hex, NumberStyles.AllowHexSpecifier, CultureInfo.InvariantCulture, out int id) || id == 0)
+            if (hex.Length == 0 || !hex.All(Uri.IsHexDigit))
                 return null;
-            return hex;
+            ulong id = ulong.TryParse(hex, NumberStyles.AllowHexSpecifier, CultureInfo.InvariantCulture, out ulong parsed)
+                && parsed <= uint.MaxValue ? parsed : uint.MaxValue;
+            id &= 0xffff;
+            return id != 0 ? id.ToString("x", CultureInfo.InvariantCulture) : null;
         }
 
         static bool? ParseBool(string value)

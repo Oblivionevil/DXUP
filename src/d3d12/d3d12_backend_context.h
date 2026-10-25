@@ -349,7 +349,6 @@ namespace dxup::d3d12 {
 
     void afterSubmitted(std::function<void()> fn) override;
     void waitForQueue() override;
-    bool submitsAsync() const override;
 
   private:
     D3D12BackendDevice* m_device;
@@ -432,6 +431,7 @@ namespace dxup::d3d12 {
     std::array<uint64_t, kCommandListPoolSize> m_commandListTickets = {};
     uint32_t m_commandListCount = 1;
     uint32_t m_currentCommandList = 0;
+    bool     m_commandListPoolMade = false;
     void nextCommandList();
     // D3D11 orders unordered access between draws and dispatches: one sees
     // what the previous wrote. Each resource accessed through a UAV since its

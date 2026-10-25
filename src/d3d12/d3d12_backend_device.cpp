@@ -2593,7 +2593,7 @@ namespace dxup::d3d12 {
     const uint64_t value = m_fenceValue;
     m_submitQueue.waitFor(m_submitQueue.enqueue([fence, value, &hr](ID3D12CommandQueue* queue) {
       hr = queue->Signal(fence, value);
-    }), true);
+    }));
     if (FAILED(hr)) {
       logMessage(LogLevel::Error, "GPU-SYNC [%s]: Signal failed hr=0x%08X", tag, hr);
       HRESULT reason = m_device->GetDeviceRemovedReason();
