@@ -989,23 +989,24 @@ namespace dxup {
         logMessage(LogLevel::Info, "DXGISwapChain::Present #%d (sync=%u flags=0x%x) proxy=%p bbCount=%u",
           presentCount, SyncInterval, Flags,
           m_proxyRenderTarget.Get(), (uint32_t)m_backBufferTextures.size());
-      return presentFrame(SyncInterval, Flags, nullptr, false);
+      return presentFrame(SyncInterval, Flags, false);
     }
 
     HRESULT STDMETHODCALLTYPE GetBuffer(UINT Buffer, REFIID riid, void** ppSurface) override {
       if (!ppSurface) return E_POINTER;
       // Buffers the application does not have (the DISCARD effects give
-      // the first only, as Windows' D3D11).
-      DXGI_SWAP_CHAIN_DESC realDesc = {};
-      if ((m_appDiscard && Buffer > 0)
-       || (SUCCEEDED(m_realSwapChain->GetDesc(&realDesc)) && Buffer >= realDesc.BufferCount)) {
+      // the first only, as Windows' D3D11; the real swap chain may have
+      // more than it asked for).
+      if ((m_appDiscard && Buffer > 0) || (m_appBufferCount && Buffer >= m_appBufferCount)) {
         *ppSurface = nullptr;
         return DXGI_ERROR_INVALID_CALL;
       }
 
-      // Lazily create back buffer textures + proxy
+      // Lazily create back buffer textures + proxy, once no present queued
+      // on the worker reads them any more.
       if (m_backBufferTextures.empty()) {
-        DXGI_SWAP_CHAIN_DESC desc;
+        DXGI_SWAP_CHAIN_DESC desc = {};
+        waitForPresents();
         m_realSwapChain->GetDesc(&desc);
         createBackBufferTextures(desc.BufferCount);
       }
@@ -1111,8 +1112,12 @@ namespace dxup {
         createBackBufferTextures(desc.BufferCount);
       if (direct) {
         m_direct = fetchDirectBuffers(desc.BufferCount);
+        // Without the new buffers the application's buffer becomes a texture
+        // of its own, which Present copies as a proxy.
         if (m_direct)
           retargetNow(m_proxyBackendImage, m_directBuffers[m_realSwapChain->GetCurrentBackBufferIndex() % m_directBuffers.size()].Get());
+        else
+          retargetNow(m_proxyBackendImage, standInFor(m_proxyBackendImage).Get());
       }
     }
 
@@ -1133,7 +1138,10 @@ namespace dxup {
         if (m_appFormat != DXGI_FORMAT_UNKNOWN)
           pDesc->BufferDesc.Format = m_appFormat;
         pDesc->SampleDesc = m_appSampleDesc;
-        pDesc->Flags = applicationFlags(pDesc->Flags);
+        pDesc->BufferUsage = m_appUsage;
+        pDesc->BufferCount = m_appBufferCount;
+        pDesc->SwapEffect = m_appSwapEffect;
+        pDesc->Flags = m_appFlags;
         if (m_appWidth) {
           pDesc->BufferDesc.Width = m_appWidth;
           pDesc->BufferDesc.Height = m_appHeight;
@@ -1145,6 +1153,7 @@ namespace dxup {
     // The size the real buffers get for the application's (ResizeBuffers):
     // remembers the application's when DXUP scales up at Present.
     void chooseRealSize(UINT& width, UINT& height) {
+      const UINT appWidth0 = m_appWidth, appHeight0 = m_appHeight;
       m_appWidth = m_appHeight = 0;
       DXGI_SWAP_CHAIN_DESC1 desc = {};
       HWND window = nullptr;
@@ -1152,6 +1161,16 @@ namespace dxup {
       if (FAILED(m_realSwapChain->GetDesc1(&desc)) || FAILED(m_realSwapChain->GetHwnd(&window)))
         return;
       m_realSwapChain->GetFullscreenState(&fullscreen, nullptr);
+      // With a render scale GetDesc reports the application's smaller
+      // buffers: given back (and not the window's size), the real buffers
+      // keep theirs, as the application's do.
+      RECT client = {};
+      if (appWidth0 && UserOverrides::get().renderScale < 1.0f && width == appWidth0 && height == appHeight0
+       && !(GetClientRect(window, &client) && UINT(client.right - client.left) == width
+         && UINT(client.bottom - client.top) == height)) {
+        width = desc.Width;
+        height = desc.Height;
+      }
       UINT appWidth = 0, appHeight = 0;
       if (spatialUpscaleSize(window, !fullscreen, desc.Scaling, width, height, appWidth, appHeight)) {
         m_appWidth = appWidth;
@@ -1181,17 +1200,49 @@ namespace dxup {
       m_resolveImage = nullptr;
       releaseBackBufferReferences();
 
-      if (NewFormat != DXGI_FORMAT_UNKNOWN)
-        m_appFormat = NewFormat;
+      const ApplicationBuffers previous = beginResize(NewFormat);
       chooseRealSize(Width, Height);
       HRESULT hr = m_realSwapChain->ResizeBuffers(
         flipModelBufferCount(BufferCount), Width, Height, flipModelFormat(NewFormat), resizeFlags(SwapChainFlags));
+      endResize(hr, previous, BufferCount, SwapChainFlags);
       if (SUCCEEDED(hr)) {
         noteBackBufferSize();
         noteWindowSize();
       }
 
       return hr;
+    }
+
+    // What ResizeBuffers changes of the application's buffers, put back
+    // when the real swap chain refuses it (which then stays as it was).
+    struct ApplicationBuffers {
+      DXGI_FORMAT format;
+      UINT        width, height;
+    };
+
+    // The swap chain may have gone in or out of full screen without DXUP
+    // (DXGI's own Alt+Enter, its exit when the window loses the focus):
+    // the state is asked for again at the next Present.
+    ApplicationBuffers beginResize(DXGI_FORMAT format) {
+      const ApplicationBuffers previous = { m_appFormat, m_appWidth, m_appHeight };
+      m_fullscreenKnown = false;
+      m_presentStatus.store(false, std::memory_order_relaxed);
+      if (format != DXGI_FORMAT_UNKNOWN)
+        m_appFormat = format;
+      return previous;
+    }
+
+    // DXGI's flags of a swap chain are the ones its last ResizeBuffers gave.
+    void endResize(HRESULT hr, const ApplicationBuffers& previous, UINT bufferCount, UINT flags) {
+      if (FAILED(hr)) {
+        m_appFormat = previous.format;
+        m_appWidth = previous.width;
+        m_appHeight = previous.height;
+        return;
+      }
+      if (bufferCount)
+        m_appBufferCount = bufferCount;
+      m_appFlags = flags;
     }
 
     HRESULT STDMETHODCALLTYPE ResizeTarget(const DXGI_MODE_DESC* pNewTargetParameters) override {
@@ -1238,7 +1289,10 @@ namespace dxup {
         if (m_appFormat != DXGI_FORMAT_UNKNOWN)
           pDesc->Format = m_appFormat;
         pDesc->SampleDesc = m_appSampleDesc;
-        pDesc->Flags = applicationFlags(pDesc->Flags);
+        pDesc->BufferUsage = m_appUsage;
+        pDesc->BufferCount = m_appBufferCount;
+        pDesc->SwapEffect = m_appSwapEffect;
+        pDesc->Flags = m_appFlags;
         if (m_appWidth) {
           pDesc->Width = m_appWidth;
           pDesc->Height = m_appHeight;
@@ -1254,11 +1308,17 @@ namespace dxup {
       m_appSampleDesc = sampleDesc.Count ? sampleDesc : DXGI_SAMPLE_DESC{ 1, 0 };
     }
 
-    // The swap effect and buffer usage the application asked for.
-    void setApplicationSwapModel(DXGI_SWAP_EFFECT effect, DXGI_USAGE usage) {
+    // The swap effect, buffer usage and buffer count the application asked
+    // for; the real swap chain flips with two buffers or more.
+    void setApplicationSwapModel(DXGI_SWAP_EFFECT effect, DXGI_USAGE usage, UINT bufferCount) {
       m_appFlipModel = effect == DXGI_SWAP_EFFECT_FLIP_DISCARD || effect == DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
       m_appDiscard = effect == DXGI_SWAP_EFFECT_DISCARD || effect == DXGI_SWAP_EFFECT_FLIP_DISCARD;
       m_appUnorderedAccess = (usage & DXGI_USAGE_UNORDERED_ACCESS) != 0;
+      m_appSwapEffect = effect;
+      m_appUsage = usage;
+      DXGI_SWAP_CHAIN_DESC1 desc = {};
+      m_appBufferCount = bufferCount ? bufferCount
+        : SUCCEEDED(m_realSwapChain->GetDesc1(&desc)) ? desc.BufferCount : 2u;
     }
 
     // The real swap chain has a frame latency object the application did
@@ -1271,6 +1331,7 @@ namespace dxup {
     void setApplicationFlags(UINT flags) {
       DXGI_SWAP_CHAIN_DESC1 desc = {};
       ComPtr<IDXGISwapChain2> swapChain2;
+      m_appFlags = flags;
       if ((flags & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT)
        || FAILED(m_realSwapChain->GetDesc1(&desc))
        || !(desc.Flags & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT)
@@ -1282,19 +1343,17 @@ namespace dxup {
 
     // Before the worker writes the next back buffer. What the frame
     // recorded so far goes to the GPU first, so that it does not run dry
-    // while the worker waits.
+    // while the worker waits. A present that failed queued no frame, which
+    // would give back what its wait took: the next present does not wait.
     void waitForBackBuffer(IBackendContext* backendContext) {
+      if (m_lastPresentFailed.exchange(false, std::memory_order_acq_rel))
+        return;
       if (!m_latencyWaitable || WaitForSingleObjectEx(m_latencyWaitable, 0, TRUE) != WAIT_TIMEOUT)
         return;
       if (backendContext)
         backendContext->flush();
       if (WaitForSingleObjectEx(m_latencyWaitable, 1000, TRUE) == WAIT_TIMEOUT)
         logMessage(LogLevel::Warn, "DXGISwapChain: no back buffer after 1 s");
-    }
-
-    // What the application sees of the real swap chain's flags.
-    UINT applicationFlags(UINT flags) const {
-      return m_latencyWaitable ? flags & ~DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT : flags;
     }
 
     HRESULT STDMETHODCALLTYPE GetFullscreenDesc(DXGI_SWAP_CHAIN_FULLSCREEN_DESC* pDesc) override {
@@ -1309,8 +1368,10 @@ namespace dxup {
       return m_realSwapChain->GetCoreWindow(refiid, ppUnk);
     }
 
+    // Dirty and scroll rectangles are hints: DXUP presents whole frames.
     HRESULT STDMETHODCALLTYPE Present1(UINT SyncInterval, UINT PresentFlags, const DXGI_PRESENT_PARAMETERS* pPresentParameters) override {
-      return presentFrame(SyncInterval, PresentFlags, pPresentParameters, true);
+      (void)pPresentParameters;
+      return presentFrame(SyncInterval, PresentFlags, true);
     }
 
     BOOL STDMETHODCALLTYPE IsTemporaryMonoSupported() override {
@@ -1397,8 +1458,10 @@ namespace dxup {
 
     // ---- IDXGISwapChain3 ----
 
+    // As in Direct3D 11, buffer 0 is always the one the application draws
+    // into (GetBuffer): the real swap chain's index names none of its own.
     UINT STDMETHODCALLTYPE GetCurrentBackBufferIndex() override {
-      return m_realSwapChain->GetCurrentBackBufferIndex();
+      return 0;
     }
 
     HRESULT STDMETHODCALLTYPE CheckColorSpaceSupport(DXGI_COLOR_SPACE_TYPE ColorSpace, UINT* pColorSpaceSupport) override {
@@ -1426,8 +1489,7 @@ namespace dxup {
       m_proxyBackendImage = nullptr;
       m_resolveImage = nullptr;
       releaseBackBufferReferences();
-      if (Format != DXGI_FORMAT_UNKNOWN)
-        m_appFormat = Format;
+      const ApplicationBuffers previous = beginResize(Format);
       chooseRealSize(Width, Height);
       // A single buffer becomes two, each node and queue named twice.
       UINT nodeMasks[2] = {};
@@ -1450,6 +1512,7 @@ namespace dxup {
         resizeFlags(SwapChainFlags),
         pCreationNodeMask,
         ppPresentQueue);
+      endResize(hr, previous, BufferCount, SwapChainFlags);
       if (SUCCEEDED(hr))
         noteBackBufferSize();
       return hr;
@@ -1553,6 +1616,10 @@ namespace dxup {
     bool                         m_appUnorderedAccess = false;
     DXGI_FORMAT                  m_appFormat = DXGI_FORMAT_UNKNOWN;
     DXGI_SAMPLE_DESC             m_appSampleDesc = { 1, 0 };
+    DXGI_SWAP_EFFECT             m_appSwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+    DXGI_USAGE                   m_appUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    UINT                         m_appBufferCount = 0;
+    UINT                         m_appFlags = 0;
     // The application's buffer size while DXUP scales it up at Present
     // (dxgi.upscale), else 0.
     UINT                         m_appWidth = 0;
@@ -1561,6 +1628,10 @@ namespace dxup {
     // fullscreen, where a present can wait for the window's thread.
     bool                         m_fullscreenKnown = false;
     bool                         m_exclusiveFullscreen = false;
+    // A present returned something other than S_OK (see noteFullscreenChange).
+    std::atomic<bool>            m_presentStatus{ false };
+    // The last present the application issued failed (see waitForBackBuffer).
+    std::atomic<bool>            m_lastPresentFailed{ false };
     // The real swap chain was created to tear (VSync forced off).
     bool                         m_tearing = false;
     HANDLE                       m_latencyWaitable = nullptr;
@@ -1592,15 +1663,17 @@ namespace dxup {
 
     // VSync forced by dxup.conf: the interval, and tearing where VSync is off
     // and the swap chain allows it. Tearing needs interval 0 and a window.
-    void overrideSyncInterval(UINT& syncInterval, UINT& flags) {
+    // True when DXUP decides the tearing.
+    bool overrideSyncInterval(UINT& syncInterval, UINT& flags) {
       const int32_t forced = UserOverrides::get().syncInterval;
       if (forced < 0)
-        return;
+        return false;
       syncInterval = static_cast<UINT>(forced);
       if (syncInterval || !m_tearing || exclusiveFullscreen())
         flags &= ~DXGI_PRESENT_ALLOW_TEARING;
       else
         flags |= DXGI_PRESENT_ALLOW_TEARING;
+      return true;
     }
     // What the last present the worker made returned.
     std::atomic<HRESULT>         m_lastPresentResult{ S_OK };
@@ -1616,34 +1689,52 @@ namespace dxup {
       return !exclusiveFullscreen() && !dxupSyncPresentEnabled();
     }
 
-    // A Present1 call's parameters, copied for the worker.
-    struct PresentParameters {
-      std::vector<RECT> dirtyRects;
-      RECT              scrollRect = {};
-      POINT             scrollOffset = {};
-      bool              hasScrollRect = false;
-      bool              hasScrollOffset = false;
+    // The real Present, of whole frames: DXUP copies (and scales) the whole
+    // buffer, and the real flip discard swap chain takes no dirty or scroll
+    // rectangles. Tearing DXUP decided needs a window: in a full screen the
+    // swap chain entered behind DXUP's back the present would fail.
+    HRESULT presentReal(UINT syncInterval, UINT flags, bool present1, bool dxupTearing) {
+      BOOL fullscreen = FALSE;
+      if (dxupTearing && (flags & DXGI_PRESENT_ALLOW_TEARING)
+       && SUCCEEDED(m_realSwapChain->GetFullscreenState(&fullscreen, nullptr)) && fullscreen)
+        flags &= ~DXGI_PRESENT_ALLOW_TEARING;
+      DXGI_PRESENT_PARAMETERS whole = {};
+      const HRESULT hr = present1
+        ? m_realSwapChain->Present1(syncInterval, flags, &whole)
+        : m_realSwapChain->Present(syncInterval, flags);
+      if (FAILED(hr))
+        logMessage(LogLevel::Error, "DXGI Present FAILED: hr=0x%08x", static_cast<unsigned>(hr));
+      if (hr != S_OK || fullscreen)
+        m_presentStatus.store(true, std::memory_order_release);
+      if (!(flags & DXGI_PRESENT_TEST))
+        m_lastPresentFailed.store(FAILED(hr), std::memory_order_release);
+      return hr;
+    }
 
-      explicit PresentParameters(const DXGI_PRESENT_PARAMETERS* params) {
-        if (!params)
-          return;
-        if (params->pDirtyRects && params->DirtyRectsCount)
-          dirtyRects.assign(params->pDirtyRects, params->pDirtyRects + params->DirtyRectsCount);
-        if ((hasScrollRect = params->pScrollRect != nullptr))
-          scrollRect = *params->pScrollRect;
-        if ((hasScrollOffset = params->pScrollOffset != nullptr))
-          scrollOffset = *params->pScrollOffset;
+    // After a present returned a status: whether the swap chain went in or
+    // out of full screen without DXUP (DXGI's own Alt+Enter, its exit when
+    // the window loses the focus), where presents must leave the worker or
+    // may go back to it. A flip model swap chain then presents again only
+    // with new buffers, as after SetFullscreenState.
+    void noteFullscreenChange() {
+      if (!m_presentStatus.exchange(false, std::memory_order_acq_rel))
+        return;
+      BOOL fullscreen = FALSE;
+      if (FAILED(m_realSwapChain->GetFullscreenState(&fullscreen, nullptr))) {
+        m_fullscreenKnown = false;
+        return;
       }
-
-      DXGI_PRESENT_PARAMETERS get() {
-        DXGI_PRESENT_PARAMETERS params = {};
-        params.DirtyRectsCount = static_cast<UINT>(dirtyRects.size());
-        params.pDirtyRects = dirtyRects.empty() ? nullptr : dirtyRects.data();
-        params.pScrollRect = hasScrollRect ? &scrollRect : nullptr;
-        params.pScrollOffset = hasScrollOffset ? &scrollOffset : nullptr;
-        return params;
-      }
-    };
+      const bool changed = m_fullscreenKnown && m_exclusiveFullscreen != (fullscreen != FALSE);
+      m_exclusiveFullscreen = fullscreen != FALSE;
+      m_fullscreenKnown = true;
+      if (!changed)
+        return;
+      logMessage(LogLevel::Info, "DXGISwapChain: %s full screen without SetFullscreenState",
+        fullscreen ? "entered" : "left");
+      waitForPresents();
+      renewRealBuffers();
+      noteWindowSize();
+    }
 
     // FPS counter
     uint32_t m_fpsFrameCount = 0;
@@ -1693,7 +1784,7 @@ namespace dxup {
         ctx->synchronize();
     }
 
-    HRESULT presentFrame(UINT syncInterval, UINT flags, const DXGI_PRESENT_PARAMETERS* params, bool present1) {
+    HRESULT presentFrame(UINT syncInterval, UINT flags, bool present1) {
       HitchScope hitch("present", syncInterval);
       // A device DXUP lost without the system knowing (IBackendDevice::
       // lostReason): the application recreates it as after a GPU fault.
@@ -1701,7 +1792,6 @@ namespace dxup {
         if (FAILED(backend->lostReason()))
           return DXGI_ERROR_DEVICE_REMOVED;
       }
-      overrideSyncInterval(syncInterval, flags);
       if (hitchTraceEnabled()) {
         // Frames that took long, to line the operations above up with.
         static int64_t s_lastPresent = 0;
@@ -1727,6 +1817,8 @@ namespace dxup {
       }
       // Present uses the immediate context.
       D3D11ContextMtGuard mtGuard(m_d3d11Device, false);
+      noteFullscreenChange();
+      const bool dxupTearing = overrideSyncInterval(syncInterval, flags);
       if (dxupFpsOverlayEnabled())
         updateFps();
 
@@ -1796,26 +1888,19 @@ namespace dxup {
       // presents the frame while the application goes on with the next;
       // applyFrameLatency keeps it at most a frame ahead of the worker.
       if (ctx && !(flags & DXGI_PRESENT_TEST) && presentOnWorker()) {
-        auto parameters = std::make_shared<PresentParameters>(params);
-        const bool hasParameters = params != nullptr;
         // The worker may wait for the display (the application does not):
         // DO_NOT_WAIT there would drop the frame queued as presented.
         const UINT workerFlags = flags & ~UINT(DXGI_PRESENT_DO_NOT_WAIT);
-        ctx->executeOnBackend([this, syncInterval, flags = workerFlags, present1, parameters, hasParameters](IBackendContext* backend) {
+        ctx->executeOnBackend([this, syncInterval, flags = workerFlags, present1, dxupTearing](IBackendContext* backend) {
           preparePresent(backend);
           // With the submit thread (d3d12.submitThread) the frame's lists
           // reach the queue first. Present stays here: on the submit thread
           // NVIDIA's Present spun and held the next frame's lists back.
           backend->waitForQueue();
-          DXGI_PRESENT_PARAMETERS copy = parameters->get();
           const int64_t start = hitchTraceEnabled() ? hitchTimestamp() : 0;
-          const HRESULT hr = present1
-            ? m_realSwapChain->Present1(syncInterval, flags, hasParameters ? &copy : nullptr)
-            : m_realSwapChain->Present(syncInterval, flags);
+          const HRESULT hr = presentReal(syncInterval, flags, present1, dxupTearing);
           if (start)
             notePresentTime(start);
-          if (FAILED(hr))
-            logMessage(LogLevel::Error, "DXGI Present FAILED: hr=0x%08x", static_cast<unsigned>(hr));
           retargetDirectBackBuffer(backend);
           m_lastPresentResult.store(hr, std::memory_order_release);
         });
@@ -1830,12 +1915,8 @@ namespace dxup {
         ctx->waitForQueue();
       }
 
-      HRESULT hr = present1
-        ? m_realSwapChain->Present1(syncInterval, flags, params)
-        : m_realSwapChain->Present(syncInterval, flags);
-      if (FAILED(hr))
-        logMessage(LogLevel::Error, "DXGI Present FAILED: hr=0x%08x", static_cast<unsigned>(hr));
-      else if (!(flags & DXGI_PRESENT_TEST)) {
+      HRESULT hr = presentReal(syncInterval, flags, present1, dxupTearing);
+      if (SUCCEEDED(hr) && !(flags & DXGI_PRESENT_TEST)) {
         if (ctx && m_direct)
           ctx->executeOnBackend([this](IBackendContext* backend) { retargetDirectBackBuffer(backend); });
         if (ctx)
@@ -1889,18 +1970,31 @@ namespace dxup {
       waitForPresents();
       m_direct = false;
       IBackendImage* image = m_proxyBackendImage;
-      m_detachedImages.erase(std::remove_if(m_detachedImages.begin(), m_detachedImages.end(),
-        [](const DetachedImage& detached) { return detached.owner.expired(); }), m_detachedImages.end());
+      pruneDetachedImages();
       ComPtr<IUnknown> standIn;
-      if (image && m_proxyRenderTarget && m_d3d11Device
-       && (m_proxyRenderTarget.Get()->AddRef(), m_proxyRenderTarget.Get()->Release()) > 1) {
-        if (Rc<IBackendImage> copy = m_d3d11Device->GetBackend()->createImage(image->getDesc())) {
-          standIn = static_cast<d3d12::D3D12BackendImage*>(copy.get())->getResource();
-          m_detachedImages.push_back({ static_cast<d3d12::D3D12BackendImage*>(image)->weak_from_this(), std::move(copy) });
-        }
-      }
+      if (m_proxyRenderTarget && (m_proxyRenderTarget.Get()->AddRef(), m_proxyRenderTarget.Get()->Release()) > 1)
+        standIn = standInFor(image);
       retargetNow(image, standIn.Get());
       m_directBuffers.clear();
+    }
+
+    void pruneDetachedImages() {
+      m_detachedImages.erase(std::remove_if(m_detachedImages.begin(), m_detachedImages.end(),
+        [](const DetachedImage& detached) { return detached.owner.expired(); }), m_detachedImages.end());
+    }
+
+    // A resource of its own for the application's direct buffer, kept as
+    // long as the image (its texture) lives.
+    ComPtr<IUnknown> standInFor(IBackendImage* image) {
+      pruneDetachedImages();
+      ComPtr<IUnknown> standIn;
+      if (!image || !m_d3d11Device)
+        return standIn;
+      if (Rc<IBackendImage> copy = m_d3d11Device->GetBackend()->createImage(image->getDesc())) {
+        standIn = static_cast<d3d12::D3D12BackendImage*>(copy.get())->getResource();
+        m_detachedImages.push_back({ static_cast<d3d12::D3D12BackendImage*>(image)->weak_from_this(), std::move(copy) });
+      }
+      return standIn;
     }
 
     // dxgi.directBackBuffer: the application draws into the real buffer
@@ -2366,10 +2460,6 @@ namespace dxup {
         // The application drew into the buffer Present shows.
         retargetDirectBackBuffer(backendContext);
         presentImage = m_proxyBackendImage;
-        DXGI_SWAP_CHAIN_DESC swapChainDesc = {};
-        if (dxupFpsOverlayEnabled() && SUCCEEDED(m_realSwapChain->GetDesc(&swapChainDesc)))
-          renderFpsOverlay(static_cast<d3d12::D3D12BackendContext*>(backendContext), presentImage,
-            swapChainDesc.BufferDesc.Width, swapChainDesc.BufferDesc.Height);
       } else if (m_proxyBackendImage && presentImage && m_appWidth) {
         // dxgi.upscale: the application's smaller buffer scaled up.
         const auto& proxyDesc = m_proxyBackendImage->getDesc();
@@ -2385,9 +2475,6 @@ namespace dxup {
             logMessage(LogLevel::Warn, "dxgi.upscale: scaling the back buffer failed");
           warned = true;
         }
-        DXGI_SWAP_CHAIN_DESC swapChainDesc = {};
-        if (dxupFpsOverlayEnabled() && SUCCEEDED(m_realSwapChain->GetDesc(&swapChainDesc)))
-          renderFpsOverlay(d3d12Context, presentImage, swapChainDesc.BufferDesc.Width, swapChainDesc.BufferDesc.Height);
       } else if (m_proxyBackendImage && presentImage) {
         const auto& proxyDesc = m_proxyBackendImage->getDesc();
         if (proxyDesc.sampleCount > 1) {
@@ -2400,17 +2487,9 @@ namespace dxup {
         } else {
           backendContext->copyImage(presentImage, {}, m_proxyBackendImage, {});
         }
-
-        DXGI_SWAP_CHAIN_DESC swapChainDesc = {};
-        if (dxupFpsOverlayEnabled() && SUCCEEDED(m_realSwapChain->GetDesc(&swapChainDesc))) {
-          auto* d3d12Context = static_cast<d3d12::D3D12BackendContext*>(backendContext);
-          renderFpsOverlay(
-            d3d12Context,
-            presentImage,
-            swapChainDesc.BufferDesc.Width,
-            swapChainDesc.BufferDesc.Height);
-        }
       }
+      if (dxupFpsOverlayEnabled() && m_proxyBackendImage && presentImage)
+        renderFpsOverlay(static_cast<d3d12::D3D12BackendContext*>(backendContext), presentImage);
 
       backendContext->presentImage(presentImage);
       backendContext->suspendPredication(false);
@@ -2437,8 +2516,20 @@ namespace dxup {
       }
     }
 
-    void renderFpsOverlay(d3d12::D3D12BackendContext* ctx, IBackendImage* target,
-                          uint32_t targetW, uint32_t targetH) {
+    // The counter as 8-bit RGBA texels (green on gray reads the same as
+    // BGRA), on targets of that size of texel only, which it fits on.
+    void renderFpsOverlay(d3d12::D3D12BackendContext* ctx, IBackendImage* target) {
+      const ImageDesc& targetDesc = target->getDesc();
+      switch (targetDesc.format) {
+        case DXGI_FORMAT_R8G8B8A8_TYPELESS: case DXGI_FORMAT_R8G8B8A8_UNORM: case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+        case DXGI_FORMAT_B8G8R8A8_TYPELESS: case DXGI_FORMAT_B8G8R8A8_UNORM: case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+          break;
+        default:
+          return;
+      }
+      if (targetDesc.sampleCount > 1)
+        return;
+      const uint32_t targetW = targetDesc.width, targetH = targetDesc.height;
       // 5x7 bitmap font: 0-9, space, F, P, S, period
       static const uint8_t font[][7] = {
         {0x0E,0x11,0x13,0x15,0x19,0x11,0x0E}, // 0
@@ -2471,6 +2562,8 @@ namespace dxup {
       constexpr uint32_t S = 2, CW = 5*S, CH = 7*S, GAP = S, PAD = 4;
       uint32_t overlayW = (textLen * (CW + GAP) + PAD * 2 + 3) & ~3u;
       uint32_t overlayH = CH + PAD * 2;
+      if (targetW < overlayW + 8 || targetH < overlayH + 8)
+        return;
 
       std::vector<uint32_t> px(overlayW * overlayH, 0xFF1A1A1A); // dark bg
 
@@ -2492,8 +2585,7 @@ namespace dxup {
         }
       }
 
-      uint32_t dstX = (targetW > overlayW + 8) ? targetW - overlayW - 8 : 0;
-      ctx->blitPixels(target, dstX, 8, overlayW, overlayH, px.data());
+      ctx->blitPixels(target, targetW - overlayW - 8, 8, overlayW, overlayH, px.data());
     }
 
     void createBackBufferTextures(UINT bufferCount) {
@@ -3017,6 +3109,7 @@ namespace dxup {
     UINT                    appFlags,
     DXGI_SWAP_EFFECT        appSwapEffect,
     DXGI_USAGE              appUsage,
+    UINT                    appBufferCount,
     UINT                    appWidth = 0,
     UINT                    appHeight = 0) {
     if (!factory || !ourDevice || !ppSwapChain)
@@ -3031,7 +3124,7 @@ namespace dxup {
 
     auto* wrappedSwapChain = new DXGISwapChain(ourDevice, factory, swapChain3, commandQueue);
     wrappedSwapChain->setApplicationBufferDesc(appFormat, appSampleDesc);
-    wrappedSwapChain->setApplicationSwapModel(appSwapEffect, appUsage);
+    wrappedSwapChain->setApplicationSwapModel(appSwapEffect, appUsage, appBufferCount);
     wrappedSwapChain->setApplicationFlags(appFlags);
     if (appWidth)
       wrappedSwapChain->setApplicationSize(appWidth, appHeight);
@@ -3124,7 +3217,7 @@ namespace dxup {
     associateBackendFactory(factoryForSwapChain, pDesc->OutputWindow, pDesc->Windowed != FALSE);
 
     hr = wrapDxgiSwapChain(this, ourDevice, swapChain1, commandQueue, reinterpret_cast<void**>(ppSwapChain), __uuidof(IDXGISwapChain),
-      pDesc->BufferDesc.Format, pDesc->SampleDesc, pDesc->Flags, pDesc->SwapEffect, pDesc->BufferUsage,
+      pDesc->BufferDesc.Format, pDesc->SampleDesc, pDesc->Flags, pDesc->SwapEffect, pDesc->BufferUsage, pDesc->BufferCount,
       scaled ? appWidth : 0, scaled ? appHeight : 0);
     ourDevice->Release();
     return hr;
@@ -3203,7 +3296,7 @@ namespace dxup {
     logMessage(LogLevel::Info, "DXGIFactory::CreateSwapChainForHwnd: swap chain created successfully");
 
     hr = wrapDxgiSwapChain(this, ourDevice, swapChain1, commandQueue, reinterpret_cast<void**>(ppSwapChain), __uuidof(IDXGISwapChain1),
-      pDesc->Format, pDesc->SampleDesc, pDesc->Flags, pDesc->SwapEffect, pDesc->BufferUsage,
+      pDesc->Format, pDesc->SampleDesc, pDesc->Flags, pDesc->SwapEffect, pDesc->BufferUsage, pDesc->BufferCount,
       scaled ? appWidth : 0, scaled ? appHeight : 0);
     ourDevice->Release();
     return hr;
@@ -3261,7 +3354,7 @@ namespace dxup {
     }
 
     hr = wrapDxgiSwapChain(this, ourDevice, swapChain1, commandQueue, reinterpret_cast<void**>(ppSwapChain), __uuidof(IDXGISwapChain1),
-      pDesc->Format, pDesc->SampleDesc, pDesc->Flags, pDesc->SwapEffect, pDesc->BufferUsage);
+      pDesc->Format, pDesc->SampleDesc, pDesc->Flags, pDesc->SwapEffect, pDesc->BufferUsage, pDesc->BufferCount);
     ourDevice->Release();
     return hr;
   }

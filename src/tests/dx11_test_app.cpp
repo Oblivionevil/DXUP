@@ -403,6 +403,8 @@ void main(uint2 id : SV_DispatchThreadID) {
         {"planar_region_copy", &Dx11TestApp::testPlanarRegionCopy},
         {"dxgi_device_interfaces", &Dx11TestApp::testDxgiDeviceInterfaces},
         {"swap_chain_buffer_index", &Dx11TestApp::testSwapChainBufferIndex},
+        {"swap_chain_application_desc", &Dx11TestApp::testSwapChainApplicationDesc},
+        {"failed_presents_do_not_stall", &Dx11TestApp::testFailedPresentsDoNotStall},
         {"context_interfaces", &Dx11TestApp::testContextInterfaces},
         {"render_target_hole", &Dx11TestApp::testRenderTargetHole},
         {"large_constant_buffer", &Dx11TestApp::testLargeConstantBuffer},
@@ -5284,6 +5286,181 @@ float4 main(float4 position : SV_Position) : SV_Target { return float4(1.0f, 1.0
       return true;
     }
 
+    // A swap chain describes the buffers the application asked for (DXUP's
+    // real one flips with two or more, without unordered access or mode
+    // switches), also after ResizeBuffers, whose flags replace the old ones;
+    // GetBuffer goes by its count. A flip sequential one draws into buffer
+    // 0 frame after frame, presenting dirty rectangles of it.
+    bool testSwapChainApplicationDesc(std::string& error) {
+      ComPtr<IDXGIDevice> dxgiDevice;
+      ComPtr<IDXGIAdapter> adapter;
+      ComPtr<IDXGIFactory2> factory;
+      if (FAILED(m_device.As(&dxgiDevice)) || FAILED(dxgiDevice->GetAdapter(adapter.GetAddressOf()))
+       || FAILED(adapter->GetParent(__uuidof(IDXGIFactory2), reinterpret_cast<void**>(factory.GetAddressOf())))) {
+        error = "getting the DXGI factory failed";
+        return false;
+      }
+      HWND window = CreateWindowExA(0, kWindowClassName, "application desc", WS_OVERLAPPEDWINDOW,
+        CW_USEDEFAULT, CW_USEDEFAULT, 64, 64, nullptr, nullptr, GetModuleHandleA(nullptr), nullptr);
+      if (!window) {
+        error = "CreateWindowExA failed";
+        return false;
+      }
+      struct WindowGuard { HWND h; ~WindowGuard() { DestroyWindow(h); } } guard{ window };
+      DXGI_SWAP_CHAIN_DESC desc = {};
+      desc.BufferDesc.Width = 64;
+      desc.BufferDesc.Height = 48;
+      desc.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+      desc.SampleDesc.Count = 1;
+      desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT | DXGI_USAGE_SHADER_INPUT | DXGI_USAGE_UNORDERED_ACCESS;
+      desc.BufferCount = 1;
+      desc.OutputWindow = window;
+      desc.Windowed = TRUE;
+      desc.SwapEffect = DXGI_SWAP_EFFECT_SEQUENTIAL;
+      desc.Flags = DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH;
+      ComPtr<IDXGISwapChain> swapChain;
+      ComPtr<IDXGISwapChain1> swapChain1;
+      HRESULT hr = factory->CreateSwapChain(m_device.Get(), &desc, swapChain.GetAddressOf());
+      if (FAILED(hr) || FAILED(hr = swapChain.As(&swapChain1))) {
+        error = "CreateSwapChain failed: " + formatHResult(hr);
+        return false;
+      }
+      auto check = [&](UINT flags, const char* when) {
+        DXGI_SWAP_CHAIN_DESC got = {};
+        DXGI_SWAP_CHAIN_DESC1 got1 = {};
+        if (FAILED(swapChain->GetDesc(&got)) || FAILED(swapChain1->GetDesc1(&got1))) {
+          error = formatString("%s: GetDesc failed", when);
+          return false;
+        }
+        if (got.BufferCount != 1 || got.SwapEffect != desc.SwapEffect || (got.BufferUsage & desc.BufferUsage) != desc.BufferUsage
+         || got.Flags != flags || got1.BufferCount != 1 || got1.SwapEffect != desc.SwapEffect
+         || (got1.BufferUsage & desc.BufferUsage) != desc.BufferUsage || got1.Flags != flags) {
+          error = formatString("%s: %u buffers, effect %d, usage 0x%x, flags 0x%x (GetDesc1: %u, %d, 0x%x, 0x%x)", when,
+            got.BufferCount, int(got.SwapEffect), unsigned(got.BufferUsage), got.Flags, got1.BufferCount,
+            int(got1.SwapEffect), unsigned(got1.BufferUsage), got1.Flags);
+          return false;
+        }
+        ComPtr<ID3D11Texture2D> buffer;
+        if (SUCCEEDED(swapChain->GetBuffer(1, __uuidof(ID3D11Texture2D), reinterpret_cast<void**>(buffer.GetAddressOf())))) {
+          error = formatString("%s: GetBuffer(1) of a single buffer succeeded", when);
+          return false;
+        }
+        return true;
+      };
+      if (!check(DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH, "created"))
+        return false;
+      if (FAILED(hr = swapChain->ResizeBuffers(0, 80, 40, DXGI_FORMAT_UNKNOWN, 0))) {
+        error = "ResizeBuffers failed: " + formatHResult(hr);
+        return false;
+      }
+      if (!check(0, "resized"))
+        return false;
+      swapChain1.Reset();
+      swapChain.Reset();
+
+      DXGI_SWAP_CHAIN_DESC1 flipDesc = {};
+      flipDesc.Width = 64;
+      flipDesc.Height = 48;
+      flipDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+      flipDesc.SampleDesc.Count = 1;
+      flipDesc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+      flipDesc.BufferCount = 3;
+      flipDesc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
+      ComPtr<IDXGISwapChain3> swapChain3;
+      ComPtr<ID3D11Texture2D> backBuffer;
+      ComPtr<ID3D11RenderTargetView> rtv;
+      if (FAILED(hr = factory->CreateSwapChainForHwnd(m_device.Get(), window, &flipDesc, nullptr, nullptr, swapChain1.GetAddressOf()))
+       || FAILED(hr = swapChain1.As(&swapChain3))
+       || FAILED(hr = swapChain1->GetBuffer(0, __uuidof(ID3D11Texture2D), reinterpret_cast<void**>(backBuffer.GetAddressOf())))
+       || FAILED(hr = m_device->CreateRenderTargetView(backBuffer.Get(), nullptr, rtv.GetAddressOf()))) {
+        error = "flip sequential swap chain failed: " + formatHResult(hr);
+        return false;
+      }
+      RECT dirty = { 8, 8, 40, 32 };
+      for (int frame = 0; frame < 6; frame++) {
+        const float color[4] = { 0.125f * float(frame), 0.5f, 0.25f, 1.0f };
+        ID3D11RenderTargetView* target = rtv.Get();
+        m_context->OMSetRenderTargets(1, &target, nullptr);
+        m_context->ClearRenderTargetView(rtv.Get(), color);
+        const UINT index = swapChain3->GetCurrentBackBufferIndex();
+        if (index != 0) {
+          error = formatString("frame %d: GetCurrentBackBufferIndex returned %u", frame, index);
+          return false;
+        }
+        // The first frame whole, then parts.
+        DXGI_PRESENT_PARAMETERS parameters = {};
+        if (frame) {
+          parameters.DirtyRectsCount = 1;
+          parameters.pDirtyRects = &dirty;
+        }
+        hr = swapChain1->Present1(0, 0, &parameters);
+        if (FAILED(hr)) {
+          error = formatString("frame %d: Present1 returned %s", frame, formatHResult(hr).c_str());
+          return false;
+        }
+      }
+      m_context->ClearState();
+      return true;
+    }
+
+    // Presents that fail (tearing a swap chain was not made for) queue no
+    // frame: the presents after them do not wait for one (DXUP's waited a
+    // second each for the frame latency object).
+    bool testFailedPresentsDoNotStall(std::string& error) {
+      ComPtr<IDXGIDevice> dxgiDevice;
+      ComPtr<IDXGIAdapter> adapter;
+      ComPtr<IDXGIFactory> factory;
+      if (FAILED(m_device.As(&dxgiDevice)) || FAILED(dxgiDevice->GetAdapter(adapter.GetAddressOf()))
+       || FAILED(adapter->GetParent(__uuidof(IDXGIFactory), reinterpret_cast<void**>(factory.GetAddressOf())))) {
+        error = "getting the DXGI factory failed";
+        return false;
+      }
+      HWND window = CreateWindowExA(0, kWindowClassName, "failed presents", WS_OVERLAPPEDWINDOW,
+        CW_USEDEFAULT, CW_USEDEFAULT, 64, 64, nullptr, nullptr, GetModuleHandleA(nullptr), nullptr);
+      if (!window) {
+        error = "CreateWindowExA failed";
+        return false;
+      }
+      struct WindowGuard { HWND h; ~WindowGuard() { DestroyWindow(h); } } guard{ window };
+      DXGI_SWAP_CHAIN_DESC desc = {};
+      desc.BufferDesc.Width = 64;
+      desc.BufferDesc.Height = 48;
+      desc.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+      desc.SampleDesc.Count = 1;
+      desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+      desc.BufferCount = 2;
+      desc.OutputWindow = window;
+      desc.Windowed = TRUE;
+      desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+      ComPtr<IDXGISwapChain> swapChain;
+      ComPtr<ID3D11Texture2D> backBuffer;
+      ComPtr<ID3D11RenderTargetView> rtv;
+      HRESULT hr = factory->CreateSwapChain(m_device.Get(), &desc, swapChain.GetAddressOf());
+      if (FAILED(hr)
+       || FAILED(hr = swapChain->GetBuffer(0, __uuidof(ID3D11Texture2D), reinterpret_cast<void**>(backBuffer.GetAddressOf())))
+       || FAILED(hr = m_device->CreateRenderTargetView(backBuffer.Get(), nullptr, rtv.GetAddressOf()))) {
+        error = "swap chain failed: " + formatHResult(hr);
+        return false;
+      }
+      const ULONGLONG start = GetTickCount64();
+      for (int frame = 0; frame < 6; frame++) {
+        const float color[4] = { 0.125f * float(frame), 0.25f, 0.5f, 1.0f };
+        ID3D11RenderTargetView* target = rtv.Get();
+        m_context->OMSetRenderTargets(1, &target, nullptr);
+        m_context->ClearRenderTargetView(rtv.Get(), color);
+        swapChain->Present(0, frame < 3 ? DXGI_PRESENT_ALLOW_TEARING : 0);
+      }
+      // After the presents queued so far.
+      swapChain->Present(0, DXGI_PRESENT_TEST);
+      const ULONGLONG elapsed = GetTickCount64() - start;
+      m_context->ClearState();
+      if (elapsed > 1000) {
+        error = formatString("6 presents took %llu ms", elapsed);
+        return false;
+      }
+      return true;
+    }
+
     // IDXGIDevice3/4 on the device (same COM object); EnqueueSetEvent signals
     // once the GPU is done with the work so far.
     bool testDxgiDeviceInterfaces(std::string& error) {
@@ -9240,13 +9417,15 @@ float4 main(float4 position : SV_Position, float4 t0 : TEXCOORD0, float4 t : TEX
     // A swap chain created in full screen (Windowed FALSE, as Just Cause 2
     // does) presents its first frame (DXUP's failed with INVALID_CALL), and
     // leaves full screen again. Skipped where full screen is not available.
+    // DXGI's own Alt+Enter takes one to full screen too, where it presents
+    // (see runAltEnterChild).
     bool testFullscreenSwapChain(std::string& error) {
-      for (const char* mode : { "--fullscreen-child", "--fullscreen-child toggle" }) {
+      for (const char* mode : { "--fullscreen-child", "--fullscreen-child toggle", "--alt-enter-child" }) {
         if (!runChildProcess(mode, error)) {
           if (error == "the child exited with 77")
             error = "SKIP: full screen not available";
           else
-            error = std::string(mode + 19) + ": " + error;
+            error = std::string(mode) + ": " + error;
           return false;
         }
       }
@@ -22660,6 +22839,16 @@ float4 main() : SV_Target { return color; }
       result = checkSize(160 / divisor, 120 / divisor, 40);
     if (!result)
       result = drawAndPresent(160 / divisor, 120 / divisor, 50);
+    // Given back the size GetDesc reports, the buffers keep theirs.
+    if (!result) {
+      DXGI_SWAP_CHAIN_DESC desc = {};
+      context->ClearState();
+      if (FAILED(swapChain->GetDesc(&desc))
+       || FAILED(swapChain->ResizeBuffers(0, desc.BufferDesc.Width, desc.BufferDesc.Height, DXGI_FORMAT_UNKNOWN, 0)))
+        result = 60;
+    }
+    if (!result)
+      result = checkSize(160 / divisor, 120 / divisor, 70);
     swapChain.Reset();
     DestroyWindow(window);
     return result;
@@ -23136,6 +23325,81 @@ float4 main() : SV_Target { return color; }
       if (FAILED(swapChain->SetFullscreenState(FALSE, nullptr)) && !result)
         result = 6;
     }
+    swapChain.Reset();
+    DestroyWindow(window);
+    return result;
+  }
+
+  // See testFullscreenSwapChain: DXGI's own Alt+Enter takes a swap chain in
+  // a window to full screen, where it goes on presenting (DXUP presented on
+  // its worker as in a window, and its flip model swap chain failed every
+  // present without new buffers). Returns 0, 77 without full screen, or the
+  // failed check.
+  int runAltEnterChild() {
+    const int width = GetSystemMetrics(SM_CXSCREEN), height = GetSystemMetrics(SM_CYSCREEN);
+    HWND window = CreateWindowExA(WS_EX_TOPMOST, "STATIC", "dxup alt enter", WS_POPUP | WS_VISIBLE, 0, 0, width, height,
+      nullptr, nullptr, GetModuleHandleA(nullptr), nullptr);
+    if (!window)
+      return 2;
+    ComPtr<ID3D11Device> device;
+    ComPtr<ID3D11DeviceContext> context;
+    ComPtr<IDXGIDevice> dxgiDevice;
+    ComPtr<IDXGIAdapter> adapter;
+    ComPtr<IDXGIFactory2> factory;
+    D3D_FEATURE_LEVEL level = D3D_FEATURE_LEVEL_11_0;
+    if (FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, &level, 1, D3D11_SDK_VERSION,
+          device.GetAddressOf(), nullptr, context.GetAddressOf()))
+     || FAILED(device.As(&dxgiDevice)) || FAILED(dxgiDevice->GetAdapter(adapter.GetAddressOf()))
+     || FAILED(adapter->GetParent(__uuidof(IDXGIFactory2), reinterpret_cast<void**>(factory.GetAddressOf()))))
+      return 3;
+    DXGI_SWAP_CHAIN_DESC1 desc = {};
+    desc.Width = UINT(width);
+    desc.Height = UINT(height);
+    desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    desc.SampleDesc.Count = 1;
+    desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    desc.BufferCount = 2;
+    desc.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
+    ComPtr<IDXGISwapChain1> swapChain;
+    ComPtr<ID3D11Texture2D> backBuffer;
+    ComPtr<ID3D11RenderTargetView> rtv;
+    if (FAILED(factory->CreateSwapChainForHwnd(device.Get(), window, &desc, nullptr, nullptr, swapChain.GetAddressOf()))
+     || FAILED(swapChain->GetBuffer(0, __uuidof(ID3D11Texture2D), reinterpret_cast<void**>(backBuffer.GetAddressOf())))
+     || FAILED(device->CreateRenderTargetView(backBuffer.Get(), nullptr, rtv.GetAddressOf())))
+      return 4;
+    auto frame = [&]() {
+      MSG msg;
+      while (PeekMessageA(&msg, nullptr, 0, 0, PM_REMOVE))
+        DispatchMessageA(&msg);
+      const float gray[4] = { 0.2f, 0.2f, 0.2f, 1.0f };
+      ID3D11RenderTargetView* target = rtv.Get();
+      context->OMSetRenderTargets(1, &target, nullptr);
+      context->ClearRenderTargetView(rtv.Get(), gray);
+      return swapChain->Present(0, 0);
+    };
+    int result = 0;
+    if (FAILED(frame()))
+      result = 5;
+    PostMessageA(window, WM_SYSKEYDOWN, VK_RETURN, LPARAM(1) << 29);
+    HRESULT results[12] = {};
+    for (HRESULT& hr : results)
+      hr = frame();
+    BOOL fullscreen = FALSE;
+    swapChain->GetFullscreenState(&fullscreen, nullptr);
+    if (!result && !fullscreen)
+      result = 77;
+    // The first presents may come before DXGI's switch is through.
+    for (int i = 8; i < 12 && !result; i++) {
+      if (results[i] != S_OK) {
+        std::fprintf(stderr, "present %d after Alt+Enter: 0x%08X\n", i, unsigned(results[i]));
+        result = 6;
+      }
+    }
+    context->ClearState();
+    rtv.Reset();
+    backBuffer.Reset();
+    if (fullscreen && FAILED(swapChain->SetFullscreenState(FALSE, nullptr)) && !result)
+      result = 7;
     swapChain.Reset();
     DestroyWindow(window);
     return result;
@@ -23728,6 +23992,8 @@ int main(int argc, char** argv) {
     return runIdleMemoryTrimChild();
   if (argc > 1 && std::strcmp(argv[1], "--window-ghosting-child") == 0)
     return runWindowGhostingChild();
+  if (argc > 1 && std::strcmp(argv[1], "--alt-enter-child") == 0)
+    return runAltEnterChild();
   if (argc > 1 && std::strcmp(argv[1], "--fullscreen-child") == 0)
     return runFullscreenChild(argc > 2 && std::strcmp(argv[2], "toggle") == 0);
   if (argc > 2 && std::strcmp(argv[1], "--upscaler-child") == 0)
