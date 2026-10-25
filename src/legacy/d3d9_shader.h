@@ -58,7 +58,6 @@ namespace dxup::legacy {
     std::vector<std::pair<uint32_t, std::array<uint32_t, 4>>> relativeDefs;
     bool     writesDepth = false;
     uint32_t colorOutputs = 0;         // bitmask of oC0-3
-    bool     nonFiniteDefs = false;    // a def constant is NaN or infinite
   };
 
   struct TranslateOptions9 {

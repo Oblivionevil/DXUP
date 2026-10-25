@@ -44,7 +44,8 @@ namespace Dxup.Shared
 
         public GameSettings Clone() => (GameSettings)MemberwiseClone();
 
-        // Reads one setting as DXUP names it; false for keys it does not know.
+        // Reads one setting as DXUP names it, its value without a comment
+        // (GamesConfig.Parse, Import); false for keys it does not know.
         public bool Set(string key, string value)
         {
             switch (key.ToLowerInvariant())
@@ -72,7 +73,7 @@ namespace Dxup.Shared
                 case "d3d11.upscalerinject": UpscalerInject = ParseBool(value) ?? false; return true;
                 case "dxgi.upscale": SpatialUpscale = value.Trim().Equals("spatial", StringComparison.OrdinalIgnoreCase); return true;
                 case "dxgi.adapter":
-                    string adapter = BeforeComment(value).ToLowerInvariant();
+                    string adapter = value.Trim().ToLowerInvariant();
                     Adapter = adapter.Length > 0 ? adapter : null;
                     return true;
                 case "dxgi.spoofvendor":
@@ -86,8 +87,7 @@ namespace Dxup.Shared
                 case "dxgi.customvendorid": CustomVendorId = ParseHex(value); return true;
                 case "dxgi.customdeviceid": CustomDeviceId = ParseHex(value); return true;
                 case "dxgi.customdevicedesc":
-                    string desc = BeforeComment(value);
-                    CustomDeviceDesc = desc.Length > 0 ? desc : null;
+                    CustomDeviceDesc = value.Trim().Length > 0 ? value.Trim() : null;
                     return true;
                 case "dxgi.directbackbuffer": DirectBackBuffer = ParseBool(value) ?? true; return true;
                 case "d3d9.floatemulation":
@@ -265,10 +265,12 @@ namespace Dxup.Shared
                     case "dir": current.Dir = value; break;
                     case "exe": current.Exe = value; break;
                     case "appid": current.AppId = value; break;
-                    case "enabled": current.Enabled = value.Equals("true", StringComparison.OrdinalIgnoreCase) || value == "1"; break;
-                    case "largeaddressaware": current.LargeAddressAware = value.Equals("true", StringComparison.OrdinalIgnoreCase) || value == "1"; break;
+                    case "enabled": current.Enabled = IsTrue(GameSettings.BeforeComment(value)); break;
+                    case "largeaddressaware": current.LargeAddressAware = IsTrue(GameSettings.BeforeComment(value)); break;
                     default:
-                        if (!current.Settings.Set(key, value))
+                        // DXUP reads the settings up to a '#' (name, dir and
+                        // exe are taken whole). Unknown lines stay as written.
+                        if (!current.Settings.Set(key, GameSettings.BeforeComment(value)))
                             current.Extra.Add(new KeyValuePair<string, string>(key, value));
                         break;
                 }
@@ -276,6 +278,8 @@ namespace Dxup.Shared
             games.RemoveAll(game => game.Dir.Length == 0);
             return games;
         }
+
+        static bool IsTrue(string value) => value.Equals("true", StringComparison.OrdinalIgnoreCase) || value == "1";
 
         public static string Format(IEnumerable<GameEntry> games)
         {

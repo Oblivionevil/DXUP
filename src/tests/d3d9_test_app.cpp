@@ -1752,7 +1752,8 @@ PO main(float4 c : COLOR0) { PO o; o.c0 = c; o.c1 = c.gbra * 0.8; return o; }
   // shader constant reaching the pixel shader through a texture
   // coordinate, then finite constants again. Below, an infinite vertex
   // shader constant in c253 (the last group of four a shader can read),
-  // then an infinite def constant a vertex shader reads relatively.
+  // then an infinite def constant a vertex shader reads relatively (DXUP
+  // makes it the largest float, as a def read directly).
   // Every strip is gray (0.5); a draw that missed the switch gives NaN,
   // black.
   bool sceneFiniteSwitch(IDirect3DDevice9* d) {

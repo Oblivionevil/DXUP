@@ -113,9 +113,13 @@ namespace Dxup.Tests
             var lazy = new GameSettings();
             lazy.Set("d3d12.lazyTargets", "yes");
             Check(!lazy.LazyTargets.HasValue, "d3d12.lazyTargets = yes is DXUP's automatic choice");
-            var named = new GameSettings();
-            named.Set("dxgi.customDeviceDesc", "Radeon RX 7900 #2");
-            Check(named.CustomDeviceDesc == "Radeon RX 7900", "a GPU name ends at '#' as DXUP reads it");
+            var commented = GamesConfig.Parse("[game]\ndir = C:\\Games\\#1\nname = Foo #1\nenabled = true # on\n"
+                + "d3d11.samplerAnisotropy = 16 # max\ndxgi.customVendorId = 10de # nvidia\n"
+                + "dxgi.customDeviceDesc = Radeon RX 7900 #2\nd3d11.future = x # kept\n");
+            Check(commented.Count == 1 && commented[0].Dir == @"C:\Games\#1" && commented[0].Name == "Foo #1" && commented[0].Enabled
+               && commented[0].Settings.Anisotropy == 16 && commented[0].Settings.CustomVendorId == "10de"
+               && commented[0].Settings.CustomDeviceDesc == "Radeon RX 7900" && commented[0].Extra.Count == 1
+               && commented[0].Extra[0].Value == "x # kept", "games.cfg settings end at '#' as DXUP reads them");
 
             string path = Path.Combine(Path.GetTempPath(), "dxup_test_games.cfg");
             GamesConfig.Save(path, parsed);

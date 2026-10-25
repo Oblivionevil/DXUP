@@ -1829,9 +1829,8 @@ namespace dxup::legacy {
     // d3d9.floatEmulation auto: a pixel shader whose constants are finite
     // gets plain dot products (the emulation costs heavy shaders about a
     // fifth of their time). NaN or infinity from textures or vertices is
-    // not looked for.
-    options.finiteInputs = in.finiteInputs && !vertex() && !m_info.nonFiniteDefs
-                        && UserOverrides::get().d3d9FloatEmulation < 0;
+    // not looked for; def constants are finite (ShaderInfo9::relativeDefs).
+    options.finiteInputs = in.finiteInputs && !vertex() && UserOverrides::get().d3d9FloatEmulation < 0;
     if (options.finiteInputs)
       options.dotEmulation = false;
     if (vertex())
@@ -4217,11 +4216,10 @@ namespace dxup::legacy {
     for (uint32_t stage = 0; stage < 4; stage++)
       projectedStages |= (m_stageStates[stage][TssTextureTransformFlags] & 256) ? 1u << stage : 0u;
     // Pixel shaders' dot products skip the 0 times infinity emulation while
-    // no float constant the draw's shaders read is NaN or infinite. Def
-    // constants count too: read relatively they come from the constant
-    // buffer as they are (the pixel shader's own: Shader::variant).
-    bool finite = !(m_pixelShader && m_vertexShader && m_vertexShader->info().nonFiniteDefs);
-    if (finite && m_pixelShader && (m_nonFiniteGroups[0] | m_nonFiniteGroups[1])) {
+    // no float constant the application set for the draw's shaders is NaN
+    // or infinite (def constants are made finite).
+    bool finite = true;
+    if (m_pixelShader && (m_nonFiniteGroups[0] | m_nonFiniteGroups[1])) {
       // Groups of 4 registers: 253 floats and more are all 64.
       auto groups = [](uint32_t floats) {
         const uint32_t count = (floats + 3) / 4;

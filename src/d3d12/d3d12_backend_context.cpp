@@ -699,11 +699,12 @@ namespace dxup::d3d12 {
       }
     }
 
-    // A list that faults in ExecuteCommandLists is lost. Its fence value still
-    // comes (as flush()'s recovery signals a lost batch's), so waits for it
-    // end, but the device counts as lost: the worker recorded later lists
-    // on the states the lost one's barriers would have left, and unlike
-    // flush() without the thread it cannot take them back.
+    // A list that faults in ExecuteCommandLists is lost, and the device with
+    // it: the worker recorded later lists on the states the lost one's
+    // barriers would have left, and unlike flush() without the thread it
+    // cannot take them back. The device is removed for real, so the
+    // application sees it as after a GPU fault and can start anew; the
+    // batch's fence value is signaled all the same.
     __declspec(noinline)
     bool safeExecute(ID3D12CommandQueue* queue, ID3D12CommandList* list) {
       __try {
@@ -719,7 +720,7 @@ namespace dxup::d3d12 {
     void safeExecuteAndSignal(ID3D12CommandQueue* queue, ID3D12CommandList* list, ID3D12Fence* fence, uint64_t value,
                               SubmitQueue* submit) {
       if (!safeExecute(queue, list))
-        submit->checkResult(DXGI_ERROR_DRIVER_INTERNAL_ERROR, "ExecuteCommandLists (resource states unknown)");
+        submit->removeDevice("a command list faulted in ExecuteCommandLists (resource states unknown)");
       HRESULT hr = E_FAIL;
       __try {
         hr = queue->Signal(fence, value);

@@ -922,8 +922,6 @@ namespace dxup::legacy {
           + floatLiteral(i.literal[2]) + ", " + floatLiteral(i.literal[3]) + ")";
         if (index < 256)
           w.floatDefBits[index] = { i.literal[0], i.literal[1], i.literal[2], i.literal[3] };
-        for (int k = 0; k < 4; k++)
-          info.nonFiniteDefs |= (i.literal[k] & 0x7f800000u) == 0x7f800000u;
         if (layout)
           layout->floatDefs[index] = { i.literal[0], i.literal[1], i.literal[2], i.literal[3] };
       } else if (i.opcode == OpDefI) {
@@ -1265,9 +1263,17 @@ namespace dxup::legacy {
     info.floatConstantCount = info.relativeConstants ? 256 : (std::min)(w.maxConst, 256u);
     info.directConstantCount = (std::min)(w.maxConst, 256u);
     if (info.relativeConstants) {
+      // Read from the constant buffer, as the literals are: infinity the
+      // largest float, NaN 0. Defs then never bring NaN or infinity into a
+      // shader (the finite pixel shader variants rely on that).
       info.relativeDefs.assign(w.floatDefBits.begin(), w.floatDefBits.end());
-      for (const auto& def : info.relativeDefs)
+      for (auto& def : info.relativeDefs) {
+        for (uint32_t& bits : def.second) {
+          if ((bits & 0x7f800000u) == 0x7f800000u)
+            bits = (bits & 0x007fffffu) ? 0u : (bits & 0x80000000u) | 0x7f7fffffu;
+        }
         info.directConstantCount = (std::max)(info.directConstantCount, (std::min)(def.first + 1, 256u));
+      }
     }
     hlsl = std::move(s);
     if (layout) {

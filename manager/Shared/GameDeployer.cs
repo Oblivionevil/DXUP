@@ -301,7 +301,11 @@ namespace Dxup.Shared
                 }
             }
             if (!RemoveDlls(game, allGames, out error))
+            {
+                if (exeError != null)
+                    error = exeError + "; " + error;
                 return false;
+            }
             error = exeError;
             return exeError == null;
         }

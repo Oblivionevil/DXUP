@@ -61,6 +61,10 @@ namespace dxup::d3d12 {
     // back.
     void checkResult(HRESULT hr, const char* what);
     void checkDevice(const char* what);
+    // The work handed in cannot go on (a list was lost): the device is
+    // removed, so the application learns it as after a GPU fault
+    // (GetDeviceRemovedReason, Present) and its waits end.
+    void removeDevice(const char* what);
 
   private:
     uint64_t runHere(Job& job);

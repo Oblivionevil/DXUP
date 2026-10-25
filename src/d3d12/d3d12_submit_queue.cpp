@@ -1,5 +1,6 @@
 #include "d3d12_submit_queue.h"
 #include "../util/util_types.h"
+#include "../util/com_ptr.h"
 
 #include <chrono>
 
@@ -105,6 +106,17 @@ namespace dxup::d3d12 {
   void SubmitQueue::checkDevice(const char* what) {
     if (m_device)
       checkResult(m_device->GetDeviceRemovedReason(), what);
+  }
+
+  void SubmitQueue::removeDevice(const char* what) {
+    ComPtr<ID3D12Device5> device5;
+    if (m_device && SUCCEEDED(m_device->QueryInterface(IID_PPV_ARGS(&device5)))) {
+      logMessage(LogLevel::Error, "submit thread: %s; the device is removed", what);
+      device5->RemoveDevice();
+      checkDevice(what);
+    }
+    // Without ID3D12Device5 DXUP stops rendering at least.
+    checkResult(DXGI_ERROR_DEVICE_REMOVED, what);
   }
 
   void SubmitQueue::threadMain() {
