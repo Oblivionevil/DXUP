@@ -2094,8 +2094,12 @@ namespace dxup::d3d9 {
      || stream.offset + (uint64_t(srcStart) + count) * srcStride > from->size()
      || (uint64_t(destIndex) + count) * dstStride > to->size())
       return D3DERR_INVALIDCALL;
-    m_core->processVertices(from->data() + stream.offset + size_t(srcStart) * srcStride, m_fvf, srcStride,
-      to->data() + size_t(destIndex) * dstStride, desc.FVF, dstStride, count, m_core->renderState(D3DRS_LIGHTING) != 0,
+    uint8_t* source = from->data();
+    uint8_t* target = to->data();
+    if (!source || !target)
+      return D3DERR_OUTOFVIDEOMEMORY;
+    m_core->processVertices(source + stream.offset + size_t(srcStart) * srcStride, m_fvf, srcStride,
+      target + size_t(destIndex) * dstStride, desc.FVF, dstStride, count, m_core->renderState(D3DRS_LIGHTING) != 0,
       !(flags & D3DPV_DONOTCOPYDATA));
     to->invalidate(destIndex * dstStride, count * dstStride);
     return D3D_OK;

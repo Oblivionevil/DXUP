@@ -210,9 +210,10 @@ namespace dxup::legacy {
     ~Buffer();
     bool valid() const { return m_buffer.get() != nullptr; }
     uint32_t size() const { return m_size; }
+    // Null when the copy that went cannot come back from the GPU.
     uint8_t* data() {
-      if (m_dropped)
-        restoreCopy();
+      if (m_dropped && !restoreCopy())
+        return nullptr;
       return m_data.data();
     }
     // The application may have written [offset, offset + size) (size 0: all).
@@ -235,7 +236,7 @@ namespace dxup::legacy {
     uint32_t           m_indexRangesVersion = 0;
     uint32_t           m_version = 0;   // counts writes
     Device*            m_device;
-    void restoreCopy();
+    bool restoreCopy();
     std::vector<uint8_t> m_data;
     uint32_t           m_size = 0;
     bool               m_dropCopy = false;

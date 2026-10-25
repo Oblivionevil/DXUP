@@ -578,7 +578,8 @@ namespace Dxup.Manager
             // Ids DXUP cannot read are left out (the box shows what is kept).
             settings.CustomVendorId = GameSettings.ParseHex(VendorIdBox.Text);
             settings.CustomDeviceId = GameSettings.ParseHex(DeviceIdBox.Text);
-            settings.CustomDeviceDesc = DeviceDescBox.Text.Trim().Length > 0 ? DeviceDescBox.Text.Trim() : null;
+            string desc = GameSettings.BeforeComment(DeviceDescBox.Text);
+            settings.CustomDeviceDesc = desc.Length > 0 ? desc : null;
             settings.FloatEmulation = Value<string>(FloatBox);
             settings.NanDepth = Value<string>(NanDepthBox);
             settings.FxcCompiler = Value<bool>(CompilerBox);
@@ -604,6 +605,7 @@ namespace Dxup.Manager
             m_loading = true;
             VendorIdBox.Text = settings.CustomVendorId ?? "";
             DeviceIdBox.Text = settings.CustomDeviceId ?? "";
+            DeviceDescBox.Text = settings.CustomDeviceDesc ?? "";
             m_loading = false;
             Save();
         }

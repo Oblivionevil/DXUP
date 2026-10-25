@@ -640,11 +640,18 @@ namespace dxup::d3d9 {
     }
     if (!size || uint64_t(offset) + size > total)
       size = total - offset;
+    // The copy first: one that cannot come back from the GPU fails the
+    // lock with the buffer as it was.
+    uint8_t* copy = m_buffer->data();
+    if (!copy) {
+      *data = nullptr;
+      return D3DERR_OUTOFVIDEOMEMORY;
+    }
     if (flags & D3DLOCK_DISCARD)
       m_buffer->invalidate(0, 0);
     else if (!(flags & D3DLOCK_READONLY))
       m_buffer->invalidate(offset, size);
-    *data = m_buffer->data() + offset;
+    *data = copy + offset;
     return D3D_OK;
   }
 

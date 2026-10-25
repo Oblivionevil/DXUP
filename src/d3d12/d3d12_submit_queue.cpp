@@ -65,8 +65,9 @@ namespace dxup::d3d12 {
       // A job handed in while stop() ends the thread runs here: queued, it
       // would never run.
       if (!m_exited) {
-        ticket = m_issued.load(std::memory_order_relaxed) + 1;
-        m_issued.store(ticket, std::memory_order_release);
+        // fetch_add as runHere's: callers running jobs here while start()
+        // turns the thread on get tickets of their own.
+        ticket = m_issued.fetch_add(1, std::memory_order_acq_rel) + 1;
         m_jobs.emplace_back(ticket, std::move(job));
       }
     }
@@ -124,7 +125,10 @@ namespace dxup::d3d12 {
       for (auto& job : jobs) {
         job.second(m_queue);
         job.second = nullptr;
-        m_done.store(job.first, std::memory_order_seq_cst);
+        // Only ever up: a job run on its caller's thread (while start() or
+        // stop() switched) may have finished a later ticket.
+        uint64_t done = m_done.load(std::memory_order_relaxed);
+        while (done < job.first && !m_done.compare_exchange_weak(done, job.first, std::memory_order_seq_cst)) { }
         if (m_waiters.load(std::memory_order_seq_cst)) {
           { std::lock_guard<std::mutex> lock(m_doneMutex); }
           m_doneCv.notify_all();

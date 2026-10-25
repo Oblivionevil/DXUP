@@ -887,8 +887,8 @@ namespace dxup::legacy {
     const uint32_t size = index32 ? 4 : 2;
     if (!count || (uint64_t(start) + count) * size > m_size)
       return false;
-    if (m_dropped)
-      restoreCopy();
+    if (m_dropped && !restoreCopy())
+      return false;
     const uint64_t key = (uint64_t(start) << 33) ^ (uint64_t(count) << 1) ^ (index32 ? 1u : 0u);
     // Ranges of dynamic buffers are drawn once each: not kept.
     const bool keep = !m_dynamic;
@@ -987,8 +987,8 @@ namespace dxup::legacy {
       D3D11_BOX box = { from, 0, 0, to, 1, 1 };
       m_device->context()->UpdateSubresource(m_buffer.get(), 0, &box, m_data.data() + from, 0, 0);
     };
-    if (m_dropped)
-      restoreCopy();
+    if (m_dropped && !restoreCopy())
+      return;
     // Upload the gaps between clean ranges inside [begin, end).
     for (const auto& range : m_clean) {
       if (range.second <= begin)
@@ -1030,14 +1030,19 @@ namespace dxup::legacy {
     }
   }
 
-  void Buffer::restoreCopy() {
+  bool Buffer::restoreCopy() {
     // Back from the GPU, as uploaded; kept from now on. Read in pieces
-    // through a small staging buffer: the copy went for want of address
-    // space, which a staging buffer of the whole size would take again.
-    constexpr uint32_t kPiece = 1u << 20;
-    m_dropped = false;
-    m_keptCopy = true;
-    m_data.resize(m_size);
+    // through small staging buffers: the copy went for want of address
+    // space, which one staging buffer of the whole size would take again.
+    // Up to 8 pieces per wait for the GPU.
+    constexpr uint32_t kPiece = 1u << 20, kBatch = 8;
+    try {
+      m_data.resize(m_size);
+    } catch (const std::bad_alloc&) {
+      m_data.clear();
+      logMessage(LogLevel::Error, "d3d9: vertex buffer %p (%u bytes): no memory for its copy", static_cast<void*>(this), m_size);
+      return false;
+    }
     D3D11_BUFFER_DESC bd = {};
     m_buffer->GetDesc(&bd);
     bd.ByteWidth = (std::min)(bd.ByteWidth, kPiece);
@@ -1046,23 +1051,40 @@ namespace dxup::legacy {
     bd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
     bd.MiscFlags = 0;
     bd.StructureByteStride = 0;
-    Ref<ID3D11Buffer> staging;
-    bool read = SUCCEEDED(m_device->d3d11()->CreateBuffer(&bd, nullptr, staging.put()));
-    for (uint32_t done = 0; read && done < m_size; done += kPiece) {
-      const uint32_t piece = (std::min)(m_size - done, kPiece);
-      const D3D11_BOX box = { done, 0, 0, done + piece, 1, 1 };
-      m_device->context()->CopySubresourceRegion(staging.get(), 0, 0, 0, 0, m_buffer.get(), 0, &box);
-      D3D11_MAPPED_SUBRESOURCE mapped = {};
-      read = SUCCEEDED(m_device->context()->Map(staging.get(), 0, D3D11_MAP_READ, 0, &mapped));
-      if (read) {
-        std::memcpy(m_data.data() + done, mapped.pData, piece);
-        m_device->context()->Unmap(staging.get(), 0);
+    const uint32_t pieces = (m_size + kPiece - 1) / kPiece;
+    const uint32_t batch = (std::min)(pieces, kBatch);
+    Ref<ID3D11Buffer> staging[kBatch];
+    bool read = true;
+    for (uint32_t i = 0; read && i < batch; i++)
+      read = SUCCEEDED(m_device->d3d11()->CreateBuffer(&bd, nullptr, staging[i].put()));
+    for (uint32_t first = 0; read && first < pieces; first += batch) {
+      const uint32_t count = (std::min)(batch, pieces - first);
+      for (uint32_t i = 0; i < count; i++) {
+        const uint32_t from = (first + i) * kPiece;
+        const D3D11_BOX box = { from, 0, 0, (std::min)(m_size, from + kPiece), 1, 1 };
+        m_device->context()->CopySubresourceRegion(staging[i].get(), 0, 0, 0, 0, m_buffer.get(), 0, &box);
+      }
+      for (uint32_t i = 0; read && i < count; i++) {
+        const uint32_t from = (first + i) * kPiece;
+        D3D11_MAPPED_SUBRESOURCE mapped = {};
+        read = SUCCEEDED(m_device->context()->Map(staging[i].get(), 0, D3D11_MAP_READ, 0, &mapped));
+        if (read) {
+          std::memcpy(m_data.data() + from, mapped.pData, (std::min)(m_size - from, kPiece));
+          m_device->context()->Unmap(staging[i].get(), 0);
+        }
       }
     }
-    // The GPU keeps the contents; reads of the copy see zeros.
-    if (!read)
+    if (!read) {
+      // Not read: the contents stay on the GPU only, asked for again next
+      // time (a copy of zeros would be uploaded over them).
+      std::vector<uint8_t>().swap(m_data);
       logMessage(LogLevel::Error, "d3d9: vertex buffer %p (%u bytes): its contents could not be read back from the GPU",
         static_cast<void*>(this), m_size);
+      return false;
+    }
+    m_dropped = false;
+    m_keptCopy = true;
+    return true;
   }
 
   // ============================================================
@@ -4195,9 +4217,11 @@ namespace dxup::legacy {
     for (uint32_t stage = 0; stage < 4; stage++)
       projectedStages |= (m_stageStates[stage][TssTextureTransformFlags] & 256) ? 1u << stage : 0u;
     // Pixel shaders' dot products skip the 0 times infinity emulation while
-    // no float constant the draw's shaders read is NaN or infinite.
-    bool finite = true;
-    if (m_pixelShader && (m_nonFiniteGroups[0] | m_nonFiniteGroups[1])) {
+    // no float constant the draw's shaders read is NaN or infinite. Def
+    // constants count too: read relatively they come from the constant
+    // buffer as they are (the pixel shader's own: Shader::variant).
+    bool finite = !(m_pixelShader && m_vertexShader && m_vertexShader->info().nonFiniteDefs);
+    if (finite && m_pixelShader && (m_nonFiniteGroups[0] | m_nonFiniteGroups[1])) {
       // Groups of 4 registers: 253 floats and more are all 64.
       auto groups = [](uint32_t floats) {
         const uint32_t count = (floats + 3) / 4;

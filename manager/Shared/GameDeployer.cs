@@ -279,19 +279,36 @@ namespace Dxup.Shared
 
         // Takes DXUP's DLLs out of the game's folder unless another set-up
         // game uses the same folder, and puts backups back.
-        public bool Remove(GameEntry game, IEnumerable<GameEntry> allGames, out string error)
+        // uninstalling: the DLLs go even when the executable cannot be
+        // restored (the game runs); it keeps the bit and its backup, and the
+        // result is false with the reason.
+        public bool Remove(GameEntry game, IEnumerable<GameEntry> allGames, out string error, bool uninstalling = false)
         {
             error = null;
+            string exeError = null;
             // The executable as the game brought it (the bit is this game's own).
             if (!string.IsNullOrEmpty(game.Exe))
             {
                 try { LargeAddressAware.Disable(game.ExePath); }
                 catch (Exception e)
                 {
-                    error = e.Message;
-                    return false;
+                    if (!uninstalling)
+                    {
+                        error = e.Message;
+                        return false;
+                    }
+                    exeError = e.Message + " (" + game.ExePath + LargeAddressAware.BackupSuffix + ")";
                 }
             }
+            if (!RemoveDlls(game, allGames, out error))
+                return false;
+            error = exeError;
+            return exeError == null;
+        }
+
+        bool RemoveDlls(GameEntry game, IEnumerable<GameEntry> allGames, out string error)
+        {
+            error = null;
             if (allGames.Any(other => other != game && other.Enabled && SameFolder(other.Dir, game.Dir)))
                 return true;
             try

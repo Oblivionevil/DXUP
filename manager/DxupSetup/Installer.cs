@@ -131,7 +131,7 @@ namespace Dxup.Setup
             var games = GamesConfig.Load(install.GamesConfigPath);
             foreach (var game in games.Where(g => g.Enabled && Directory.Exists(g.Dir)))
             {
-                if (!deployer.Remove(game, Enumerable.Empty<GameEntry>(), out string error))
+                if (!deployer.Remove(game, Enumerable.Empty<GameEntry>(), out string error, uninstalling: true))
                     failed.Add($"{game.Name}: {error}");
                 game.Enabled = false;
             }

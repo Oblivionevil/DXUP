@@ -72,7 +72,7 @@ namespace Dxup.Shared
                 case "d3d11.upscalerinject": UpscalerInject = ParseBool(value) ?? false; return true;
                 case "dxgi.upscale": SpatialUpscale = value.Trim().Equals("spatial", StringComparison.OrdinalIgnoreCase); return true;
                 case "dxgi.adapter":
-                    string adapter = value.Trim().ToLowerInvariant();
+                    string adapter = BeforeComment(value).ToLowerInvariant();
                     Adapter = adapter.Length > 0 ? adapter : null;
                     return true;
                 case "dxgi.spoofvendor":
@@ -86,7 +86,8 @@ namespace Dxup.Shared
                 case "dxgi.customvendorid": CustomVendorId = ParseHex(value); return true;
                 case "dxgi.customdeviceid": CustomDeviceId = ParseHex(value); return true;
                 case "dxgi.customdevicedesc":
-                    CustomDeviceDesc = value.Trim().Length > 0 ? value.Trim() : null;
+                    string desc = BeforeComment(value);
+                    CustomDeviceDesc = desc.Length > 0 ? desc : null;
                     return true;
                 case "dxgi.directbackbuffer": DirectBackBuffer = ParseBool(value) ?? true; return true;
                 case "d3d9.floatemulation":
@@ -167,6 +168,13 @@ namespace Dxup.Shared
         }
 
         static KeyValuePair<string, string> Entry(string key, string value) => new KeyValuePair<string, string>(key, value);
+
+        // DXUP reads a value up to a '#' (a comment): what a game sees.
+        public static string BeforeComment(string value)
+        {
+            int comment = value.IndexOf('#');
+            return (comment >= 0 ? value.Substring(0, comment) : value).Trim();
+        }
 
         static int? ParseInt(string value) =>
             int.TryParse(value.Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out int parsed) ? parsed : (int?)null;

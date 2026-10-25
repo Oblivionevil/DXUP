@@ -113,6 +113,9 @@ namespace Dxup.Tests
             var lazy = new GameSettings();
             lazy.Set("d3d12.lazyTargets", "yes");
             Check(!lazy.LazyTargets.HasValue, "d3d12.lazyTargets = yes is DXUP's automatic choice");
+            var named = new GameSettings();
+            named.Set("dxgi.customDeviceDesc", "Radeon RX 7900 #2");
+            Check(named.CustomDeviceDesc == "Radeon RX 7900", "a GPU name ends at '#' as DXUP reads it");
 
             string path = Path.Combine(Path.GetTempPath(), "dxup_test_games.cfg");
             GamesConfig.Save(path, parsed);
@@ -284,13 +287,24 @@ namespace Dxup.Tests
                 foreach (string bin in new[] { "bin", "bin32" })
                 {
                     Directory.CreateDirectory(Path.Combine(dir, "install", bin));
-                    File.WriteAllBytes(Path.Combine(dir, "install", bin, "d3d11.dll"), new byte[] { 1, 2, 3 });
+                    // Recognised as DXUP's by the marker name it holds.
+                    File.WriteAllBytes(Path.Combine(dir, "install", bin, "d3d11.dll"), System.Text.Encoding.ASCII.GetBytes("dxup_info_log.txt"));
                 }
                 using (new FileStream(game.ExePath, FileMode.Open, FileAccess.Read, FileShare.Read))
                     Check(!deployer.Install(game, out error) && !File.Exists(Path.Combine(dir, "d3d11.dll"))
                         && !LargeAddressAware.SetByDxup(game.ExePath), "a locked executable: nothing is installed");
                 Check(deployer.Install(game, out error) && File.Exists(Path.Combine(dir, "d3d11.dll"))
                     && LargeAddressAware.Get(game.ExePath) == true, "then it installs " + error);
+                // Removing while the game runs: refused; uninstalling takes the
+                // DLLs and leaves the executable with its backup.
+                using (new FileStream(game.ExePath, FileMode.Open, FileAccess.Read, FileShare.Read))
+                {
+                    Check(!deployer.Remove(game, new[] { game }, out error) && File.Exists(Path.Combine(dir, "d3d11.dll")),
+                        "a locked executable: DXUP stays");
+                    Check(!deployer.Remove(game, new[] { game }, out error, uninstalling: true) && error != null
+                        && !File.Exists(Path.Combine(dir, "d3d11.dll")) && LargeAddressAware.SetByDxup(game.ExePath),
+                        "uninstalling with a locked executable: the DLLs go");
+                }
                 deployer.Remove(game, new[] { game }, out error);
 
                 // Steam's DRM wrapper (a .bind section): the executable stays as it is.

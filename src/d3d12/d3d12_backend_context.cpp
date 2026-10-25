@@ -699,17 +699,27 @@ namespace dxup::d3d12 {
       }
     }
 
-    // A list that faults in ExecuteCommandLists is lost, but its fence value
-    // still comes (as flush()'s recovery signals a lost batch's): waits for
-    // it end. Only a failed Signal or a removed device count as lost.
+    // A list that faults in ExecuteCommandLists is lost. Its fence value still
+    // comes (as flush()'s recovery signals a lost batch's), so waits for it
+    // end, but the device counts as lost: the worker recorded later lists
+    // on the states the lost one's barriers would have left, and unlike
+    // flush() without the thread it cannot take them back.
+    __declspec(noinline)
+    bool safeExecute(ID3D12CommandQueue* queue, ID3D12CommandList* list) {
+      __try {
+        queue->ExecuteCommandLists(1, &list);
+        return true;
+      } __except (EXCEPTION_EXECUTE_HANDLER) {
+        logMessage(LogLevel::Error, "submit thread: ExecuteCommandLists CRASHED (SEH=0x%08X); the list is lost", GetExceptionCode());
+        return false;
+      }
+    }
+
     __declspec(noinline)
     void safeExecuteAndSignal(ID3D12CommandQueue* queue, ID3D12CommandList* list, ID3D12Fence* fence, uint64_t value,
                               SubmitQueue* submit) {
-      __try {
-        queue->ExecuteCommandLists(1, &list);
-      } __except (EXCEPTION_EXECUTE_HANDLER) {
-        logMessage(LogLevel::Error, "submit thread: ExecuteCommandLists CRASHED (SEH=0x%08X); the list is lost", GetExceptionCode());
-      }
+      if (!safeExecute(queue, list))
+        submit->checkResult(DXGI_ERROR_DRIVER_INTERNAL_ERROR, "ExecuteCommandLists (resource states unknown)");
       HRESULT hr = E_FAIL;
       __try {
         hr = queue->Signal(fence, value);
@@ -945,6 +955,9 @@ namespace dxup::d3d12 {
   D3D12BackendContext::~D3D12BackendContext() {
 #ifdef _WIN32
     m_cmdList.stopThread();
+    // Queued submissions use the lists, allocators and the fence: they run
+    // first (synchronize() below stops early on a removed device).
+    m_device->submitQueue().drain();
     // With ring allocator, GPU may still be executing command lists using our
     // allocators even when upload lists are empty. Must always sync before
     // destroying allocators, since all contexts share one command queue.
