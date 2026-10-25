@@ -135,6 +135,7 @@ namespace dxup {
         m_backendCtx->releaseBindings();
       releaseAllBindings();
       m_bufferOverrides.clear();
+      m_retargetedViews.clear();
       m_recordedDiscards.clear();
       if (m_activeContextState) {
         static_cast<D3D11DeviceChild<ID3DDeviceContextState>*>(m_activeContextState)->ReleasePrivate();
@@ -2572,9 +2573,13 @@ namespace dxup {
       if (dim == D3D11_RESOURCE_DIMENSION_BUFFER) {
         ID3D11Buffer* buf = static_cast<ID3D11Buffer*>(pDstResource);
         auto* trackedBuffer = static_cast<D3D11Buffer*>(buf);
+        // Empty boxes (in any dimension) and ranges past the buffer do
+        // nothing, as in D3D11.
+        if (pDstBox && (pDstBox->right <= pDstBox->left || pDstBox->bottom <= pDstBox->top
+         || pDstBox->back <= pDstBox->front || pDstBox->right > trackedBuffer->GetDescRef().ByteWidth))
+          return;
         IBackendBuffer* backendBuf = getBackendBuffer(trackedBuffer);
-        if (m_historyOn && !m_isDeferred && (trackedBuffer->GetDescRef().BindFlags & D3D11_BIND_CONSTANT_BUFFER)
-         && (!pDstBox || (pDstBox->right > pDstBox->left && pDstBox->right <= trackedBuffer->GetDescRef().ByteWidth))) {
+        if (m_historyOn && !m_isDeferred && (trackedBuffer->GetDescRef().BindFlags & D3D11_BIND_CONSTANT_BUFFER)) {
           const UINT bytes = pDstBox ? pDstBox->right - pDstBox->left : trackedBuffer->GetDescRef().ByteWidth;
           checkConstants(pDstResource, static_cast<const float*>(pSrcData), bytes / 4);
         }
@@ -2587,14 +2592,13 @@ namespace dxup {
           if (!pDstBox) {
             size = bufferDesc.ByteWidth;
           }
-          // Empty ranges and ranges past the buffer do nothing, as in D3D11.
-          if (pDstBox && (pDstBox->right <= pDstBox->left || pDstBox->right > bufferDesc.ByteWidth))
-            return;
           bool renamed = false;
           bool queued = false;
           const UINT srvUavFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
           const bool fullBufferUpdate = offset == 0 && size == bufferDesc.ByteWidth;
-          const bool renameEnabled = renameSrvUavUpdatesEnabled();
+          // Deferred contexts record the update instead: renaming would give
+          // the buffer and its views the list's contents before it runs.
+          const bool renameEnabled = renameSrvUavUpdatesEnabled() && !m_isDeferred;
           const bool srvUavDefaultBuffer = bufferDesc.Usage == D3D11_USAGE_DEFAULT
                                         && bufferDesc.CPUAccessFlags == 0
                                         && (bufferDesc.BindFlags & srvUavFlags);
@@ -2606,8 +2610,6 @@ namespace dxup {
               if (renamedBuffer) {
                 IBackendBuffer* newBackendBuffer = renamedBuffer.get();
                 m_backendCtx->updateBuffer(newBackendBuffer, 0, size, pSrcData);
-                if (m_isDeferred)
-                  m_recordedDiscards.emplace_back(trackedBuffer, renamedBuffer);
 
                 auto oldBackendBuffer = trackedBuffer->ReplaceBackendBuffer(std::move(renamedBuffer), m_backendCtx.get());
                 void* oldBackendPtr = oldBackendBuffer.get();
@@ -2819,12 +2821,14 @@ namespace dxup {
         if (dstImg && srcImg) {
           const auto& dstDesc = dstImg->getDesc();
           const auto& srcDesc = srcImg->getDesc();
-          // D3D11 copies only textures of the same layout and drops the
-          // call otherwise; D3D12 would reject the command list.
+          // D3D11 copies only textures of the same layout in compatible
+          // formats and drops the call otherwise; D3D12 would reject the
+          // command list.
           if (dstDesc.width != srcDesc.width || dstDesc.height != srcDesc.height || dstDesc.depth != srcDesc.depth
            || dstDesc.mipLevels != srcDesc.mipLevels || dstDesc.arraySize != srcDesc.arraySize
            || dstDesc.sampleCount != srcDesc.sampleCount
-           || getFormatBlockSize(dstDesc.format) != getFormatBlockSize(srcDesc.format))
+           || getFormatBlockSize(dstDesc.format) != getFormatBlockSize(srcDesc.format)
+           || !copyableFormats(dstDesc.format, srcDesc.format))
             return;
           const bool shadowAlong = forcedMsaaShadowCopyable(pDstResource, pSrcResource);
           readForcedMsaa(pSrcResource, !shadowAlong);
@@ -2882,15 +2886,20 @@ namespace dxup {
         IBackendBuffer* srcBuf = getBackendBuffer(srcBuffer);
         if (dstBuf && srcBuf) {
           // Ranges outside either buffer are cut off, as D3D11 does; D3D12
-          // would reject the whole command list.
+          // would reject the whole command list. Boxes empty in any
+          // dimension copy nothing.
           const uint64_t srcSize = srcBuffer->GetDescRef().ByteWidth;
           const uint64_t dstSize = dstBuffer->GetDescRef().ByteWidth;
           uint64_t srcOffset = pSrcBox ? pSrcBox->left : 0;
           uint64_t srcEnd    = pSrcBox ? (std::min)(uint64_t(pSrcBox->right), srcSize) : srcSize;
-          if (srcOffset >= srcEnd || DstX >= dstSize)
+          if (srcOffset >= srcEnd || DstX >= dstSize
+           || (pSrcBox && (pSrcBox->bottom <= pSrcBox->top || pSrcBox->back <= pSrcBox->front)))
             return;
           uint64_t size = (std::min)(srcEnd - srcOffset, dstSize - DstX);
-          m_backendCtx->copyBuffer(dstBuf, DstX, srcBuf, srcOffset, size);
+          if (dstBuf != srcBuf)
+            m_backendCtx->copyBuffer(dstBuf, DstX, srcBuf, srcOffset, size);
+          else if (DstX != srcOffset)
+            copyBufferWithin(dstBuf, DstX, srcOffset, size);
           dstBuffer->CopyShadowDataFrom(srcBuffer, DstX, srcOffset, size);
         }
       } else {
@@ -2944,16 +2953,10 @@ namespace dxup {
           // D3D12 would reject the whole command list. Formats of one element
           // size copy element for element, a block of a compressed format
           // for a texel of an uncompressed one: the cut is in elements.
-          // D3D11 drops copies between formats of different element sizes.
-          auto elementBytes = [](DXGI_FORMAT format) {
-            const uint32_t blockBytes = getFormatBlockBytes(format);
-            return blockBytes ? blockBytes : getFormatBpp(format);
-          };
-          const uint32_t dstElement = elementBytes(dstDesc.format);
-          const uint32_t srcElement = elementBytes(srcDesc.format);
-          if (dstElement && srcElement && dstElement != srcElement)
+          // D3D11 drops copies between other formats (copyableFormats).
+          if (!copyableFormats(dstDesc.format, srcDesc.format))
             return;
-          if (dstElement == srcElement) {
+          if (formatElementBytes(dstDesc.format) == formatElementBytes(srcDesc.format)) {
             auto extent = [](uint32_t size, uint32_t mip) { return (std::max)(size >> mip, 1u); };
             auto elements = [](uint32_t texels, uint32_t block) { return (texels + block - 1) / block; };
             const uint32_t srcBlock = getFormatBlockSize(srcDesc.format);
@@ -2985,6 +2988,25 @@ namespace dxup {
             if (!pSrcBox && region.width == srcW && region.height == srcH && region.depth == srcD
              && DstX == 0 && DstY == 0 && DstZ == 0 && srcBlock == dstBlock)
               regionPtr = nullptr;
+          }
+
+          // A subresource copied onto itself (and a staging texture, whose
+          // subresources share one buffer) goes through a temporary image:
+          // D3D12 cannot have it in the copy source and destination states
+          // at once, and D3D11 copies overlapping regions as if through one
+          // (CopyWithOverlap). A region copied to where it is stays as it is.
+          const bool sameSubresource = dstImg == srcImg && dstSub.mipLevel == srcSub.mipLevel
+            && dstSub.arrayLayer == srcSub.arrayLayer;
+          if (sameSubresource && (!regionPtr || (region.x == DstX && region.y == DstY && region.z == DstZ)))
+            return;
+          if (sameSubresource || (dstImg == srcImg && srcImg->isCpuAccessible())) {
+            if (!regionPtr) {
+              auto extent = [](uint32_t size, uint32_t mip) { return (std::max)(size >> mip, 1u); };
+              region = { 0, 0, 0, extent(srcDesc.width, srcSub.mipLevel), extent(srcDesc.height, srcSub.mipLevel),
+                srcDesc.type == ImageType::Tex3D ? extent(srcDesc.depth, srcSub.mipLevel) : 1u };
+            }
+            copyImageWithin(srcImg, dstSub, DstX, DstY, DstZ, srcSub, region);
+            return;
           }
 
           m_backendCtx->copyImageRegion(dstImg, dstSub, DstX, DstY, DstZ, srcImg, srcSub, regionPtr);
@@ -3056,43 +3078,44 @@ namespace dxup {
               if (renamedBuffer) {
                 IBackendBuffer* newBackendBuffer = renamedBuffer.get();
                 if (m_isDeferred) {
+                  // Other contexts keep seeing the old contents until the
+                  // command list runs, as in D3D11: the memory is this
+                  // context's (its views are pointed at it in the list,
+                  // see bufferSrvForBind), and the buffer gets it when the
+                  // list runs on the immediate context.
                   renamedBuffer->pinnedContents = true;
                   m_recordedDiscards.emplace_back(trackedBuffer, renamedBuffer);
-                  // Without views nothing else follows the buffer's memory:
-                  // other contexts keep seeing the old contents until the
-                  // command list runs, as in D3D11.
-                  if (!(bufferDesc.BindFlags & (D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS))) {
-                    m_bufferOverrides[trackedBuffer] = std::move(renamedBuffer);
-                    if (bufferDesc.BindFlags & D3D11_BIND_CONSTANT_BUFFER)
-                      rebindRenamedConstantBuffer(trackedBuffer);
-                    if (bufferDesc.BindFlags & (D3D11_BIND_VERTEX_BUFFER | D3D11_BIND_INDEX_BUFFER))
-                      rebindRenamedInputAssemblerBuffer(trackedBuffer);
-                    renamedForDiscard = true;
-                  }
-                }
-                if (renamedBuffer) {
-                auto oldBackendBuffer = trackedBuffer->ReplaceBackendBuffer(std::move(renamedBuffer), m_backendCtx.get());
-                void* oldBackendPtr = oldBackendBuffer.get();
-                if (oldBackendBuffer)
-                  m_backendCtx->retainTemporaryBuffer(std::move(oldBackendBuffer));
+                  m_bufferOverrides[trackedBuffer] = std::move(renamedBuffer);
+                  if (bufferDesc.BindFlags & D3D11_BIND_CONSTANT_BUFFER)
+                    rebindRenamedConstantBuffer(trackedBuffer);
+                  if (bufferDesc.BindFlags & (D3D11_BIND_VERTEX_BUFFER | D3D11_BIND_INDEX_BUFFER))
+                    rebindRenamedInputAssemblerBuffer(trackedBuffer);
+                  if (bufferDesc.BindFlags & D3D11_BIND_SHADER_RESOURCE)
+                    rebindBufferViewsForResource(pResource);
+                  renamedForDiscard = true;
+                } else {
+                  auto oldBackendBuffer = trackedBuffer->ReplaceBackendBuffer(std::move(renamedBuffer), m_backendCtx.get());
+                  void* oldBackendPtr = oldBackendBuffer.get();
+                  if (oldBackendBuffer)
+                    m_backendCtx->retainTemporaryBuffer(std::move(oldBackendBuffer));
 
-                if (bufferDesc.BindFlags & D3D11_BIND_CONSTANT_BUFFER)
-                  rebindRenamedConstantBuffer(trackedBuffer);
-                if (bufferDesc.BindFlags & (D3D11_BIND_VERTEX_BUFFER | D3D11_BIND_INDEX_BUFFER))
-                  rebindRenamedInputAssemblerBuffer(trackedBuffer);
-                if (bufferDesc.BindFlags & D3D11_BIND_SHADER_RESOURCE)
-                  rebindBufferViewsForResource(pResource);
+                  if (bufferDesc.BindFlags & D3D11_BIND_CONSTANT_BUFFER)
+                    rebindRenamedConstantBuffer(trackedBuffer);
+                  if (bufferDesc.BindFlags & (D3D11_BIND_VERTEX_BUFFER | D3D11_BIND_INDEX_BUFFER))
+                    rebindRenamedInputAssemblerBuffer(trackedBuffer);
+                  if (bufferDesc.BindFlags & D3D11_BIND_SHADER_RESOURCE)
+                    rebindBufferViewsForResource(pResource);
 
-                logMessage(
-                  LogLevel::Info,
-                  "Map-WRITE_DISCARD-rename: buf=%p oldBackend=%p newBackend=%p size=%u bind=0x%x cpu=0x%x",
-                  trackedBuffer,
-                  oldBackendPtr,
-                  newBackendBuffer,
-                  bufferDesc.ByteWidth,
-                  bufferDesc.BindFlags,
-                  bufferDesc.CPUAccessFlags);
-                renamedForDiscard = true;
+                  logMessage(
+                    LogLevel::Info,
+                    "Map-WRITE_DISCARD-rename: buf=%p oldBackend=%p newBackend=%p size=%u bind=0x%x cpu=0x%x",
+                    trackedBuffer,
+                    oldBackendPtr,
+                    newBackendBuffer,
+                    bufferDesc.ByteWidth,
+                    bufferDesc.BindFlags,
+                    bufferDesc.CPUAccessFlags);
+                  renamedForDiscard = true;
                 }
               }
             }
@@ -3230,7 +3253,12 @@ namespace dxup {
           m_backendCtx->synchronize();
         }
 
-        void* ptr = m_backendCtx->mapBuffer(stagingBuf.get(), mode);
+        // The staging buffer is new: nothing reads it but the copy at
+        // Unmap, which a discard would only move to another buffer (and
+        // the backend's single staged discard map would lose it to the
+        // next texture mapped).
+        const bool reads = mode == MapMode::Read || mode == MapMode::ReadWrite;
+        void* ptr = m_backendCtx->mapBuffer(stagingBuf.get(), reads ? mode : MapMode::Write);
         if (!ptr) return E_FAIL;
 
         pMappedResource->pData      = ptr;
@@ -3379,18 +3407,24 @@ namespace dxup {
         UINT8                   Stencil) override {
       DXUP_CONTEXT_MT_GUARD;
       if (!pDepthStencilView) return;
+      auto* view = static_cast<D3D11DepthStencilView*>(pDepthStencilView);
+      // Only planes the format has and the view writes are cleared (native
+      // runtime): a clear of none does nothing, D3D12 would get an empty or
+      // invalid clear.
+      const UINT allPlanes = hazard_detail::hasStencil(view->GetPipelineFormat())
+        ? (D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL) : D3D11_CLEAR_DEPTH;
+      const UINT writtenPlanes = depthStencilWriteRange(pDepthStencilView).planes;
+      ClearFlags &= ((writtenPlanes & 1u) ? D3D11_CLEAR_DEPTH : 0u) | ((writtenPlanes & 2u) ? D3D11_CLEAR_STENCIL : 0u);
+      if (!ClearFlags) return;
       IBackendImageView* backendDSV = getBackendDSV(pDepthStencilView);
       if (m_historyOn && !m_isDeferred) {
         const float value[4] = { Depth, float(Stencil), float(ClearFlags), 0.0f };
         recordClear(RecordOp::ClearDepth, pDepthStencilView, backendDSV, value);
       }
       {
-        auto* view = static_cast<D3D11DepthStencilView*>(pDepthStencilView);
         // All of it is cleared when every plane of the format is.
-        const UINT allPlanes = hazard_detail::hasStencil(view->GetPipelineFormat())
-          ? (D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL) : D3D11_CLEAR_DEPTH;
         if (IBackendImageView* shadow = clearedForcedMsaaShadow(view->GetResourceRaw(), view->GetShadowView(),
-              (ClearFlags & allPlanes) == allPlanes)) {
+              ClearFlags == allPlanes)) {
           m_backendCtx->clearDepthStencil(shadow, Depth, Stencil, ClearFlags);
           if (ClearFlags & D3D11_CLEAR_STENCIL) {
             D3D11Texture2D* texture = forcedMsaaTexture(view->GetResourceRaw());
@@ -3544,9 +3578,11 @@ namespace dxup {
         ID3D11Resource* pResource,
         FLOAT           MinLOD) override {
       DXUP_CONTEXT_MT_GUARD;
-      // D3D11 ignores the call for textures created without RESOURCE_CLAMP.
+      // D3D11 ignores the call for textures created without RESOURCE_CLAMP,
+      // and on deferred contexts, also when their command list runs (native
+      // runtime): the texture's value is the immediate context's.
       IBackendImage* image = getBackendImage(pResource);
-      if (!image || !(textureMiscFlags(pResource) & D3D11_RESOURCE_MISC_RESOURCE_CLAMP))
+      if (m_isDeferred || !image || !(textureMiscFlags(pResource) & D3D11_RESOURCE_MISC_RESOURCE_CLAMP))
         return;
       const float clamped = MinLOD > 0.0f ? MinLOD : 0.0f;
       if (image->minLod.load(std::memory_order_relaxed) == clamped)
@@ -3577,6 +3613,26 @@ namespace dxup {
         default:
           return 0;
       }
+    }
+
+    // Bytes of a texel, or of a block of a compressed format; 0 if unknown.
+    static uint32_t formatElementBytes(DXGI_FORMAT format) {
+      const uint32_t blockBytes = getFormatBlockBytes(format);
+      return blockBytes ? blockBytes : getFormatBpp(format);
+    }
+
+    // D3D11 copies between formats of one family, and between block
+    // compressed and uncompressed formats whose texels are as large as the
+    // blocks; it drops other copies (native runtime). Formats of unknown
+    // element size are left to the backend.
+    static bool copyableFormats(DXGI_FORMAT dst, DXGI_FORMAT src) {
+      const uint32_t dstElement = formatElementBytes(dst);
+      const uint32_t srcElement = formatElementBytes(src);
+      if (!dstElement || !srcElement)
+        return true;
+      if (dstElement != srcElement)
+        return false;
+      return getFormatFamily(dst) == getFormatFamily(src) || !getFormatBlockBytes(dst) != !getFormatBlockBytes(src);
     }
 
     FLOAT STDMETHODCALLTYPE GetResourceMinLOD(
@@ -3652,6 +3708,7 @@ namespace dxup {
       m_recordedDiscards.clear();
       m_recordedMsaaUses.clear();
       m_bufferOverrides.clear();
+      m_retargetedViews.clear();
 
       // The next command list starts from the default state unless the
       // application keeps the current one, which then has to be recorded
@@ -3695,18 +3752,18 @@ namespace dxup {
           continue;
         // A deferred context running a list keeps the contents to itself
         // too, until its own list runs.
-        const bool views = buffer->GetDescRef().BindFlags & (D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS);
         if (m_isDeferred) {
           m_recordedDiscards.emplace_back(buffer, discard.contents());
-          if (!views) {
-            m_bufferOverrides[buffer] = discard.contents();
-            continue;
-          }
+          m_bufferOverrides[buffer] = discard.contents();
+          continue;
         }
         auto previous = buffer->ReplaceBackendBuffer(discard.contents(), m_backendCtx.get());
         if (previous)
           m_backendCtx->retainTemporaryBuffer(std::move(previous));
       }
+      // The list pointed views wherever its own discards went.
+      if (m_isDeferred)
+        m_retargetedViews.clear();
 
       // The command list leaves its own state bound: return to ours, or to
       // the default state.
@@ -4408,12 +4465,15 @@ namespace dxup {
     // jittered. The scene color the upscaler was set up for.
     std::shared_ptr<std::atomic<bool>> m_injectReady = std::make_shared<std::atomic<bool>>(false);
     ID3D11Resource* m_injectPreparedFor = nullptr;
-    // Buffer contents a deferred context replaced (WRITE_DISCARD, whole
-    // UpdateSubresource), for its command list.
+    // Buffer contents a deferred context replaced (WRITE_DISCARD, also in
+    // command lists it executed), for its command list.
     std::vector<RecordedDiscard> m_recordedDiscards;
     // Deferred contexts: buffers discarded while recording, kept alive by
     // m_recordedDiscards.
     std::unordered_map<D3D11Buffer*, Rc<IBackendBuffer>> m_bufferOverrides;
+    // Deferred contexts: the memory the command list points buffer views at
+    // from where it is recorded so far (see bufferSrvForBind).
+    std::unordered_map<IBackendBufferView*, IBackendBuffer*> m_retargetedViews;
     // State object whose state is active; created on the first swap.
     D3D11DeviceChild<ID3DDeviceContextState>* m_activeContextState = nullptr;
 
@@ -6454,7 +6514,7 @@ namespace dxup {
           if (IBackendImageView* imageView = getBackendImageSRV(view))
             m_backendCtx->bindShaderResource(stage, slot, imageView);
           else
-            m_backendCtx->bindShaderResource(stage, slot, getBackendBufferSRV(view));
+            m_backendCtx->bindShaderResource(stage, slot, bufferSrvForBind(view));
         }
         for (UINT slot = 0; slot < D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT_MAX; slot++) {
           if (state.samplers[slot])
@@ -7252,9 +7312,29 @@ namespace dxup {
       if (backendImageView) {
         m_backendCtx->bindShaderResource(stage, slot, backendImageView);
       } else {
-        IBackendBufferView* backendBufferView = getBackendBufferSRV(view);
-        m_backendCtx->bindShaderResource(stage, slot, backendBufferView);
+        m_backendCtx->bindShaderResource(stage, slot, bufferSrvForBind(view));
       }
+    }
+
+    // A deferred context's view of a buffer it discarded reads the memory
+    // the discard gave the buffer: the command list points the view there
+    // before it binds it. The commands of other contexts run before or
+    // after the list's, and executing the list on the immediate context
+    // gives the buffer that memory (with all its views) right after them.
+    IBackendBufferView* bufferSrvForBind(ID3D11ShaderResourceView* view) {
+      IBackendBufferView* backendView = getBackendBufferSRV(view);
+      if (!backendView || m_bufferOverrides.empty())
+        return backendView;
+      ID3D11Resource* resource = static_cast<D3D11ShaderResourceView*>(view)->GetResourceRaw();
+      auto it = m_bufferOverrides.find(static_cast<D3D11Buffer*>(static_cast<ID3D11Buffer*>(resource)));
+      if (it == m_bufferOverrides.end())
+        return backendView;
+      IBackendBuffer*& target = m_retargetedViews[backendView];
+      if (target != it->second.get()) {
+        target = it->second.get();
+        m_backendCtx->retargetBufferViews(target, { backendView });
+      }
+      return backendView;
     }
 
     void bindUnorderedAccessView(
@@ -7268,6 +7348,62 @@ namespace dxup {
         IBackendBufferView* backendBufferView = getBackendBufferUAV(view);
         m_backendCtx->bindUnorderedAccess(stage, slot, backendBufferView);
       }
+    }
+
+    // Copies within one buffer through a temporary one: D3D12 cannot have a
+    // buffer in the copy source and destination states at once, and D3D11
+    // copies overlapping ranges as if through one (CopyWithOverlap). The
+    // temporary is a buffer of its own, not a slice of the same block.
+    void copyBufferWithin(IBackendBuffer* buffer, uint64_t dstOffset, uint64_t srcOffset, uint64_t size) {
+      auto* backend = m_device->GetBackend();
+      BufferDesc desc = {};
+      desc.size = size;
+      desc.usage = ResourceUsage::Default;
+      desc.bindFlags = BindFlags::UnorderedAccess;
+      auto temporary = backend ? backend->createBuffer(desc) : nullptr;
+      if (!temporary)
+        return;
+      m_backendCtx->copyBuffer(temporary.get(), 0, buffer, srcOffset, size);
+      m_backendCtx->copyBuffer(buffer, dstOffset, temporary.get(), 0, size);
+      m_backendCtx->retainTemporaryBuffer(std::move(temporary));
+    }
+
+    // The same for a region of an image, through an image of whole blocks.
+    void copyImageWithin(IBackendImage* image, const ImageSubresource& dstSub, uint32_t dstX, uint32_t dstY,
+                         uint32_t dstZ, const ImageSubresource& srcSub, const ImageCopyRegion& region) {
+      const ImageDesc& desc = image->getDesc();
+      // Multisampled subresources are copied whole only, which onto
+      // themselves leaves them as they are.
+      if (desc.sampleCount > 1)
+        return;
+      auto* backend = m_device->GetBackend();
+      const uint32_t block = getFormatBlockSize(desc.format);
+      ImageDesc temporaryDesc = {};
+      temporaryDesc.type = desc.type;
+      temporaryDesc.width = (region.width + block - 1) / block * block;
+      temporaryDesc.height = (region.height + block - 1) / block * block;
+      temporaryDesc.depth = desc.type == ImageType::Tex3D ? region.depth : 1u;
+      temporaryDesc.format = desc.format;
+      temporaryDesc.usage = ResourceUsage::Default;
+      switch (desc.format) {
+        case DXGI_FORMAT_D16_UNORM: case DXGI_FORMAT_D24_UNORM_S8_UINT: case DXGI_FORMAT_D32_FLOAT:
+        case DXGI_FORMAT_D32_FLOAT_S8X24_UINT: case DXGI_FORMAT_R24G8_TYPELESS: case DXGI_FORMAT_R32G8X24_TYPELESS:
+          temporaryDesc.bindFlags = BindFlags::DepthStencil;
+          break;
+        default:
+          break;
+      }
+      auto temporary = backend ? backend->createImage(temporaryDesc) : nullptr;
+      if (!temporary)
+        return;
+      const ImageSubresource temporarySub = {};
+      const ImageCopyRegion temporaryRegion = { 0, 0, 0, region.width, region.height, region.depth };
+      m_backendCtx->copyImageRegion(temporary.get(), temporarySub, 0, 0, 0, image, srcSub, &region);
+      m_backendCtx->copyImageRegion(image, dstSub, dstX, dstY, dstZ, temporary.get(), temporarySub, &temporaryRegion);
+      // It lives until the GPU has run the copies.
+      std::vector<std::shared_ptr<void>> retired;
+      retired.push_back(std::move(temporary));
+      m_backendCtx->retireAfterGpu(retired);
     }
 
     void rebindBufferViewsForResource(ID3D11Resource* resource) {

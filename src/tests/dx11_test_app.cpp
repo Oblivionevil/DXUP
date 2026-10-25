@@ -420,6 +420,8 @@ void main(uint2 id : SV_DispatchThreadID) {
         {"deferred_discard_isolation", &Dx11TestApp::testDeferredDiscardIsolation},
         {"command_list_keeps_objects", &Dx11TestApp::testCommandListKeepsObjects},
         {"command_list_retirement", &Dx11TestApp::testCommandListRetirement},
+        {"deferred_discard_views", &Dx11TestApp::testDeferredDiscardViews},
+        {"copy_within_and_clear_rules", &Dx11TestApp::testCopyWithinAndClearRules},
         {"texture_creation_validation", &Dx11TestApp::testTextureCreationValidation},
         {"buffer_creation_validation", &Dx11TestApp::testBufferCreationValidation},
         {"view_creation_validation", &Dx11TestApp::testViewCreationValidation},
@@ -11741,6 +11743,529 @@ float4 main(float4 position : SV_Position) : SV_Target {
       return expectTexturePixel(target.texture.Get(), 4, 4, { 0, 255, 0, 255 }, 0, error);
     }
 
+    // Deferred discards (deferred_discard_isolation) of a buffer read
+    // through a shader resource view, bound before or after the discard: a list released unexecuted
+    // leaves the buffer as it was, and a deferred context that executes a
+    // list reads the list's contents from then on.
+    bool testDeferredDiscardViews(std::string& error) {
+      static const char* kBufferColorPs = R"(
+Buffer<float4> colors : register(t0);
+float4 main(float4 position : SV_Position) : SV_Target { return colors[0]; }
+)";
+      TextureTarget target;
+      ComPtr<ID3D11VertexShader> vertexShader;
+      ComPtr<ID3DBlob> vertexBytecode;
+      ComPtr<ID3D11PixelShader> pixelShader;
+      if (!createColorTarget(8, 8, D3D11_BIND_RENDER_TARGET, target, error)
+       || !createVertexShader(kFullscreenTriangleVs, "main", vertexShader, vertexBytecode, error)
+       || !createPixelShader(kBufferColorPs, "main", pixelShader, error))
+        return false;
+      D3D11_BUFFER_DESC desc = { 16, D3D11_USAGE_DYNAMIC, D3D11_BIND_SHADER_RESOURCE, D3D11_CPU_ACCESS_WRITE, 0, 0 };
+      D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+      srvDesc.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+      srvDesc.ViewDimension = D3D11_SRV_DIMENSION_BUFFER;
+      srvDesc.Buffer.NumElements = 1;
+      ComPtr<ID3D11Buffer> colors, readBuffer;
+      ComPtr<ID3D11ShaderResourceView> srv;
+      ComPtr<ID3D11DeviceContext> deferred, nesting;
+      HRESULT hr = m_device->CreateBuffer(&desc, nullptr, colors.GetAddressOf());
+      D3D11_BUFFER_DESC readDesc = { 16, D3D11_USAGE_STAGING, 0, D3D11_CPU_ACCESS_READ, 0, 0 };
+      if (SUCCEEDED(hr))
+        hr = m_device->CreateBuffer(&readDesc, nullptr, readBuffer.GetAddressOf());
+      if (SUCCEEDED(hr))
+        hr = m_device->CreateShaderResourceView(colors.Get(), &srvDesc, srv.GetAddressOf());
+      if (SUCCEEDED(hr))
+        hr = m_device->CreateDeferredContext(0, deferred.GetAddressOf());
+      if (SUCCEEDED(hr))
+        hr = m_device->CreateDeferredContext(0, nesting.GetAddressOf());
+      if (FAILED(hr)) {
+        error = "setup failed: " + formatHResult(hr);
+        return false;
+      }
+      auto writeColor = [&](ID3D11DeviceContext* context, const float (&color)[4]) {
+        D3D11_MAPPED_SUBRESOURCE mapped = {};
+        if (FAILED(context->Map(colors.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped)))
+          return false;
+        std::memcpy(mapped.pData, color, sizeof(color));
+        context->Unmap(colors.Get(), 0);
+        return true;
+      };
+      auto bindState = [&](ID3D11DeviceContext* context) {
+        ID3D11RenderTargetView* rtv = target.rtv.Get();
+        context->OMSetRenderTargets(1, &rtv, nullptr);
+        D3D11_VIEWPORT viewport = { 0.0f, 0.0f, 8.0f, 8.0f, 0.0f, 1.0f };
+        context->RSSetViewports(1, &viewport);
+        context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        context->VSSetShader(vertexShader.Get(), nullptr, 0);
+        context->PSSetShader(pixelShader.Get(), nullptr, 0);
+        context->PSSetShaderResources(0, 1, srv.GetAddressOf());
+      };
+      auto expectDraw = [&](const Rgba8& expected, const char* what) {
+        bindState(m_context.Get());
+        m_context->Draw(3, 0);
+        if (!expectTexturePixel(target.texture.Get(), 4, 4, expected, 1, error)) {
+          error = std::string(what) + ": " + error;
+          return false;
+        }
+        return true;
+      };
+      const float red[4] = { 1.0f, 0.0f, 0.0f, 1.0f };
+      const float green[4] = { 0.0f, 1.0f, 0.0f, 1.0f };
+      const float blue[4] = { 0.0f, 0.0f, 1.0f, 1.0f };
+      const float white[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+      ComPtr<ID3D11CommandList> redList, greenList, nestedList;
+      bool ok = writeColor(m_context.Get(), blue);
+      // The view bound after the discard, then one bound before it.
+      ok = ok && writeColor(deferred.Get(), green);
+      bindState(deferred.Get());
+      deferred->Draw(3, 0);
+      ok = ok && SUCCEEDED(deferred->FinishCommandList(FALSE, greenList.GetAddressOf()));
+      bindState(deferred.Get());
+      ok = ok && writeColor(deferred.Get(), red);
+      deferred->Draw(3, 0);
+      ok = ok && SUCCEEDED(deferred->FinishCommandList(FALSE, redList.GetAddressOf()));
+      if (!ok) {
+        error = "recording failed";
+        return false;
+      }
+      // What the immediate context copies out of the buffer.
+      auto expectContents = [&](const float (&color)[4], const char* what) {
+        m_context->CopyResource(readBuffer.Get(), colors.Get());
+        D3D11_MAPPED_SUBRESOURCE mapped = {};
+        if (FAILED(hr = m_context->Map(readBuffer.Get(), 0, D3D11_MAP_READ, 0, &mapped))) {
+          error = "Map(read buffer) failed: " + formatHResult(hr);
+          return false;
+        }
+        const bool same = std::memcmp(mapped.pData, color, sizeof(color)) == 0;
+        m_context->Unmap(readBuffer.Get(), 0);
+        if (!same)
+          error = std::string(what) + ": the buffer holds other contents";
+        return same;
+      };
+      if (!expectContents(blue, "before the lists run")
+       || !expectDraw(Rgba8{0, 0, 255, 255}, "immediate context before the lists run"))
+        return false;
+      greenList.Reset();
+      if (!expectDraw(Rgba8{0, 0, 255, 255}, "immediate context after a list was released unexecuted"))
+        return false;
+      m_context->ExecuteCommandList(redList.Get(), FALSE);
+      if (!expectTexturePixel(target.texture.Get(), 4, 4, Rgba8{255, 0, 0, 255}, 1, error)) {
+        error = "command list: " + error;
+        return false;
+      }
+      if (!expectDraw(Rgba8{255, 0, 0, 255}, "immediate context after the list")
+       || !expectContents(red, "after the list"))
+        return false;
+
+      // A deferred context executing the list reads its contents after it.
+      if (!writeColor(m_context.Get(), white)) {
+        error = "immediate Map failed";
+        return false;
+      }
+      bindState(nesting.Get());
+      nesting->ExecuteCommandList(redList.Get(), TRUE);
+      const float black[4] = {};
+      nesting->ClearRenderTargetView(target.rtv.Get(), black);
+      nesting->Draw(3, 0);
+      if (FAILED(hr = nesting->FinishCommandList(FALSE, nestedList.GetAddressOf()))) {
+        error = "FinishCommandList (nested) failed: " + formatHResult(hr);
+        return false;
+      }
+      if (!expectContents(white, "before the nesting list runs")
+       || !expectDraw(Rgba8{255, 255, 255, 255}, "immediate context before the nesting list runs"))
+        return false;
+      m_context->ExecuteCommandList(nestedList.Get(), FALSE);
+      if (!expectTexturePixel(target.texture.Get(), 4, 4, Rgba8{255, 0, 0, 255}, 1, error)) {
+        error = "draw after the nested list: " + error;
+        return false;
+      }
+      if (!expectDraw(Rgba8{255, 0, 0, 255}, "immediate context after the nesting list")
+       || !expectContents(red, "after the nesting list"))
+        return false;
+      m_context->ClearState();
+      return true;
+    }
+
+    // Copies within one resource (the device reports CopyWithOverlap:
+    // overlapping regions copy as if through a temporary), buffer boxes
+    // empty in height or depth, copies between formats of other element
+    // sizes or families, depth clears of planes the format lacks or the view
+    // only reads, and two dynamic textures mapped at once.
+    bool testCopyWithinAndClearRules(std::string& error) {
+      static const char* kExpected =
+        "buffer overlap forward: 0 4 8 12 0 4 8 12 16 20 24 28 48 52 56 60\n"
+        "buffer overlap backward: 16 20 24 28 32 36 40 44 32 36 40 44 48 52 56 60\n"
+        "buffer apart: 0 4 8 12 16 20 24 28 32 36 40 44 48 52 0 4\n"
+        "buffer in place: 0 4 8 12 16 20 24 28 32 36 40 44 48 52 56 60\n"
+        "buffer copy flat box: 0 4 8 12 16 20 24 28 32 36 40 44 48 52 56 60\n"
+        "buffer copy thin box: 0 4 8 12 16 20 24 28 32 36 40 44 48 52 56 60\n"
+        "buffer copy tall box: 0 4 8 12 16 20 24 28 0 4 8 12 48 52 56 60\n"
+        "buffer update flat box: 0 4 8 12 16 20 24 28 32 36 40 44 48 52 56 60\n"
+        "buffer update thin box: 0 4 8 12 16 20 24 28 32 36 40 44 48 52 56 60\n"
+        "buffer update tall box: 238 238 238 238 16 20 24 28 32 36 40 44 48 52 56 60\n"
+        "texture overlap forward: | 16 17 0 1 2 3 4 5 | 56 57 40 41 42 43 44 45\n"
+        "texture overlap backward: | 18 19 20 21 22 23 6 7 | 58 59 60 61 62 63 46 47\n"
+        "texture mip to mip: | 8 9 10 11\n"
+        "texture in place: | 16 17 18 19 20 21 22 23\n"
+        "bc1 overlap: | 1 2 3 4 | 5 1 2 8 | 9 5 6 12 | 13 14 15 16\n"
+        "staging slices: | 34 34 34 34 | 34 17 17 34 | 34 17 17 34 | 34 34 34 34\n"
+        "copy into rgba8 uint: 0x40302010\n"
+        "copy into bgra8 unorm: 0x00000000\n"
+        "copy into r32 float: 0x00000000\n"
+        "copy into r16g16 float: 0x00000000\n"
+        "copy into rgba16 unorm: 0x00000000\n"
+        "copy into r32 float region: 0x00000000\n"
+        "copy into rgba16 unorm region: 0x00000000\n"
+        "format 12 into bc1: 0x04030201\n"
+        "format 17 into bc1: 0x04030201\n"
+        "format 16 into bc1: 0x04030201\n"
+        "clear depth: 0.25\n"
+        "clear stencil only: 0.25\n"
+        "clear no planes: 0.25\n"
+        "clear read-only view: 0.25\n"
+        "clear depth and stencil: 1.00\n"
+        "dynamic textures: 17 34\n";
+      std::string results;
+      // 1. Buffers: 64 bytes holding 0..63; every 4th byte is printed.
+      std::vector<uint8_t> bytes(64), marks(64, 0xEE);
+      for (size_t i = 0; i < bytes.size(); i++)
+        bytes[i] = uint8_t(i);
+      D3D11_BUFFER_DESC bufferDesc = { 64, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, 0, 0 };
+      D3D11_BUFFER_DESC readDesc = { 64, D3D11_USAGE_STAGING, 0, D3D11_CPU_ACCESS_READ, 0, 0 };
+      ComPtr<ID3D11Buffer> buffer, readBuffer;
+      HRESULT hr = m_device->CreateBuffer(&bufferDesc, nullptr, buffer.GetAddressOf());
+      if (SUCCEEDED(hr))
+        hr = m_device->CreateBuffer(&readDesc, nullptr, readBuffer.GetAddressOf());
+      if (FAILED(hr)) {
+        error = "CreateBuffer failed: " + formatHResult(hr);
+        return false;
+      }
+      auto bufferCase = [&](const char* name, const std::function<void()>& op) {
+        m_context->UpdateSubresource(buffer.Get(), 0, nullptr, bytes.data(), 0, 0);
+        op();
+        m_context->CopyResource(readBuffer.Get(), buffer.Get());
+        D3D11_MAPPED_SUBRESOURCE mapped = {};
+        if (FAILED(m_context->Map(readBuffer.Get(), 0, D3D11_MAP_READ, 0, &mapped)))
+          return false;
+        results += name;
+        for (UINT i = 0; i < 64; i += 4)
+          results += formatString(" %u", static_cast<const uint8_t*>(mapped.pData)[i]);
+        results += '\n';
+        m_context->Unmap(readBuffer.Get(), 0);
+        return true;
+      };
+      ID3D11Buffer* b = buffer.Get();
+      const D3D11_BOX front32 = { 0, 0, 0, 32, 1, 1 }, back32 = { 16, 0, 0, 48, 1, 1 }, first8 = { 0, 0, 0, 8, 1, 1 };
+      const D3D11_BOX flat = { 0, 1, 0, 16, 1, 1 }, thin = { 0, 0, 1, 16, 1, 1 }, tall = { 0, 0, 0, 16, 2, 1 };
+      bool ok = bufferCase("buffer overlap forward:", [&] { m_context->CopySubresourceRegion(b, 0, 16, 0, 0, b, 0, &front32); })
+        && bufferCase("buffer overlap backward:", [&] { m_context->CopySubresourceRegion(b, 0, 0, 0, 0, b, 0, &back32); })
+        && bufferCase("buffer apart:", [&] { m_context->CopySubresourceRegion(b, 0, 56, 0, 0, b, 0, &first8); })
+        && bufferCase("buffer in place:", [&] { m_context->CopySubresourceRegion(b, 0, 0, 0, 0, b, 0, &front32); })
+        && bufferCase("buffer copy flat box:", [&] { m_context->CopySubresourceRegion(b, 0, 32, 0, 0, b, 0, &flat); })
+        && bufferCase("buffer copy thin box:", [&] { m_context->CopySubresourceRegion(b, 0, 32, 0, 0, b, 0, &thin); })
+        && bufferCase("buffer copy tall box:", [&] { m_context->CopySubresourceRegion(b, 0, 32, 0, 0, b, 0, &tall); })
+        && bufferCase("buffer update flat box:", [&] { m_context->UpdateSubresource(b, 0, &flat, marks.data(), 0, 0); })
+        && bufferCase("buffer update thin box:", [&] { m_context->UpdateSubresource(b, 0, &thin, marks.data(), 0, 0); })
+        && bufferCase("buffer update tall box:", [&] { m_context->UpdateSubresource(b, 0, &tall, marks.data(), 0, 0); });
+      if (!ok) {
+        error = "buffer readback failed";
+        return false;
+      }
+
+      // 2. An 8x8 texture with two mips: red is x + 8y (mip 1: 100 + x + 4y).
+      D3D11_TEXTURE2D_DESC texDesc = { 8, 8, 2, 1, DXGI_FORMAT_R8G8B8A8_UNORM, { 1, 0 }, D3D11_USAGE_DEFAULT,
+        D3D11_BIND_SHADER_RESOURCE, 0, 0 };
+      std::vector<uint32_t> mip0(64), mip1(16);
+      for (uint32_t i = 0; i < 64; i++)
+        mip0[i] = 0xFF000000u | i;
+      for (uint32_t i = 0; i < 16; i++)
+        mip1[i] = 0xFF000000u | (100 + i);
+      ComPtr<ID3D11Texture2D> texture, readTexture;
+      hr = m_device->CreateTexture2D(&texDesc, nullptr, texture.GetAddressOf());
+      D3D11_TEXTURE2D_DESC readTexDesc = texDesc;
+      readTexDesc.Usage = D3D11_USAGE_STAGING;
+      readTexDesc.BindFlags = 0;
+      readTexDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+      if (SUCCEEDED(hr))
+        hr = m_device->CreateTexture2D(&readTexDesc, nullptr, readTexture.GetAddressOf());
+      if (FAILED(hr)) {
+        error = "CreateTexture2D failed: " + formatHResult(hr);
+        return false;
+      }
+      auto textureCase = [&](const char* name, UINT sub, std::initializer_list<UINT> rows, const std::function<void()>& op) {
+        m_context->UpdateSubresource(texture.Get(), 0, nullptr, mip0.data(), 8 * 4, 0);
+        m_context->UpdateSubresource(texture.Get(), 1, nullptr, mip1.data(), 4 * 4, 0);
+        op();
+        m_context->CopyResource(readTexture.Get(), texture.Get());
+        D3D11_MAPPED_SUBRESOURCE mapped = {};
+        if (FAILED(m_context->Map(readTexture.Get(), sub, D3D11_MAP_READ, 0, &mapped)))
+          return false;
+        results += name;
+        for (UINT row : rows) {
+          results += " |";
+          for (UINT x = 0; x < (sub ? 4u : 8u); x++)
+            results += formatString(" %u", static_cast<const uint8_t*>(mapped.pData)[row * mapped.RowPitch + x * 4]);
+        }
+        results += '\n';
+        m_context->Unmap(readTexture.Get(), sub);
+        return true;
+      };
+      ID3D11Texture2D* t = texture.Get();
+      const D3D11_BOX upperLeft = { 0, 0, 0, 6, 6, 1 }, lowerRight = { 2, 2, 0, 8, 8, 1 }, quarter = { 0, 0, 0, 4, 4, 1 };
+      const D3D11_BOX middle = { 2, 2, 0, 6, 6, 1 };
+      ok = textureCase("texture overlap forward:", 0, { 2, 7 }, [&] { m_context->CopySubresourceRegion(t, 0, 2, 2, 0, t, 0, &upperLeft); })
+        && textureCase("texture overlap backward:", 0, { 0, 5 }, [&] { m_context->CopySubresourceRegion(t, 0, 0, 0, 0, t, 0, &lowerRight); })
+        && textureCase("texture mip to mip:", 1, { 1 }, [&] { m_context->CopySubresourceRegion(t, 1, 0, 0, 0, t, 0, &quarter); })
+        && textureCase("texture in place:", 0, { 2 }, [&] { m_context->CopySubresourceRegion(t, 0, 2, 2, 0, t, 0, &middle); });
+      if (!ok) {
+        error = "texture readback failed";
+        return false;
+      }
+
+      // 3. BC1 blocks (16x16: 4x4 blocks numbered 1..16) overlapping.
+      {
+        std::vector<uint8_t> blocks(16 * 8);
+        for (size_t i = 0; i < blocks.size(); i++)
+          blocks[i] = uint8_t(i / 8 + 1);
+        D3D11_TEXTURE2D_DESC bcDesc = { 16, 16, 1, 1, DXGI_FORMAT_BC1_UNORM, { 1, 0 }, D3D11_USAGE_DEFAULT,
+          D3D11_BIND_SHADER_RESOURCE, 0, 0 };
+        D3D11_SUBRESOURCE_DATA init = { blocks.data(), 4 * 8, 0 };
+        ComPtr<ID3D11Texture2D> bc, bcRead;
+        hr = m_device->CreateTexture2D(&bcDesc, &init, bc.GetAddressOf());
+        bcDesc.Usage = D3D11_USAGE_STAGING;
+        bcDesc.BindFlags = 0;
+        bcDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        if (SUCCEEDED(hr))
+          hr = m_device->CreateTexture2D(&bcDesc, nullptr, bcRead.GetAddressOf());
+        if (FAILED(hr)) {
+          error = "CreateTexture2D(BC1) failed: " + formatHResult(hr);
+          return false;
+        }
+        const D3D11_BOX box = { 0, 0, 0, 8, 8, 1 };
+        m_context->CopySubresourceRegion(bc.Get(), 0, 4, 4, 0, bc.Get(), 0, &box);
+        m_context->CopyResource(bcRead.Get(), bc.Get());
+        D3D11_MAPPED_SUBRESOURCE mapped = {};
+        if (FAILED(hr = m_context->Map(bcRead.Get(), 0, D3D11_MAP_READ, 0, &mapped))) {
+          error = "Map(BC1) failed: " + formatHResult(hr);
+          return false;
+        }
+        results += "bc1 overlap:";
+        for (UINT row = 0; row < 4; row++) {
+          results += " |";
+          for (UINT col = 0; col < 4; col++)
+            results += formatString(" %u", static_cast<const uint8_t*>(mapped.pData)[row * mapped.RowPitch + col * 8]);
+        }
+        results += '\n';
+        m_context->Unmap(bcRead.Get(), 0);
+      }
+
+      // 4. Between the two array slices of a staging texture.
+      {
+        D3D11_TEXTURE2D_DESC stagingDesc = { 4, 4, 1, 2, DXGI_FORMAT_R8G8B8A8_UNORM, { 1, 0 }, D3D11_USAGE_STAGING, 0,
+          D3D11_CPU_ACCESS_READ | D3D11_CPU_ACCESS_WRITE, 0 };
+        ComPtr<ID3D11Texture2D> staging;
+        if (FAILED(hr = m_device->CreateTexture2D(&stagingDesc, nullptr, staging.GetAddressOf()))) {
+          error = "CreateTexture2D(staging array) failed: " + formatHResult(hr);
+          return false;
+        }
+        for (UINT slice = 0; slice < 2; slice++) {
+          D3D11_MAPPED_SUBRESOURCE mapped = {};
+          if (FAILED(hr = m_context->Map(staging.Get(), slice, D3D11_MAP_WRITE, 0, &mapped))) {
+            error = "Map(staging slice) failed: " + formatHResult(hr);
+            return false;
+          }
+          for (UINT row = 0; row < 4; row++)
+            std::memset(static_cast<uint8_t*>(mapped.pData) + row * mapped.RowPitch, slice ? 0x22 : 0x11, 16);
+          m_context->Unmap(staging.Get(), slice);
+        }
+        const D3D11_BOX box = { 0, 0, 0, 2, 2, 1 };
+        m_context->CopySubresourceRegion(staging.Get(), 1, 1, 1, 0, staging.Get(), 0, &box);
+        D3D11_MAPPED_SUBRESOURCE mapped = {};
+        if (FAILED(hr = m_context->Map(staging.Get(), 1, D3D11_MAP_READ, 0, &mapped))) {
+          error = "Map(staging slice read) failed: " + formatHResult(hr);
+          return false;
+        }
+        results += "staging slices:";
+        for (UINT row = 0; row < 4; row++) {
+          results += " |";
+          for (UINT x = 0; x < 4; x++)
+            results += formatString(" %u", static_cast<const uint8_t*>(mapped.pData)[row * mapped.RowPitch + x * 4]);
+        }
+        results += '\n';
+        m_context->Unmap(staging.Get(), 1);
+      }
+
+      // 5. Whole-texture copies from RGBA8 into formats of the same and of
+      // other element sizes and families.
+      {
+        const uint32_t texel = 0x40302010u;
+        std::vector<uint32_t> source(16, texel);
+        std::vector<uint64_t> zeros(16, 0);
+        auto make = [&](DXGI_FORMAT format, D3D11_USAGE usage, const void* data, UINT pitch, ComPtr<ID3D11Texture2D>& out) {
+          D3D11_TEXTURE2D_DESC desc = { 4, 4, 1, 1, format, { 1, 0 }, usage,
+            usage == D3D11_USAGE_STAGING ? 0u : UINT(D3D11_BIND_SHADER_RESOURCE),
+            usage == D3D11_USAGE_STAGING ? UINT(D3D11_CPU_ACCESS_READ) : 0u, 0 };
+          D3D11_SUBRESOURCE_DATA init = { data, pitch, 0 };
+          return SUCCEEDED(m_device->CreateTexture2D(&desc, data ? &init : nullptr, out.GetAddressOf()));
+        };
+        ComPtr<ID3D11Texture2D> rgba;
+        if (!make(DXGI_FORMAT_R8G8B8A8_UNORM, D3D11_USAGE_DEFAULT, source.data(), 16, rgba)) {
+          error = "CreateTexture2D(rgba) failed";
+          return false;
+        }
+        struct FormatCase { const char* name; DXGI_FORMAT format; UINT bytes; bool region; };
+        const FormatCase formatCases[] = {
+          { "rgba8 uint", DXGI_FORMAT_R8G8B8A8_UINT, 4, false },
+          { "bgra8 unorm", DXGI_FORMAT_B8G8R8A8_UNORM, 4, false },
+          { "r32 float", DXGI_FORMAT_R32_FLOAT, 4, false },
+          { "r16g16 float", DXGI_FORMAT_R16G16_FLOAT, 4, false },
+          { "rgba16 unorm", DXGI_FORMAT_R16G16B16A16_UNORM, 8, false },
+          { "r32 float region", DXGI_FORMAT_R32_FLOAT, 4, true },
+          { "rgba16 unorm region", DXGI_FORMAT_R16G16B16A16_UNORM, 8, true },
+        };
+        for (const auto& c : formatCases) {
+          ComPtr<ID3D11Texture2D> dst, read;
+          if (!make(c.format, D3D11_USAGE_DEFAULT, zeros.data(), 4 * c.bytes, dst)
+           || !make(c.format, D3D11_USAGE_STAGING, nullptr, 0, read)) {
+            error = std::string("CreateTexture2D failed: ") + c.name;
+            return false;
+          }
+          if (c.region)
+            m_context->CopySubresourceRegion(dst.Get(), 0, 0, 0, 0, rgba.Get(), 0, nullptr);
+          else
+            m_context->CopyResource(dst.Get(), rgba.Get());
+          m_context->CopyResource(read.Get(), dst.Get());
+          D3D11_MAPPED_SUBRESOURCE mapped = {};
+          if (FAILED(hr = m_context->Map(read.Get(), 0, D3D11_MAP_READ, 0, &mapped))) {
+            error = "Map(format case) failed: " + formatHResult(hr);
+            return false;
+          }
+          results += formatString("copy into %s: 0x%08x\n", c.name, *static_cast<const uint32_t*>(mapped.pData));
+          m_context->Unmap(read.Get(), 0);
+        }
+        // A texel of 64-bit formats into a BC1 block (of the same size).
+        for (DXGI_FORMAT format : { DXGI_FORMAT_R16G16B16A16_UINT, DXGI_FORMAT_R32G32_UINT, DXGI_FORMAT_R32G32_FLOAT }) {
+          const uint64_t wide = 0x0807060504030201ull;
+          ComPtr<ID3D11Texture2D> src, bc, read;
+          D3D11_TEXTURE2D_DESC desc = { 1, 1, 1, 1, format, { 1, 0 }, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, 0 };
+          D3D11_SUBRESOURCE_DATA init = { &wide, 8, 0 };
+          hr = m_device->CreateTexture2D(&desc, &init, src.GetAddressOf());
+          desc = { 4, 4, 1, 1, DXGI_FORMAT_BC1_UNORM, { 1, 0 }, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, 0 };
+          init = { zeros.data(), 8, 0 };
+          if (SUCCEEDED(hr))
+            hr = m_device->CreateTexture2D(&desc, &init, bc.GetAddressOf());
+          desc.Usage = D3D11_USAGE_STAGING;
+          desc.BindFlags = 0;
+          desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+          if (SUCCEEDED(hr))
+            hr = m_device->CreateTexture2D(&desc, nullptr, read.GetAddressOf());
+          D3D11_MAPPED_SUBRESOURCE mapped = {};
+          if (SUCCEEDED(hr)) {
+            m_context->CopySubresourceRegion(bc.Get(), 0, 0, 0, 0, src.Get(), 0, nullptr);
+            m_context->CopyResource(read.Get(), bc.Get());
+            hr = m_context->Map(read.Get(), 0, D3D11_MAP_READ, 0, &mapped);
+          }
+          if (FAILED(hr)) {
+            error = "BC1 reinterpretation setup failed: " + formatHResult(hr);
+            return false;
+          }
+          results += formatString("format %u into bc1: 0x%08x\n", unsigned(format), *static_cast<const uint32_t*>(mapped.pData));
+          m_context->Unmap(read.Get(), 0);
+        }
+      }
+
+      // 6. Depth clears of a D32 texture.
+      {
+        D3D11_TEXTURE2D_DESC depthDesc = { 4, 4, 1, 1, DXGI_FORMAT_D32_FLOAT, { 1, 0 }, D3D11_USAGE_DEFAULT,
+          D3D11_BIND_DEPTH_STENCIL, 0, 0 };
+        ComPtr<ID3D11Texture2D> depth, depthRead;
+        ComPtr<ID3D11DepthStencilView> dsv, readOnlyDsv;
+        hr = m_device->CreateTexture2D(&depthDesc, nullptr, depth.GetAddressOf());
+        depthDesc.Usage = D3D11_USAGE_STAGING;
+        depthDesc.BindFlags = 0;
+        depthDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        if (SUCCEEDED(hr))
+          hr = m_device->CreateTexture2D(&depthDesc, nullptr, depthRead.GetAddressOf());
+        if (SUCCEEDED(hr))
+          hr = m_device->CreateDepthStencilView(depth.Get(), nullptr, dsv.GetAddressOf());
+        D3D11_DEPTH_STENCIL_VIEW_DESC roDesc = {};
+        roDesc.Format = DXGI_FORMAT_D32_FLOAT;
+        roDesc.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
+        roDesc.Flags = D3D11_DSV_READ_ONLY_DEPTH;
+        if (SUCCEEDED(hr))
+          hr = m_device->CreateDepthStencilView(depth.Get(), &roDesc, readOnlyDsv.GetAddressOf());
+        if (FAILED(hr)) {
+          error = "depth setup failed: " + formatHResult(hr);
+          return false;
+        }
+        struct ClearCase { const char* name; ID3D11DepthStencilView* view; UINT flags; float value; };
+        const ClearCase clearCases[] = {
+          { "depth", dsv.Get(), D3D11_CLEAR_DEPTH, 0.25f },
+          { "stencil only", dsv.Get(), D3D11_CLEAR_STENCIL, 0.75f },
+          { "no planes", dsv.Get(), 0, 0.5f },
+          { "read-only view", readOnlyDsv.Get(), D3D11_CLEAR_DEPTH, 0.5f },
+          { "depth and stencil", dsv.Get(), D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.0f },
+        };
+        for (const auto& c : clearCases) {
+          m_context->ClearDepthStencilView(c.view, c.flags, c.value, 0);
+          m_context->CopyResource(depthRead.Get(), depth.Get());
+          D3D11_MAPPED_SUBRESOURCE mapped = {};
+          if (FAILED(hr = m_context->Map(depthRead.Get(), 0, D3D11_MAP_READ, 0, &mapped))) {
+            error = "Map(depth) failed: " + formatHResult(hr);
+            return false;
+          }
+          results += formatString("clear %s: %.2f\n", c.name, *static_cast<const float*>(mapped.pData));
+          m_context->Unmap(depthRead.Get(), 0);
+        }
+      }
+
+      // 7. Two dynamic textures mapped with WRITE_DISCARD at once.
+      {
+        D3D11_TEXTURE2D_DESC dynamicDesc = { 4, 4, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, { 1, 0 }, D3D11_USAGE_DYNAMIC,
+          D3D11_BIND_SHADER_RESOURCE, D3D11_CPU_ACCESS_WRITE, 0 };
+        ComPtr<ID3D11Texture2D> dynamic[2], read;
+        hr = m_device->CreateTexture2D(&dynamicDesc, nullptr, dynamic[0].GetAddressOf());
+        if (SUCCEEDED(hr))
+          hr = m_device->CreateTexture2D(&dynamicDesc, nullptr, dynamic[1].GetAddressOf());
+        dynamicDesc.Usage = D3D11_USAGE_STAGING;
+        dynamicDesc.BindFlags = 0;
+        dynamicDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        if (SUCCEEDED(hr))
+          hr = m_device->CreateTexture2D(&dynamicDesc, nullptr, read.GetAddressOf());
+        D3D11_MAPPED_SUBRESOURCE mapped[2] = {};
+        for (UINT i = 0; i < 2 && SUCCEEDED(hr); i++)
+          hr = m_context->Map(dynamic[i].Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped[i]);
+        if (FAILED(hr)) {
+          error = "dynamic texture setup failed: " + formatHResult(hr);
+          return false;
+        }
+        for (UINT i = 0; i < 2; i++) {
+          for (UINT row = 0; row < 4; row++)
+            std::memset(static_cast<uint8_t*>(mapped[i].pData) + row * mapped[i].RowPitch, i ? 0x22 : 0x11, 16);
+        }
+        m_context->Unmap(dynamic[0].Get(), 0);
+        m_context->Unmap(dynamic[1].Get(), 0);
+        results += "dynamic textures:";
+        for (UINT i = 0; i < 2; i++) {
+          m_context->CopyResource(read.Get(), dynamic[i].Get());
+          D3D11_MAPPED_SUBRESOURCE readMapped = {};
+          if (FAILED(hr = m_context->Map(read.Get(), 0, D3D11_MAP_READ, 0, &readMapped))) {
+            error = "Map(dynamic readback) failed: " + formatHResult(hr);
+            return false;
+          }
+          results += formatString(" %u", *static_cast<const uint8_t*>(readMapped.pData));
+          m_context->Unmap(read.Get(), 0);
+        }
+        results += '\n';
+      }
+
+      if (results != kExpected) {
+        error = "differs from the native runtime:\n" + results;
+        return false;
+      }
+      return true;
+    }
+
     bool testDeferredCommandListSemantics(std::string& error) {
       static const char* kAddRedPs = R"(
 float4 main(float4 position : SV_Position) : SV_Target {
@@ -18667,7 +19192,52 @@ float4 main(float4 position : SV_Position) : SV_Target {
         return false;
 
       m_context->SetResourceMinLOD(texture.Get(), 0.0f);
-      return drawWith(srv.Get(), Rgba8{255, 0, 0, 255}, "min LOD back to 0");
+      if (!drawWith(srv.Get(), Rgba8{255, 0, 0, 255}, "min LOD back to 0"))
+        return false;
+
+      // Deferred contexts ignore the call (native runtime), also when their
+      // command list runs; it must not keep the immediate context's calls
+      // from counting.
+      ComPtr<ID3D11DeviceContext> deferred;
+      ComPtr<ID3D11CommandList> list;
+      hr = m_device->CreateDeferredContext(0, deferred.GetAddressOf());
+      if (SUCCEEDED(hr))
+        deferred->SetResourceMinLOD(texture.Get(), 2.0f);
+      const float deferredMinLod = deferred ? deferred->GetResourceMinLOD(texture.Get()) : -1.0f;
+      if (SUCCEEDED(hr))
+        hr = deferred->FinishCommandList(FALSE, list.GetAddressOf());
+      if (FAILED(hr)) {
+        error = "deferred context failed: " + formatHResult(hr);
+        return false;
+      }
+      const float beforeList = m_context->GetResourceMinLOD(texture.Get());
+      if (beforeList != 0.0f || deferredMinLod != 0.0f) {
+        error = formatString("GetResourceMinLOD before the list runs: immediate %f, deferred %f", beforeList, deferredMinLod);
+        return false;
+      }
+      if (!drawWith(srv.Get(), Rgba8{255, 0, 0, 255}, "min LOD set by a deferred context"))
+        return false;
+      m_context->SetResourceMinLOD(texture.Get(), 2.0f);
+      if (!drawWith(srv.Get(), Rgba8{0, 0, 255, 255}, "immediate min LOD 2 after the deferred one"))
+        return false;
+      m_context->SetResourceMinLOD(texture.Get(), 1.0f);
+      m_context->ExecuteCommandList(list.Get(), TRUE);
+      const float afterList = m_context->GetResourceMinLOD(texture.Get());
+      if (afterList != 1.0f) {
+        error = formatString("GetResourceMinLOD after the list ran: %f", afterList);
+        return false;
+      }
+      ComPtr<ID3D11ShaderResourceView> newSrv;
+      hr = m_device->CreateShaderResourceView(texture.Get(), nullptr, newSrv.GetAddressOf());
+      if (FAILED(hr)) {
+        error = "CreateShaderResourceView (after the list) failed: " + formatHResult(hr);
+        return false;
+      }
+      if (!drawWith(srv.Get(), Rgba8{0, 255, 0, 255}, "min LOD 1 after the list")
+       || !drawWith(newSrv.Get(), Rgba8{0, 255, 0, 255}, "min LOD 1 on a view created after the list"))
+        return false;
+      m_context->SetResourceMinLOD(texture.Get(), 0.0f);
+      return drawWith(srv.Get(), Rgba8{255, 0, 0, 255}, "min LOD 0 after the list");
     }
 
     // Descriptors beyond the heap DXUP starts with: 70000 draws, each with
