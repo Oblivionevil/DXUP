@@ -1264,7 +1264,7 @@ namespace dxup::legacy {
     // DLL, records of hash, size and DXBC appended as they compile.
     // Changes whenever the translator's output changes (the HLSL path's;
     // DXUP's compiler is not cached, it is faster than reading the cache).
-    constexpr uint64_t kTranslatorVersion = 10;
+    constexpr uint64_t kTranslatorVersion = 11;
 
     // dxup_pso_cache\d3d9_shaders.bin: fxc's code of translated variants. A
     // header with the translator version (another one: started anew), then
@@ -2576,9 +2576,9 @@ namespace dxup::legacy {
 
   namespace {
     // Direct3D 9's depth bias is in depth units, D3D11's in steps of the
-    // depth buffer's format.
+    // depth buffer's format: the D3D11 one (D15S1 is held in D24S8).
     float depthBiasSteps(const Texture* depth) {
-      return depth && formatInfo(depth->desc().format).bytesPerBlock == 2 ? 65535.0f : 16777215.0f;
+      return depth && directDxgiFormat(depth->desc().format) == DXGI_FORMAT_D16_UNORM ? 65535.0f : 16777215.0f;
     }
   }
 

@@ -512,16 +512,18 @@ namespace dxup::legacy {
       // The x component of a source.
       Op one(const Instruction& ins, size_t i) { return comp(src(ins, i), 0); }
 
-      // A scalar condition register: nonzero is true. not: test zero.
+      // A scalar condition register: nonzero is true. not: test zero
+      // (predicates and boolean constants may be negated: if !b#).
       struct Condition { Op op; bool zero = false; };
       Condition condition(const Operand& op) {
+        const bool negated = (op.type == RegPredicate || op.type == RegConstBool) && op.modifier == kModifierNot;
         if (op.type == RegPredicate)
-          return { scalar(temp(P0), op.swizzle & 3), op.modifier == kModifierNot };
+          return { scalar(temp(P0), op.swizzle & 3), negated };
         if (op.type == RegConstBool && !L.boolDefs.count(op.index))
-          return { scalar(cbuf(2, 16 + ((op.index & 15) >> 2)), op.index & 3), false };
+          return { scalar(cbuf(2, 16 + ((op.index & 15) >> 2)), op.index & 3), negated };
         const uint32_t s = scratch();
         emit(DxNe, { tempDst(s, 1), comp(source(op), 0), immF(0.0f) });
-        return { scalar(temp(s)), false };
+        return { scalar(temp(s)), negated };
       }
 
       // a OP b by a D3D9 comparison (controls), into s's mask components.

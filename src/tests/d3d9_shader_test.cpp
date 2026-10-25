@@ -371,6 +371,26 @@ loop aL, i2
 endloop
 ret
 )", nullptr },
+    // Negated booleans (the constant b3 false, the def b4 true).
+    { "ps3_negated_bools", kVsPass, "vs_3_0", R"(ps_3_0
+def c10, 0.5, 0.25, -1.0, 2.0
+defb b4, true
+dcl_texcoord0 v0
+mov r0, v0
+if !b3
+  add r0, r0, c10.y
+endif
+if !b4
+  add r0, r0, c10.w
+endif
+callnz l1, !b4
+callnz l1, !b3
+mov oC0, r0
+ret
+label l1
+add r0.x, r0.x, c10.x
+ret
+)", nullptr },
     { "ps3_breakp", kVsPass, "vs_3_0", R"(ps_3_0
 defi i0, 6, 0, 1, 0
 def c10, 0.5, 0.25, -1.0, 2.0

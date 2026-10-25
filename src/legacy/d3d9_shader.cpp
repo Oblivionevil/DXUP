@@ -433,10 +433,14 @@ namespace dxup::legacy {
         return "(" + source(op) + ").x";
       }
 
-      // A boolean condition: a predicate component or a nonzero value.
+      // A boolean condition: a predicate component, a boolean constant (both
+      // may be negated: if !b#, callnz l#, !b#) or a nonzero value.
       std::string condition(const Operand& op) {
+        const std::string negation = op.modifier == kModifierNot ? "!" : "";
         if (op.type == RegPredicate)
-          return std::string(op.modifier == kModifierNot ? "!" : "") + "p0." + kComponents[op.swizzle & 3];
+          return negation + "p0." + kComponents[op.swizzle & 3];
+        if (op.type == RegConstBool)
+          return negation + registerName(op, false);
         return "(" + scalar(op) + " != 0.0f)";
       }
 
