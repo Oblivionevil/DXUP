@@ -27,7 +27,30 @@ namespace Dxup.Shared
         public string BinDir32 => Path.Combine(Dir, "bin32");
         public string GamesConfigPath => Path.Combine(Dir, GamesConfig.FileName);
 
-        public DxupInstall(string dir) { Dir = dir.TrimEnd('\\', '/'); }
+        public DxupInstall(string dir) { Dir = TrimFolder(dir); }
+
+        // A folder without a trailing separator, except a drive's root: "D:"
+        // alone means the current folder of drive D, not "D:\".
+        public static string TrimFolder(string dir)
+        {
+            string trimmed = dir.TrimEnd('\\', '/');
+            if (trimmed.Length == 2 && trimmed[1] == ':')
+                return trimmed + "\\";
+            return trimmed.Length != 0 ? trimmed : dir;
+        }
+
+        // Whether a program is DXUP's (its version resource names DXUP).
+        public static bool IsDxupProgram(string path)
+        {
+            try
+            {
+                return File.Exists(path) && FileVersionInfo.GetVersionInfo(path).ProductName == "DXUP";
+            }
+            catch (Exception)
+            {
+                return false;
+            }
+        }
 
         public static string DefaultDir =>
             Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "DXUP");
@@ -39,7 +62,10 @@ namespace Dxup.Shared
         {
             using (var root = LocalMachine())
             using (var key = root.OpenSubKey(RegistryKey))
-                return key?.GetValue("InstallDir") as string;
+            {
+                string dir = key?.GetValue("InstallDir") as string;
+                return string.IsNullOrWhiteSpace(dir) ? null : dir;
+            }
         }
 
         public static string RegisteredVersion()

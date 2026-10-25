@@ -13,14 +13,14 @@
   <sys:String x:Key="Cancel">Cancel</sys:String>
   <sys:String x:Key="Close">Close</sys:String>
   <sys:String x:Key="Finish">Finish</sys:String>
-  <sys:String x:Key="Installing">Installing DXUP …</sys:String>
+  <sys:String x:Key="Installing">Installing DXUP in {0} …</sys:String>
   <sys:String x:Key="Done">DXUP {0} is installed.</sys:String>
   <sys:String x:Key="StartManager">Start DXUP Manager</sys:String>
   <sys:String x:Key="ManagerRunning">DXUP Manager is still running. Please close it, then click OK.</sys:String>
   <sys:String x:Key="Uninstall">Uninstall</sys:String>
   <sys:String x:Key="UninstallInfo">DXUP is removed from all games – DLLs of other programs that DXUP backed up come back – and then uninstalled.</sys:String>
   <sys:String x:Key="KeepSettings">Keep the game settings (games.cfg) for a later installation</sys:String>
-  <sys:String x:Key="Uninstalling">Uninstalling DXUP …</sys:String>
+  <sys:String x:Key="Uninstalling">Uninstalling DXUP from {0} …</sys:String>
   <sys:String x:Key="Uninstalled">DXUP has been uninstalled.</sys:String>
   <sys:String x:Key="ErrFailed">Error: {0}</sys:String>
   <sys:String x:Key="GameErrors">These games could not be changed (is the game still running?):
@@ -32,4 +32,8 @@
   <sys:String x:Key="StepRemoveGames">Removing DXUP from the games</sys:String>
   <sys:String x:Key="StepRemoveFiles">Removing files</sys:String>
   <sys:String x:Key="NeedsX64">DXUP needs 64-bit Windows.</sys:String>
+  <sys:String x:Key="ErrNotInstalled">DXUP is not installed in "{0}": there is nothing to uninstall there.</sys:String>
+  <sys:String x:Key="ErrFolderNotEmpty">"{0}" already holds other files. Please choose an empty folder or a new one for DXUP.</sys:String>
+  <sys:String x:Key="ErrFolder">"{0}" is not a valid folder.</sys:String>
+  <sys:String x:Key="ErrFolderMissing">The game's folder was not found: {0}</sys:String>
 </ResourceDictionary>

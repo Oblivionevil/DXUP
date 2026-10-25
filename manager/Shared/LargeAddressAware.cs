@@ -69,15 +69,19 @@ namespace Dxup.Shared
             if (SteamDrm(exe))
                 throw new InvalidOperationException("Steam DRM: the game would not start with a changed executable");
             string backup = exe + BackupSuffix;
-            // An update of the game replaced the executable: that is the original now.
+            // An update of the game replaced the executable: that is the
+            // original now. The copy takes the executable's attributes; a
+            // read-only backup could neither be replaced nor deleted.
+            ClearReadOnly(backup);
             File.Copy(exe, backup, true);
+            ClearReadOnly(backup);
             try
             {
                 Write(exe, true);
             }
             catch (Exception)
             {
-                File.Delete(backup);
+                try { File.Delete(backup); } catch (Exception) { }
                 throw;
             }
         }
@@ -86,15 +90,36 @@ namespace Dxup.Shared
         // back when the executable is still DXUP's change of it. Enable
         // backs up whatever executable it changes, so another executable
         // with the bit came with it (an update made it large address
-        // aware): it stays as it is.
+        // aware): it stays as it is. A read-only executable stays so.
         public static void Disable(string exe)
         {
             string backup = exe + BackupSuffix;
             if (!File.Exists(backup))
                 return;
             if (File.Exists(exe) && Get(exe) == true && Get(backup) != true && ChangedHeaderOnly(exe, backup))
-                File.Copy(backup, exe, true);
+            {
+                var attributes = File.GetAttributes(exe);
+                ClearReadOnly(exe);
+                try
+                {
+                    File.Copy(backup, exe, true);
+                }
+                finally
+                {
+                    File.SetAttributes(exe, attributes);
+                }
+            }
+            ClearReadOnly(backup);
             File.Delete(backup);
+        }
+
+        static void ClearReadOnly(string path)
+        {
+            if (!File.Exists(path))
+                return;
+            var attributes = File.GetAttributes(path);
+            if ((attributes & FileAttributes.ReadOnly) != 0)
+                File.SetAttributes(path, attributes & ~FileAttributes.ReadOnly);
         }
 
         // Whether the files differ in the header's characteristics and
@@ -137,8 +162,18 @@ namespace Dxup.Shared
                 if (valid)
                     BitConverter.GetBytes(CheckSum(bytes, header.CheckSumOffset)).CopyTo(bytes, header.CheckSumOffset);
             }
-            using (var stream = new FileStream(exe, FileMode.Open, FileAccess.Write, FileShare.Read))
-                stream.Write(bytes, 0, bytes.Length);
+            // A read-only executable is written and stays read-only.
+            var attributes = File.GetAttributes(exe);
+            ClearReadOnly(exe);
+            try
+            {
+                using (var stream = new FileStream(exe, FileMode.Open, FileAccess.Write, FileShare.Read))
+                    stream.Write(bytes, 0, bytes.Length);
+            }
+            finally
+            {
+                File.SetAttributes(exe, attributes);
+            }
         }
 
         // CheckSumMappedFile's sum: 16-bit words with the carry folded back,

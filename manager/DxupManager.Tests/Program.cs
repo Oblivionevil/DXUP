@@ -4,6 +4,7 @@ using System.IO;
 using System.IO.Compression;
 using System.Linq;
 using Dxup.Manager;
+using Dxup.Setup;
 using Dxup.Shared;
 
 namespace Dxup.Tests
@@ -19,16 +20,31 @@ namespace Dxup.Tests
                 s_failed++;
         }
 
+        // Files the code under test would have Windows delete at the next
+        // restart: recorded instead, as that writes the registry.
+        static readonly List<string> s_restartDeletes = new List<string>();
+
         static int Main()
         {
+            GameDeployer.DeleteAtRestart = path => s_restartDeletes.Add(path);
             GamesConfigRoundTrip();
+            GamesConfigKeepsOtherLines();
             GamesConfigImport();
             SteamFiles();
             BattleNet();
             PeHeaders();
             LargeAddress();
+            LargeAddressReadOnly();
             Deployer();
+            DeployerFolders();
+            ForeignBackups();
+            NamesInFile();
+            SettingOptions();
+            InstallFolders();
+            UninstallFiles();
+            ReplaceInUse();
             DiagnosticsChecks();
+            CrashReports();
             Console.WriteLine(s_failed == 0 ? "All passed" : s_failed + " failed");
             return s_failed == 0 ? 0 : 1;
         }
@@ -474,6 +490,404 @@ namespace Dxup.Tests
             DiagnosticMarkers.ClearAll(dir);
             Check(!DiagnosticMarkers.AnyOn(dir), "all switches off");
             Directory.Delete(dir, true);
+        }
+
+        static string TempDir(string name)
+        {
+            string dir = Path.Combine(Path.GetTempPath(), name + "_" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(dir);
+            return dir;
+        }
+
+        // Deletes a test folder, read-only files too.
+        static void DeleteTree(string dir)
+        {
+            if (!Directory.Exists(dir))
+                return;
+            foreach (string file in Directory.GetFiles(dir, "*", SearchOption.AllDirectories))
+                File.SetAttributes(file, FileAttributes.Normal);
+            Directory.Delete(dir, true);
+        }
+
+        // Comments, other sections, lines without '=' and [game] blocks
+        // without a dir survive a save, and a second save changes nothing.
+        static void GamesConfigKeepsOtherLines()
+        {
+            string hand = "# my games\n\n[game]\n# Trine 4, patched\nname = Trine\ndir = C:\\Games\\Trine\nexe = trine.exe\n"
+                + "a line without equals\nd3d11.msaaSamples = 16\n\n[othertool]\nkey = value\n# tool comment\n\n"
+                + "[game]\nname = No dir yet\nd3d11.msaaSamples = 4\n";
+            var document = GamesConfig.ParseDocument(hand);
+            Check(document.Games.Count == 1 && document.Games[0].Settings.MsaaSamples == 16, "games.cfg with other lines: one game");
+            string saved = GamesConfig.Format(document.Games, document);
+            Check(saved.Contains("# my games\n") && saved.Contains("# Trine 4, patched\n") && saved.Contains("a line without equals\n")
+               && saved.Contains("[othertool]\nkey = value\n# tool comment\n") && saved.Contains("[game]\nname = No dir yet\nd3d11.msaaSamples = 4\n"),
+                "games.cfg keeps comments, other sections and blocks without dir: " + saved);
+            var again = GamesConfig.ParseDocument(saved);
+            Check(GamesConfig.Format(again.Games, again) == saved && again.Games.Count == 1 && again.Games[0].Lines.Count == 2,
+                "games.cfg with other lines saves the same twice");
+            Check(saved.Split('\n').Count(line => line.StartsWith("# DXUP settings per game")) == 1, "the manager's header is written once");
+            // The game's block still ends where DXUP's DLLs see it end.
+            int game = saved.IndexOf("dir = C:\\Games\\Trine", StringComparison.Ordinal);
+            int other = saved.IndexOf("[othertool]", StringComparison.Ordinal);
+            Check(game >= 0 && other > game && saved.IndexOf("d3d11.msaaSamples = 16", StringComparison.Ordinal) < other,
+                "other sections come after the games");
+            string path = Path.Combine(Path.GetTempPath(), "dxup_test_keep_" + Guid.NewGuid().ToString("N") + ".cfg");
+            File.WriteAllText(path, hand);
+            var loaded = GamesConfig.LoadDocument(path);
+            loaded.Games[0].Settings.MsaaSamples = 8;
+            GamesConfig.Save(path, loaded.Games, loaded);
+            string written = File.ReadAllText(path);
+            Check(written.Contains("[othertool]") && written.Contains("# my games") && written.Contains("d3d11.msaaSamples = 8"),
+                "saving a changed setting keeps the other lines");
+            File.Delete(path);
+
+            // Values beyond the manager's lists stay as written.
+            var odd = GamesConfig.Parse("[game]\ndir = C:\\X\nd3d11.msaaSamples = 16\ndxgi.maxFrameLatency = 8\ndxgi.syncInterval = 2\n"
+                + "d3d11.samplerAnisotropy = 1\ndxgi.renderScale = 0.875\nd3d11.samplerLodBias = -0.333\n");
+            string oddText = GamesConfig.Format(odd);
+            Check(oddText.Contains("d3d11.msaaSamples = 16") && oddText.Contains("dxgi.maxFrameLatency = 8") && oddText.Contains("dxgi.syncInterval = 2")
+               && oddText.Contains("d3d11.samplerAnisotropy = 1") && oddText.Contains("dxgi.renderScale = 0.875")
+               && oddText.Contains("d3d11.samplerLodBias = -0.333"), "values beyond the lists are written as read: " + oddText);
+            var scale = GamesConfig.Parse("[game]\ndir = C:\\X\ndxgi.renderScale = 0.8\n")[0].Settings;
+            Check(scale.RenderScale == 80.0, "render scale 0.8 is 80 %");
+
+            // Characters paths cannot hold: the entry stays, flagged.
+            var bad = GamesConfig.Parse("[game]\ndir = C:\\Games\\\"Bad|<Name>\nexe = game.exe\nenabled = true\n");
+            Check(bad.Count == 1 && !bad[0].ValidPath && GamesConfig.Format(bad).Contains("Bad|<Name>"),
+                "a dir with \" | < > is kept and flagged");
+        }
+
+        static void SettingOptions()
+        {
+            var presets = new[] { new Option("game", null), new Option("2x", 2), new Option("4x", 4), new Option("8x", 8) };
+            Func<object, string> text = value => value + "x";
+            var (options, selected) = Option.Including(presets, 4, text);
+            Check(options == presets && selected == presets[2], "a preset value selects its choice");
+            (options, selected) = Option.Including(presets, null, text);
+            Check(options == presets && selected == presets[0], "no value selects the game's choice");
+            (options, selected) = Option.Including(presets, 16, text);
+            Check(options.Length == 5 && selected == options[4] && Equals(selected.Value, 16) && selected.Text == "16x",
+                "a value beyond the presets is one more choice and keeps its value");
+            (options, selected) = Option.Including(new[] { new Option("off", null), new Option("75 %", 75.0) }, 87.5, value => value + " %");
+            Check(options.Length == 3 && Equals(selected.Value, 87.5), "a render scale beyond the presets is kept");
+        }
+
+        // A 32-bit executable that is read-only: the bit is set and cleared,
+        // the executable stays read-only, the backup is never read-only.
+        static void LargeAddressReadOnly()
+        {
+            string dir = TempDir("dxup_laa_ro_test");
+            try
+            {
+                string original = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.SystemX86), "cmd.exe");
+                string exe = Path.Combine(dir, "game.exe");
+                string backup = exe + LargeAddressAware.BackupSuffix;
+                File.Copy(original, exe);
+                File.SetAttributes(exe, FileAttributes.ReadOnly);
+                bool enabled = false;
+                try { LargeAddressAware.Enable(exe); enabled = true; } catch (Exception) { }
+                Check(enabled && LargeAddressAware.Get(exe) == true && (File.GetAttributes(exe) & FileAttributes.ReadOnly) != 0
+                    && (File.GetAttributes(backup) & FileAttributes.ReadOnly) == 0, "a read-only executable gets the bit and stays read-only");
+                bool disabled = false;
+                try { LargeAddressAware.Disable(exe); disabled = true; } catch (Exception) { }
+                Check(disabled && LargeAddressAware.SameContent(exe, original) && !File.Exists(backup)
+                    && (File.GetAttributes(exe) & FileAttributes.ReadOnly) != 0, "clearing it restores the read-only original");
+
+                // A read-only backup left by an older manager: replaced, and
+                // removed again.
+                File.Copy(original, backup);
+                File.SetAttributes(backup, FileAttributes.ReadOnly);
+                enabled = disabled = false;
+                try { LargeAddressAware.Enable(exe); enabled = true; } catch (Exception) { }
+                try { LargeAddressAware.Disable(exe); disabled = true; } catch (Exception) { }
+                Check(enabled && disabled && !File.Exists(backup) && LargeAddressAware.SameContent(exe, original),
+                    "a read-only backup does not block setting and clearing the bit");
+
+                // Writing fails (the game runs): no backup stays behind.
+                using (new FileStream(exe, FileMode.Open, FileAccess.Read, FileShare.Read))
+                {
+                    try { LargeAddressAware.Enable(exe); } catch (Exception) { }
+                }
+                Check(!File.Exists(backup) && LargeAddressAware.Get(exe) == false, "a failed write leaves no backup");
+            }
+            finally
+            {
+                DeleteTree(dir);
+            }
+        }
+
+        // Folders that are gone and paths a hand-edited games.cfg cannot use.
+        static void DeployerFolders()
+        {
+            string root = TempDir("dxup_folders_test");
+            try
+            {
+                var deployer = new GameDeployer(new DxupInstall(Path.Combine(root, "install")));
+                var gone = new GameEntry { Name = "Gone", Dir = Path.Combine(root, "gone"), Exe = "game.exe", Enabled = true, LargeAddressAware = true };
+                Check(deployer.State(gone) == GameState.FolderMissing, "a game whose folder is gone");
+                Check(deployer.Remove(gone, new[] { gone }, out string error) && error == null, "a game whose folder is gone can be removed " + error);
+                Check(!deployer.Install(gone, out error) && error != null, "a game whose folder is gone cannot be activated");
+
+                var bad = new GameEntry { Name = "Bad", Dir = @"C:\Games\""Bad|<Name>", Exe = "ga|me.exe", Enabled = true };
+                bool threw = false;
+                GameState state = GameState.Active;
+                try
+                {
+                    state = deployer.State(bad);
+                    GameDeployer.DllsFor(bad);
+                    GameDeployer.HasLocalConfig(bad);
+                    GameDeployer.AntiCheat(bad);
+                    deployer.SourceDir(bad);
+                    Check(!deployer.Install(bad, out error) && deployer.Remove(bad, new[] { bad }, out error), "a bad path: install refused, remove allowed");
+                }
+                catch (Exception) { threw = true; }
+                Check(!threw && state == GameState.FolderMissing, "a path with \" | < > throws nowhere");
+            }
+            finally
+            {
+                DeleteTree(root);
+            }
+        }
+
+        // Another program's DLL updated over DXUP's (ReShade's dxgi.dll):
+        // repairing keeps it as the newest backup, the older one under a
+        // name of its own; removing DXUP brings back the newest.
+        static void ForeignBackups()
+        {
+            string root = TempDir("dxup_backup_test");
+            try
+            {
+                string bin = Path.Combine(root, "install", "bin");
+                string gameDir = Path.Combine(root, "game");
+                Directory.CreateDirectory(bin);
+                Directory.CreateDirectory(gameDir);
+                foreach (string dll in DxupInstall.Dlls)
+                    File.WriteAllText(Path.Combine(bin, dll), "dxup_info_log.txt " + dll);
+                string target = Path.Combine(gameDir, "dxgi.dll");
+                string backup = target + GameDeployer.BackupSuffix;
+                File.WriteAllText(target, "reshade 1");
+                var deployer = new GameDeployer(new DxupInstall(Path.Combine(root, "install")));
+                var game = new GameEntry { Name = "Game", Dir = gameDir, Exe = "game.exe", Enabled = true };
+                Check(deployer.Install(game, out string error) && File.ReadAllText(backup) == "reshade 1", "the foreign DLL is backed up " + error);
+                File.WriteAllText(target, "reshade 2");
+                Check(deployer.State(game) == GameState.Outdated, "a foreign DLL over DXUP's: outdated");
+                Check(deployer.Install(game, out error) && File.ReadAllText(backup) == "reshade 2"
+                    && File.ReadAllText(backup + ".1") == "reshade 1" && DxupInstall.IsDxupFile(target),
+                    "repairing keeps the newer foreign DLL and the older one " + error);
+                // The same file again: it is a copy of the backup, nothing new.
+                File.WriteAllText(target, "reshade 2");
+                Check(deployer.Install(game, out error) && File.ReadAllText(backup) == "reshade 2" && !File.Exists(backup + ".2"),
+                    "a copy of the backup is not backed up twice " + error);
+                Check(deployer.Remove(game, new[] { game }, out error) && File.ReadAllText(target) == "reshade 2"
+                    && File.ReadAllText(backup + ".1") == "reshade 1", "removing restores the newest foreign DLL " + error);
+            }
+            finally
+            {
+                DeleteTree(root);
+            }
+        }
+
+        // Names of DLLs in an executable, as ASCII or UTF-16 string literals.
+        static void NamesInFile()
+        {
+            string dir = TempDir("dxup_names_test");
+            try
+            {
+                string wide = Path.Combine(dir, "wide.exe");
+                File.WriteAllBytes(wide, new byte[] { 1, 2, 3 }.Concat(System.Text.Encoding.Unicode.GetBytes("xx D3D9.DLL yy")).ToArray());
+                string ascii = Path.Combine(dir, "ascii.exe");
+                File.WriteAllBytes(ascii, System.Text.Encoding.ASCII.GetBytes("..DDraw.dll.."));
+                string neither = Path.Combine(dir, "neither.exe");
+                File.WriteAllBytes(neither, System.Text.Encoding.ASCII.GetBytes("d3d9_dll d\u00003d8 dd raw.dll d3d9.dl"));
+                var names = DxupInstall.LegacyDlls.ToList();
+                Check(GameDeployer.NamesIn(wide, names).SequenceEqual(new[] { "d3d9.dll" }), "a UTF-16 DLL name is found");
+                Check(GameDeployer.NamesIn(ascii, names).SequenceEqual(new[] { "ddraw.dll" }), "an ASCII DLL name is found in any case");
+                Check(!GameDeployer.NamesIn(neither, names).Any(), "other text is no DLL name");
+            }
+            finally
+            {
+                DeleteTree(dir);
+            }
+        }
+
+        // Which folder the setup installs into, and which it uninstalls.
+        static void InstallFolders()
+        {
+            Check(DxupInstall.TrimFolder(@"D:\") == @"D:\" && DxupInstall.TrimFolder(@"D:\Games\") == @"D:\Games"
+               && new DxupInstall(@"D:\").GamesConfigPath == @"D:\games.cfg", "a drive's root keeps its separator");
+            string root = TempDir("dxup_folder_test");
+            try
+            {
+                string empty = Path.Combine(root, "empty");
+                Directory.CreateDirectory(empty);
+                Check(Installer.InstallFolder(empty, null) == empty, "an empty folder is used");
+                Check(Installer.InstallFolder(Path.Combine(root, "new"), null) == Path.Combine(root, "new"), "a new folder is used");
+                string games = Path.Combine(root, "Games");
+                Directory.CreateDirectory(Path.Combine(games, "Some Game"));
+                File.WriteAllText(Path.Combine(games, "notes.txt"), "mine");
+                Check(Installer.InstallFolder(games + "\\", null) == Path.Combine(games, "DXUP"), "a folder with other files gets a DXUP folder");
+                Check(Installer.InstallFolder(games, games) == games, "the registered folder is used");
+                Directory.CreateDirectory(Path.Combine(games, "DXUP"));
+                File.WriteAllText(Path.Combine(games, "DXUP", "other.txt"), "not DXUP");
+                Check(Installer.InstallFolder(games, null) == null, "a DXUP folder with other files is refused");
+                File.WriteAllText(Path.Combine(games, "DXUP", Installer.FileList), "README.txt\r\n");
+                Check(Installer.InstallFolder(games, null) == null, "a file list without its header is not DXUP's");
+                File.WriteAllText(Path.Combine(games, "DXUP", Installer.FileList), Installer.FileListHeader + "\r\nREADME.txt\r\n");
+                Check(Installer.InstallFolder(games, null) == Path.Combine(games, "DXUP"), "an installation is upgraded");
+
+                Check(!Installer.MayUninstall(games, null), "a folder that is no installation is not uninstalled");
+                Check(Installer.MayUninstall(games, games + "\\"), "the registered installation is uninstalled");
+                Check(Installer.MayUninstall(Path.Combine(games, "DXUP"), null), "a folder with the file list is an installation");
+                string manager = Path.Combine(root, "manager");
+                Directory.CreateDirectory(manager);
+                File.Copy(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), "notepad.exe"), Path.Combine(manager, DxupInstall.ManagerExe));
+                Check(!Installer.MayUninstall(manager, null), "another program named DXUP Manager.exe is no installation");
+                File.Copy(typeof(Program).Assembly.Location, Path.Combine(manager, DxupInstall.ManagerExe), true);
+                Check(Installer.MayUninstall(manager, null), "DXUP's manager marks an installation");
+            }
+            finally
+            {
+                DeleteTree(root);
+            }
+        }
+
+        // The uninstaller deletes DXUP's files and empty folders only.
+        static void UninstallFiles()
+        {
+            string root = TempDir("dxup_uninstall_test");
+            try
+            {
+                string dir = Path.Combine(root, "DXUP");
+                string[] own =
+                {
+                    DxupInstall.ManagerExe, DxupInstall.ManagerExe + ".config", "README.txt", "LICENSE.txt", @"bin\d3d11.dll", @"bin\dxgi.dll",
+                    @"bin32\d3d9.dll", @"bin\upscalers\libxess.dll", @"bin\upscalers\licenses\Intel-XeSS-LICENSE.txt", "games.cfg",
+                    DxupInstall.UninstallExe, @"bin\listed.dll", @"bin\future.dll", @"bin\d3d11.dll.dxup-old123", "games.cfg.new",
+                };
+                string[] mine = { "notes.txt", @"bin\user.dll", @"Saves\save1.dat" };
+                foreach (string name in own.Concat(mine))
+                {
+                    Directory.CreateDirectory(Path.GetDirectoryName(Path.Combine(dir, name)));
+                    File.WriteAllText(Path.Combine(dir, name), name);
+                }
+                File.SetAttributes(Path.Combine(dir, "README.txt"), FileAttributes.ReadOnly);
+                File.WriteAllText(Path.Combine(root, "outside.txt"), "outside");
+                File.WriteAllText(Path.Combine(root, "outside2.txt"), "outside");
+                File.WriteAllLines(Path.Combine(dir, Installer.FileList), new[] { Installer.FileListHeader,
+                    @"bin\listed.dll", @"..\outside.txt", Path.Combine(root, "outside2.txt"), "notes.txt\\..\\..\\outside.txt" });
+                // Another program's list of the same name lists nothing of DXUP's.
+                string foreign = Path.Combine(root, "Foreign");
+                Directory.CreateDirectory(foreign);
+                File.WriteAllText(Path.Combine(foreign, "mine.txt"), "mine");
+                File.WriteAllText(Path.Combine(foreign, Installer.FileList), "mine.txt\r\n");
+                Check(!Installer.MayUninstall(foreign, null) && Installer.ReadFileList(foreign).Count == 0
+                    && Installer.OwnFiles(foreign, Enumerable.Empty<string>(), false).Count == 0, "a list without DXUP's header is ignored");
+
+                var failed = Installer.RemoveFiles(dir, new[] { @"bin\future.dll" }, false, null);
+                Check(failed.Count == 0 && own.All(name => !File.Exists(Path.Combine(dir, name))) && !File.Exists(Path.Combine(dir, Installer.FileList)),
+                    "uninstalling deletes DXUP's files: " + string.Join(", ", own.Where(name => File.Exists(Path.Combine(dir, name)))));
+                Check(mine.All(name => File.Exists(Path.Combine(dir, name))) && File.Exists(Path.Combine(root, "outside.txt"))
+                    && File.Exists(Path.Combine(root, "outside2.txt")), "uninstalling keeps the user's files and everything outside");
+                Check(!Directory.Exists(Path.Combine(dir, "bin32")) && !Directory.Exists(Path.Combine(dir, @"bin\upscalers"))
+                    && Directory.Exists(Path.Combine(dir, "bin")) && Directory.Exists(dir), "empty DXUP folders go, others stay");
+
+                // Settings kept: games.cfg and the list stay, the folder too.
+                string kept = Path.Combine(root, "Kept");
+                foreach (string name in new[] { "README.txt", "games.cfg", DxupInstall.UninstallExe, @"bin\d3d11.dll" })
+                {
+                    Directory.CreateDirectory(Path.GetDirectoryName(Path.Combine(kept, name)));
+                    File.WriteAllText(Path.Combine(kept, name), name);
+                }
+                File.WriteAllText(Path.Combine(kept, Installer.FileList), Installer.FileListHeader + "\r\nREADME.txt\r\n");
+                string self = Path.Combine(kept, DxupInstall.UninstallExe);
+                Installer.RemoveFiles(kept, Enumerable.Empty<string>(), true, self);
+                Check(File.Exists(Path.Combine(kept, "games.cfg")) && File.Exists(Path.Combine(kept, Installer.FileList)) && File.Exists(self)
+                    && !File.Exists(Path.Combine(kept, "README.txt")) && !Directory.Exists(Path.Combine(kept, "bin"))
+                    && Installer.InstallFolder(kept, null) == kept, "kept settings stay for the next installation; the running uninstaller stays");
+
+                // Only DXUP in the folder: it goes as a whole.
+                string only = Path.Combine(root, "Only");
+                Directory.CreateDirectory(Path.Combine(only, "bin"));
+                File.WriteAllText(Path.Combine(only, "bin", "d3d11.dll"), "x");
+                File.WriteAllText(Path.Combine(only, DxupInstall.UninstallExe), "x");
+                Installer.RemoveFiles(only, Enumerable.Empty<string>(), false, null);
+                Check(!Directory.Exists(only), "an installation folder with nothing else goes");
+
+                string command = Installer.SelfDeleteCommand(@"C:\DXUP\uninstall.exe.dxup-old1", @"C:\DXUP");
+                Check(command.Contains("for /l") && command.Contains("del /f /q \"C:\\DXUP\\uninstall.exe.dxup-old1\"")
+                    && command.Contains("rmdir \"C:\\DXUP\"") && !command.Contains("/s"), "the uninstaller deletes itself after it exited, the folder only when empty");
+            }
+            finally
+            {
+                DeleteTree(root);
+            }
+        }
+
+        [System.Runtime.InteropServices.DllImport("kernel32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode, SetLastError = true)]
+        static extern IntPtr LoadLibraryEx(string file, IntPtr reserved, int flags);
+
+        [System.Runtime.InteropServices.DllImport("kernel32.dll")]
+        static extern bool FreeLibrary(IntPtr module);
+
+        // A DLL a game loaded from the installation (an upscaler runtime):
+        // an upgrade replaces it and an uninstall removes it, the old file
+        // renamed and deleted at the next restart.
+        static void ReplaceInUse()
+        {
+            string dir = TempDir("dxup_in_use_test");
+            IntPtr module = IntPtr.Zero;
+            try
+            {
+                string system = Environment.GetFolderPath(Environment.SpecialFolder.System);
+                string target = Path.Combine(dir, "libxess.dll");
+                File.Copy(Path.Combine(system, "version.dll"), target);
+                module = LoadLibraryEx(target, IntPtr.Zero, 0x20);   // LOAD_LIBRARY_AS_IMAGE_RESOURCE: mapped as an image
+                bool locked = false;
+                try { File.Delete(target); } catch (Exception) { locked = true; }
+                if (!locked)
+                {
+                    Console.WriteLine("[SKIP] a DLL in use (could be deleted)");
+                    return;
+                }
+                File.WriteAllText(target + ".new", "new version");
+                s_restartDeletes.Clear();
+                bool replaced = false;
+                try { Installer.ReplaceFile(target + ".new", target); replaced = true; } catch (Exception) { }
+                Check(replaced && File.ReadAllText(target) == "new version" && s_restartDeletes.Count == 1
+                    && s_restartDeletes[0].StartsWith(target + GameDeployer.OldSuffix, StringComparison.OrdinalIgnoreCase) && File.Exists(s_restartDeletes[0]),
+                    "a DLL in use is replaced, the old one goes at the next restart");
+                FreeLibrary(module);
+                module = IntPtr.Zero;
+
+                // Uninstalling with the DLL in use.
+                string inUse = Path.Combine(dir, "bin", "upscalers", "libxess.dll");
+                Directory.CreateDirectory(Path.GetDirectoryName(inUse));
+                File.Copy(Path.Combine(system, "version.dll"), inUse);
+                module = LoadLibraryEx(inUse, IntPtr.Zero, 0x20);
+                s_restartDeletes.Clear();
+                var failed = Installer.RemoveFiles(dir, Enumerable.Empty<string>(), false, null);
+                Check(failed.Count == 0 && !File.Exists(inUse) && s_restartDeletes.Count == 2
+                    && s_restartDeletes[1] == Path.Combine(dir, "bin", "upscalers"), "uninstalling: a DLL in use goes at the next restart, its folder after it");
+            }
+            finally
+            {
+                if (module != IntPtr.Zero)
+                    FreeLibrary(module);
+                DeleteTree(dir);
+            }
+        }
+
+        static void CrashReports()
+        {
+            string exe = @"D:\Games\Foo\game.exe";
+            string own = "Faulting application name: game.exe, version: 1.0.0.0\r\nFaulting application path: D:\\Games\\Foo\\game.exe\r\n";
+            string other = "Faulting application name: game.exe, version: 1.0.0.0\r\nFaulting application path: E:\\Other\\game.exe\r\n";
+            Check(Diagnostics.IsAbout(own, exe, "game.exe"), "a crash report of the game's program");
+            Check(!Diagnostics.IsAbout(other, exe, "game.exe"), "a program of the same name in another folder is left out");
+            Check(Diagnostics.IsAbout("Problem signature:\r\nP1: game.exe\r\nP2: 1.0.0.0", exe, "game.exe"), "a report naming the program only");
+            Check(!Diagnostics.IsAbout("Faulting application name: mygame.exe, version 1", exe, "game.exe")
+               && !Diagnostics.IsAbout("game.exe.config could not be read", exe, "game.exe"), "the name as a whole word only");
+            Check(!Diagnostics.IsAbout(own, @"D:\Games\Foo\", ""), "no program, no reports");
         }
     }
 }

@@ -56,7 +56,7 @@ namespace Dxup.Manager
                         "The user folder, user and computer names are replaced by %USERPROFILE%, <user> and <pc>.\r\n");
                     AddText(zip, "system.txt", SystemInfo(game, dxupVersion));
                     AddText(zip, "settings.txt", games + LocalConfig(game));
-                    if (Directory.Exists(game.Dir))
+                    if (GameDeployer.FolderExists(game))
                     {
                         var logs = Directory.GetFiles(game.Dir, "logdxup*.log")
                             .Concat(Directory.GetFiles(game.Dir, "dxup_upscaler_*.txt"))
@@ -74,7 +74,7 @@ namespace Dxup.Manager
                         foreach (var frame in glitches)
                             AddPng(zip, "glitches/" + Path.GetFileNameWithoutExtension(frame.Name) + ".png", frame.FullName);
                     }
-                    AddText(zip, "crashes.txt", Crashes(game.Exe));
+                    AddText(zip, "crashes.txt", Crashes(game));
                 }
                 return null;
             }
@@ -116,8 +116,8 @@ namespace Dxup.Manager
 
         static string LocalConfig(GameEntry game)
         {
-            string path = Path.Combine(game.Dir, "dxup.conf");
-            return File.Exists(path) ? "\r\n# dxup.conf in the game folder (takes precedence):\r\n" + File.ReadAllText(path) : "";
+            return GameDeployer.HasLocalConfig(game)
+                ? "\r\n# dxup.conf in the game folder (takes precedence):\r\n" + File.ReadAllText(Path.Combine(game.Dir, "dxup.conf")) : "";
         }
 
         static string SystemInfo(GameEntry game, string dxupVersion)
@@ -145,6 +145,11 @@ namespace Dxup.Manager
                     string.Join(", ", pe.Imports.Where(i => i.StartsWith("d3d", StringComparison.OrdinalIgnoreCase)
                         || i.StartsWith("dxgi", StringComparison.OrdinalIgnoreCase) || i.StartsWith("ddraw", StringComparison.OrdinalIgnoreCase))));
             text.AppendLine("DXUP active: " + (game.Enabled ? "yes" : "no"));
+            if (!GameDeployer.FolderExists(game))
+            {
+                text.AppendLine("Game folder not found.");
+                return text.ToString();
+            }
             text.AppendLine("Diagnostics on: " + string.Join(", ", DiagnosticMarkers.All.Where(m => DiagnosticMarkers.IsOn(game.Dir, m))));
             text.AppendLine("DLLs in the game folder:");
             foreach (string dll in DxupInstall.Dlls.Concat(DxupInstall.LegacyDlls))
@@ -180,10 +185,35 @@ namespace Dxup.Manager
             return text;
         }
 
+        // Whether an error report is about the game's program: it names its
+        // path, or its name as a whole word and no other folder's program of
+        // that name (Application Error gives name and path, Windows Error
+        // Reporting often the name only). Reports of other programs stay
+        // out of the package.
+        public static bool IsAbout(string message, string exePath, string exeName)
+        {
+            if (string.IsNullOrEmpty(message) || string.IsNullOrEmpty(exeName))
+                return false;
+            if (!string.IsNullOrEmpty(exePath) && message.IndexOf(exePath, StringComparison.OrdinalIgnoreCase) >= 0)
+                return true;
+            bool named = false;
+            foreach (Match match in Regex.Matches(message, @"(?<![\w.\-])" + Regex.Escape(exeName) + @"(?![\w.\-])", RegexOptions.IgnoreCase))
+            {
+                char before = match.Index > 0 ? message[match.Index - 1] : ' ';
+                if (before == '\\' || before == '/')
+                    return false;
+                named = true;
+            }
+            return named;
+        }
+
         // Application errors and Windows error reports of the game's program
         // in the last two weeks.
-        static string Crashes(string exe)
+        static string Crashes(GameEntry game)
         {
+            string exe = game.Exe;
+            if (string.IsNullOrEmpty(exe))
+                return "No program is set for the game: no error reports collected.\r\n";
             var text = new StringBuilder();
             try
             {
@@ -198,7 +228,7 @@ namespace Dxup.Manager
                         {
                             string message;
                             try { message = record.FormatDescription(); } catch (Exception) { message = null; }
-                            if (message == null || message.IndexOf(exe, StringComparison.OrdinalIgnoreCase) < 0)
+                            if (!IsAbout(message, game.ExePath, exe))
                                 continue;
                             text.AppendLine(record.TimeCreated?.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture) + " " + record.ProviderName);
                             text.AppendLine(message.Trim());

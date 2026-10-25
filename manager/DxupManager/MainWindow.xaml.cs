@@ -46,7 +46,10 @@ namespace Dxup.Manager
                     element.Visibility = Visibility.Collapsed;
             GameList.ItemsSource = m_games;
             m_view = CollectionViewSource.GetDefaultView(m_games);
-            var entries = GamesConfig.Load(m_install.GamesConfigPath);
+            // The other lines of games.cfg (comments, other sections) stay
+            // when the manager saves it.
+            m_document = GamesConfig.LoadDocument(m_install.GamesConfigPath);
+            var entries = m_document.Games;
             foreach (var entry in entries)
                 m_games.Add(new GameItem(entry));
             // The window shows at once; the folders are checked in the
@@ -69,45 +72,60 @@ namespace Dxup.Manager
         }
 
         readonly ICollectionView m_view;
+        readonly GamesDocument m_document;
         int m_refresh;   // the newest refresh; an older one that ends later is dropped
 
         // ---- Settings lists ----
 
         void FillOptions()
         {
-            AnisotropyBox.ItemsSource = new[] {
+            Func<object, string> times = value => Convert.ToString(value, CultureInfo.InvariantCulture) + "x";
+            Func<object, string> plain = value => Convert.ToString(value, CultureInfo.InvariantCulture);
+            SetOptions(AnisotropyBox, times,
                 new Option(Loc.T("OptGame"), null), new Option(Loc.T("OptOff"), 0), new Option("2x", 2),
-                new Option("4x", 4), new Option("8x", 8), new Option("16x", 16) };
-            MsaaBox.ItemsSource = new[] {
-                new Option(Loc.T("OptGame"), null), new Option("2x", 2), new Option("4x", 4), new Option("8x", 8) };
-            ScopeBox.ItemsSource = new[] {
-                new Option(Loc.T("OptScopeGeometry"), false), new Option(Loc.T("OptScopeAll"), true) };
-            SgssaaBox.ItemsSource = new[] {
-                new Option(Loc.T("OptOff"), "off"), new Option(Loc.T("OptSgssaaAlpha"), "alpha"), new Option(Loc.T("OptSgssaaFull"), "true") };
-            UpscalerBox.ItemsSource = new[] {
+                new Option("4x", 4), new Option("8x", 8), new Option("16x", 16));
+            SetOptions(MsaaBox, times,
+                new Option(Loc.T("OptGame"), null), new Option("2x", 2), new Option("4x", 4), new Option("8x", 8));
+            SetOptions(ScopeBox, plain,
+                new Option(Loc.T("OptScopeGeometry"), false), new Option(Loc.T("OptScopeAll"), true));
+            SetOptions(SgssaaBox, plain,
+                new Option(Loc.T("OptOff"), "off"), new Option(Loc.T("OptSgssaaAlpha"), "alpha"), new Option(Loc.T("OptSgssaaFull"), "true"));
+            SetOptions(UpscalerBox, plain,
                 new Option(Loc.T("OptOff"), "off"), new Option("NVIDIA DLSS", "dlss"), new Option("AMD FSR", "fsr"),
-                new Option("Intel XeSS", "xess") };
-            VSyncBox.ItemsSource = new[] {
-                new Option(Loc.T("OptGame"), null), new Option(Loc.T("OptOff"), 0), new Option(Loc.T("OptOn"), 1) };
-            FramesBox.ItemsSource = new[] {
-                new Option(Loc.T("OptGame"), null), new Option("1", 1), new Option("2", 2), new Option("3", 3), new Option("4", 4) };
-            RenderScaleBox.ItemsSource = new[] {
-                new Option(Loc.T("OptOff"), null), new Option("90 %", 90), new Option("75 %", 75), new Option("67 %", 67),
-                new Option("50 %", 50) };
+                new Option("Intel XeSS", "xess"));
+            SetOptions(VSyncBox, value => Loc.F("OptVSyncInterval", value),
+                new Option(Loc.T("OptGame"), null), new Option(Loc.T("OptOff"), 0), new Option(Loc.T("OptOn"), 1));
+            SetOptions(FramesBox, plain,
+                new Option(Loc.T("OptGame"), null), new Option("1", 1), new Option("2", 2), new Option("3", 3), new Option("4", 4));
+            SetOptions(RenderScaleBox, value => ((double)value).ToString("0.##", CultureInfo.CurrentCulture) + " %",
+                new Option(Loc.T("OptOff"), null), new Option("90 %", 90.0), new Option("75 %", 75.0), new Option("67 %", 67.0),
+                new Option("50 %", 50.0));
             AdapterBox.ItemsSource = AdapterOptions(null);
-            SpoofBox.ItemsSource = new[] {
+            SetOptions(SpoofBox, plain,
                 new Option(Loc.T("OptRealGpu"), null), new Option("NVIDIA", "nvidia"), new Option("AMD", "amd"),
-                new Option("Intel", "intel") };
-            FloatBox.ItemsSource = new[] {
-                new Option(Loc.T("OptAuto"), null), new Option(Loc.T("OptFloatStrict"), "strict"), new Option(Loc.T("OptFloatIeee"), "off") };
-            NanDepthBox.ItemsSource = new[] {
-                new Option(Loc.T("OptNanAuto"), null), new Option(Loc.T("OptNanDiscard"), "discard"), new Option(Loc.T("OptNanZero"), "zero") };
-            CompilerBox.ItemsSource = new[] {
-                new Option(Loc.T("OptCompilerDxup"), false), new Option(Loc.T("OptCompilerFxc"), true) };
-            UavBox.ItemsSource = new[] {
-                new Option(Loc.T("OptAuto"), null), new Option(Loc.T("OptUavRelaxed"), true), new Option(Loc.T("OptUavStrict"), false) };
-            LazyBox.ItemsSource = new[] {
-                new Option(Loc.T("OptLazyAuto"), null), new Option(Loc.T("OptLazyOn"), true), new Option(Loc.T("OptLazyOff"), false) };
+                new Option("Intel", "intel"));
+            SetOptions(FloatBox, plain,
+                new Option(Loc.T("OptAuto"), null), new Option(Loc.T("OptFloatStrict"), "strict"), new Option(Loc.T("OptFloatIeee"), "off"));
+            SetOptions(NanDepthBox, plain,
+                new Option(Loc.T("OptNanAuto"), null), new Option(Loc.T("OptNanDiscard"), "discard"), new Option(Loc.T("OptNanZero"), "zero"));
+            SetOptions(CompilerBox, plain,
+                new Option(Loc.T("OptCompilerDxup"), false), new Option(Loc.T("OptCompilerFxc"), true));
+            SetOptions(UavBox, plain,
+                new Option(Loc.T("OptAuto"), null), new Option(Loc.T("OptUavRelaxed"), true), new Option(Loc.T("OptUavStrict"), false));
+            SetOptions(LazyBox, plain,
+                new Option(Loc.T("OptLazyAuto"), null), new Option(Loc.T("OptLazyOn"), true), new Option(Loc.T("OptLazyOff"), false));
+        }
+
+        // The choices of each list. A value of games.cfg that is none of them
+        // (msaaSamples = 16, maxFrameLatency = 8, renderScale = 0.8) is shown
+        // as one more choice, so that saving another setting keeps it.
+        readonly Dictionary<ComboBox, (Option[] presets, Func<object, string> text)> m_presets =
+            new Dictionary<ComboBox, (Option[], Func<object, string>)>();
+
+        void SetOptions(ComboBox box, Func<object, string> text, params Option[] presets)
+        {
+            m_presets[box] = (presets, text);
+            box.ItemsSource = presets;
         }
 
         // The graphics cards Windows knows (WMI takes a moment: they come in
@@ -159,8 +177,15 @@ namespace Dxup.Manager
             return options;
         }
 
-        static void Select(ComboBox box, object value)
+        void Select(ComboBox box, object value)
         {
+            if (m_presets.TryGetValue(box, out var list))
+            {
+                var (options, selected) = Option.Including(list.presets, value, list.text);
+                box.ItemsSource = options;
+                box.SelectedItem = selected;
+                return;
+            }
             foreach (Option option in box.ItemsSource)
             {
                 if (Equals(option.Value, value))
@@ -186,8 +211,7 @@ namespace Dxup.Manager
             int refresh = ++m_refresh;
             UpdateEmptyText();
             var items = m_games.ToList();
-            var states = await Task.Run(() => items.Select(item => (state: m_deployer.State(item.Entry),
-                legacy: GameDeployer.DllsFor(item.Entry).Count > DxupInstall.Dlls.Length)).ToList());
+            var states = await Task.Run(() => items.Select(item => CheckGame(item.Entry)).ToList());
             if (refresh != m_refresh)
                 return;
             for (int i = 0; i < items.Count; i++)
@@ -197,6 +221,21 @@ namespace Dxup.Manager
             OutdatedText.Text = Loc.F("OutdatedBanner", outdated);
             if (Selected != null && items.Contains(Selected))
                 ShowDetails();
+        }
+
+        // A game's state and whether it gets the Direct3D 7-9 DLLs. A game
+        // that cannot be checked (a folder that cannot be read) counts as
+        // one whose folder is missing; the others are checked still.
+        (GameState state, bool legacy) CheckGame(GameEntry entry)
+        {
+            try
+            {
+                return (m_deployer.State(entry), GameDeployer.DllsFor(entry).Count > DxupInstall.Dlls.Length);
+            }
+            catch (Exception)
+            {
+                return (entry.Enabled ? GameState.FolderMissing : GameState.Inactive, false);
+            }
         }
 
         void UpdateEmptyText()
@@ -243,7 +282,12 @@ namespace Dxup.Manager
 
             var settings = entry.Settings;
             Select(AnisotropyBox, settings.Anisotropy);
-            LodSlider.Value = settings.LodBias ?? 0.0;
+            // A bias beyond the slider's -2..2 widens it (to whole numbers,
+            // so that its ticks stay on quarters) rather than being cut off.
+            double lod = settings.LodBias ?? 0.0;
+            LodSlider.Minimum = Math.Min(-2.0, Math.Floor(lod));
+            LodSlider.Maximum = Math.Max(2.0, Math.Ceiling(lod));
+            LodSlider.Value = lod;
             UpdateLodText();
             Select(MsaaBox, settings.MsaaSamples);
             ForceBox.IsChecked = settings.MsaaForce;
@@ -274,7 +318,7 @@ namespace Dxup.Manager
             HoistingBox.IsChecked = settings.BarrierHoisting;
             Select(UavBox, settings.RelaxedUavBarriers);
             Select(LazyBox, settings.LazyTargets);
-            Select(VSyncBox, settings.SyncInterval.HasValue ? (object)(settings.SyncInterval.Value == 0 ? 0 : 1) : null);
+            Select(VSyncBox, settings.SyncInterval);
             Select(FramesBox, settings.MaxFrameLatency);
             AsyncBox.IsChecked = settings.AsyncShaders;
             PrecompileBox.IsChecked = settings.ShaderPrecompile;
@@ -539,7 +583,7 @@ namespace Dxup.Manager
             UpscalerAutoBox.IsEnabled = (Value<string>(UpscalerBox) ?? "off") != "off";
             UpscalerInjectBox.IsEnabled = UpscalerAutoBox.IsEnabled;
             // The sharpening of DXUP's upscale at Present.
-            SharpnessSlider.IsEnabled = SpatialBox.IsChecked == true || IntValue(RenderScaleBox).HasValue;
+            SharpnessSlider.IsEnabled = SpatialBox.IsChecked == true || (RenderScaleBox.SelectedItem as Option)?.Value != null;
         }
 
         void UpdateLodText()
@@ -572,7 +616,7 @@ namespace Dxup.Manager
             settings.UpscalerAuto = UpscalerAutoBox.IsChecked == true;
             settings.UpscalerInject = UpscalerInjectBox.IsChecked == true;
             settings.SpatialUpscale = SpatialBox.IsChecked == true;
-            settings.RenderScale = IntValue(RenderScaleBox);
+            settings.RenderScale = (RenderScaleBox.SelectedItem as Option)?.Value as double?;
             settings.Adapter = Value<string>(AdapterBox);
             settings.SpoofVendor = Value<string>(SpoofBox);
             // Ids DXUP cannot read are left out (the box shows what is kept).
@@ -658,7 +702,7 @@ namespace Dxup.Manager
         {
             try
             {
-                GamesConfig.Save(m_install.GamesConfigPath, m_games.Select(item => item.Entry));
+                GamesConfig.Save(m_install.GamesConfigPath, m_games.Select(item => item.Entry), m_document);
                 StatusText.Text = Loc.T("StatusSaved");
                 return true;
             }
@@ -805,19 +849,16 @@ namespace Dxup.Manager
                 return;
 
             // A dxup.conf of the game's folder would take precedence: its
-            // settings move into games.cfg.
+            // settings move into games.cfg. It is renamed once they are
+            // saved there; until then it stays as it was.
             string conf = Path.Combine(dir, "dxup.conf");
-            bool imported = false;
+            bool importing = false;
             if (File.Exists(conf))
             {
                 try
                 {
                     GamesConfig.Import(entry, File.ReadAllText(conf));
-                    string target = conf + ".imported";
-                    if (File.Exists(target))
-                        File.Delete(target);
-                    File.Move(conf, target);
-                    imported = true;
+                    importing = true;
                 }
                 catch (Exception) { }
             }
@@ -830,10 +871,29 @@ namespace Dxup.Manager
             entry.Enabled = true;
             var item = new GameItem(entry);
             m_games.Add(item);
-            Save();
+            bool saved = Save();
+            bool imported = false;
+            if (importing && saved)
+            {
+                try
+                {
+                    File.Move(conf, FreeName(conf + ".imported"));
+                    imported = true;
+                }
+                catch (Exception) { }
+            }
             RefreshAll();
             GameList.SelectedItem = item;
             StatusText.Text = Loc.F("StatusAdded", entry.Name) + (imported ? "  " + Loc.T("Imported") : "");
+        }
+
+        // The path, or with .2, .3 ... when a file has it (an earlier import).
+        static string FreeName(string path)
+        {
+            string name = path;
+            for (int number = 2; File.Exists(name); number++)
+                name = path + "." + number.ToString(CultureInfo.InvariantCulture);
+            return name;
         }
 
         static string GameName(string exePath)

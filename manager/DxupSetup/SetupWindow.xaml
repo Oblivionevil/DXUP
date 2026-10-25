@@ -35,7 +35,7 @@
 
       <!-- Uninstall confirmation -->
       <StackPanel x:Name="UninstallPage" Visibility="Collapsed">
-        <TextBlock Text="{DynamicResource UninstallInfo}" TextWrapping="Wrap" />
+        <TextBlock x:Name="UninstallText" Text="{DynamicResource UninstallInfo}" TextWrapping="Wrap" />
         <CheckBox x:Name="KeepBox" Content="{DynamicResource KeepSettings}" Margin="0,16,0,0" />
       </StackPanel>
 

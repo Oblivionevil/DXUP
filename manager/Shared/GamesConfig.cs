@@ -24,7 +24,7 @@ namespace Dxup.Shared
         public bool UpscalerAuto;        // find the game's TAA pass without a profile
         public bool UpscalerInject;      // DXUP's own temporal anti-aliasing for games without TAA
         public bool SpatialUpscale;      // scale a back buffer smaller than the window up at Present
-        public int? RenderScale;         // percent of the asked back buffer size (33-99), null = all
+        public double? RenderScale;      // percent of the asked back buffer size (33-99.99), null = all
         public string Adapter;           // part of the GPU's name in lower case, "warp"; null = the game's choice
         public string SpoofVendor;       // nvidia, amd, intel: the GPU the game sees; null = the real one
         public float? SpatialSharpness;  // sharpening of DXUP's upscale at Present (0-1); null = DXUP's 0.2
@@ -123,7 +123,8 @@ namespace Dxup.Shared
                     return true;
                 case "dxgi.renderscale":
                     float? scale = ParseFloat(value);
-                    RenderScale = scale.HasValue && scale.Value < 1.0f ? (int?)Math.Max(33, (int)Math.Round(scale.Value * 100.0f)) : null;
+                    // As DXUP reads it (at least 0.33), to a hundredth of a percent.
+                    RenderScale = scale.HasValue && scale.Value < 1.0f ? (double?)Math.Max(33.0, Math.Round(scale.Value * 100.0, 2)) : null;
                     return true;
                 default: return false;
             }
@@ -133,7 +134,8 @@ namespace Dxup.Shared
         public IEnumerable<KeyValuePair<string, string>> Entries()
         {
             if (Anisotropy.HasValue) yield return Entry("d3d11.samplerAnisotropy", Anisotropy.Value.ToString(CultureInfo.InvariantCulture));
-            if (LodBias.HasValue && LodBias.Value != 0.0f) yield return Entry("d3d11.samplerLodBias", LodBias.Value.ToString("0.##", CultureInfo.InvariantCulture));
+            // Floats with the digits they were written with (-0.333 stays so).
+            if (LodBias.HasValue && LodBias.Value != 0.0f) yield return Entry("d3d11.samplerLodBias", LodBias.Value.ToString("0.#####", CultureInfo.InvariantCulture));
             if (MsaaSamples.HasValue) yield return Entry("d3d11.msaaSamples", MsaaSamples.Value.ToString(CultureInfo.InvariantCulture));
             if (MsaaForce) yield return Entry("d3d11.msaaForce", "true");
             if (MsaaScopeAll) yield return Entry("d3d11.msaaScope", "all");
@@ -147,11 +149,11 @@ namespace Dxup.Shared
             if (UpscalerInject) yield return Entry("d3d11.upscalerInject", "true");
             if (SpatialUpscale) yield return Entry("dxgi.upscale", "spatial");
             if (RenderScale.HasValue && RenderScale.Value < 100)
-                yield return Entry("dxgi.renderScale", (RenderScale.Value / 100.0f).ToString("0.##", CultureInfo.InvariantCulture));
+                yield return Entry("dxgi.renderScale", (RenderScale.Value / 100.0).ToString("0.######", CultureInfo.InvariantCulture));
             if (!string.IsNullOrEmpty(Adapter)) yield return Entry("dxgi.adapter", Adapter);
             if (!string.IsNullOrEmpty(SpoofVendor)) yield return Entry("dxgi.spoofVendor", SpoofVendor);
             if (SpatialSharpness.HasValue)
-                yield return Entry("dxgi.upscaleSharpness", SpatialSharpness.Value.ToString("0.##", CultureInfo.InvariantCulture));
+                yield return Entry("dxgi.upscaleSharpness", SpatialSharpness.Value.ToString("0.#####", CultureInfo.InvariantCulture));
             if (!string.IsNullOrEmpty(CustomVendorId)) yield return Entry("dxgi.customVendorId", CustomVendorId);
             if (!string.IsNullOrEmpty(CustomDeviceId)) yield return Entry("dxgi.customDeviceId", CustomDeviceId);
             if (!string.IsNullOrEmpty(CustomDeviceDesc)) yield return Entry("dxgi.customDeviceDesc", CustomDeviceDesc);
@@ -224,9 +226,28 @@ namespace Dxup.Shared
         public GameSettings Settings = new GameSettings();
         // Lines DXUP or a newer manager knows, kept as they are.
         public List<KeyValuePair<string, string>> Extra = new List<KeyValuePair<string, string>>();
+        // Comments and other lines of the block without a setting, as written.
+        public List<string> Lines = new List<string>();
 
         // Hand-edited files may hold characters paths cannot.
         public string ExePath => Dir.TrimEnd('\\', '/') + "\\" + Exe;
+
+        // Whether dir and exe can be used as paths: a hand-edited games.cfg
+        // may hold characters they cannot (" < > | and control characters),
+        // which the file functions refuse with an exception.
+        public bool ValidPath =>
+            Dir.Length != 0 && Dir.IndexOfAny(Path.GetInvalidPathChars()) < 0
+            && Exe.IndexOfAny(Path.GetInvalidFileNameChars()) < 0;
+    }
+
+    // What games.cfg holds besides the games' blocks, kept as written when
+    // DXUP Manager saves it: lines before the first section (the user's
+    // comments), other sections and [game] blocks without a dir.
+    public sealed class GamesDocument
+    {
+        public List<GameEntry> Games = new List<GameEntry>();
+        public List<string> Head = new List<string>();
+        public List<string> Tail = new List<string>();
     }
 
     // games.cfg in the DXUP installation: one [game] block per game, read
@@ -237,26 +258,63 @@ namespace Dxup.Shared
     {
         public const string FileName = "games.cfg";
 
-        public static List<GameEntry> Parse(string text)
+        // The comment Format starts the file with (not kept as the user's).
+        static readonly string[] s_header =
         {
-            var games = new List<GameEntry>();
+            "# DXUP settings per game, written by DXUP Manager.",
+            "# DXUP's DLLs use the block whose dir is the folder they were copied to.",
+        };
+
+        public static List<GameEntry> Parse(string text) => ParseDocument(text).Games;
+
+        public static GamesDocument ParseDocument(string text)
+        {
+            var document = new GamesDocument();
             GameEntry current = null;
+            List<string> block = null;     // the [game] block as written
+            bool section = false;          // past the first section header
             foreach (string raw in text.Replace("\r\n", "\n").Split('\n'))
             {
-                string line = raw.Trim().TrimStart((char)0xFEFF);
-                if (line.Length == 0 || line[0] == '#')
-                    continue;
-                if (line[0] == '[')
+                string written = raw.TrimEnd('\r').TrimStart((char)0xFEFF);
+                string line = raw.Trim().TrimStart((char)0xFEFF).Trim();
+                if (line.Length != 0 && line[0] == '[')
                 {
+                    EndBlock(document, current, block);
+                    current = null;
+                    block = null;
+                    section = true;
                     if (line.Equals("[game]", StringComparison.OrdinalIgnoreCase))
-                        games.Add(current = new GameEntry());
+                    {
+                        current = new GameEntry();
+                        block = new List<string> { written };
+                    }
                     else
-                        current = null;
+                    {
+                        // Another program's section: DXUP's DLLs skip it.
+                        document.Tail.Add(written);
+                    }
                     continue;
                 }
-                int equals = line.IndexOf('=');
-                if (current == null || equals < 0)
+                if (!section)
+                {
+                    if (!s_header.Contains(line))
+                        document.Head.Add(written);
                     continue;
+                }
+                if (current == null)
+                {
+                    document.Tail.Add(written);
+                    continue;
+                }
+                block.Add(written);
+                if (line.Length == 0)
+                    continue;
+                int equals = line.IndexOf('=');
+                if (line[0] == '#' || equals < 0)
+                {
+                    current.Lines.Add(line);
+                    continue;
+                }
                 string key = line.Substring(0, equals).Trim();
                 string value = line.Substring(equals + 1).Trim();
                 switch (key.ToLowerInvariant())
@@ -275,17 +333,43 @@ namespace Dxup.Shared
                         break;
                 }
             }
-            games.RemoveAll(game => game.Dir.Length == 0);
-            return games;
+            EndBlock(document, current, block);
+            Trim(document.Head, true);
+            Trim(document.Tail, false);
+            return document;
+        }
+
+        // A block with a dir is a game; one without stays as written.
+        static void EndBlock(GamesDocument document, GameEntry game, List<string> block)
+        {
+            if (game == null)
+                return;
+            if (game.Dir.Length != 0)
+                document.Games.Add(game);
+            else
+                document.Tail.AddRange(block);
+        }
+
+        // Without the blank lines Format puts between blocks.
+        static void Trim(List<string> lines, bool start)
+        {
+            while (lines.Count != 0 && lines[lines.Count - 1].Trim().Length == 0)
+                lines.RemoveAt(lines.Count - 1);
+            while (start && lines.Count != 0 && lines[0].Trim().Length == 0)
+                lines.RemoveAt(0);
         }
 
         static bool IsTrue(string value) => value.Equals("true", StringComparison.OrdinalIgnoreCase) || value == "1";
 
-        public static string Format(IEnumerable<GameEntry> games)
+        // The games and, from the document they were read with, the lines
+        // the manager does not know.
+        public static string Format(IEnumerable<GameEntry> games, GamesDocument kept = null)
         {
             var text = new StringBuilder();
-            text.Append("# DXUP settings per game, written by DXUP Manager.\n");
-            text.Append("# DXUP's DLLs use the block whose dir is the folder they were copied to.\n");
+            foreach (string line in s_header)
+                text.Append(line).Append('\n');
+            foreach (string line in kept?.Head ?? Enumerable.Empty<string>())
+                text.Append(line).Append('\n');
             foreach (var game in games)
             {
                 text.Append("\n[game]\n");
@@ -301,6 +385,14 @@ namespace Dxup.Shared
                     Line(text, entry.Key, entry.Value);
                 foreach (var entry in game.Extra)
                     Line(text, entry.Key, entry.Value);
+                foreach (string line in game.Lines)
+                    text.Append(line.Replace("\r", "").Replace("\n", " ")).Append('\n');
+            }
+            if (kept != null && kept.Tail.Count != 0)
+            {
+                text.Append('\n');
+                foreach (string line in kept.Tail)
+                    text.Append(line).Append('\n');
             }
             return text.ToString();
         }
@@ -311,19 +403,22 @@ namespace Dxup.Shared
             text.Append(key).Append(" = ").Append(value.Replace("\r", "").Replace("\n", " ")).Append('\n');
         }
 
-        public static List<GameEntry> Load(string path)
+        public static List<GameEntry> Load(string path) => LoadDocument(path).Games;
+
+        public static GamesDocument LoadDocument(string path)
         {
             if (!File.Exists(path))
-                return new List<GameEntry>();
-            return Parse(File.ReadAllText(path, Encoding.UTF8));
+                return new GamesDocument();
+            return ParseDocument(File.ReadAllText(path, Encoding.UTF8));
         }
 
         // Written to a temporary file and swapped in, so a game starting
-        // meanwhile reads either the old or the new file.
-        public static void Save(string path, IEnumerable<GameEntry> games)
+        // meanwhile reads either the old or the new file. kept: the
+        // document the games were loaded with, whose other lines stay.
+        public static void Save(string path, IEnumerable<GameEntry> games, GamesDocument kept = null)
         {
             string temp = path + ".new";
-            File.WriteAllText(temp, Format(games), new UTF8Encoding(false));
+            File.WriteAllText(temp, Format(games, kept), new UTF8Encoding(false));
             if (File.Exists(path))
                 File.Replace(temp, path, null);
             else

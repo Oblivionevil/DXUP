@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Text;
@@ -14,6 +15,8 @@ namespace Dxup.Shared
         Outdated,      // DXUP's DLLs in the folder differ from the installed ones (or the
                        // executable lost the large address aware bit, e.g. to an update)
         Missing,       // set up, but DXUP's DLLs are gone (e.g. the launcher repaired the game)
+        FolderMissing, // set up, but the game's folder is gone or cannot be reached (a drive
+                       // that is not connected, a path with characters paths cannot hold)
     }
 
     // Puts DXUP's DLLs into a game's folder and takes them out again. The
@@ -31,6 +34,10 @@ namespace Dxup.Shared
 
         public GameState State(GameEntry game)
         {
+            if (!game.Enabled)
+                return GameState.Inactive;
+            if (!FolderExists(game))
+                return GameState.FolderMissing;
             bool any = false, all = true, current = true;
             string sourceDir = SourceDir(game);
             foreach (string dll in DllsFor(game))
@@ -48,8 +55,6 @@ namespace Dxup.Shared
                 if (DxupInstall.Hash(target) != DxupInstall.Hash(source))
                     current = false;
             }
-            if (!game.Enabled)
-                return GameState.Inactive;
             if (!any)
                 return GameState.Missing;
             if (LargeAddressAware.Wanted(game) && LargeAddressAware.Get(game.ExePath) == false)
@@ -67,6 +72,8 @@ namespace Dxup.Shared
         public static List<string> DllsFor(GameEntry game)
         {
             var dlls = new List<string>(DxupInstall.Dlls);
+            if (!game.ValidPath)
+                return dlls;
             HashSet<string> used = null;
             foreach (string dll in DxupInstall.LegacyDlls)
             {
@@ -98,7 +105,7 @@ namespace Dxup.Shared
                     if (pe?.ImportsDll(dll) == true)
                         used.Add(dll);
                 }
-                // LoadLibrary("d3d9.dll"): the name is in the file.
+                // LoadLibrary("d3d9.dll") or LoadLibraryW(L"d3d9.dll"): the name is in the file.
                 used.UnionWith(NamesIn(exe, DxupInstall.LegacyDlls.Where(dll => !used.Contains(dll)).ToList()));
             }
             try
@@ -148,15 +155,33 @@ namespace Dxup.Shared
         }
 
         // Which of the names (lower case ASCII) occur in the file, in any
-        // case: one pass over the file in large blocks, without decoding it.
-        static IEnumerable<string> NamesIn(string path, IList<string> names)
+        // case, as ASCII or UTF-16 (wide string literals): one pass over the
+        // file in large blocks, without decoding it.
+        public static IEnumerable<string> NamesIn(string path, IList<string> names)
         {
             var found = new List<string>();
             if (names.Count == 0)
                 return found;
-            var patterns = names.Select(name => Encoding.ASCII.GetBytes(name.ToLowerInvariant())).ToArray();
-            var done = new bool[patterns.Length];
-            int longest = patterns.Max(pattern => pattern.Length);
+            // Each name twice: its ASCII bytes, and with a zero byte after
+            // each (UTF-16LE). Letters match in either case (bit 0x20),
+            // digits, dots and the zero bytes exactly.
+            var patterns = new List<(int name, byte[] bytes, byte[] fold)>();
+            for (int n = 0; n < names.Count; n++)
+            {
+                byte[] ascii = Encoding.ASCII.GetBytes(names[n].ToLowerInvariant());
+                patterns.Add((n, ascii, ascii.Select(b => (byte)(b >= 'a' && b <= 'z' ? 0x20 : 0)).ToArray()));
+                byte[] wide = Encoding.Unicode.GetBytes(names[n].ToLowerInvariant());
+                patterns.Add((n, wide, wide.Select(b => (byte)(b >= 'a' && b <= 'z' ? 0x20 : 0)).ToArray()));
+            }
+            var done = new bool[names.Count];
+            int longest = patterns.Max(pattern => pattern.bytes.Length);
+            // The bytes a name can start with.
+            var starts = new bool[256];
+            foreach (var (_, bytes, fold) in patterns)
+            {
+                starts[bytes[0]] = true;
+                starts[bytes[0] & ~fold[0]] = true;
+            }
             try
             {
                 using (var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete,
@@ -165,7 +190,7 @@ namespace Dxup.Shared
                     var buffer = new byte[(4 << 20) + longest];
                     int kept = 0;
                     long remaining = stream.Length;
-                    while (remaining > 0 && found.Count < patterns.Length)
+                    while (remaining > 0 && found.Count < names.Count)
                     {
                         int read = stream.Read(buffer, kept, buffer.Length - kept);
                         if (read <= 0)
@@ -176,21 +201,19 @@ namespace Dxup.Shared
                         int scanEnd = remaining > 0 ? Math.Max(0, end - longest + 1) : end;
                         for (int i = 0; i < scanEnd; i++)
                         {
-                            // Bit 0x20 folds ASCII letters to lower case; the names'
-                            // digits and dots already have it.
-                            int first = buffer[i] | 0x20;
-                            for (int p = 0; p < patterns.Length; p++)
+                            if (!starts[buffer[i]])
+                                continue;
+                            foreach (var (name, pattern, fold) in patterns)
                             {
-                                var pattern = patterns[p];
-                                if (done[p] || first != pattern[0] || i + pattern.Length > end)
+                                if (done[name] || (buffer[i] | fold[0]) != pattern[0] || i + pattern.Length > end)
                                     continue;
                                 int j = 1;
-                                while (j < pattern.Length && (buffer[i + j] | 0x20) == pattern[j])
+                                while (j < pattern.Length && (buffer[i + j] | fold[j]) == pattern[j])
                                     j++;
                                 if (j == pattern.Length)
                                 {
-                                    done[p] = true;
-                                    found.Add(names[p]);
+                                    done[name] = true;
+                                    found.Add(names[name]);
                                 }
                             }
                         }
@@ -206,19 +229,26 @@ namespace Dxup.Shared
         // The DLLs for the game's executable: 32-bit games load 32-bit DLLs.
         public string SourceDir(GameEntry game)
         {
-            string exe = string.IsNullOrEmpty(game.Exe) ? null : Path.Combine(game.Dir, game.Exe);
+            string exe = string.IsNullOrEmpty(game.Exe) || !game.ValidPath ? null : game.ExePath;
             var pe = exe != null && File.Exists(exe) ? PeFile.Read(exe) : null;
             return pe != null && pe.Is32Bit ? m_install.BinDir32 : m_install.BinDir;
         }
 
         // A dxup.conf in the game's folder overrides games.cfg.
-        public static bool HasLocalConfig(GameEntry game) => File.Exists(Path.Combine(game.Dir, "dxup.conf"));
+        public static bool HasLocalConfig(GameEntry game) => game.ValidPath && File.Exists(Path.Combine(game.Dir, "dxup.conf"));
+
+        public static bool FolderExists(GameEntry game) => game.ValidPath && Directory.Exists(game.Dir);
 
         // Copies DXUP's DLLs into the game's folder. Returns false and an
         // error text when that failed.
         public bool Install(GameEntry game, out string error)
         {
             error = null;
+            if (!FolderExists(game))
+            {
+                error = Loc.F("ErrFolderMissing", game.Dir);
+                return false;
+            }
             // The executable first (locked while the game runs): when it
             // cannot change, nothing else does.
             bool laaSet = false;
@@ -253,11 +283,19 @@ namespace Dxup.Shared
                         }
                         else
                         {
-                            // Another program's DLL: keep it, never overwrite an older backup.
+                            // Another program's DLL: it is kept. One backed up
+                            // before (the program was updated over DXUP's DLL
+                            // meanwhile) keeps a name of its own; the newest
+                            // comes back when DXUP goes.
                             string backup = target + BackupSuffix;
                             if (File.Exists(backup))
-                                MoveAside(target);
-                            else
+                            {
+                                if (LargeAddressAware.SameContent(target, backup))
+                                    MoveAside(target);
+                                else
+                                    File.Move(backup, OlderBackupName(target));
+                            }
+                            if (File.Exists(target))
                                 File.Move(target, backup);
                         }
                     }
@@ -310,9 +348,25 @@ namespace Dxup.Shared
             return exeError == null;
         }
 
+        // A name for an older backup of another program's DLL: *.dxup-backup.1, .2, ...
+        static string OlderBackupName(string target)
+        {
+            for (int number = 1; ; number++)
+            {
+                string name = target + BackupSuffix + "." + number.ToString(CultureInfo.InvariantCulture);
+                if (!File.Exists(name))
+                    return name;
+            }
+        }
+
         bool RemoveDlls(GameEntry game, IEnumerable<GameEntry> allGames, out string error)
         {
             error = null;
+            // Nothing to take out of a folder that is gone (or on a drive
+            // that is not connected): the game can still be deactivated and
+            // removed from the list.
+            if (!FolderExists(game))
+                return true;
             if (allGames.Any(other => other != game && other.Enabled && SameFolder(other.Dir, game.Dir)))
                 return true;
             try
@@ -343,21 +397,33 @@ namespace Dxup.Shared
             }
         }
 
-        // Deletes a file, or renames it when it is in use and deletes it at
-        // the next restart.
-        static void MoveAside(string path)
+        // Deletes a file, or renames it when it is in use (a loaded DLL or a
+        // running program can be renamed, not deleted) and deletes it at the
+        // next restart. Returns the new name, or null when it is gone.
+        public static string MoveAside(string path)
         {
+            if (!File.Exists(path))
+                return null;
             try
             {
+                var attributes = File.GetAttributes(path);
+                if ((attributes & FileAttributes.ReadOnly) != 0)
+                    File.SetAttributes(path, attributes & ~FileAttributes.ReadOnly);
                 File.Delete(path);
-                return;
+                return null;
             }
             catch (IOException) { }
             catch (UnauthorizedAccessException) { }
-            string old = path + OldSuffix + DateTime.Now.Ticks.ToString();
+            string old = path + OldSuffix + DateTime.Now.Ticks.ToString(CultureInfo.InvariantCulture);
             File.Move(path, old);
-            NativeMethods.MoveFileEx(old, null, NativeMethods.MOVEFILE_DELAY_UNTIL_REBOOT);
+            DeleteAtRestart(old);
+            return old;
         }
+
+        // Windows deletes the file (or empty folder) when it starts next.
+        // Replaced in the tests: it writes to the registry.
+        internal static Action<string> DeleteAtRestart = path =>
+            NativeMethods.MoveFileEx(path, null, NativeMethods.MOVEFILE_DELAY_UNTIL_REBOOT);
 
         // Leftovers of DLLs that were in use when DXUP replaced them.
         public static void CleanOldFiles(string dir)
@@ -412,6 +478,8 @@ namespace Dxup.Shared
         // BattleNetAntiCheat stands for it.
         public static string AntiCheat(GameEntry game)
         {
+            if (!game.ValidPath)
+                return null;
             string[] markers = { "EasyAntiCheat", "BattlEye", "EAAntiCheat", "vgc", "PunkBuster" };
             string dir = game.Dir;
             for (int level = 0; level < 3 && !string.IsNullOrEmpty(dir); level++, dir = Path.GetDirectoryName(dir))

@@ -23,6 +23,8 @@ namespace Dxup.Setup
             Theme.Attach(this);
             m_uninstall = uninstall;
             m_registered = DxupInstall.RegisteredDir();
+            // Closed while it works, the setup would stop halfway.
+            Closing += (s, e) => e.Cancel = m_stage == Stage.Working;
             TitleText.Text = Loc.F("SetupTitle", Installer.Version);
             SubtitleText.Text = Loc.T(uninstall ? "Uninstall" : "Subtitle");
 
@@ -31,7 +33,18 @@ namespace Dxup.Setup
                 OptionsPage.Visibility = Visibility.Collapsed;
                 UninstallPage.Visibility = Visibility.Visible;
                 MainButton.Content = Loc.T("Uninstall");
-                m_dir = m_registered ?? Path.GetDirectoryName(typeof(SetupWindow).Assembly.Location);
+                m_dir = Installer.UninstallFolder(m_registered);
+                // Started outside an installation (the setup from the
+                // downloads folder with /uninstall): there is nothing to
+                // remove there.
+                if (!Installer.MayUninstall(m_dir, m_registered))
+                {
+                    UninstallText.Text = Loc.F("ErrNotInstalled", m_dir);
+                    KeepBox.Visibility = Visibility.Collapsed;
+                    MainButton.Visibility = Visibility.Collapsed;
+                    MainButton.IsEnabled = false;
+                    CancelButton.Content = Loc.T("Close");
+                }
                 return;
             }
             DirBox.Text = m_registered ?? DxupInstall.DefaultDir;
@@ -86,8 +99,23 @@ namespace Dxup.Setup
             }
             if (!m_uninstall)
             {
-                try { m_dir = Path.GetFullPath(DirBox.Text.Trim()); }
-                catch (Exception) { return; }
+                // A folder with other files (D:\Games) gets a DXUP folder in
+                // it: the uninstaller removes DXUP's files only, but the
+                // folder should be DXUP's alone.
+                string dir;
+                try { dir = Installer.InstallFolder(DirBox.Text.Trim(), m_registered); }
+                catch (Exception)
+                {
+                    Dialog.Show(this, Loc.F("ErrFolder", DirBox.Text.Trim()), Dialog.Kind.Error);
+                    return;
+                }
+                if (dir == null)
+                {
+                    Dialog.Show(this, Loc.F("ErrFolderNotEmpty", DirBox.Text.Trim()), Dialog.Kind.Error);
+                    return;
+                }
+                m_dir = dir;
+                DirBox.Text = dir;
             }
             bool desktop = DesktopBox.IsChecked == true;
             bool keep = KeepBox.IsChecked == true;
@@ -98,7 +126,7 @@ namespace Dxup.Setup
             ProgressPage.Visibility = Visibility.Visible;
             MainButton.IsEnabled = false;
             CancelButton.IsEnabled = false;
-            LogBox.Text = Loc.T(m_uninstall ? "Uninstalling" : "Installing") + Environment.NewLine;
+            LogBox.Text = Loc.F(m_uninstall ? "Uninstalling" : "Installing", m_dir) + Environment.NewLine;
 
             int steps = 0;
             var installer = new Installer

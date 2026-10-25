@@ -13,14 +13,14 @@
   <sys:String x:Key="Cancel">Abbrechen</sys:String>
   <sys:String x:Key="Close">Schließen</sys:String>
   <sys:String x:Key="Finish">Fertig stellen</sys:String>
-  <sys:String x:Key="Installing">DXUP wird installiert …</sys:String>
+  <sys:String x:Key="Installing">DXUP wird in {0} installiert …</sys:String>
   <sys:String x:Key="Done">DXUP {0} ist installiert.</sys:String>
   <sys:String x:Key="StartManager">DXUP Manager starten</sys:String>
   <sys:String x:Key="ManagerRunning">Der DXUP Manager läuft noch. Bitte schließe ihn und klicke dann auf OK.</sys:String>
   <sys:String x:Key="Uninstall">Deinstallieren</sys:String>
   <sys:String x:Key="UninstallInfo">DXUP wird aus allen Spielen entfernt – DLLs anderer Programme, die DXUP gesichert hat, kommen zurück – und anschließend deinstalliert.</sys:String>
   <sys:String x:Key="KeepSettings">Spiele-Einstellungen behalten (games.cfg) für eine spätere Installation</sys:String>
-  <sys:String x:Key="Uninstalling">DXUP wird deinstalliert …</sys:String>
+  <sys:String x:Key="Uninstalling">DXUP wird aus {0} deinstalliert …</sys:String>
   <sys:String x:Key="Uninstalled">DXUP wurde deinstalliert.</sys:String>
   <sys:String x:Key="ErrFailed">Fehler: {0}</sys:String>
   <sys:String x:Key="GameErrors">Bei diesen Spielen ging es nicht (läuft das Spiel noch?):
@@ -32,4 +32,8 @@
   <sys:String x:Key="StepRemoveGames">DXUP aus den Spielen entfernen</sys:String>
   <sys:String x:Key="StepRemoveFiles">Dateien entfernen</sys:String>
   <sys:String x:Key="NeedsX64">DXUP benötigt ein 64-Bit-Windows.</sys:String>
+  <sys:String x:Key="ErrNotInstalled">DXUP ist nicht in „{0}“ installiert: dort gibt es nichts zu deinstallieren.</sys:String>
+  <sys:String x:Key="ErrFolderNotEmpty">„{0}“ enthält schon andere Dateien. Bitte wähle für DXUP einen leeren oder neuen Ordner.</sys:String>
+  <sys:String x:Key="ErrFolder">„{0}“ ist kein gültiger Ordner.</sys:String>
+  <sys:String x:Key="ErrFolderMissing">Der Ordner des Spiels wurde nicht gefunden: {0}</sys:String>
 </ResourceDictionary>

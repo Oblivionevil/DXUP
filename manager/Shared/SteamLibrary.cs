@@ -47,9 +47,17 @@ namespace Dxup.Shared
         {
             var libraries = new List<string> { steamDir };
             string vdf = Path.Combine(steamDir, "steamapps", "libraryfolders.vdf");
-            if (File.Exists(vdf))
+            string text = null;
+            try
             {
-                foreach (var pair in Pairs(File.ReadAllText(vdf)))
+                // Steam may be writing it.
+                if (File.Exists(vdf))
+                    text = File.ReadAllText(vdf);
+            }
+            catch (Exception) { }
+            if (text != null)
+            {
+                foreach (var pair in Pairs(text))
                 {
                     // New format: "path" "D:\\Steam"; old format: "1" "D:\\Steam".
                     bool path = pair.Key.Equals("path", StringComparison.OrdinalIgnoreCase)
@@ -71,9 +79,16 @@ namespace Dxup.Shared
             foreach (string library in Libraries(steamDir))
             {
                 string apps = Path.Combine(library, "steamapps");
-                if (!Directory.Exists(apps))
+                string[] manifests;
+                try
+                {
+                    manifests = Directory.Exists(apps) ? Directory.GetFiles(apps, "appmanifest_*.acf") : new string[0];
+                }
+                catch (Exception)
+                {
                     continue;
-                foreach (string manifest in Directory.GetFiles(apps, "appmanifest_*.acf"))
+                }
+                foreach (string manifest in manifests)
                 {
                     try
                     {

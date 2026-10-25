@@ -12,6 +12,7 @@
   <sys:String x:Key="StateInactive">Inactive</sys:String>
   <sys:String x:Key="StateOutdated">Outdated</sys:String>
   <sys:String x:Key="StateMissing">DLLs missing</sys:String>
+  <sys:String x:Key="StateFolderMissing">Folder not found</sys:String>
   <sys:String x:Key="Activate">Enable DXUP</sys:String>
   <sys:String x:Key="Deactivate">Disable DXUP</sys:String>
   <sys:String x:Key="Update">Update DXUP</sys:String>
@@ -39,6 +40,7 @@
   <sys:String x:Key="OptGame">As the game sets</sys:String>
   <sys:String x:Key="OptOff">Off</sys:String>
   <sys:String x:Key="OptOn">On</sys:String>
+  <sys:String x:Key="OptVSyncInterval">On (sync interval {0})</sys:String>
   <sys:String x:Key="OptScopeGeometry">3D geometry (recommended)</sys:String>
   <sys:String x:Key="OptScopeAll">All draws</sys:String>
   <sys:String x:Key="OptSgssaaFull">Full (very expensive)</sys:String>
@@ -77,6 +79,9 @@ Add it anyway?</sys:String>
   <sys:String x:Key="ErrRemove">DXUP could not be removed from the game's folder:
 {0}</sys:String>
   <sys:String x:Key="ErrSave">The settings could not be saved:
+{0}</sys:String>
+  <sys:String x:Key="ErrFolderMissing">The game's folder was not found: {0}</sys:String>
+  <sys:String x:Key="ErrUnexpected">An unexpected error occurred:
 {0}</sys:String>
   <sys:String x:Key="Imported">The dxup.conf of the game's folder was taken over and renamed to dxup.conf.imported.</sys:String>
   <sys:String x:Key="StatusAdded">"{0}" added, DXUP is active.</sys:String>

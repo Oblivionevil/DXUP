@@ -1,5 +1,6 @@
 <Project Sdk="Microsoft.NET.Sdk">
-  <!-- Console checks of the shared manager code: games.cfg, Steam and Battle.net, PE headers. -->
+  <!-- Console checks of the shared manager code: games.cfg, Steam and Battle.net, PE headers,
+       and of the setup's choice of files (in temporary folders, without the registry). -->
   <PropertyGroup>
     <OutputType>Exe</OutputType>
     <UseWPF>true</UseWPF>
@@ -9,6 +10,8 @@
     <Compile Include="..\Shared\*.cs" Link="Shared\%(Filename)%(Extension)" />
     <Compile Include="..\DxupManager\Diagnostics.cs" Link="Manager\Diagnostics.cs" />
     <Compile Include="..\DxupManager\Unelevated.cs" Link="Manager\Unelevated.cs" />
+    <Compile Include="..\DxupManager\GameItem.cs" Link="Manager\GameItem.cs" />
+    <Compile Include="..\DxupSetup\Installer.cs" Link="Setup\Installer.cs" />
     <Reference Include="System.Drawing" />
     <Reference Include="System.Management" />
     <Reference Include="System.IO.Compression" />

@@ -31,9 +31,26 @@ namespace Dxup.Setup
                 Shutdown(RunQuiet(uninstall) ? 0 : 1);
                 return;
             }
+            // An error nothing else caught is shown; the window stays.
+            DispatcherUnhandledException += (s, a) =>
+            {
+                a.Handled = true;
+                var owner = MainWindow != null && MainWindow.IsLoaded ? MainWindow : null;
+                try { Dialog.Show(owner, Loc.F("ErrFailed", a.Exception.Message), Dialog.Kind.Error); }
+                catch (Exception) { }
+                if (owner == null)
+                    Shutdown(1);
+            };
             var window = new SetupWindow(uninstall);
             window.Closed += (s, a) => Shutdown(0);
             window.Show();
+        }
+
+        // The uninstaller, run from the installation, goes after it exited.
+        protected override void OnExit(ExitEventArgs e)
+        {
+            Installer.DeleteSelfAfterExit();
+            base.OnExit(e);
         }
 
         static bool RunQuiet(bool uninstall)
@@ -43,9 +60,11 @@ namespace Dxup.Setup
                 if (Installer.ManagerRunning())
                     return false;
                 var installer = new Installer();
-                string dir = DxupInstall.RegisteredDir() ?? DxupInstall.DefaultDir;
-                var failed = uninstall ? installer.Uninstall(dir, false) : installer.Install(dir, false);
-                return failed.Count == 0;
+                string registered = DxupInstall.RegisteredDir();
+                if (uninstall)
+                    return installer.Uninstall(Installer.UninstallFolder(registered), false).Count == 0;
+                string dir = Installer.InstallFolder(registered ?? DxupInstall.DefaultDir, registered);
+                return dir != null && installer.Install(dir, false).Count == 0;
             }
             catch (Exception)
             {

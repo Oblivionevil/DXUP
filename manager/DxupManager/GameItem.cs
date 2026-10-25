@@ -41,6 +41,7 @@ namespace Dxup.Manager
                     case GameState.Active: return Loc.T("StateActive");
                     case GameState.Outdated: return Loc.T("StateOutdated");
                     case GameState.Missing: return Loc.T("StateMissing");
+                    case GameState.FolderMissing: return Loc.T("StateFolderMissing");
                     default: return Loc.T("StateInactive");
                 }
             }
@@ -56,7 +57,8 @@ namespace Dxup.Manager
                 {
                     case GameState.Active: return (Brush)Application.Current.FindResource("Good");
                     case GameState.Outdated: return (Brush)Application.Current.FindResource("Warn");
-                    case GameState.Missing: return (Brush)Application.Current.FindResource("Bad");
+                    case GameState.Missing:
+                    case GameState.FolderMissing: return (Brush)Application.Current.FindResource("Bad");
                     default: return (Brush)Application.Current.FindResource("Neutral");
                 }
             }
@@ -113,5 +115,17 @@ namespace Dxup.Manager
         public string Text { get; }
         public object Value { get; }
         public Option(string text, object value) { Text = text; Value = value; }
+
+        // A list's choices for a value, and the one to select: a value that
+        // is none of the presets comes as one more choice (text names it),
+        // null selects the first.
+        public static (Option[] options, Option selected) Including(Option[] presets, object value, Func<object, string> text)
+        {
+            var match = presets.FirstOrDefault(option => Equals(option.Value, value));
+            if (match != null || value == null)
+                return (presets, match ?? presets[0]);
+            match = new Option(text(value), value);
+            return (presets.Concat(new[] { match }).ToArray(), match);
+        }
     }
 }

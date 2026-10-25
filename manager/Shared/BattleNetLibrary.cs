@@ -30,15 +30,21 @@ namespace Dxup.Shared
                             continue;
                         foreach (string name in programs.GetSubKeyNames())
                         {
-                            using (var key = programs.OpenSubKey(name))
+                            // One odd entry (a path with characters paths
+                            // cannot hold) does not hide the others.
+                            try
                             {
-                                if (key == null)
-                                    continue;
-                                var game = Game(key.GetValue("UninstallString") as string, key.GetValue("DisplayName") as string,
-                                                key.GetValue("InstallLocation") as string, key.GetValue("DisplayIcon") as string);
-                                if (game != null && !games.Any(known => known.Id == game.Id))
-                                    games.Add(game);
+                                using (var key = programs.OpenSubKey(name))
+                                {
+                                    if (key == null)
+                                        continue;
+                                    var game = Game(key.GetValue("UninstallString") as string, key.GetValue("DisplayName") as string,
+                                                    key.GetValue("InstallLocation") as string, key.GetValue("DisplayIcon") as string);
+                                    if (game != null && !games.Any(known => known.Id == game.Id))
+                                        games.Add(game);
+                                }
                             }
+                            catch (Exception) { }
                         }
                     }
                 }
