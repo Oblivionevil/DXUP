@@ -15,6 +15,7 @@
 #include <d3dcompiler.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cfloat>
 #include <cmath>
@@ -24,6 +25,7 @@
 #include <limits>
 #include <functional>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -162,6 +164,9 @@ namespace {
     const char* name;
     std::function<bool(IDirect3DDevice9*)> draw;
     int tolerance = 2;
+    // D3DCREATE_MULTITHREADED: a second thread sets and reads states the
+    // scene does not use while it draws (the device's lock taken by both).
+    DWORD createFlags = 0;
   };
 
   bool sceneClear(IDirect3DDevice9* d) {
@@ -464,6 +469,83 @@ float4 main(float4 c : COLOR0, float2 t : TEXCOORD0) : COLOR { return tex2D(tex,
       d->DrawPrimitive(D3DPT_TRIANGLELIST, slot, 1);
     }
     d->SetStreamSource(0, nullptr, 0, 0);
+    vb->Release();
+    return true;
+  }
+
+  // A dynamic buffer drawn again unchanged: DXUP draws it from where its
+  // last upload into the vertex ring put it while the buffer is unwritten and
+  // the ring's memory the same (Mirror's Edge draws one ten times a frame).
+  // Additive blending counts the draws of each triangle: one drawn from the
+  // wrong place of the ring is too bright or missing. Written in place, and
+  // after the ring wrapped (8 MB of degenerate triangles), it is uploaded
+  // again.
+  bool sceneDynamicRedraw(IDirect3DDevice9* d) {
+    d->Clear(0, nullptr, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, 0xff000000u, 1.0f, 0);
+    d->SetRenderState(D3DRS_LIGHTING, FALSE);
+    d->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+    d->SetRenderState(D3DRS_ZENABLE, D3DZB_FALSE);
+    d->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
+    d->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_ONE);
+    d->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_ONE);
+    d->SetFVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE);
+    IDirect3DVertexBuffer9* vb = nullptr;
+    IDirect3DIndexBuffer9* ib = nullptr;
+    IDirect3DVertexBuffer9* filler = nullptr;
+    const UINT ring = 8u << 20;
+    if (FAILED(d->CreateVertexBuffer(sizeof(TLVertex) * 9, D3DUSAGE_DYNAMIC | D3DUSAGE_WRITEONLY,
+                                     D3DFVF_XYZRHW | D3DFVF_DIFFUSE, D3DPOOL_DEFAULT, &vb, nullptr))
+     || FAILED(d->CreateIndexBuffer(9 * sizeof(WORD), D3DUSAGE_WRITEONLY, D3DFMT_INDEX16, D3DPOOL_MANAGED, &ib, nullptr))
+     || FAILED(d->CreateVertexBuffer(ring, D3DUSAGE_DYNAMIC | D3DUSAGE_WRITEONLY, D3DFVF_XYZRHW | D3DFVF_DIFFUSE,
+                                     D3DPOOL_DEFAULT, &filler, nullptr)))
+      return false;
+    auto triangle = [](TLVertex* v, float x, float y, DWORD c) {
+      v[0] = { x, y, 0.5f, 1.0f, c };
+      v[1] = { x + 20.0f, y, 0.5f, 1.0f, c };
+      v[2] = { x, y + 14.0f, 0.5f, 1.0f, c };
+    };
+    TLVertex* v = nullptr;
+    vb->Lock(0, 0, reinterpret_cast<void**>(&v), D3DLOCK_DISCARD);
+    triangle(v, 2.0f, 2.0f, 0xff200000u);
+    triangle(v + 3, 26.0f, 2.0f, 0xff002000u);
+    triangle(v + 6, 50.0f, 2.0f, 0xff000020u);
+    vb->Unlock();
+    WORD* indices = nullptr;
+    ib->Lock(0, 0, reinterpret_cast<void**>(&indices), 0);
+    for (WORD i = 0; i < 9; i++) indices[i] = i;
+    ib->Unlock();
+    void* bytes = nullptr;
+    filler->Lock(0, 0, &bytes, D3DLOCK_DISCARD);
+    auto* f = static_cast<TLVertex*>(bytes);
+    for (UINT i = 0; i < ring / sizeof(TLVertex); i++)
+      f[i] = { 0.0f, 0.0f, 0.5f, 1.0f, 0xffffffffu };   // all at one point
+    filler->Unlock();
+    d->SetStreamSource(0, vb, 0, sizeof(TLVertex));
+    d->SetIndices(ib);
+    // The first triangle twice, all three, the second alone (inside the
+    // range of all three) and indexed: red and green three times, blue once.
+    d->DrawPrimitive(D3DPT_TRIANGLELIST, 0, 1);
+    d->DrawPrimitive(D3DPT_TRIANGLELIST, 0, 1);
+    d->DrawPrimitive(D3DPT_TRIANGLELIST, 0, 3);
+    d->DrawPrimitive(D3DPT_TRIANGLELIST, 3, 1);
+    d->DrawIndexedPrimitive(D3DPT_TRIANGLELIST, 0, 3, 3, 3, 1);
+    // The first written in place one row down: drawn from the new bytes.
+    vb->Lock(0, 3 * sizeof(TLVertex), reinterpret_cast<void**>(&v), 0);
+    triangle(v, 2.0f, 24.0f, 0xff202000u);
+    vb->Unlock();
+    d->DrawPrimitive(D3DPT_TRIANGLELIST, 0, 1);
+    // The third uploaded, the ring filled past its end, the third again
+    // (three times in all).
+    d->DrawPrimitive(D3DPT_TRIANGLELIST, 6, 1);
+    d->SetStreamSource(0, filler, 0, sizeof(TLVertex));
+    d->DrawPrimitive(D3DPT_TRIANGLELIST, 0, ring / sizeof(TLVertex) / 3);
+    d->SetStreamSource(0, vb, 0, sizeof(TLVertex));
+    d->DrawPrimitive(D3DPT_TRIANGLELIST, 6, 1);
+    d->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+    d->SetStreamSource(0, nullptr, 0, 0);
+    d->SetIndices(nullptr);
+    filler->Release();
+    ib->Release();
     vb->Release();
     return true;
   }
@@ -3332,6 +3414,7 @@ float4 main(float2 t : TEXCOORD0) : COLOR { float v = tex2D(depth, t).r; return 
     { "render_to_texture", sceneRenderToTexture },
     { "fog", sceneFog, 3 },
     { "dynamic_buffer", sceneDynamicBuffer },
+    { "dynamic_redraw", sceneDynamicRedraw },
     { "instancing", sceneInstancing },
     { "vertex_ranges", sceneVertexRanges },
     { "l16", sceneL16 },
@@ -3371,6 +3454,11 @@ float4 main(float2 t : TEXCOORD0) : COLOR { float v = tex2D(depth, t).r; return 
     { "getdc_alpha", sceneGetDcAlpha },
     { "reset_same_chain", sceneResetSameChain },
     { "constant_ranges", sceneConstantRanges },
+    { "shaders_mt", sceneShaders, 2, D3DCREATE_MULTITHREADED },
+    { "instancing_mt", sceneInstancing, 2, D3DCREATE_MULTITHREADED },
+    { "textured_mt", sceneTextured, 2, D3DCREATE_MULTITHREADED },
+    { "dynamic_redraw_mt", sceneDynamicRedraw, 2, D3DCREATE_MULTITHREADED },
+    { "state_block_contents_mt", sceneStateBlockContents, 2, D3DCREATE_MULTITHREADED },
   };
 
   // ---- Running ----
@@ -3391,7 +3479,7 @@ float4 main(float2 t : TEXCOORD0) : COLOR { float v = tex2D(depth, t).r; return 
     pp.PresentationInterval = D3DPRESENT_INTERVAL_IMMEDIATE;
     IDirect3DDevice9* device = nullptr;
     HRESULT hr = d3d->CreateDevice(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, window,
-                                   D3DCREATE_HARDWARE_VERTEXPROCESSING | D3DCREATE_FPU_PRESERVE, &pp, &device);
+                                   D3DCREATE_HARDWARE_VERTEXPROCESSING | D3DCREATE_FPU_PRESERVE | scene.createFlags, &pp, &device);
     if (FAILED(hr)) {
       error = "CreateDevice failed";
       d3d->Release();
@@ -3399,9 +3487,25 @@ float4 main(float2 t : TEXCOORD0) : COLOR { float v = tex2D(depth, t).r; return 
       return false;
     }
     TRACE("[%s] device created\n", runtime.name);
+    std::atomic<bool> stop{ false };
+    std::thread other;
+    if (scene.createFlags & D3DCREATE_MULTITHREADED) {
+      other = std::thread([&] {
+        for (DWORD i = 0; !stop.load(); i++) {
+          device->SetSamplerState(15, D3DSAMP_MAXANISOTROPY, 1 + (i & 7));
+          device->SetRenderState(D3DRS_POINTSIZE_MAX, i & 1 ? 0x42800000u : 0x43000000u);
+          DWORD value = 0;
+          device->GetRenderState(D3DRS_ZENABLE, &value);
+          device->GetSamplerState(0, D3DSAMP_MINFILTER, &value);
+        }
+      });
+    }
     device->BeginScene();
     const bool drawn = scene.draw(device);
     device->EndScene();
+    stop = true;
+    if (other.joinable())
+      other.join();
     TRACE("[%s] drawn\n", runtime.name);
     bool ok = drawn;
     if (!drawn)

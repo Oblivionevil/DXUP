@@ -73,7 +73,7 @@ namespace dxup {
 
   template<typename Fn>
   struct CsTypedCommand final : CsCommand {
-    explicit CsTypedCommand(Fn&& fn) : m_fn(std::move(fn)) {
+    __forceinline explicit CsTypedCommand(Fn&& fn) : m_fn(std::move(fn)) {
       invoke = [](CsCommand* command, CsWorkerState* state, CsOp op) {
         auto* self = static_cast<CsTypedCommand*>(command);
         if (op != CsOp::Destroy)
@@ -94,8 +94,11 @@ namespace dxup {
   public:
     static constexpr size_t kSize = 16384;
 
+    // Inlined with the caller's lambda: its captures go straight into the
+    // chunk (a lambda built on the stack and copied out with one wide load
+    // waits for its narrow stores, as each write of a mapped buffer did).
     template<typename Fn>
-    bool push(Fn&& fn) {
+    __forceinline bool push(Fn&& fn) {
       using Cmd = CsTypedCommand<std::decay_t<Fn>>;
       static_assert(sizeof(Cmd) <= kSize, "command too large for a chunk");
       void* ptr = allocate(sizeof(Cmd), alignof(Cmd));
@@ -519,7 +522,7 @@ namespace dxup {
     void unmapDirect(IBackendBuffer* buffer);
 
     template<typename Fn>
-    void emit(Fn&& fn) {
+    __forceinline void emit(Fn&& fn) {
       if (!m_chunk->push(std::forward<Fn>(fn))) {
         submitChunk();
         m_chunk->push(std::forward<Fn>(fn));

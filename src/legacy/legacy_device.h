@@ -224,14 +224,19 @@ namespace dxup::legacy {
     // Uploads what of [offset, offset + size) changed since its last upload.
     void prepare(uint32_t offset, uint32_t size);
     // All of it uploaded: draws need not know which part they read.
-    bool uploaded() const {
-      return m_clean.size() == 1 && m_clean[0].first == 0 && m_clean[0].second >= m_size;
-    }
+    bool uploaded() const { return m_uploaded; }
     ID3D11Buffer* resource() const { return m_buffer.get(); }
     // The smallest and largest of `count` indices from index `start`, kept
     // until the buffer is written again; false past the buffer's end.
     bool indexRange(uint32_t start, uint32_t count, bool index32, uint32_t& lo, uint32_t& hi);
+    // Where the device's vertex ring holds bytes of this buffer as written
+    // (version) by its last upload there (generation of the ring's memory):
+    // a dynamic buffer drawn again unchanged is not uploaded again.
+    struct RingCopy { uint64_t begin = 0; uint32_t size = 0, offset = 0, version = 0, generation = 0; };
+    RingCopy& ringCopy() { return m_ringCopy; }
+    uint32_t version() const { return m_version; }
   private:
+    RingCopy           m_ringCopy;
     struct IndexRange { uint32_t lo, hi; };
     std::unordered_map<uint64_t, IndexRange> m_indexRanges;   // of m_indexRangesVersion
     struct RecentRange { uint64_t key; uint32_t version, lo, hi; };
@@ -240,6 +245,8 @@ namespace dxup::legacy {
     uint32_t           m_version = 0;   // counts writes
     Device*            m_device;
     bool restoreCopy();
+    // After m_clean changed.
+    void noteClean() { m_uploaded = m_clean.size() == 1 && m_clean[0].first == 0 && m_clean[0].second >= m_size; }
     std::vector<uint8_t> m_data;
     uint32_t           m_size = 0;
     bool               m_dropCopy = false;
@@ -247,6 +254,7 @@ namespace dxup::legacy {
     bool               m_keptCopy = false;   // asked for again after a drop: stays
     Ref<ID3D11Buffer>  m_buffer;
     bool               m_dynamic = false;
+    bool               m_uploaded = false;    // m_clean is all of it (kept here: draws ask, the vector is a cache miss)
     bool               m_declaredDynamic = false;
     bool               m_settled = false;     // static for good
     uint32_t           m_writes = 0;
@@ -389,12 +397,20 @@ namespace dxup::legacy {
     Texture* depthStencil() const { return m_depthStencil; }
 
     // ---- States ----
-    void     setRenderState(uint32_t state, uint32_t value);
+    // Games set most states to what the device holds, thousands of times a
+    // frame: compared here, changes in changeRenderState/SamplerState.
+    void     setRenderState(uint32_t state, uint32_t value) {
+      if (state >= RsCount || m_renderStates[state] != value)
+        changeRenderState(state, value);
+    }
     uint32_t renderState(uint32_t state) const { return state < RsCount ? m_renderStates[state] : 0; }
     void     setTextureStageState(uint32_t stage, uint32_t type, uint32_t value);
     uint32_t textureStageState(uint32_t stage, uint32_t type) const;
     // Samplers 0-15, and 16-19 of vertex shaders.
-    void     setSamplerState(uint32_t sampler, uint32_t type, uint32_t value);
+    void     setSamplerState(uint32_t sampler, uint32_t type, uint32_t value) {
+      if (sampler >= kSamplerCount || type >= SampCount || m_samplerStatesValues[sampler][type] != value)
+        changeSamplerState(sampler, type, value);
+    }
     uint32_t samplerState(uint32_t sampler, uint32_t type) const;
     void     setTexture(uint32_t stage, Texture* texture);
     Texture* texture(uint32_t stage) const { return stage < kSamplerCount ? m_textures[stage] : nullptr; }
@@ -542,6 +558,9 @@ namespace dxup::legacy {
     // uploadVertices writes into the reserved room only.
     bool reserveVertices(uint64_t size);
     uint32_t uploadVertices(const void* data, uint32_t size);
+    uint32_t streamVertices(Buffer& buffer, uint64_t begin, uint32_t size);
+    void changeRenderState(uint32_t state, uint32_t value);
+    void changeSamplerState(uint32_t sampler, uint32_t type, uint32_t value);
     uint32_t uploadIndices(const void* data, uint32_t size);
     void drawQuad(ID3D11PixelShader* shader, const float rect[4], const float texRect[4], const float color[4],
                   float depth, float keyEnabled);
@@ -628,6 +647,7 @@ namespace dxup::legacy {
     Ref<ID3D11Buffer>               m_indexRing;
     uint32_t                        m_vertexRingSize = 0, m_vertexRingOffset = 0;
     bool                            m_vertexRingDiscard = false;   // the next upload maps it discarded
+    uint32_t                        m_vertexRingGeneration = 1;    // counts its memory (each discard)
     uint32_t                        m_indexRingSize = 0, m_indexRingOffset = 0;
     Ref<ID3D11SamplerState>         m_pointSampler, m_linearSampler;
     Ref<ID3D11BlendState>           m_opaqueBlend;

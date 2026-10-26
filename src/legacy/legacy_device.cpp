@@ -956,6 +956,7 @@ namespace dxup::legacy {
       m_dynamic = true;
     if (!size) {
       m_clean.clear();
+      m_uploaded = false;
       return;
     }
     const uint32_t end = offset + size;
@@ -970,10 +971,11 @@ namespace dxup::legacy {
       if (range.second > end) remaining.push_back({ end, range.second });
     }
     m_clean.swap(remaining);
+    noteClean();
   }
 
   void Buffer::prepare(uint32_t offset, uint32_t size) {
-    if (!m_buffer)
+    if (!m_buffer || m_uploaded)
       return;
     // A copy that goes once uploaded: all of the buffer at once, or bytes
     // no draw reads (padding) would keep it.
@@ -1036,6 +1038,7 @@ namespace dxup::legacy {
     if (!placed)
       merged.push_back(added);
     m_clean.swap(merged);
+    noteClean();
     // All of it on the GPU, and not rewritten between draws: the copy goes.
     if (m_dropCopy && !m_keptCopy && !m_dynamic && uploaded()) {
       std::vector<uint8_t>().swap(m_data);
@@ -2349,7 +2352,7 @@ namespace dxup::legacy {
     }
   }
 
-  void Device::setRenderState(uint32_t state, uint32_t value) {
+  void Device::changeRenderState(uint32_t state, uint32_t value) {
     if (state >= RsCount || m_renderStates[state] == value)
       return;
     m_renderStates[state] = value;
@@ -2402,7 +2405,7 @@ namespace dxup::legacy {
     return stage < kFixedStages && type < TssCount ? m_stageStates[stage][type] : 0;
   }
 
-  void Device::setSamplerState(uint32_t sampler, uint32_t type, uint32_t value) {
+  void Device::changeSamplerState(uint32_t sampler, uint32_t type, uint32_t value) {
     if (sampler >= kSamplerCount || type >= SampCount || m_samplerStatesValues[sampler][type] == value)
       return;
     m_samplerStatesValues[sampler][type] = value;
@@ -2629,7 +2632,13 @@ namespace dxup::legacy {
     // The same pass notes NaN or infinity among the new values (exponent
     // all ones).
     float (*target)[4] = m_constants[pixel].f;
-    uint64_t changed = 0;
+    // The groups' bits in two halves: a 64-bit shift by a variable count is
+    // a helper call in 32-bit code, which also spills the SSE registers.
+    uint32_t changedLow = 0, changedHigh = 0;
+    auto note = [&](uint32_t reg, int sameMask) {
+      if (sameMask != 0xffff)
+        (reg < 128 ? changedLow : changedHigh) |= 1u << ((reg >> 2) & 31);
+    };
     const __m128i exponent = _mm_set1_epi32(0x7f800000);
     __m128i special = _mm_setzero_si128();
     auto copy = [&](uint32_t i) {
@@ -2641,13 +2650,14 @@ namespace dxup::legacy {
     };
     uint32_t i = 0;
     for (; i < count && ((start + i) & 3); i++)
-      changed |= uint64_t(_mm_movemask_epi8(copy(i)) != 0xffff) << ((start + i) / 4);
+      note(start + i, _mm_movemask_epi8(copy(i)));
     for (; i + 4 <= count; i += 4) {
       const __m128i same = _mm_and_si128(_mm_and_si128(copy(i), copy(i + 1)), _mm_and_si128(copy(i + 2), copy(i + 3)));
-      changed |= uint64_t(_mm_movemask_epi8(same) != 0xffff) << ((start + i) / 4);
+      note(start + i, _mm_movemask_epi8(same));
     }
     for (; i < count; i++)
-      changed |= uint64_t(_mm_movemask_epi8(copy(i)) != 0xffff) << ((start + i) / 4);
+      note(start + i, _mm_movemask_epi8(copy(i)));
+    const uint64_t changed = changedLow | (uint64_t(changedHigh) << 32);
     if (!changed)
       return;
     m_shaderConstantsDirty[pixel] = true;
@@ -4691,6 +4701,7 @@ namespace dxup::legacy {
     if (m_vertexRingOffset + size > m_vertexRingSize) {
       m_vertexRingOffset = 0;
       m_vertexRingDiscard = true;
+      m_vertexRingGeneration++;   // offsets in the ring's present memory go
     }
     return true;
   }
@@ -4703,6 +4714,20 @@ namespace dxup::legacy {
     m_vertexRingDiscard = false;
     const uint32_t offset = m_vertexRingOffset;
     m_vertexRingOffset += uint32_t(aligned);
+    return offset;
+  }
+
+  // A range of a dynamic buffer through the vertex ring: where its last
+  // upload left it if the buffer and the ring's memory are as then (Mirror's
+  // Edge draws a 114 KB buffer ten times a frame between writes).
+  uint32_t Device::streamVertices(Buffer& buffer, uint64_t begin, uint32_t size) {
+    Buffer::RingCopy& copy = buffer.ringCopy();
+    if (copy.generation == m_vertexRingGeneration && copy.version == buffer.version() && begin >= copy.begin
+     && begin + size <= copy.begin + copy.size && ((begin - copy.begin) & 3) == 0)
+      return copy.offset + uint32_t(begin - copy.begin);
+    const uint32_t offset = uploadVertices(buffer.data() + begin, size);
+    if (offset != UINT32_MAX)
+      copy = { begin, size, offset, buffer.version(), m_vertexRingGeneration };
     return offset;
   }
 
@@ -4899,8 +4924,7 @@ namespace dxup::legacy {
         offset = s.offset;
         stride = s.stride;
         const bool instanced = (s.frequency & kInstanceData) != 0;
-        const uint32_t ringOffset = ringSizes[stream]
-          ? uploadVertices(s.buffer->data() + ringBegins[stream], ringSizes[stream]) : UINT32_MAX;
+        const uint32_t ringOffset = ringSizes[stream] ? streamVertices(*s.buffer, ringBegins[stream], ringSizes[stream]) : UINT32_MAX;
         if (instanced) {
           if (ringOffset != UINT32_MAX) {
             s.buffer->noteStreamedDraw();
