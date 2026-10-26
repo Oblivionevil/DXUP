@@ -831,7 +831,7 @@ namespace dxup::d3d12 {
       if (!limitRead) {
         limitRead = true;
         // The file next to d3d11.dll.
-        FILE* f = fopen(dxupSiblingPath("dxup_gpu_limit.txt").c_str(), "r");
+        FILE* f = dxupOpenSibling("dxup_gpu_limit.txt", "r");
         if (f) {
           int val = -1;
           if (fscanf(f, "%d", &val) == 1) {
@@ -962,9 +962,9 @@ namespace dxup::d3d12 {
       queryHeapDesc.Type = D3D12_QUERY_HEAP_TYPE_SO_STATISTICS;
       d3d12Device->CreateQueryHeap(&queryHeapDesc, IID_PPV_ARGS(&m_streamOutputQueryHeap));
 
-      char profileMarker[MAX_PATH] = {}, profileOut[MAX_PATH] = {};
-      if (dxupSiblingPathTo(profileMarker, MAX_PATH, "dxup_gpu_profile.txt")
-       && dxupSiblingPathTo(profileOut, MAX_PATH, "dxup_gpu_profile_out.txt"))
+      const std::wstring profileMarker = dxupSiblingPathW("dxup_gpu_profile.txt");
+      const std::wstring profileOut = dxupSiblingPathW("dxup_gpu_profile_out.txt");
+      if (!profileMarker.empty() && !profileOut.empty())
         m_gpuProfiler.init(d3d12Device, device->getCommandQueue(), profileMarker, profileOut);
 
     }

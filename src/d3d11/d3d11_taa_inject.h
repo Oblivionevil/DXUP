@@ -413,7 +413,7 @@ namespace dxup {
         if (m_loaded) {
           m_camera = m_loadedCamera;
           m_state = State::Active;
-          logMessage(LogLevel::Warn, "upscalerInject: camera from %s", path().c_str());
+          logMessage(LogLevel::Warn, "upscalerInject: camera from %s", kCameraFile);
         } else {
           m_state = State::Calibrating;
           m_calibration = std::make_shared<d3d12::VelocityCalibration>();
@@ -658,13 +658,10 @@ namespace dxup {
       logMessage(LogLevel::Warn, "%s - no injected upscaling", message);
     }
 
-    static std::string path() {
-      return dxupSiblingPath("dxup_upscaler_inject.txt");
-    }
+    static constexpr const char* kCameraFile = "dxup_upscaler_inject.txt";
 
     void save() const {
-      const std::string file = path();
-      FILE* out = file.empty() ? nullptr : std::fopen(file.c_str(), "w");
+      FILE* out = dxupOpenSibling(kCameraFile, "w");
       if (!out)
         return;
       std::fprintf(out, "%u %u %u\n", m_camera.slot, m_camera.offset, m_camera.layout);
@@ -672,8 +669,7 @@ namespace dxup {
     }
 
     void load() {
-      const std::string file = path();
-      FILE* in = file.empty() ? nullptr : std::fopen(file.c_str(), "r");
+      FILE* in = dxupOpenSibling(kCameraFile, "r");
       if (!in)
         return;
       unsigned slot = 0, offset = 0, layout = 0;

@@ -283,6 +283,7 @@ namespace dxup {
     void updateBuffer(IBackendBuffer* buffer, uint64_t offset, uint64_t size, const void* data) override;
     void updateBufferRegions(IBackendBuffer* buffer, const BufferUpdateRegion* regions, uint32_t regionCount) override;
     void retainTemporaryBuffer(Rc<IBackendBuffer> buffer) override;
+    void retireAfterGpu(std::vector<std::shared_ptr<void>>& objects) override;
     void* discardBuffer(IBackendBuffer* buffer) override;
     void writeMappedBuffer(IBackendBuffer* buffer, uint64_t offset, const void* data, size_t size, size_t padded) override;
     void writeMappedBufferWith(IBackendBuffer* buffer, uint64_t offset, size_t size, WriteFn fn, void* user,

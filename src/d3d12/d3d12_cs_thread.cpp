@@ -639,6 +639,7 @@ namespace dxup {
   }
 
   void CsThreadContext::drawIndirect(IBackendBuffer* buffer, uint64_t offset) {
+    keep(buffer);
     emit([=](CsWorkerState& s) {
       s.rebindOutputMergerIfNeeded();
       s.ctx->drawIndirect(buffer, offset);
@@ -646,6 +647,7 @@ namespace dxup {
   }
 
   void CsThreadContext::drawIndexedIndirect(IBackendBuffer* buffer, uint64_t offset) {
+    keep(buffer);
     emit([=](CsWorkerState& s) {
       s.rebindOutputMergerIfNeeded();
       s.ctx->drawIndexedIndirect(buffer, offset);
@@ -653,6 +655,7 @@ namespace dxup {
   }
 
   void CsThreadContext::dispatchIndirect(IBackendBuffer* buffer, uint64_t offset) {
+    keep(buffer);
     emit([=](CsWorkerState& s) { s.ctx->dispatchIndirect(buffer, offset); });
   }
 
@@ -1148,6 +1151,20 @@ namespace dxup {
     }
     emitFilled(dataSize, [pack, packUser, dataSize](uint8_t* data) { if (pack && dataSize) pack(packUser, data); },
       [target, size, fn, user](CsWorkerState&, const uint8_t* data, size_t n) { fn(user, target, target ? size : 0, data, n); });
+  }
+
+  void CsThreadContext::retireAfterGpu(std::vector<std::shared_ptr<void>>& objects) {
+    if (objects.empty())
+      return;
+    // The queued commands keep them (a command list as long as it exists:
+    // each execution uses them), then the context until the GPU has run
+    // the commands.
+    auto kept = std::make_shared<std::vector<std::shared_ptr<void>>>(std::move(objects));
+    objects.clear();
+    emit([kept](CsWorkerState& s) {
+      std::vector<std::shared_ptr<void>> retired = *kept;
+      s.ctx->retireAfterGpu(retired);
+    });
   }
 
   void CsThreadContext::retainTemporaryBuffer(Rc<IBackendBuffer> buffer) {

@@ -1529,7 +1529,7 @@ namespace dxup::d3d12 {
       uint8_t missing = 0;
     };
     std::mutex m_stateCacheMutex;
-    std::string m_stateCachePath;   // set before other threads run, then only read
+    std::wstring m_stateCachePath;  // set before other threads run, then only read
     std::atomic<bool> m_stateCacheFailed{false};   // the file could not be written
     // Fixed once the device is created; `missing` changes under the mutex.
     std::vector<StoredPipeline> m_storedPipelines;
@@ -1608,7 +1608,7 @@ namespace dxup::d3d12 {
       // Or a pipeline description for the state cache.
       std::vector<uint8_t> record;
     };
-    std::string m_psoDiskCacheDir;
+    std::wstring m_psoDiskCacheDir;
     // Pipelines are compiled from arbitrary threads (deferred contexts, shader
     // creation), so blobs are handed out under a lock and removed on use.
     std::unordered_map<uint64_t, std::vector<uint8_t>> m_psoDiskBlobs;
@@ -1634,7 +1634,7 @@ namespace dxup::d3d12 {
     bool m_stopPsoDiskWriter = false;
     void initPsoDiskCache();
     void loadPsoDiskCache();
-    std::string psoDiskPath(uint64_t keyHash) const;
+    std::wstring psoDiskPath(uint64_t keyHash) const;
     std::vector<uint8_t> takePsoDiskBlob(uint64_t keyHash);
     void deferPsoBlobWrite(uint64_t keyHash, ID3D12PipelineState* pso);
     void runPsoDiskWriter();

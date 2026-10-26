@@ -16,6 +16,7 @@
 #include <string>
 #include <vector>
 #include <fstream>
+#include <share.h>
 #include <set>
 
 #ifndef _WIN32
@@ -3640,12 +3641,12 @@ namespace dxup::d3d12 {
       char name[80];
       snprintf(name, sizeof(name), "dxup_shaders\\%s_%016llx.dxbc", stage < 6 ? stages[stage] : "xs",
         static_cast<unsigned long long>(shader->getBytecodeHash()));
-      char path[MAX_PATH] = {};
-      if (dxupSiblingPathTo(path, MAX_PATH, "dxup_shaders")) {
-        CreateDirectoryA(path, nullptr);
-        dxupSiblingPathTo(path, MAX_PATH, name);
-        if (GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES) {
-          if (FILE* file = fopen(path, "wb")) {
+      const std::wstring folder = dxupSiblingPathW("dxup_shaders");
+      if (!folder.empty()) {
+        CreateDirectoryW(folder.c_str(), nullptr);
+        const std::wstring path = dxupSiblingPathW(name);
+        if (GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES) {
+          if (FILE* file = _wfsopen(path.c_str(), L"wb", _SH_DENYNO)) {
             fwrite(desc.bytecode, 1, desc.bytecodeSize, file);
             fclose(file);
           }
@@ -4730,7 +4731,7 @@ namespace dxup::d3d12 {
       psoDesc.CachedPSO = {};
       rawPso = nullptr;
       hr = safeCreateGraphicsPSO(m_device.Get(), &psoDesc, &rawPso);
-      DeleteFileA(psoDiskPath(psoKeyHash).c_str());
+      DeleteFileW(psoDiskPath(psoKeyHash).c_str());
       hadDiskCache = false;
     }
 
@@ -4873,12 +4874,10 @@ namespace dxup::d3d12 {
 
       // Save first shader to file for offline analysis
       if (csCreateLogCount == 0) {
-        const std::string shaderFile = dxupSiblingPath("dxup_cs0.dxbc");
-        FILE* sf = fopen(shaderFile.c_str(), "wb");
-        if (sf) {
+        if (FILE* sf = dxupOpenSibling("dxup_cs0.dxbc", "wb")) {
           fwrite(desc.csBytecode, 1, desc.csBytecodeSize, sf);
           fclose(sf);
-          logMessage(LogLevel::Info, "  Saved shader to %s", shaderFile.c_str());
+          logMessage(LogLevel::Info, "  Saved shader to dxup_cs0.dxbc");
         }
       }
 
@@ -5038,7 +5037,7 @@ namespace dxup::d3d12 {
       psoDesc.CachedPSO = {};
       hr = safeCreateComputePSO(m_device.Get(), &psoDesc, pso.ReleaseAndGetAddressOf());
 
-      DeleteFileA(psoDiskPath(psoKeyHash).c_str());
+      DeleteFileW(psoDiskPath(psoKeyHash).c_str());
       hadDiskCache = false;
     }
     if (FAILED(hr) || !pso) {
@@ -5058,11 +5057,10 @@ namespace dxup::d3d12 {
     if (markerFileEnabled("dxup_dred.txt")) {
       char name[64];
       snprintf(name, sizeof(name), "dxup_shaders\\cs_%016llx.dxbc", static_cast<unsigned long long>(cacheKey.csHash));
-      char path[MAX_PATH] = {};
-      if (dxupSiblingPathTo(path, MAX_PATH, "dxup_shaders")) {
-        CreateDirectoryA(path, nullptr);
-        dxupSiblingPathTo(path, MAX_PATH, name);
-        if (FILE* file = fopen(path, "wb")) {
+      const std::wstring folder = dxupSiblingPathW("dxup_shaders");
+      if (!folder.empty()) {
+        CreateDirectoryW(folder.c_str(), nullptr);
+        if (FILE* file = _wfsopen(dxupSiblingPathW(name).c_str(), L"wb", _SH_DENYNO)) {
           fwrite(desc.csBytecode, 1, desc.csBytecodeSize, file);
           fclose(file);
         }
@@ -5386,13 +5384,14 @@ namespace dxup::d3d12 {
   void D3D12BackendDevice::initPsoDiskCache() {
 #ifdef _WIN32
     // dxup_pso_cache next to the DLL.
-    m_psoDiskCacheDir = dxupSiblingPath("dxup_pso_cache");
+    // Wide paths: a game folder may hold any character.
+    m_psoDiskCacheDir = dxupSiblingPathW("dxup_pso_cache");
 
     // Create directory if it doesn't exist
-    CreateDirectoryA(m_psoDiskCacheDir.c_str(), nullptr);
-    DWORD attr = GetFileAttributesA(m_psoDiskCacheDir.c_str());
+    CreateDirectoryW(m_psoDiskCacheDir.c_str(), nullptr);
+    DWORD attr = m_psoDiskCacheDir.empty() ? INVALID_FILE_ATTRIBUTES : GetFileAttributesW(m_psoDiskCacheDir.c_str());
     if (attr == INVALID_FILE_ATTRIBUTES || !(attr & FILE_ATTRIBUTE_DIRECTORY)) {
-      logMessage(LogLevel::Warn, "PSO disk cache: failed to create dir '%s'",
+      logMessage(LogLevel::Warn, "PSO disk cache: failed to create dir '%ls'",
         m_psoDiskCacheDir.c_str());
       m_psoDiskCacheDir.clear();
       return;
@@ -5408,12 +5407,12 @@ namespace dxup::d3d12 {
       logMessage(LogLevel::Warn, "PSO disk cache: failed to start background writer: %s", e.what());
     }
 
-    logMessage(LogLevel::Info, "PSO disk cache: loaded %zu and listed %zu cached blobs from '%s'",
+    logMessage(LogLevel::Info, "PSO disk cache: loaded %zu and listed %zu cached blobs from '%ls'",
       m_psoDiskBlobs.size(), m_psoDiskFiles.size(), m_psoDiskCacheDir.c_str());
 #endif
   }
 
-  static bool readPsoFile(const std::string& path, std::vector<uint8_t>& blob) {
+  static bool readPsoFile(const std::wstring& path, std::vector<uint8_t>& blob) {
     std::ifstream f(path, std::ios::binary | std::ios::ate);
     if (!f)
       return false;
@@ -5429,10 +5428,10 @@ namespace dxup::d3d12 {
     return false;
   }
 
-  std::string D3D12BackendDevice::psoDiskPath(uint64_t keyHash) const {
-    char filename[64];
-    snprintf(filename, sizeof(filename), "%llx.pso", static_cast<unsigned long long>(keyHash));
-    return m_psoDiskCacheDir + "\\" + filename;
+  std::wstring D3D12BackendDevice::psoDiskPath(uint64_t keyHash) const {
+    wchar_t filename[64];
+    swprintf_s(filename, L"%llx.pso", static_cast<unsigned long long>(keyHash));
+    return m_psoDiskCacheDir + L"\\" + filename;
   }
 
   std::vector<uint8_t> D3D12BackendDevice::takePsoDiskBlob(uint64_t keyHash) {
@@ -5534,19 +5533,19 @@ namespace dxup::d3d12 {
     // their pipeline compiles, mostly on a compiler thread.
     const bool listOnly = true;
 
-    std::string searchPath = m_psoDiskCacheDir + "\\*.pso";
-    WIN32_FIND_DATAA fd = {};
-    HANDLE hFind = FindFirstFileA(searchPath.c_str(), &fd);
+    std::wstring searchPath = m_psoDiskCacheDir + L"\\*.pso";
+    WIN32_FIND_DATAW fd = {};
+    HANDLE hFind = FindFirstFileW(searchPath.c_str(), &fd);
     if (hFind == INVALID_HANDLE_VALUE) return;
 
     do {
       if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
 
       // Filename is "hexhash.pso"
-      std::string name(fd.cFileName);
-      auto dotPos = name.rfind('.');
-      if (dotPos == std::string::npos) continue;
-      std::string stem = name.substr(0, dotPos);
+      std::wstring name(fd.cFileName);
+      auto dotPos = name.rfind(L'.');
+      if (dotPos == std::wstring::npos) continue;
+      std::wstring stem = name.substr(0, dotPos);
 
       uint64_t hash = 0;
       try { hash = std::stoull(stem, nullptr, 16); }
@@ -5557,9 +5556,9 @@ namespace dxup::d3d12 {
         continue;
       }
       std::vector<uint8_t> blob;
-      if (readPsoFile(m_psoDiskCacheDir + "\\" + fd.cFileName, blob))
+      if (readPsoFile(m_psoDiskCacheDir + L"\\" + fd.cFileName, blob))
         m_psoDiskBlobs[hash] = std::move(blob);
-    } while (FindNextFileA(hFind, &fd));
+    } while (FindNextFileW(hFind, &fd));
 
     FindClose(hFind);
 #endif
@@ -5579,9 +5578,9 @@ namespace dxup::d3d12 {
 
     // Written beside it and renamed: a run that ends meanwhile, or another
     // process reading the cache, never finds a partial blob under the name.
-    const std::string path = psoDiskPath(keyHash);
-    const std::string temp = path + ".tmp" + std::to_string(GetCurrentProcessId()) + "_"
-      + std::to_string(GetCurrentThreadId());
+    const std::wstring path = psoDiskPath(keyHash);
+    const std::wstring temp = path + L".tmp" + std::to_wstring(GetCurrentProcessId()) + L"_"
+      + std::to_wstring(GetCurrentThreadId());
     bool written = false;
     {
       std::ofstream f(temp, std::ios::binary | std::ios::trunc);
@@ -5592,11 +5591,11 @@ namespace dxup::d3d12 {
         written = !f.fail();
       }
     }
-    if (written && MoveFileExA(temp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING)) {
-      logMessage(LogLevel::Debug, "PSO disk cache: saved %zu bytes to %s",
-        rawBlob->GetBufferSize(), path.c_str());
+    if (written && MoveFileExW(temp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+      logMessage(LogLevel::Debug, "PSO disk cache: saved %zu bytes as %016llx.pso",
+        rawBlob->GetBufferSize(), static_cast<unsigned long long>(keyHash));
     } else {
-      DeleteFileA(temp.c_str());
+      DeleteFileW(temp.c_str());
     }
     rawBlob->Release();
 #endif

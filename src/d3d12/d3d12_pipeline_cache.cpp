@@ -335,10 +335,10 @@ namespace dxup::d3d12 {
   void D3D12BackendDevice::loadPipelineStateCache() {
     if (m_psoDiskCacheDir.empty() || !UserOverrides::get().shaderPrecompile)
       return;
-    m_stateCachePath = m_psoDiskCacheDir + "\\pipelines.bin";
+    m_stateCachePath = m_psoDiskCacheDir + L"\\pipelines.bin";
     // Shared: another device of this process or another process may append
     // meanwhile.
-    HANDLE file = CreateFileA(m_stateCachePath.c_str(), GENERIC_READ,
+    HANDLE file = CreateFileW(m_stateCachePath.c_str(), GENERIC_READ,
       FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (file == INVALID_HANDLE_VALUE)
       return;
@@ -359,7 +359,7 @@ namespace dxup::d3d12 {
       std::memcpy(&version, contents.data() + sizeof(kStateCacheMagic), sizeof(version));
     if (contents.size() < headerSize || std::memcmp(contents.data(), kStateCacheMagic, sizeof(kStateCacheMagic))
      || version != kStateCacheVersion) {
-      logMessage(LogLevel::Warn, "Pipeline cache: '%s' has another format, starting over", m_stateCachePath.c_str());
+      logMessage(LogLevel::Warn, "Pipeline cache: '%ls' has another format, starting over", m_stateCachePath.c_str());
       return;
     }
 
@@ -401,7 +401,7 @@ namespace dxup::d3d12 {
       m_storedPipelines.push_back(std::move(stored));
     }
     m_stateCacheValidSize = offset;
-    logMessage(LogLevel::Info, "Pipeline cache: %zu pipelines, %zu shaders from '%s'",
+    logMessage(LogLevel::Info, "Pipeline cache: %zu pipelines, %zu shaders from '%ls'",
       m_storedPipelines.size(), m_storedPipelinesByShader.size(), m_stateCachePath.c_str());
   }
 
@@ -496,7 +496,7 @@ namespace dxup::d3d12 {
     if (m_stateCacheFailed.load(std::memory_order_relaxed))
       return;
     if (m_stateCacheHandle == INVALID_HANDLE_VALUE) {
-      HANDLE handle = CreateFileA(m_stateCachePath.c_str(), GENERIC_READ | GENERIC_WRITE,
+      HANDLE handle = CreateFileW(m_stateCachePath.c_str(), GENERIC_READ | GENERIC_WRITE,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
       if (handle == INVALID_HANDLE_VALUE) {
         m_stateCacheFailed.store(true, std::memory_order_relaxed);
@@ -523,7 +523,7 @@ namespace dxup::d3d12 {
       CloseHandle(handle);
       // Append-only access: every write lands at the end of the file as it
       // is then, also with other writers.
-      m_stateCacheHandle = CreateFileA(m_stateCachePath.c_str(), FILE_APPEND_DATA | SYNCHRONIZE,
+      m_stateCacheHandle = CreateFileW(m_stateCachePath.c_str(), FILE_APPEND_DATA | SYNCHRONIZE,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
       if (m_stateCacheHandle == INVALID_HANDLE_VALUE) {
         m_stateCacheFailed.store(true, std::memory_order_relaxed);

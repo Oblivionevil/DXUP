@@ -44,10 +44,7 @@ namespace dxup {
   // the application rendered is saved as dxup_frame_<n>.bmp at a few
   // presents.
   inline bool dxupFrameDumpEnabled() {
-    static const bool enabled = [] {
-      const DWORD attributes = GetFileAttributesA(dxupSiblingPath("dxup_frame_dump.txt").c_str());
-      return attributes != INVALID_FILE_ATTRIBUTES && !(attributes & FILE_ATTRIBUTE_DIRECTORY);
-    }();
+    static const bool enabled = dxupSiblingExists("dxup_frame_dump.txt");
     return enabled;
   }
 
@@ -55,20 +52,14 @@ namespace dxup {
   // has no frame latency object of DXUP's and Present blocks for the next
   // buffer as before, for comparison.
   inline bool dxupBlockingPresent() {
-    static const bool enabled = [] {
-      const DWORD attributes = GetFileAttributesA(dxupSiblingPath("dxup_blocking_present.txt").c_str());
-      return attributes != INVALID_FILE_ATTRIBUTES && !(attributes & FILE_ATTRIBUTE_DIRECTORY);
-    }();
+    static const bool enabled = dxupSiblingExists("dxup_blocking_present.txt");
     return enabled;
   }
 
   // With dxup_sync_present.txt next to the DLL, presents run on the
   // application thread after the worker recorded the frame, for comparison.
   inline bool dxupSyncPresentEnabled() {
-    static const bool enabled = [] {
-      const DWORD attributes = GetFileAttributesA(dxupSiblingPath("dxup_sync_present.txt").c_str());
-      return attributes != INVALID_FILE_ATTRIBUTES && !(attributes & FILE_ATTRIBUTE_DIRECTORY);
-    }();
+    static const bool enabled = dxupSiblingExists("dxup_sync_present.txt");
     return enabled;
   }
 
@@ -1593,8 +1584,7 @@ namespace dxup {
       if (now - m_traceGoLastCheck < 2000)
         return false;
       m_traceGoLastCheck = now;
-      static const std::string path = dxupSiblingPath("dxup_trace_go.txt");
-      return GetFileAttributesA(path.c_str()) != INVALID_FILE_ATTRIBUTES;
+      return dxupSiblingExists("dxup_trace_go.txt");
     }
     uint32_t                     m_traceGoFrames = 0;
     bool                         m_traceGoDone = false;
@@ -1860,7 +1850,7 @@ namespace dxup {
           if (m_periodicDumps.size() > 4) {
             char old[64];
             sprintf_s(old, "dxup_frame_%u.bmp", m_periodicDumps.front());
-            DeleteFileA(dxupSiblingPath(old).c_str());
+            dxupDeleteSibling(old);
             m_periodicDumps.erase(m_periodicDumps.begin());
           }
         }
@@ -2094,7 +2084,7 @@ namespace dxup {
       if (FAILED(context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped)))
         return false;
 
-      FILE* file = fopen(dxupSiblingPath(name).c_str(), "wb");
+      FILE* file = dxupOpenSibling(name, "wb");
       if (file) {
         const uint32_t imageSize = desc.Width * desc.Height * 4;
         BITMAPFILEHEADER fileHeader = {};

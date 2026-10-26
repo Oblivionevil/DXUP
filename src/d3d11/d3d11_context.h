@@ -1574,14 +1574,13 @@ namespace dxup {
         return false;
       char name[64];
       sprintf_s(name, "dxup_trace_%u_cb%u.bin", call, slot);
-      const std::string path = dxupSiblingPath(name);
       m_probing = true;
       const D3D11_BOX box = { 0, 0, 0, size, 1, 1 };
       CopySubresourceRegion(staging.Get(), 0, 0, 0, 0, buffer, 0, &box);
       bool written = false;
       D3D11_MAPPED_SUBRESOURCE mapped = {};
       if (SUCCEEDED(Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped))) {
-        if (FILE* file = fopen(path.c_str(), "wb")) {
+        if (FILE* file = dxupOpenSibling(name, "wb")) {
           written = fwrite(mapped.pData, 1, size, file) == size;
           fclose(file);
         }
@@ -4615,7 +4614,7 @@ namespace dxup {
     void dumpCallTargets(uint32_t index) {
       static const std::vector<uint32_t> calls = [] {
         std::vector<uint32_t> list;
-        if (FILE* file = fopen(dxupSiblingPath("dxup_dump_calls.txt").c_str(), "r")) {
+        if (FILE* file = dxupOpenSibling("dxup_dump_calls.txt", "r")) {
           unsigned value = 0;
           while (fscanf_s(file, "%u", &value) == 1)
             list.push_back(value);
@@ -4674,7 +4673,7 @@ namespace dxup {
       CopySubresourceRegion(staging.Get(), 0, 0, 0, 0, resource, 0, nullptr);
       D3D11_MAPPED_SUBRESOURCE mapped = {};
       if (SUCCEEDED(Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped))) {
-        if (FILE* file = fopen(dxupSiblingPath(name).c_str(), "wb")) {
+        if (FILE* file = dxupOpenSibling(name, "wb")) {
           const uint32_t imageSize = desc.Width * desc.Height * 4;
           BITMAPFILEHEADER fileHeader = {};
           BITMAPINFOHEADER infoHeader = {};
@@ -4755,7 +4754,7 @@ namespace dxup {
     void probeRenderTarget(std::string& line) {
       static const POINT probe = [] {
         POINT point = { -1, -1 };
-        if (FILE* file = fopen(dxupSiblingPath("dxup_probe_pixel.txt").c_str(), "r")) {
+        if (FILE* file = dxupOpenSibling("dxup_probe_pixel.txt", "r")) {
           if (fscanf_s(file, "%ld %ld", &point.x, &point.y) != 2)
             point = { -1, -1 };
           fclose(file);

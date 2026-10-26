@@ -649,13 +649,10 @@ namespace dxup {
       logMessage(LogLevel::Warn, format, args...);
     }
 
-    static std::string profilePath() {
-      return dxupSiblingPath("dxup_upscaler_auto.txt");
-    }
+    static constexpr const char* kProfileFile = "dxup_upscaler_auto.txt";
 
     void saveProfile() const {
-      const std::string path = profilePath();
-      FILE* file = path.empty() ? nullptr : std::fopen(path.c_str(), "w");
+      FILE* file = dxupOpenSibling(kProfileFile, "w");
       if (!file)
         return;
       const Profile& p = m_profile;
@@ -667,8 +664,7 @@ namespace dxup {
     }
 
     void loadProfile() {
-      const std::string path = profilePath();
-      FILE* file = path.empty() ? nullptr : std::fopen(path.c_str(), "r");
+      FILE* file = dxupOpenSibling(kProfileFile, "r");
       if (!file)
         return;
       Profile p;
@@ -692,7 +688,7 @@ namespace dxup {
       m_profile = p;
       m_state = State::Found;
       m_fromFile = true;
-      logMessage(LogLevel::Info, "upscalerAuto: profile %016llx from %s", hash, path.c_str());
+      logMessage(LogLevel::Info, "upscalerAuto: profile %016llx from %s", hash, kProfileFile);
     }
 
     State    m_state = State::Searching;

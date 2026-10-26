@@ -3,6 +3,9 @@
 #ifdef _WIN32
 #include <windows.h>
 
+#include <share.h>
+
+#include <cstdio>
 #include <cstring>
 #include <string>
 
@@ -114,17 +117,39 @@ namespace dxup {
     return folder.empty() || !name ? std::wstring() : folder + name;
   }
 
+  // An ASCII name (or fopen mode) as a wide string.
+  inline std::wstring dxupWiden(const char* text) {
+    std::wstring wide;
+    for (const char* c = text; c && *c; c++)
+      wide += static_cast<wchar_t>(static_cast<unsigned char>(*c));
+    return wide;
+  }
+
+  // The wide path of a file next to the DLL named in ASCII.
+  inline std::wstring dxupSiblingPathW(const char* name) {
+    return name ? dxupSiblingPathW(dxupWiden(name).c_str()) : std::wstring();
+  }
+
   // Whether a file (a dxup_*.txt marker, named in ASCII) lies next to the
   // DLL, whatever characters its folder holds.
   inline bool dxupSiblingExists(const char* name) {
-    if (!name)
-      return false;
-    std::wstring wideName;
-    for (const char* c = name; *c; c++)
-      wideName += static_cast<wchar_t>(static_cast<unsigned char>(*c));
-    const std::wstring path = dxupSiblingPathW(wideName.c_str());
+    const std::wstring path = dxupSiblingPathW(name);
     const DWORD attributes = path.empty() ? INVALID_FILE_ATTRIBUTES : GetFileAttributesW(path.c_str());
     return attributes != INVALID_FILE_ATTRIBUTES && !(attributes & FILE_ATTRIBUTE_DIRECTORY);
+  }
+
+  // Opens a file next to the DLL (named in ASCII), whatever characters its
+  // folder holds; null when that fails.
+  inline FILE* dxupOpenSibling(const char* name, const char* mode) {
+    const std::wstring path = dxupSiblingPathW(name);
+    return path.empty() ? nullptr : _wfsopen(path.c_str(), dxupWiden(mode).c_str(), _SH_DENYNO);
+  }
+
+  // Deletes a file next to the DLL (named in ASCII).
+  inline void dxupDeleteSibling(const char* name) {
+    const std::wstring path = dxupSiblingPathW(name);
+    if (!path.empty())
+      DeleteFileW(path.c_str());
   }
 
 }

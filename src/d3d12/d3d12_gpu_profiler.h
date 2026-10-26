@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <map>
 #include <windows.h>
+#include <share.h>
 #include <string>
 #include <vector>
 #include <unordered_set>
@@ -124,15 +125,15 @@ namespace dxup {
       DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN, depthFormat = DXGI_FORMAT_UNKNOWN;
     };
 
-    void init(ID3D12Device* device, ID3D12CommandQueue* queue, const std::string& markerPath,
-              const std::string& outPath) {
-      FILE* marker = fopen(markerPath.c_str(), "r");
+    void init(ID3D12Device* device, ID3D12CommandQueue* queue, const std::wstring& markerPath,
+              const std::wstring& outPath) {
+      FILE* marker = _wfsopen(markerPath.c_str(), L"r", _SH_DENYNO);
       if (!marker)
         return;
       unsigned first = 2000, count = 300;
       char go[3] = {};
       if (fscanf(marker, "%2[go] %u", go, &count) == 2 && go[0] == 'g' && go[1] == 'o') {
-        m_goPath = markerPath.substr(0, markerPath.size() - 4) + "_go.txt";
+        m_goPath = markerPath.substr(0, markerPath.size() - 4) + L"_go.txt";
         first = ~0u;
       } else {
         rewind(marker);
@@ -302,7 +303,7 @@ namespace dxup {
         return;
       }
       m_frame++;
-      if (!m_goPath.empty() && !(m_frame & 63) && GetFileAttributesA(m_goPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
+      if (!m_goPath.empty() && !(m_frame & 63) && GetFileAttributesW(m_goPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
         m_firstFrame = m_frame + 1;
         m_goPath.clear();
       }
@@ -426,7 +427,7 @@ namespace dxup {
     }
 
     void report(const uint64_t* ticks) {
-      FILE* out = fopen(m_outPath.c_str(), "w");
+      FILE* out = _wfsopen(m_outPath.c_str(), L"w", _SH_DENYNO);
       if (!out)
         return;
       const double msPerTick = 1000.0 / double(m_frequency);
@@ -531,8 +532,8 @@ namespace dxup {
     uint32_t m_frame = 0, m_firstFrame = 0, m_frameCount = 0;
     uint32_t m_next = 0, m_resolved = 0, m_end = 0;
     uint64_t m_resultFence = 0;
-    std::string m_outPath;
-    std::string m_goPath;
+    std::wstring m_outPath;
+    std::wstring m_goPath;
     Targets m_targets;
     Pass m_cur;
     std::vector<Pass> m_passes;
