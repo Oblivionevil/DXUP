@@ -585,6 +585,204 @@ namespace {
     return true;
   }
 
+  // State blocks of each type hold the states Windows' Direct3D 7 puts in
+  // them: pixel blocks the blend states and all stage states, vertex blocks
+  // the lighting states, TEXCOORDINDEX, TEXTURETRANSFORMFLAGS and whether
+  // lights are enabled (not the lights), ALL blocks the lights that exist
+  // (captured again by CaptureStateBlock; lights made later stay out).
+  // Unset lights do not exist; enabled ones read 128.
+  bool stateBlockTypes(Context& c, std::string& error) {
+    IDirect3DDevice7* d = c.device.get();
+    struct Probe { D3DRENDERSTATETYPE state; DWORD captured, changed; bool pixel, vertex; };
+    const Probe probes[] = {
+      { D3DRENDERSTATE_ALPHABLENDENABLE, 1, 0, true, false }, { D3DRENDERSTATE_ZBIAS, 1, 0, true, false },
+      { D3DRENDERSTATE_LIGHTING, 1, 0, false, true }, { D3DRENDERSTATE_CULLMODE, D3DCULL_CW, D3DCULL_CCW, false, true },
+      { D3DRENDERSTATE_FOGSTART, 1, 0, true, true }, { D3DRENDERSTATE_COLORKEYENABLE, 1, 0, true, false },
+    };
+    for (D3DSTATEBLOCKTYPE type : { D3DSBT_PIXELSTATE, D3DSBT_VERTEXSTATE, D3DSBT_ALL }) {
+      for (const Probe& p : probes) {
+        DWORD old = 0, value = 0, block = 0;
+        d->GetRenderState(p.state, &old);
+        d->SetRenderState(p.state, p.captured);
+        if (FAILED(d->CreateStateBlock(type, &block))) { error = "CreateStateBlock"; return false; }
+        d->SetRenderState(p.state, p.changed);
+        d->ApplyStateBlock(block);
+        d->DeleteStateBlock(block);
+        d->GetRenderState(p.state, &value);
+        d->SetRenderState(p.state, old);
+        const bool expected = type == D3DSBT_ALL || (type == D3DSBT_PIXELSTATE ? p.pixel : p.vertex);
+        if ((value == p.captured) != expected) {
+          error = format("type %d: render state %d %s", int(type), int(p.state), expected ? "not captured" : "captured");
+          return false;
+        }
+      }
+      for (D3DTEXTURESTAGESTATETYPE t : { D3DTSS_COLOROP, D3DTSS_TEXCOORDINDEX }) {
+        DWORD value = 0, block = 0;
+        d->SetTextureStageState(1, t, 1);
+        d->CreateStateBlock(type, &block);
+        d->SetTextureStageState(1, t, 2);
+        d->ApplyStateBlock(block);
+        d->DeleteStateBlock(block);
+        d->GetTextureStageState(1, t, &value);
+        const bool expected = type != D3DSBT_VERTEXSTATE || t == D3DTSS_TEXCOORDINDEX;
+        if ((value == 1) != expected) {
+          error = format("type %d: stage state %d %s", int(type), int(t), expected ? "not captured" : "captured");
+          return false;
+        }
+      }
+    }
+    d->SetTextureStageState(1, D3DTSS_COLOROP, D3DTOP_DISABLE);
+    d->SetTextureStageState(1, D3DTSS_TEXCOORDINDEX, 1);
+    D3DLIGHT7 light = {}, got = {};
+    BOOL enabled = 5;
+    if (d->GetLight(6, &got) != DDERR_INVALIDPARAMS || d->GetLightEnable(6, &enabled) != DDERR_INVALIDPARAMS) {
+      error = "an unset light exists";
+      return false;
+    }
+    light.dltType = D3DLIGHT_DIRECTIONAL;
+    light.dvDirection.z = 1.0f;
+    for (D3DSTATEBLOCKTYPE type : { D3DSBT_ALL, D3DSBT_VERTEXSTATE, D3DSBT_PIXELSTATE }) {
+      light.dcvDiffuse.r = 0.25f;
+      d->SetLight(4, &light);
+      d->LightEnable(4, FALSE);
+      DWORD block = 0;
+      d->CreateStateBlock(type, &block);
+      light.dcvDiffuse.r = 0.5f;
+      d->SetLight(4, &light);
+      d->LightEnable(4, TRUE);
+      d->SetLight(10 + type, &light);   // made after the block
+      d->CaptureStateBlock(block);
+      light.dcvDiffuse.r = 0.75f;
+      d->SetLight(4, &light);
+      d->LightEnable(4, FALSE);
+      d->SetLight(10 + type, &light);
+      d->ApplyStateBlock(block);
+      d->DeleteStateBlock(block);
+      D3DLIGHT7 later = {};
+      d->GetLight(4, &got);
+      d->GetLight(10 + type, &later);
+      d->GetLightEnable(4, &enabled);
+      const float expectedLight = type == D3DSBT_ALL ? 0.5f : 0.75f;
+      const BOOL expectedEnable = type == D3DSBT_PIXELSTATE ? FALSE : 128;
+      if (got.dcvDiffuse.r != expectedLight || enabled != expectedEnable || later.dcvDiffuse.r != 0.75f) {
+        error = format("type %d: light %.2f enabled %d, light made later %.2f", int(type), got.dcvDiffuse.r, enabled,
+          later.dcvDiffuse.r);
+        return false;
+      }
+    }
+    d->LightEnable(4, FALSE);
+    return true;
+  }
+
+  // Direct3D 7 keeps the viewport when the render target changes.
+  bool renderTargetViewport(Context& c, std::string& error) {
+    DDSURFACEDESC2 desc = {};
+    desc.dwSize = sizeof(desc);
+    desc.dwFlags = DDSD_CAPS | DDSD_WIDTH | DDSD_HEIGHT | DDSD_PIXELFORMAT;
+    desc.dwWidth = desc.dwHeight = 32;
+    desc.ddsCaps.dwCaps = DDSCAPS_OFFSCREENPLAIN | DDSCAPS_3DDEVICE | DDSCAPS_VIDEOMEMORY;
+    desc.ddpfPixelFormat = rgbFormat(32, 0xff0000, 0xff00, 0xff, 0);
+    Com<IDirectDrawSurface7> other;
+    if (FAILED(c.dd->CreateSurface(&desc, other.put(), nullptr))) { error = "second target"; return false; }
+    D3DVIEWPORT7 narrow = { 2, 3, 20, 10, 0.0f, 1.0f }, vp = {};
+    c.device->SetViewport(&narrow);
+    HRESULT hr = c.device->SetRenderTarget(other.get(), 0);
+    c.device->GetViewport(&vp);
+    c.device->SetRenderTarget(c.target.get(), 0);
+    D3DVIEWPORT7 full = { 0, 0, Context::size, Context::size, 0.0f, 1.0f };
+    c.device->SetViewport(&full);
+    if (FAILED(hr) || vp.dwX != 2 || vp.dwY != 3 || vp.dwWidth != 20 || vp.dwHeight != 10) {
+      error = format("SetRenderTarget 0x%08lx, viewport %lu %lu %lu %lu", hr, vp.dwX, vp.dwY, vp.dwWidth, vp.dwHeight);
+      return false;
+    }
+    return true;
+  }
+
+  // DXT1 mip levels: descriptions and locks report each level's linear
+  // size (not a pitch), with the flags of the description.
+  bool dxtMipLevels(Context& c, std::string& error) {
+    DDSURFACEDESC2 desc = {};
+    desc.dwSize = sizeof(desc);
+    desc.dwFlags = DDSD_CAPS | DDSD_WIDTH | DDSD_HEIGHT | DDSD_PIXELFORMAT | DDSD_MIPMAPCOUNT;
+    desc.dwWidth = desc.dwHeight = 16;
+    desc.dwMipMapCount = 3;
+    desc.ddsCaps.dwCaps = DDSCAPS_TEXTURE | DDSCAPS_MIPMAP | DDSCAPS_COMPLEX;
+    desc.ddsCaps.dwCaps2 = DDSCAPS2_TEXTUREMANAGE;
+    desc.ddpfPixelFormat.dwSize = sizeof(DDPIXELFORMAT);
+    desc.ddpfPixelFormat.dwFlags = DDPF_FOURCC;
+    desc.ddpfPixelFormat.dwFourCC = MAKEFOURCC('D', 'X', 'T', '1');
+    Com<IDirectDrawSurface7> texture;
+    if (FAILED(c.dd->CreateSurface(&desc, texture.put(), nullptr))) { error = "DXT1 mipmap"; return false; }
+    IDirectDrawSurface7* level = texture.get();
+    level->AddRef();
+    for (DWORD i = 0, size = 128; level; i++, size /= 4) {
+      DDSURFACEDESC2 got = {}, locked = {};
+      got.dwSize = locked.dwSize = sizeof(DDSURFACEDESC2);
+      level->GetSurfaceDesc(&got);
+      const HRESULT hr = level->Lock(nullptr, &locked, DDLOCK_WAIT, nullptr);
+      if (SUCCEEDED(hr)) level->Unlock(nullptr);
+      DDSCAPS2 caps = {};
+      caps.dwCaps = DDSCAPS_MIPMAP;
+      IDirectDrawSurface7* next = nullptr;
+      level->GetAttachedSurface(&caps, &next);
+      level->Release();
+      level = next;
+      if (FAILED(hr) || got.dwLinearSize != size || !(got.dwFlags & DDSD_LINEARSIZE) || (got.dwFlags & DDSD_PITCH)
+       || locked.dwLinearSize != size || (locked.dwFlags & DDSD_PITCH) || !locked.lpSurface) {
+        error = format("level %lu: description flags 0x%lx size %lu, lock 0x%08lx flags 0x%lx size %lu", i, got.dwFlags,
+          got.dwLinearSize, hr, locked.dwFlags, locked.dwLinearSize);
+        if (level) level->Release();
+        return false;
+      }
+    }
+    return true;
+  }
+
+  // GetDC of surfaces with alpha: what GDI draws gets alpha 0 (the DC
+  // draws into the surface), untouched texels keep theirs.
+  bool getDcAlpha(Context& c, std::string& error) {
+    struct Case { DWORD bits, r, g, b, a, texel, drawn; };
+    const Case cases[] = { { 32, 0xff0000, 0xff00, 0xff, 0xff000000u, 0x5500ff00u, 0x00ff0000u },
+                           { 16, 0x7c00, 0x3e0, 0x1f, 0x8000, 0x83e0, 0x7c00 } };
+    for (const Case& k : cases) {
+      DDSURFACEDESC2 desc = {};
+      desc.dwSize = sizeof(desc);
+      desc.dwFlags = DDSD_CAPS | DDSD_WIDTH | DDSD_HEIGHT | DDSD_PIXELFORMAT;
+      desc.dwWidth = desc.dwHeight = 8;
+      desc.ddsCaps.dwCaps = DDSCAPS_TEXTURE | DDSCAPS_SYSTEMMEMORY;
+      desc.ddpfPixelFormat = rgbFormat(k.bits, k.r, k.g, k.b, k.a);
+      Com<IDirectDrawSurface7> surface;
+      if (FAILED(c.dd->CreateSurface(&desc, surface.put(), nullptr))) { error = "surface"; return false; }
+      const DWORD bytes = k.bits / 8;
+      DDSURFACEDESC2 locked = {};
+      locked.dwSize = sizeof(locked);
+      if (FAILED(surface->Lock(nullptr, &locked, DDLOCK_WAIT, nullptr))) { error = "Lock"; return false; }
+      for (DWORD y = 0; y < 8; y++)
+        for (DWORD x = 0; x < 8; x++)
+          std::memcpy(static_cast<BYTE*>(locked.lpSurface) + y * locked.lPitch + x * bytes, &k.texel, bytes);
+      surface->Unlock(nullptr);
+      HDC dc = nullptr;
+      if (FAILED(surface->GetDC(&dc))) { error = "GetDC"; return false; }
+      const RECT r = { 0, 0, 4, 4 };
+      HBRUSH brush = CreateSolidBrush(RGB(255, 0, 0));
+      FillRect(dc, &r, brush);
+      DeleteObject(brush);
+      surface->ReleaseDC(dc);
+      locked = {};
+      locked.dwSize = sizeof(locked);
+      if (FAILED(surface->Lock(nullptr, &locked, DDLOCK_WAIT | DDLOCK_READONLY, nullptr))) { error = "Lock again"; return false; }
+      DWORD drawn = 0, kept = 0;
+      std::memcpy(&drawn, static_cast<BYTE*>(locked.lpSurface) + locked.lPitch + bytes, bytes);
+      std::memcpy(&kept, static_cast<BYTE*>(locked.lpSurface) + 6 * locked.lPitch + 6 * bytes, bytes);
+      surface->Unlock(nullptr);
+      if (drawn != k.drawn || kept != k.texel) {
+        error = format("%lu bits: drawn 0x%08lx, untouched 0x%08lx", k.bits, drawn, kept);
+        return false;
+      }
+    }
+    return true;
+  }
+
   bool runningOnDxup() {
     HMODULE module = GetModuleHandleA("ddraw.dll");
     char path[MAX_PATH] = {}, exe[MAX_PATH] = {};
@@ -854,6 +1052,193 @@ static int forcedMsaaEdgePixels() {
   return partial;
 }
 
+// A P8 texture takes palette entries set after SetPalette for the next draw
+// (DXUP only: Windows' Direct3D 7 draws P8 textures black on today's drivers).
+static bool paletteEntries(Context& c, std::string& error) {
+  if (!runningOnDxup())
+    return true;
+  DDSURFACEDESC2 desc = {};
+  desc.dwSize = sizeof(desc);
+  desc.dwFlags = DDSD_CAPS | DDSD_WIDTH | DDSD_HEIGHT | DDSD_PIXELFORMAT;
+  desc.dwWidth = desc.dwHeight = 4;
+  desc.ddsCaps.dwCaps = DDSCAPS_TEXTURE;
+  desc.ddpfPixelFormat.dwSize = sizeof(DDPIXELFORMAT);
+  desc.ddpfPixelFormat.dwFlags = DDPF_RGB | DDPF_PALETTEINDEXED8;
+  desc.ddpfPixelFormat.dwRGBBitCount = 8;
+  Com<IDirectDrawSurface7> texture;
+  if (FAILED(c.dd->CreateSurface(&desc, texture.put(), nullptr))) { error = "P8 texture"; return false; }
+  PALETTEENTRY entries[256] = {};
+  entries[3] = { 255, 0, 0, 0 };
+  Com<IDirectDrawPalette> palette;
+  if (FAILED(c.dd->CreatePalette(DDPCAPS_8BIT | DDPCAPS_ALLOW256, entries, palette.put(), nullptr))
+   || FAILED(texture->SetPalette(palette.get()))) { error = "palette"; return false; }
+  DDSURFACEDESC2 locked = {};
+  locked.dwSize = sizeof(locked);
+  if (FAILED(texture->Lock(nullptr, &locked, DDLOCK_WAIT, nullptr))) { error = "Lock"; return false; }
+  for (DWORD y = 0; y < 4; y++)
+    std::memset(static_cast<BYTE*>(locked.lpSurface) + y * locked.lPitch, 3, 4);
+  texture->Unlock(nullptr);
+  c.device->SetTexture(0, texture.get());
+  c.device->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
+  c.device->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
+  TLVertex v[4];
+  quad(v, 0.0f, 0.0f, 64.0f, 64.0f, 0xffffffff);
+  bool ok = true;
+  for (int pass = 0; pass < 2 && ok; pass++) {
+    if (pass == 1) {
+      const PALETTEENTRY blue = { 0, 0, 255, 0 };
+      palette->SetEntries(0, 3, 1, const_cast<PALETTEENTRY*>(&blue));
+    }
+    c.device->Clear(0, nullptr, D3DCLEAR_TARGET, 0xff000000, 1.0f, 0);
+    c.device->BeginScene();
+    c.device->DrawPrimitive(D3DPT_TRIANGLESTRIP, kTLFvf, v, 4, 0);
+    c.device->EndScene();
+    ok = expectPixel(c, 32, 32, pass ? 0x0000ff : 0xff0000, pass ? "entry set after SetPalette" : "palette", error);
+  }
+  c.device->SetTexture(0, nullptr);
+  return ok;
+}
+
+// A windowed primary is the screen: blits land at their screen rectangle in
+// the window - from system memory and P8 surfaces too (with their palette)
+// - and several small blits do not each wait for the display. On DXUP only
+// (Windows draws on the desktop); the window shows for a moment, away from
+// overlays' corner. The capture may come darker (HDR desktops): hues only.
+static bool windowedPrimary(Context&, std::string& error) {
+  if (!runningOnDxup())
+    return true;
+  WNDCLASSA wc = {};
+  wc.lpfnWndProc = DefWindowProcA;
+  wc.hInstance = GetModuleHandleA(nullptr);
+  wc.lpszClassName = "Dx7PrimaryTest";
+  RegisterClassA(&wc);
+  RECT frame = { 0, 0, 256, 192 };
+  AdjustWindowRect(&frame, WS_OVERLAPPEDWINDOW, FALSE);
+  HWND window = CreateWindowExA(0, "Dx7PrimaryTest", "dx7 primary", WS_OVERLAPPEDWINDOW, 0, 0, frame.right - frame.left,
+                                frame.bottom - frame.top, nullptr, nullptr, wc.hInstance, nullptr);
+  // Without the opening animation (it would fade the capture).
+  if (HMODULE dwm = LoadLibraryA("dwmapi.dll")) {
+    using SetAttribute = HRESULT (WINAPI*)(HWND, DWORD, LPCVOID, DWORD);
+    if (auto set = reinterpret_cast<SetAttribute>(GetProcAddress(dwm, "DwmSetWindowAttribute"))) {
+      const BOOL disabled = TRUE;
+      set(window, 3 /* DWMWA_TRANSITIONS_FORCEDISABLED */, &disabled, sizeof(disabled));
+    }
+  }
+  ShowWindow(window, SW_SHOWNOACTIVATE);
+  RECT client = {};
+  GetClientRect(window, &client);
+  POINT origin = { 0, 0 };
+  ClientToScreen(window, &origin);
+  auto screen = [&](LONG x0, LONG y0, LONG x1, LONG y1) { return RECT{ origin.x + x0, origin.y + y0, origin.x + x1, origin.y + y1 }; };
+  // Each channel of the expected colour lit (0xff) or dark (0).
+  auto hue = [](DWORD pixel, DWORD expected) {
+    for (int shift = 0; shift < 24; shift += 8) {
+      const DWORD value = (pixel >> shift) & 255;
+      if (((expected >> shift) & 255) ? value < 0x30 : value > 0x18)
+        return false;
+    }
+    return true;
+  };
+  bool ok = false;
+  {
+    Com<IDirectDraw7> dd;
+    Com<IDirectDrawSurface7> primary, source, indexed;
+    Com<IDirectDrawClipper> clipper;
+    Com<IDirectDrawPalette> palette;
+    DDSURFACEDESC2 pd = {};
+    pd.dwSize = sizeof(pd);
+    pd.dwFlags = DDSD_CAPS;
+    pd.ddsCaps.dwCaps = DDSCAPS_PRIMARYSURFACE;
+    DDSURFACEDESC2 sd = {};
+    sd.dwSize = sizeof(sd);
+    sd.dwFlags = DDSD_CAPS | DDSD_WIDTH | DDSD_HEIGHT | DDSD_PIXELFORMAT;
+    sd.dwWidth = sd.dwHeight = 16;
+    sd.ddsCaps.dwCaps = DDSCAPS_OFFSCREENPLAIN | DDSCAPS_SYSTEMMEMORY;
+    sd.ddpfPixelFormat = rgbFormat(32, 0xff0000, 0xff00, 0xff, 0);
+    DDSURFACEDESC2 id = sd;
+    id.ddpfPixelFormat = {};
+    id.ddpfPixelFormat.dwSize = sizeof(DDPIXELFORMAT);
+    id.ddpfPixelFormat.dwFlags = DDPF_RGB | DDPF_PALETTEINDEXED8;
+    id.ddpfPixelFormat.dwRGBBitCount = 8;
+    PALETTEENTRY entries[256] = {};
+    entries[7] = { 0, 255, 0, 0 };
+    if (FAILED(DirectDrawCreateEx(nullptr, reinterpret_cast<void**>(dd.put()), IID_IDirectDraw7, nullptr))
+     || FAILED(dd->SetCooperativeLevel(window, DDSCL_NORMAL)) || FAILED(dd->CreateSurface(&pd, primary.put(), nullptr))
+     || FAILED(dd->CreateClipper(0, clipper.put(), nullptr)) || FAILED(clipper->SetHWnd(0, window))
+     || FAILED(primary->SetClipper(clipper.get())) || FAILED(dd->CreateSurface(&sd, source.put(), nullptr))
+     || FAILED(dd->CreateSurface(&id, indexed.put(), nullptr))
+     || FAILED(dd->CreatePalette(DDPCAPS_8BIT | DDPCAPS_ALLOW256, entries, palette.put(), nullptr))
+     || FAILED(indexed->SetPalette(palette.get()))) {
+      error = "setup";
+    } else {
+      DDBLTFX fx = {};
+      fx.dwSize = sizeof(fx);
+      fx.dwFillColor = 0x00ff00ff;
+      source->Blt(nullptr, nullptr, nullptr, DDBLT_COLORFILL | DDBLT_WAIT, &fx);
+      fx.dwFillColor = 7;
+      indexed->Blt(nullptr, nullptr, nullptr, DDBLT_COLORFILL | DDBLT_WAIT, &fx);
+      fx.dwFillColor = 0;
+      RECT whole = screen(0, 0, client.right, client.bottom);
+      RECT a = screen(150, 120, 166, 136), b = screen(190, 120, 206, 136);
+      HRESULT hr = primary->Blt(&whole, nullptr, nullptr, DDBLT_COLORFILL | DDBLT_WAIT, &fx);
+      if (SUCCEEDED(hr)) hr = primary->Blt(&a, source.get(), nullptr, DDBLT_WAIT, nullptr);
+      if (SUCCEEDED(hr)) hr = primary->Blt(&b, indexed.get(), nullptr, DDBLT_WAIT, nullptr);
+      // Entries set after the first blit: the next one shows them.
+      const PALETTEENTRY blue = { 0, 0, 255, 0 };
+      palette->SetEntries(0, 7, 1, const_cast<PALETTEENTRY*>(&blue));
+      if (SUCCEEDED(hr)) hr = primary->Blt(&b, indexed.get(), nullptr, DDBLT_WAIT, nullptr);
+      LARGE_INTEGER frequency, start, end;
+      QueryPerformanceFrequency(&frequency);
+      QueryPerformanceCounter(&start);
+      const RECT texel = { 0, 0, 1, 1 };
+      for (int i = 0; i < 30 && SUCCEEDED(hr); i++) {
+        RECT dot = screen(150 + i, 160, 151 + i, 161);
+        hr = primary->Blt(&dot, source.get(), const_cast<RECT*>(&texel), DDBLT_WAIT, nullptr);
+      }
+      QueryPerformanceCounter(&end);
+      const double elapsed = double(end.QuadPart - start.QuadPart) * 1000.0 / double(frequency.QuadPart);
+      double period = 1000.0 / 60.0;
+      DEVMODEA mode = {};
+      mode.dmSize = sizeof(mode);
+      if (EnumDisplaySettingsA(nullptr, ENUM_CURRENT_SETTINGS, &mode) && mode.dmDisplayFrequency > 1)
+        period = 1000.0 / mode.dmDisplayFrequency;
+      // The last blits show by the window's timer.
+      for (int i = 0; i < 20; i++) {
+        MSG message;
+        while (PeekMessageA(&message, nullptr, 0, 0, PM_REMOVE))
+          DispatchMessageA(&message);
+        Sleep(10);
+      }
+      HDC windowDc = GetDC(window);
+      HDC memory = CreateCompatibleDC(windowDc);
+      BITMAPINFO info = {};
+      info.bmiHeader.biSize = sizeof(info.bmiHeader);
+      info.bmiHeader.biWidth = client.right;
+      info.bmiHeader.biHeight = -client.bottom;
+      info.bmiHeader.biPlanes = 1;
+      info.bmiHeader.biBitCount = 32;
+      void* bits = nullptr;
+      HBITMAP bitmap = CreateDIBSection(windowDc, &info, DIB_RGB_COLORS, &bits, nullptr, 0);
+      HGDIOBJ old = SelectObject(memory, bitmap);
+      PrintWindow(window, memory, PW_CLIENTONLY | 2 /* PW_RENDERFULLCONTENT */);
+      GdiFlush();
+      const auto at = [&](int x, int y) { return static_cast<const DWORD*>(bits)[y * client.right + x] & 0xffffff; };
+      const DWORD pixels[5] = { at(158, 128), at(198, 128), at(120, 100), at(151, 160), at(178, 160) };
+      SelectObject(memory, old);
+      DeleteObject(bitmap);
+      DeleteDC(memory);
+      ReleaseDC(window, windowDc);
+      ok = SUCCEEDED(hr) && hue(pixels[0], 0xff00ff) && hue(pixels[1], 0x0000ff) && hue(pixels[2], 0) && hue(pixels[3], 0xff00ff)
+        && hue(pixels[4], 0xff00ff) && elapsed < 10.0 * period;
+      if (!ok)
+        error = format("hr 0x%08lx, pixels 0x%06lx 0x%06lx 0x%06lx, dots 0x%06lx 0x%06lx, 30 blits took %.1f ms (refresh %.1f ms)",
+          hr, pixels[0], pixels[1], pixels[2], pixels[3], pixels[4], elapsed, period);
+    }
+  }
+  DestroyWindow(window);
+  return ok;
+}
+
 // Runs this program with the argument; its exit code (-1: not started).
 static int runSelf(const char* argument) {
   char exe[MAX_PATH] = {};
@@ -928,6 +1313,12 @@ int main(int argc, char** argv) {
     { "foreign_surface_blt", foreignSurfaceBlt },
     { "directdraw1_interface", directDraw1Interface },
     { "forced_msaa", forcedMsaa },
+    { "state_block_types", stateBlockTypes },
+    { "render_target_viewport", renderTargetViewport },
+    { "dxt_mip_levels", dxtMipLevels },
+    { "getdc_alpha", getDcAlpha },
+    { "palette_entries", paletteEntries },
+    { "windowed_primary", windowedPrimary },
   };
   int failed = 0;
   for (const auto& [name, test] : tests) {

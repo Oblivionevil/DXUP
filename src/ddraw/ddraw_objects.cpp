@@ -267,13 +267,13 @@ namespace dxup::ddraw {
   }
 
   HRESULT Palette::GetEntries(DWORD, DWORD base, DWORD count, LPPALETTEENTRY entries) {
-    if (!entries || base + count > 256) return DDERR_INVALIDPARAMS;
+    if (!entries || base > 256 || count > 256 - base) return DDERR_INVALIDPARAMS;
     std::memcpy(entries, m_entries + base, count * sizeof(PALETTEENTRY));
     return DD_OK;
   }
 
   HRESULT Palette::SetEntries(DWORD, DWORD base, DWORD count, LPPALETTEENTRY entries) {
-    if (!entries || base + count > 256) return DDERR_INVALIDPARAMS;
+    if (!entries || base > 256 || count > 256 - base) return DDERR_INVALIDPARAMS;
     std::memcpy(m_entries + base, entries, count * sizeof(PALETTEENTRY));
     const bool alpha = (m_caps & DDPCAPS_ALPHA) != 0;
     for (DWORD i = base; i < base + count; i++) {
@@ -314,6 +314,7 @@ namespace dxup::ddraw {
   }
 
   Surface::~Surface() {
+    stopPresentTimer();
     if (m_dc) {
       SelectObject(m_dc, m_oldBitmap);
       DeleteDC(m_dc);
@@ -664,9 +665,13 @@ namespace dxup::ddraw {
     const DWORD size = desc->dwSize ? desc->dwSize : sizeof(DDSURFACEDESC2);
     std::memcpy(desc, &m_desc, (std::min)(size_t(size), sizeof(DDSURFACEDESC2)));
     desc->dwSize = size;
-    desc->dwFlags |= DDSD_LPSURFACE | DDSD_PITCH;
     desc->lpSurface = data;
-    desc->lPitch = LONG(pitch);
+    // Block formats keep their linear size (and flags) as Windows' Lock
+    // reports them; rows of blocks lie one after the other.
+    if (!legacy::formatInfo(m_texture->desc().format).block) {
+      desc->dwFlags |= DDSD_LPSURFACE | DDSD_PITCH;
+      desc->lPitch = LONG(pitch);
+    }
     return DD_OK;
   }
 
@@ -706,6 +711,7 @@ namespace dxup::ddraw {
             legacy::toArgb(format, static_cast<const uint8_t*>(data) + size_t(y) * pitch + size_t(x) * bpp, nullptr);
       m_texture->unlock(m_subresource);
     }
+    m_dcOriginal.assign(static_cast<const uint32_t*>(m_dcBits), static_cast<const uint32_t*>(m_dcBits) + size_t(w) * h);
     *dc = m_dc;
     return DD_OK;
   }
@@ -714,17 +720,28 @@ namespace dxup::ddraw {
     if (!m_dc || dc != m_dc) return DDERR_INVALIDPARAMS;
     GdiFlush();
     const uint32_t w = m_texture->width(m_subresource), h = m_texture->height(m_subresource);
+    // Only the pixels GDI drew go back, as GDI left them (alpha 0, as on
+    // Windows, where the DC draws into the surface): the others keep their
+    // texels, alpha included.
+    const auto* bits = static_cast<const uint32_t*>(m_dcBits);
+    bool changed = false;
+    for (size_t i = 0; i < m_dcOriginal.size() && !changed; i++)
+      changed = bits[i] != m_dcOriginal[i];
     void* data = nullptr;
     uint32_t pitch = 0;
-    if (m_texture->lock(m_subresource, nullptr, false, &data, &pitch)) {
+    if (changed && m_texture->lock(m_subresource, nullptr, false, &data, &pitch)) {
       const Format format = m_texture->desc().format;
       const uint32_t bpp = legacy::formatInfo(format).bytesPerBlock;
       for (uint32_t y = 0; y < h; y++)
-        for (uint32_t x = 0; x < w; x++)
-          legacy::fromArgb(format, static_cast<const uint32_t*>(m_dcBits)[size_t(y) * w + x] | 0xff000000u,
-            static_cast<uint8_t*>(data) + size_t(y) * pitch + size_t(x) * bpp);
+        for (uint32_t x = 0; x < w; x++) {
+          const size_t i = size_t(y) * w + x;
+          if (bits[i] != m_dcOriginal[i])
+            legacy::fromArgb(format, bits[i], static_cast<uint8_t*>(data) + size_t(y) * pitch + size_t(x) * bpp);
+        }
       m_texture->unlock(m_subresource);
     }
+    m_dcOriginal.clear();
+    m_dcOriginal.shrink_to_fit();
     SelectObject(m_dc, m_oldBitmap);
     DeleteDC(m_dc);
     DeleteObject(m_bitmap);
@@ -736,20 +753,231 @@ namespace dxup::ddraw {
     return DD_OK;
   }
 
+  HWND Surface::targetWindow() const {
+    if (!m_dd->fullscreen() && m_clipper && m_clipper->window())
+      return m_clipper->window();
+    return m_dd->window();
+  }
+
+  legacy::Texture* Surface::gpuSource(Surface* source, uint32_t& subresource) {
+    legacy::Texture* texture = source->m_texture.get();
+    subresource = source->m_subresource;
+    if (!texture)
+      return nullptr;
+    source->updateTexturePalette();
+    if (!texture->desc().systemMemory && texture->srv())
+      return texture;
+    // Application memory: copied into a GPU texture of its format and size
+    // (as the core's blits upload it), with the palette of P8 surfaces.
+    const legacy::Format format = texture->desc().format;
+    const uint32_t width = texture->width(subresource), height = texture->height(subresource);
+    if (!m_gpuStage || m_gpuStage->desc().format != format || m_gpuStage->desc().width != width
+     || m_gpuStage->desc().height != height) {
+      legacy::TextureDesc td;
+      td.width = width;
+      td.height = height;
+      td.format = format;
+      m_gpuStage = std::make_shared<legacy::Texture>(m_dd->legacyDevice(), td);
+      if (!m_gpuStage->valid() || !m_gpuStage->srv()) {
+        m_gpuStage.reset();
+        return nullptr;
+      }
+    }
+    void* from = nullptr;
+    void* to = nullptr;
+    uint32_t fromPitch = 0, toPitch = 0;
+    if (!texture->lock(subresource, nullptr, true, &from, &fromPitch))
+      return nullptr;
+    if (!m_gpuStage->lock(0, nullptr, false, &to, &toPitch, true)) {
+      texture->unlock(subresource);
+      return nullptr;
+    }
+    const size_t rowBytes = legacy::legacyPitch(format, width);
+    const uint32_t rows = legacy::legacyRows(format, height);
+    for (uint32_t row = 0; row < rows; row++)
+      std::memcpy(static_cast<uint8_t*>(to) + size_t(row) * toPitch, static_cast<const uint8_t*>(from) + size_t(row) * fromPitch,
+        rowBytes);
+    m_gpuStage->unlock(0);
+    texture->unlock(subresource);
+    if (format == legacy::FormatP8) {
+      // The source's palette, else the primary's (the screen's colours).
+      const Palette* palette = source->m_palette ? source->m_palette : m_palette;
+      static const uint32_t black[256] = {};
+      m_gpuStage->setPalette(palette ? palette->argb() : black);
+    }
+    subresource = 0;
+    return m_gpuStage.get();
+  }
+
   HRESULT Surface::presentTo(const RECT* screenRect, Surface* source, const RECT* sourceRect, DWORD syncInterval) {
     (void)screenRect;
     legacy::Device* device = m_dd->legacyDevice();
     if (!device || !source || !source->m_texture)
       return DDERR_GENERIC;
-    HWND window = m_dd->window();
-    if (!m_dd->fullscreen() && m_clipper && m_clipper->window())
-      window = m_clipper->window();
+    HWND window = targetWindow();
     if (!window)
       return DD_OK;
-    const HRESULT hr = device->present(source->m_texture.get(), reinterpret_cast<const legacy::Rect*>(sourceRect),
-      window, syncInterval, &m_gamma.red[0]);
+    uint32_t subresource = 0;
+    legacy::Texture* texture = gpuSource(source, subresource);
+    if (!texture)
+      return DDERR_GENERIC;
+    const HRESULT hr = device->present(texture, reinterpret_cast<const legacy::Rect*>(sourceRect), window, syncInterval,
+      &m_gamma.red[0]);
     if (FAILED(hr))
       logMessage(LogLevel::Warn, "ddraw: present failed hr=0x%08lx", hr);
+    return DD_OK;
+  }
+
+  namespace {
+    // Timers of windowed primaries whose last blits wait to be shown (the
+    // timer's id is the surface): a surface gone meanwhile is not used.
+    std::mutex g_presentTimerMutex;
+    std::set<UINT_PTR> g_presentTimers;
+
+    int64_t performanceCounter() {
+      LARGE_INTEGER now;
+      QueryPerformanceCounter(&now);
+      return now.QuadPart;
+    }
+  }
+
+  void Surface::stopPresentTimer() {
+    if (!m_timerWindow)
+      return;
+    const UINT_PTR id = reinterpret_cast<UINT_PTR>(this);
+    {
+      std::lock_guard<std::mutex> lock(g_presentTimerMutex);
+      g_presentTimers.erase(id);
+    }
+    KillTimer(m_timerWindow, id);
+    m_timerWindow = nullptr;
+  }
+
+  void CALLBACK Surface::presentTimer(HWND window, UINT, UINT_PTR id, DWORD) {
+    KillTimer(window, id);
+    {
+      std::lock_guard<std::mutex> lock(g_presentTimerMutex);
+      if (!g_presentTimers.erase(id))
+        return;
+    }
+    auto* surface = reinterpret_cast<Surface*>(id);
+    surface->m_timerWindow = nullptr;
+    surface->presentPendingComposition();
+  }
+
+  HRESULT Surface::composeWindowed(const RECT* dstRect, Surface* source, const RECT* srcRect, bool colorKey, uint32_t key,
+                                   bool fill, uint32_t fillArgb) {
+    legacy::Device* device = m_dd->legacyDevice();
+    if (!device)
+      return DDERR_GENERIC;
+    HWND window = targetWindow();
+    RECT client = {};
+    if (!window || !GetClientRect(window, &client) || client.right <= 0 || client.bottom <= 0)
+      return DD_OK;   // nothing shows the picture
+    const uint32_t width = uint32_t(client.right), height = uint32_t(client.bottom);
+    if (!m_composed || m_composedWindow != window || m_composed->desc().width != width || m_composed->desc().height != height) {
+      legacy::TextureDesc td;
+      td.width = width;
+      td.height = height;
+      td.format = legacy::FormatX8R8G8B8;
+      td.renderTarget = true;
+      m_composed = std::make_shared<legacy::Texture>(device, td);
+      if (!m_composed->valid() || !m_composed->srv()) {
+        m_composed.reset();
+        return DDERR_OUTOFVIDEOMEMORY;
+      }
+      device->fillArgb(m_composed.get(), 0, nullptr, 0xff000000u);
+      m_composedWindow = window;
+      // The monitor's refresh: windowed presents wait for the display.
+      MONITORINFOEXW info = {};
+      info.cbSize = sizeof(info);
+      DEVMODEW mode = {};
+      mode.dmSize = sizeof(mode);
+      DWORD hz = 60;
+      if (GetMonitorInfoW(MonitorFromWindow(window, MONITOR_DEFAULTTOPRIMARY), &info)
+       && EnumDisplaySettingsW(info.szDevice, ENUM_CURRENT_SETTINGS, &mode) && mode.dmDisplayFrequency > 1)
+        hz = mode.dmDisplayFrequency;
+      LARGE_INTEGER frequency;
+      QueryPerformanceFrequency(&frequency);
+      m_refreshTicks = frequency.QuadPart / int64_t(hz);
+    }
+    // The primary is the screen: the rectangle in the client area's
+    // coordinates. Without one, the whole window (as before: games of a
+    // window covering the screen pass none).
+    legacy::Rect target = { 0, 0, int32_t(width), int32_t(height) };
+    if (dstRect) {
+      POINT origin = { 0, 0 };
+      ClientToScreen(window, &origin);
+      target = { dstRect->left - origin.x, dstRect->top - origin.y, dstRect->right - origin.x, dstRect->bottom - origin.y };
+    }
+    if (target.right <= target.left || target.bottom <= target.top)
+      return DD_OK;
+    const bool whole = target.left <= 0 && target.top <= 0 && target.right >= int32_t(width) && target.bottom >= int32_t(height);
+    if (fill) {
+      device->fillArgb(m_composed.get(), 0, &target, fillArgb);
+    } else {
+      uint32_t subresource = 0;
+      legacy::Texture* texture = gpuSource(source, subresource);
+      if (!texture)
+        return DDERR_OUTOFVIDEOMEMORY;
+      const legacy::Rect from = srcRect ? *reinterpret_cast<const legacy::Rect*>(srcRect)
+        : legacy::Rect{ 0, 0, int32_t(texture->width(subresource)), int32_t(texture->height(subresource)) };
+      const bool scaled = target.right - target.left != from.right - from.left || target.bottom - target.top != from.bottom - from.top;
+      device->blit(m_composed.get(), 0, &target, texture, subresource, &from, scaled, colorKey, key);
+    }
+    return presentComposed(whole);
+  }
+
+  HRESULT Surface::presentComposed(bool whole) {
+    // Blits covering the window show at once, waiting for the display as
+    // before; smaller ones (sprites, dirty rectangles) without waiting, at
+    // most once per refresh: each present of a windowed flip model swap
+    // chain takes a refresh, N per frame ran at 1/N of it.
+    const int64_t now = performanceCounter();
+    if (!whole && m_lastPresent && now - m_lastPresent < m_refreshTicks - m_refreshTicks / 8) {
+      m_presentPending = true;
+      if (m_timerWindow)
+        return DD_OK;
+      // The rest shows on the next blit, or by a timer when the game blits
+      // no more. Timers run on the window's thread: blits from another
+      // thread show at once instead (two threads would present together).
+      HWND window = m_composedWindow;
+      if (GetWindowThreadProcessId(window, nullptr) == GetCurrentThreadId()) {
+        const int64_t remaining = m_lastPresent + m_refreshTicks - now;
+        LARGE_INTEGER frequency;
+        QueryPerformanceFrequency(&frequency);
+        const UINT elapse = (std::max)(UINT(USER_TIMER_MINIMUM), UINT(remaining * 1000 / frequency.QuadPart + 1));
+        const UINT_PTR id = reinterpret_cast<UINT_PTR>(this);
+        {
+          std::lock_guard<std::mutex> lock(g_presentTimerMutex);
+          g_presentTimers.insert(id);
+        }
+        if (SetTimer(window, id, elapse, presentTimer)) {
+          m_timerWindow = window;
+          return DD_OK;
+        }
+        std::lock_guard<std::mutex> lock(g_presentTimerMutex);
+        g_presentTimers.erase(id);
+      }
+    }
+    m_presentPending = true;
+    stopPresentTimer();
+    return presentPendingComposition(whole ? 1 : 0);
+  }
+
+  HRESULT Surface::presentPendingComposition(DWORD syncInterval) {
+    if (!m_presentPending || !m_composed)
+      return DD_OK;
+    m_presentPending = false;
+    legacy::Device* device = m_dd->legacyDevice();
+    if (!device || !m_composedWindow)
+      return DDERR_GENERIC;
+    const HRESULT hr = device->present(m_composed.get(), nullptr, m_composedWindow, syncInterval, &m_gamma.red[0]);
+    m_lastPresent = performanceCounter();
+    if (FAILED(hr)) {
+      logMessage(LogLevel::Warn, "ddraw: present failed hr=0x%08lx", hr);
+      return DDERR_GENERIC;
+    }
     return DD_OK;
   }
 
@@ -763,8 +991,16 @@ namespace dxup::ddraw {
 
   HRESULT Surface::blt(LPRECT dstRect, LPDIRECTDRAWSURFACE7 src, LPRECT srcRect, DWORD flags, LPDDBLTFX fx) {
     legacy::Device* device = m_dd->legacyDevice();
+    // A windowed primary is the screen: blits go into the window's picture.
+    const bool windowed = isPrimary() && !m_dd->fullscreen();
     if (flags & DDBLT_COLORFILL) {
       if (!fx || !device || !m_texture) return DDERR_INVALIDPARAMS;
+      if (windowed) {
+        uint8_t raw[4] = {};
+        std::memcpy(raw, &fx->dwFillColor, 4);
+        return composeWindowed(dstRect, nullptr, nullptr, false, 0, true,
+          legacy::toArgb(m_texture->desc().format, raw, nullptr) | 0xff000000u);
+      }
       device->fill(m_texture.get(), m_subresource, reinterpret_cast<const legacy::Rect*>(dstRect), fx->dwFillColor);
       return DD_OK;
     }
@@ -783,10 +1019,7 @@ namespace dxup::ddraw {
     Surface* source = fromInterface(src);
     if (!source && !(source = stageForeign(src)))
       return DDERR_GENERIC;
-    if (isPrimary() && !m_dd->fullscreen())
-      return presentTo(dstRect, source, srcRect, 1);
     if (!device || !m_texture || !source->m_texture) return DDERR_GENERIC;
-    source->updateTexturePalette();
     bool colorKey = false;
     uint32_t key = 0;
     if ((flags & DDBLT_KEYSRCOVERRIDE) && fx) {
@@ -796,6 +1029,9 @@ namespace dxup::ddraw {
       colorKey = true;
       key = source->m_srcBltKey.dwColorSpaceLowValue;
     }
+    if (windowed)
+      return composeWindowed(dstRect, source, srcRect, colorKey, key, false, 0);
+    source->updateTexturePalette();
     bool scaled = false;
     if (dstRect && srcRect)
       scaled = (dstRect->right - dstRect->left) != (srcRect->right - srcRect->left)
@@ -913,8 +1149,12 @@ namespace dxup::ddraw {
   VertexBuffer7::VertexBuffer7(DirectDraw* dd, const D3DVERTEXBUFFERDESC& desc)
   : m_dd(dd), m_desc(desc), m_stride(legacy::fvfStride(desc.dwFVF)) {
     m_dd->AddRef();
-    if (legacy::Device* device = m_dd->legacyDevice())
-      m_buffer = std::make_unique<legacy::Buffer>(device, (std::max)(uint32_t(1), uint32_t(m_stride * desc.dwNumVertices)), false);
+    if (legacy::Device* device = m_dd->legacyDevice()) {
+      // Sizes beyond 32 bits fail (CreateVertexBuffer: out of memory).
+      const uint64_t size = uint64_t(m_stride) * desc.dwNumVertices;
+      if (size <= UINT32_MAX)
+        m_buffer = std::make_unique<legacy::Buffer>(device, (std::max)(uint32_t(1), uint32_t(size)), false);
+    }
   }
 
   VertexBuffer7::~VertexBuffer7() {
@@ -962,7 +1202,7 @@ namespace dxup::ddraw {
     if ((m_desc.dwFVF & legacy::FvfPositionMask) != legacy::FvfXyzRhw
      || (source->m_desc.dwFVF & legacy::FvfPositionMask) == legacy::FvfXyzRhw)
       return DDERR_INVALIDPARAMS;
-    if (srcIndex + count > source->m_desc.dwNumVertices || dstIndex + count > m_desc.dwNumVertices)
+    if (uint64_t(srcIndex) + count > source->m_desc.dwNumVertices || uint64_t(dstIndex) + count > m_desc.dwNumVertices)
       return DDERR_INVALIDPARAMS;
     legacy::Device* legacy = m_dd->legacyDevice();
     if (!legacy)
@@ -1082,6 +1322,8 @@ namespace dxup::ddraw {
     // Direct3D 7 starts with depth testing when a z-buffer is attached.
     m_device->setRenderState(legacy::RsZEnable, m_target->attachedDepth() ? 1 : 0);
     bindTargets();
+    // The viewport starts as the whole target (later targets keep it).
+    m_device->resetViewport();
   }
 
   Device7::~Device7() {
@@ -1115,7 +1357,8 @@ namespace dxup::ddraw {
   }
 
   void Device7::bindTargets() {
-    m_device->setRenderTarget(m_target->texture(), m_target->subresource());
+    // Direct3D 7 keeps its viewport when the target changes.
+    m_device->setRenderTarget(m_target->texture(), m_target->subresource(), true);
     Surface* depth = m_target->attachedDepth();
     m_device->setDepthStencil(depth ? depth->texture() : nullptr);
   }
@@ -1147,6 +1390,9 @@ namespace dxup::ddraw {
   HRESULT Device7::SetRenderTarget(LPDIRECTDRAWSURFACE7 surface, DWORD) {
     auto* next = Surface::fromInterface(surface);
     if (!next) return DDERR_INVALIDPARAMS;
+    // As CreateDevice: surfaces the device can draw into.
+    if (!next->texture() || !next->texture()->rtv(next->subresource()))
+      return DDERR_INVALIDCAPS;
     next->AddRef();
     m_target->Release();
     m_target = next;
@@ -1240,22 +1486,34 @@ namespace dxup::ddraw {
     static_assert(sizeof(D3DLIGHT7) == sizeof(legacy::Light), "light layouts differ");
     if (!light) return DDERR_INVALIDPARAMS;
     if (m_recording) { m_recording->lights[index] = *light; return D3D_OK; }
-    return m_device->setLight(index, *reinterpret_cast<const legacy::Light*>(light)) ? D3D_OK : DDERR_OUTOFMEMORY;
+    if (!m_device->setLight(index, *reinterpret_cast<const legacy::Light*>(light)))
+      return DDERR_OUTOFMEMORY;
+    if (index >= m_lightSet.size())
+      m_lightSet.resize(index + 1, false);
+    m_lightSet[index] = true;
+    return D3D_OK;
   }
 
+  // Lights never set nor enabled do not exist (Windows: invalid parameters).
   HRESULT Device7::GetLight(DWORD index, LPD3DLIGHT7 light) {
-    if (!light) return DDERR_INVALIDPARAMS;
+    if (!light || !lightExists(index)) return DDERR_INVALIDPARAMS;
     return m_device->getLight(index, reinterpret_cast<legacy::Light*>(light)) ? D3D_OK : DDERR_INVALIDPARAMS;
   }
 
   HRESULT Device7::LightEnable(DWORD index, BOOL enable) {
     if (m_recording) { m_recording->lightEnables[index] = enable; return D3D_OK; }
-    return m_device->lightEnable(index, enable != FALSE) ? D3D_OK : DDERR_OUTOFMEMORY;
+    if (!m_device->lightEnable(index, enable != FALSE))
+      return DDERR_OUTOFMEMORY;
+    if (index >= m_lightSet.size())
+      m_lightSet.resize(index + 1, false);
+    m_lightSet[index] = true;
+    return D3D_OK;
   }
 
   HRESULT Device7::GetLightEnable(DWORD index, BOOL* enable) {
-    if (!enable) return DDERR_INVALIDPARAMS;
-    *enable = m_device->lightEnabled(index);
+    if (!enable || !lightExists(index)) return DDERR_INVALIDPARAMS;
+    // Enabled lights read 128, as with Windows' Direct3D 7.
+    *enable = m_device->lightEnabled(index) ? 128 : FALSE;
     return D3D_OK;
   }
 
@@ -1377,10 +1635,14 @@ namespace dxup::ddraw {
 
   void Device7::prepareDraw() {
     // Color-keyed textures: the pixel shader drops their key's texels,
-    // whatever the stages' alpha operations and the alpha test.
-    for (uint32_t stage = 0; stage < 8; stage++)
-      if (m_textures[stage])
+    // whatever the stages' alpha operations and the alpha test. P8
+    // textures take their palette's entries set since (SetEntries).
+    for (uint32_t stage = 0; stage < 8; stage++) {
+      if (m_textures[stage]) {
         m_textures[stage]->applyColorKey(m_colorKeyEnable);
+        m_textures[stage]->updateTexturePalette();
+      }
+    }
   }
 
   namespace {
@@ -1486,38 +1748,82 @@ namespace dxup::ddraw {
     return D3D_OK;
   }
 
-  Device7::StateBlock Device7::capture() const {
+  namespace {
+    // The render states of Direct3D 7's pixel and vertex state blocks, as
+    // Windows' Direct3D 7 captures them (ALL: both); stage states: all for
+    // pixel blocks, TEXCOORDINDEX and TEXTURETRANSFORMFLAGS for vertex ones.
+    const uint32_t kPixelRenderStates7[] = {
+      2, 4, 7, 8, 9, 10, 14, 15, 16, 19, 20, 23, 24, 25, 26, 27, 33, 36, 37, 38, 40, 41, 47, 52, 53, 54, 55, 56, 57, 58,
+      59, 60, 128, 129, 130, 131, 132, 133, 134, 135, 144,
+    };
+    const uint32_t kVertexRenderStates7[] = {
+      9, 22, 28, 29, 34, 35, 36, 37, 38, 48, 136, 137, 138, 139, 140, 141, 142, 143, 145, 146, 147, 148, 151, 152,
+    };
+  }
+
+  Device7::StateBlock Device7::capture(D3DSTATEBLOCKTYPE type) {
     StateBlock block;
-    for (uint32_t s = 1; s < legacy::RsCount; s++)
-      block.renderStates[s] = m_device->renderState(s);
-    block.renderStates[D3DRENDERSTATE_COLORKEYENABLE] = m_colorKeyEnable;
+    const bool all = type == D3DSBT_ALL;
+    const bool pixel = all || type == D3DSBT_PIXELSTATE;
+    const bool vertex = all || type == D3DSBT_VERTEXSTATE;
+    if (pixel)
+      for (uint32_t s : kPixelRenderStates7) block.renderStates[s] = 0;
+    if (vertex)
+      for (uint32_t s : kVertexRenderStates7) block.renderStates[s] = 0;
     for (uint32_t stage = 0; stage < 8; stage++) {
       for (uint32_t t = 1; t <= 24; t++) {
-        if (t == D3DTSS_ADDRESS)   // as ADDRESSU and ADDRESSV
-          continue;
-        DWORD value = 0;
-        const_cast<Device7*>(this)->GetTextureStageState(stage, D3DTEXTURESTAGESTATETYPE(t), &value);
-        block.stageStates[(stage << 16) | t] = value;
+        // ADDRESS as ADDRESSU and ADDRESSV.
+        if (t != D3DTSS_ADDRESS && (pixel || t == D3DTSS_TEXCOORDINDEX || t == D3DTSS_TEXTURETRANSFORMFLAGS))
+          block.stageStates[(stage << 16) | t] = 0;
       }
-      block.textures[stage] = m_textures[stage];
+      if (all)
+        block.textures[stage] = nullptr;
     }
-    for (uint32_t t : { 1u, 2u, 3u, 4u, 5u, 6u, 16u, 17u, 18u, 19u, 20u, 21u, 22u, 23u }) {
-      D3DMATRIX m;
-      const_cast<Device7*>(this)->GetTransform(D3DTRANSFORMSTATETYPE(t), &m);
-      block.transforms[t] = m;
+    if (all) {
+      for (uint32_t t : { 1u, 2u, 3u, 4u, 5u, 6u, 16u, 17u, 18u, 19u, 20u, 21u, 22u, 23u })
+        block.transforms[t] = {};
+      block.hasViewport = true;
+      block.hasMaterial = true;
     }
-    block.hasViewport = true;
-    const_cast<Device7*>(this)->GetViewport(&block.viewport);
-    block.hasMaterial = true;
-    const_cast<Device7*>(this)->GetMaterial(&block.material);
-    for (uint32_t i = 0; i < 8; i++) {
-      D3DLIGHT7 light;
-      if (m_device->getLight(i, reinterpret_cast<legacy::Light*>(&light))) {
-        block.lights[i] = light;
-        block.lightEnables[i] = m_device->lightEnabled(i);
-      }
+    // The lights that exist: all of them in ALL blocks, only whether they
+    // are enabled in vertex blocks (lights made later stay out).
+    for (DWORD i = 0; i < m_lightSet.size() && vertex; i++) {
+      if (!m_lightSet[i])
+        continue;
+      if (all)
+        block.lights[i] = {};
+      block.lightEnables[i] = FALSE;
     }
+    refresh(block);
     return block;
+  }
+
+  void Device7::refresh(StateBlock& block) {
+    for (auto& [state, value] : block.renderStates) {
+      DWORD v = 0;
+      GetRenderState(D3DRENDERSTATETYPE(state), &v);
+      value = v;
+    }
+    for (auto& [key, value] : block.stageStates) {
+      DWORD v = 0;
+      GetTextureStageState(key >> 16, D3DTEXTURESTAGESTATETYPE(key & 0xffff), &v);
+      value = v;
+    }
+    for (auto& [stage, texture] : block.textures)
+      texture = m_textures[stage];
+    for (auto& [state, matrix] : block.transforms)
+      GetTransform(D3DTRANSFORMSTATETYPE(state), &matrix);
+    if (block.hasViewport)
+      GetViewport(&block.viewport);
+    if (block.hasMaterial)
+      GetMaterial(&block.material);
+    // Recorded lights the device does not have keep their values.
+    for (auto& [index, light] : block.lights)
+      if (lightExists(index))
+        GetLight(index, &light);
+    for (auto& [index, enable] : block.lightEnables)
+      if (lightExists(index))
+        enable = m_device->lightEnabled(index);
   }
 
   void Device7::apply(const StateBlock& block) {
@@ -1545,9 +1851,10 @@ namespace dxup::ddraw {
     return D3D_OK;
   }
 
-  HRESULT Device7::CreateStateBlock(D3DSTATEBLOCKTYPE, LPDWORD handle) {
+  HRESULT Device7::CreateStateBlock(D3DSTATEBLOCKTYPE type, LPDWORD handle) {
     if (!handle) return DDERR_INVALIDPARAMS;
-    m_stateBlocks.push_back(std::make_unique<StateBlock>(capture()));
+    if (type != D3DSBT_ALL && type != D3DSBT_PIXELSTATE && type != D3DSBT_VERTEXSTATE) return DDERR_INVALIDPARAMS;
+    m_stateBlocks.push_back(std::make_unique<StateBlock>(capture(type)));
     *handle = DWORD(m_stateBlocks.size());
     return D3D_OK;
   }
@@ -1560,14 +1867,7 @@ namespace dxup::ddraw {
 
   HRESULT Device7::CaptureStateBlock(DWORD handle) {
     if (!handle || handle > m_stateBlocks.size() || !m_stateBlocks[handle - 1]) return D3DERR_INVALIDSTATEBLOCK;
-    StateBlock& block = *m_stateBlocks[handle - 1];
-    const StateBlock current = capture();
-    for (auto& [state, value] : block.renderStates) value = current.renderStates.at(state);
-    for (auto& [key, value] : block.stageStates) { auto it = current.stageStates.find(key); if (it != current.stageStates.end()) value = it->second; }
-    for (auto& [stage, texture] : block.textures) texture = m_textures[stage];
-    for (auto& [state, matrix] : block.transforms) { auto it = current.transforms.find(state); if (it != current.transforms.end()) matrix = it->second; }
-    if (block.hasViewport) block.viewport = current.viewport;
-    if (block.hasMaterial) block.material = current.material;
+    refresh(*m_stateBlocks[handle - 1]);
     return D3D_OK;
   }
 
@@ -2059,7 +2359,11 @@ namespace dxup::ddraw {
       ld.dwHeight = (std::max)(1ul, desc.dwHeight >> level);
       ld.dwMipMapCount = levels - level;
       ld.ddsCaps.dwCaps2 |= DDSCAPS2_MIPMAPSUBLEVEL;
-      ld.lPitch = LONG(legacy::legacyPitch(format, ld.dwWidth));
+      // Block formats: the level's linear size (the union with the pitch).
+      if (legacy::formatInfo(format).block)
+        ld.dwLinearSize = legacy::legacyPitch(format, ld.dwWidth) * legacy::legacyRows(format, ld.dwHeight);
+      else
+        ld.lPitch = LONG(legacy::legacyPitch(format, ld.dwWidth));
       auto* child = new Surface(this, ld, shared, level, root);
       previous->addChild(child);
       previous = child;
@@ -2201,12 +2505,17 @@ namespace dxup::ddraw {
   }
 
   // Display modes are not changed: the game's window covers the monitor and
-  // the picture scales to it.
+  // the picture scales to it. Primaries are 16 or 32 bits per pixel (the
+  // modes EnumDisplayModes lists): 8-bit palettized and 24-bit ones are not
+  // emulated, and refused rather than given a primary of another format.
   HRESULT DirectDraw::SetDisplayMode(DWORD width, DWORD height, DWORD bpp, DWORD, DWORD) {
     logMessage(LogLevel::Info, "ddraw: SetDisplayMode(%lu, %lu, %lu)", width, height, bpp);
+    if (!width || !height || (bpp && bpp != 16 && bpp != 32))
+      return DDERR_INVALIDMODE;
     m_modeWidth = width;
     m_modeHeight = height;
-    m_modeBpp = bpp;
+    if (bpp)
+      m_modeBpp = bpp;
     coverMonitor();
     return DD_OK;
   }

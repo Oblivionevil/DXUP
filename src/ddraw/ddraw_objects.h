@@ -226,6 +226,8 @@ namespace dxup::ddraw {
     void addCaps(DWORD caps) { m_desc.ddsCaps.dwCaps |= caps; }
     // The texture for the color key the device's state uses.
     void applyColorKey(bool enabled);
+    // P8 textures: the attached palette's entries, when they changed.
+    void updateTexturePalette();
     // Ours, or null for a surface of another DirectDraw (Windows' own).
     static Surface* fromInterface(IDirectDrawSurface7* surface);
     IDirectDrawSurface* surface1() { return &m_surface1; }
@@ -234,7 +236,22 @@ namespace dxup::ddraw {
     HRESULT blt(LPRECT dstRect, LPDIRECTDRAWSURFACE7 src, LPRECT srcRect, DWORD flags, LPDDBLTFX fx);
     Surface* stageForeign(IDirectDrawSurface7* foreign);
     HRESULT presentTo(const RECT* screenRect, Surface* source, const RECT* sourceRect, DWORD syncInterval);
-    void updateTexturePalette();
+    // A surface's texture as the GPU samples it: application memory (and
+    // the palette of P8 surfaces) goes through m_gpuStage. Null if none.
+    legacy::Texture* gpuSource(Surface* source, uint32_t& subresource);
+    // The window a windowed primary shows in (its clipper's, else the
+    // cooperative level's).
+    HWND targetWindow() const;
+    // Windowed primary: a blit (or colour fill) into the picture of the
+    // window's client area at its screen rectangle, then shown.
+    HRESULT composeWindowed(const RECT* dstRect, Surface* source, const RECT* srcRect, bool colorKey, uint32_t key,
+                            bool fill, uint32_t fillArgb);
+    // Shows the composed picture: at once for blits covering the window,
+    // else at most once per refresh (the rest on the next blit or timer).
+    HRESULT presentComposed(bool whole);
+    HRESULT presentPendingComposition(DWORD syncInterval = 0);
+    static void CALLBACK presentTimer(HWND window, UINT, UINT_PTR id, DWORD);
+    void stopPresentTimer();
 
     DirectDraw* m_dd;
     DDSURFACEDESC2 m_desc;
@@ -256,9 +273,19 @@ namespace dxup::ddraw {
     HBITMAP m_bitmap = nullptr;
     HGDIOBJ m_oldBitmap = nullptr;
     void* m_dcBits = nullptr;
+    std::vector<uint32_t> m_dcOriginal;   // the DIB as GetDC filled it: ReleaseDC writes back what changed
     DDGAMMARAMP m_gamma = {};
     // Pixels of other DirectDraws' surfaces blitted into this one.
     Surface* m_foreignStage = nullptr;
+    // Application memory as a GPU texture (gpuSource).
+    std::shared_ptr<legacy::Texture> m_gpuStage;
+    // Windowed primary: the window's picture, and when it was last shown.
+    std::shared_ptr<legacy::Texture> m_composed;
+    HWND m_composedWindow = nullptr;
+    int64_t m_lastPresent = 0;
+    int64_t m_refreshTicks = 0;
+    bool m_presentPending = false;
+    HWND m_timerWindow = nullptr;
     Surface1 m_surface1{this};
     static inline const void* s_vtable = nullptr;
   };
@@ -357,13 +384,19 @@ namespace dxup::ddraw {
     struct StateBlock;
     void bindTargets();
     void prepareDraw();
-    StateBlock capture() const;
+    // The states a block of the type holds (as Windows' Direct3D 7), with
+    // the device's values.
+    StateBlock capture(D3DSTATEBLOCKTYPE type);
+    // The block's states take the device's values (lights that exist).
+    void refresh(StateBlock& block);
     void apply(const StateBlock& block);
+    bool lightExists(DWORD index) const { return index < m_lightSet.size() && m_lightSet[index]; }
 
     DirectDraw* m_dd;
     legacy::Device* m_device;
     Surface* m_target = nullptr;
     Surface* m_textures[8] = {};
+    std::vector<bool> m_lightSet;   // lights set or enabled (others do not exist)
     std::atomic<ULONG> m_ref{1};
     D3DCLIPSTATUS m_clipStatus = {};
     float m_clipPlanes[6][4] = {};
@@ -433,6 +466,7 @@ namespace dxup::ddraw {
     DWORD cooperativeFlags() const { return m_cooperativeFlags; }
     uint32_t modeWidth() const;
     uint32_t modeHeight() const;
+    // 16 or 32 (SetDisplayMode refuses others).
     uint32_t modeBpp() const { return m_modeBpp ? m_modeBpp : 32; }
     legacy::Format displayFormat() const { return modeBpp() == 16 ? legacy::FormatR5G6B5 : legacy::FormatX8R8G8B8; }
 

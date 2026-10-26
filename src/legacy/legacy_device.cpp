@@ -2546,7 +2546,7 @@ namespace dxup::legacy {
     m_viewportDirty = true;
   }
 
-  void Device::setRenderTarget(uint32_t index, Texture* target, uint32_t subresource) {
+  void Device::setRenderTarget(uint32_t index, Texture* target, uint32_t subresource, bool keepViewport) {
     if (index >= kMaxRenderTargets)
       return;
     if (m_renderTargets[index] == target && m_renderTargetSubresources[index] == subresource)
@@ -2554,8 +2554,9 @@ namespace dxup::legacy {
     m_renderTargets[index] = target;
     m_renderTargetSubresources[index] = subresource;
     // A new first target sets viewport and scissor to itself (Direct3D 9
-    // also does for the target already bound: resetViewport).
-    if (target && index == 0)
+    // also does for the target already bound: resetViewport), unless the
+    // caller keeps them (Direct3D 7).
+    if (target && index == 0 && !keepViewport)
       resetViewport();
     m_targetsDirty = true;
     // A texture bound as the new target is unbound from its stage.

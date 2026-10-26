@@ -375,8 +375,12 @@ namespace dxup::legacy {
                     const uint16_t* gammaRamp = nullptr);
 
     // ---- Render targets ----
-    void setRenderTarget(Texture* target, uint32_t subresource) { setRenderTarget(0, target, subresource); }
-    void setRenderTarget(uint32_t index, Texture* target, uint32_t subresource);
+    // keepViewport: a new first target leaves viewport and scissor as they
+    // are (Direct3D 7); else they become the whole target.
+    void setRenderTarget(Texture* target, uint32_t subresource, bool keepViewport = false) {
+      setRenderTarget(0, target, subresource, keepViewport);
+    }
+    void setRenderTarget(uint32_t index, Texture* target, uint32_t subresource, bool keepViewport = false);
     // Viewport and scissor of the whole first target.
     void resetViewport();
     void setDepthStencil(Texture* depth);
