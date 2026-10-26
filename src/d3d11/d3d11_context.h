@@ -3339,6 +3339,11 @@ namespace dxup {
               computeNumRows(mipH, imgDesc.format),
               mipD);
 
+            // Unmap is not predicated: the copy back runs whatever the
+            // application's predicate says.
+            const bool predicated = m_state.predicate != nullptr;
+            if (predicated)
+              m_backendCtx->suspendPredication(true);
             if (info.stagingBuffer->getDesc().cpuAccess == CpuAccess::Read) {
               m_backendCtx->unmapBuffer(info.stagingBuffer.get());
 
@@ -3367,6 +3372,8 @@ namespace dxup {
               m_backendCtx->copyBufferToImage(info.image, subres, info.stagingBuffer.get(), 0);
               m_backendCtx->retainTemporaryBuffer(info.stagingBuffer);
             }
+            if (predicated)
+              m_backendCtx->suspendPredication(false);
           } else {
             m_backendCtx->unmapBuffer(info.stagingBuffer.get());
           }
@@ -7918,6 +7925,11 @@ namespace dxup {
     ID3D12Device* device = m_device ? m_device->nativeDevice() : nullptr;
     if (!device || !pHandle)
       return E_INVALIDARG;
+    // Only a fence made shared has a handle (D3D12 refuses others too, but
+    // as a debug layer error).
+    ComPtr<ID3D12Fence1> fence1;
+    if (SUCCEEDED(m_fence.As(&fence1)) && !(fence1->GetCreationFlags() & D3D12_FENCE_FLAG_SHARED))
+      return E_INVALIDARG;
     return device->CreateSharedHandle(m_fence.Get(), pAttributes, dwAccess, lpName, pHandle);
   }
 
@@ -7932,13 +7944,28 @@ namespace dxup {
     (void)Flags;
     (void)SDKVersion;
     (void)EmulatedInterface;
+    if (ppContextState)
+      *ppContextState = nullptr;
     if (!pFeatureLevels || !FeatureLevels)
       return E_INVALIDARG;
 
-    // The first requested level the device supports.
+    // The first requested level the hardware supports (a context state may
+    // ask for more than the device was made with).
+    const D3D_FEATURE_LEVEL supported = maxFeatureLevel();
     D3D_FEATURE_LEVEL chosen = D3D_FEATURE_LEVEL(0);
     for (UINT i = 0; i < FeatureLevels; i++) {
-      if (pFeatureLevels[i] <= m_featureLevel) {
+      switch (pFeatureLevels[i]) {
+        case D3D_FEATURE_LEVEL_12_2: case D3D_FEATURE_LEVEL_12_1: case D3D_FEATURE_LEVEL_12_0:
+        case D3D_FEATURE_LEVEL_11_1: case D3D_FEATURE_LEVEL_11_0: case D3D_FEATURE_LEVEL_10_1:
+        case D3D_FEATURE_LEVEL_10_0: case D3D_FEATURE_LEVEL_9_3: case D3D_FEATURE_LEVEL_9_2:
+        case D3D_FEATURE_LEVEL_9_1:
+          break;
+        default:
+          return E_INVALIDARG;
+      }
+    }
+    for (UINT i = 0; i < FeatureLevels; i++) {
+      if (pFeatureLevels[i] <= supported) {
         chosen = pFeatureLevels[i];
         break;
       }

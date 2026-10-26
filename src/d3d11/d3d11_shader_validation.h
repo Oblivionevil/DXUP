@@ -65,6 +65,10 @@ namespace dxup {
         uint32_t version;
         std::memcpy(&version, chunk.data, 4);
         const uint32_t type = version >> 16;
+        // Direct3D 11 runs shader models up to 5.0; 5.1 is Direct3D 12's.
+        const uint32_t major = (version >> 4) & 0xfu, minor = version & 0xfu;
+        if (major > 5 || (major == 5 && minor > 0))
+          return DxbcProgramType::Invalid;
         return type <= uint32_t(DxbcProgramType::Compute) ? DxbcProgramType(type) : DxbcProgramType::Invalid;
       }
     }

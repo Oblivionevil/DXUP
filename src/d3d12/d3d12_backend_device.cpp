@@ -2609,10 +2609,16 @@ namespace dxup::d3d12 {
     ID3D12Fence* fence = m_fence.Get();
     std::lock_guard<std::mutex> lock(m_fenceMutex);
     const uint64_t value = ++m_fenceValue;
-    const uint64_t queued = m_submitQueue.enqueue([fence, value, result](ID3D12CommandQueue* queue) {
+    SubmitQueue* submit = &m_submitQueue;
+    const uint64_t queued = m_submitQueue.enqueue([fence, value, result, submit](ID3D12CommandQueue* queue) {
       const HRESULT hr = queue->Signal(fence, value);
       if (result)
         *result = hr;
+      // A value never signaled would leave its waits hanging.
+      if (FAILED(hr)) {
+        submit->checkResult(hr, "Signal");
+        submit->removeDevice("a device fence value could not be signaled");
+      }
     });
     if (ticket)
       *ticket = queued;
@@ -2635,7 +2641,13 @@ namespace dxup::d3d12 {
   void D3D12BackendDevice::waitForGpu() {
     if (!m_commandQueue || !m_fence)
       return;
-    waitForFence(signalFence(), INFINITE);
+    const uint64_t value = signalFence();
+    // A removed device (or one DXUP gave up, IBackendDevice::lostReason)
+    // may never reach the value.
+    while (!waitForFence(value, 100)) {
+      if (FAILED(m_submitQueue.lostReason()) || FAILED(m_device->GetDeviceRemovedReason()))
+        return;
+    }
   }
 
   HRESULT D3D12BackendDevice::flushAndCheckGpu(const char* tag) {
@@ -4639,6 +4651,19 @@ namespace dxup::d3d12 {
       psoDesc.StreamOutput.pBufferStrides   = desc.soBufferStrides;
       psoDesc.StreamOutput.NumStrides       = desc.numSOStrides;
       psoDesc.StreamOutput.RasterizedStream = desc.rasterizedStream;
+      // A rasterized stream without a position has nothing to rasterize;
+      // Direct3D 11 takes it, D3D12 wants no rasterized stream then.
+      const D3D12_SHADER_BYTECODE& last = psoDesc.GS.BytecodeLength ? psoDesc.GS
+                                        : psoDesc.DS.BytecodeLength ? psoDesc.DS : psoDesc.VS;
+      dxbc::Signature outputs;
+      if (desc.rasterizedStream != D3D12_SO_NO_RASTERIZED_STREAM && last.pShaderBytecode
+       && dxbc::readSignature(last.pShaderBytecode, last.BytecodeLength, true, outputs)) {
+        bool position = false;
+        for (const auto& element : outputs.elements)
+          position |= element.systemValue == D3D_NAME_POSITION && element.stream == desc.rasterizedStream;
+        if (!position)
+          psoDesc.StreamOutput.RasterizedStream = D3D12_SO_NO_RASTERIZED_STREAM;
+      }
     }
 
     // Topology type

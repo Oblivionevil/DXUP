@@ -6415,7 +6415,12 @@ namespace dxup::d3d12 {
     if (m_copyOnly || !fence || FAILED(fence->QueryInterface(IID_PPV_ARGS(&nativeFence))))
       return;
     flush();
-    m_device->submitQueue().enqueue([nativeFence, value](ID3D12CommandQueue* queue) { queue->Signal(nativeFence.Get(), value); });
+    // The application waits for the value: one that cannot be signaled
+    // removes the device (safeSignal) instead of leaving it waiting.
+    SubmitQueue* submit = &m_device->submitQueue();
+    submit->enqueue([nativeFence, value, submit](ID3D12CommandQueue* queue) {
+      safeSignal(queue, nativeFence.Get(), value, submit);
+    });
 #else
     (void)fence; (void)value;
 #endif
@@ -6429,7 +6434,10 @@ namespace dxup::d3d12 {
       return;
     // Only the commands recorded after the wait have to wait.
     flush();
-    m_device->submitQueue().enqueue([nativeFence, value](ID3D12CommandQueue* queue) { queue->Wait(nativeFence.Get(), value); });
+    SubmitQueue* submit = &m_device->submitQueue();
+    submit->enqueue([nativeFence, value, submit](ID3D12CommandQueue* queue) {
+      submit->checkResult(queue->Wait(nativeFence.Get(), value), "Wait");
+    });
 #else
     (void)fence; (void)value;
 #endif
@@ -9164,6 +9172,14 @@ namespace dxup::d3d12 {
     }
   }
 
+  // The tiles of a lazy target are mapped in queue order, ahead of the open
+  // command list: they are mapped at the target's first use of any kind, so
+  // no command recorded before reads the memory before the zero clear.
+  // Copy contexts only write targets with whole uploads and clear nothing.
+  bool D3D12BackendContext::lazyCommitDue(D3D12_RESOURCE_STATES newState) const {
+    return !m_copyOnly || (newState & kImageWriteStates);
+  }
+
   void D3D12BackendContext::commitLazyImage(D3D12BackendImage* image) {
     if (!m_device->commitLazyImage(image))
       return;
@@ -9197,7 +9213,7 @@ namespace dxup::d3d12 {
       transitionResource(image->getStagingBuffer(), newState);
       return;
     }
-    if (image->isLazyUncommitted() && (newState & kImageWriteStates))
+    if (image->isLazyUncommitted() && lazyCommitDue(newState))
       commitLazyImage(image);
     if (memstats::enabled() && (newState & kImageWriteStates))
       memstats::noteWritten(image->getResource());
@@ -9246,7 +9262,7 @@ namespace dxup::d3d12 {
       transitionResource(image->getStagingBuffer(), newState);
       return;
     }
-    if (image->isLazyUncommitted() && (newState & kImageWriteStates))
+    if (image->isLazyUncommitted() && lazyCommitDue(newState))
       commitLazyImage(image);
     if (memstats::enabled() && (newState & kImageWriteStates))
       memstats::noteWritten(image->getResource());
@@ -9294,7 +9310,7 @@ namespace dxup::d3d12 {
       transitionResource(image->getStagingBuffer(), newState);
       return;
     }
-    if (image->isLazyUncommitted() && (newState & kImageWriteStates))
+    if (image->isLazyUncommitted() && lazyCommitDue(newState))
       commitLazyImage(image);
     if (memstats::enabled() && (newState & kImageWriteStates))
       memstats::noteWritten(image->getResource());
@@ -9332,7 +9348,7 @@ namespace dxup::d3d12 {
       transitionResource(image, newState);
       return;
     }
-    if (image->isLazyUncommitted() && (newState & kImageWriteStates))
+    if (image->isLazyUncommitted() && lazyCommitDue(newState))
       commitLazyImage(image);
     if (memstats::enabled() && (newState & kImageWriteStates))
       memstats::noteWritten(image->getResource());

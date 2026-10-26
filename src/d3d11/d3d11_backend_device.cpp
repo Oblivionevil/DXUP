@@ -5,11 +5,41 @@
 #include "../util/util_config.h"
 #include "../util/util_types.h"
 #include <cstring>
+#include <stdexcept>
 #include <vector>
 
 namespace dxup {
 
   namespace {
+
+    // An initial data upload: the backend holds a lock from begin to end,
+    // which ends here whatever the upload throws.
+    class InitialDataScope {
+    public:
+      explicit InitialDataScope(IBackendDevice* backend)
+      : m_backend(backend), m_ctx(backend->beginInitialData()) { }
+      InitialDataScope(const InitialDataScope&) = delete;
+      InitialDataScope& operator=(const InitialDataScope&) = delete;
+      ~InitialDataScope() {
+        try {
+          end();
+        } catch (const std::exception& e) {
+          logMessage(LogLevel::Error, "initial data upload: ending it failed (%s)", e.what());
+        }
+      }
+
+      void end() {
+        if (Rc<IBackendContext> context = std::move(m_ctx))
+          m_backend->endInitialData(context.get());
+      }
+
+      explicit operator bool() const { return m_ctx != nullptr; }
+      IBackendContext* operator->() const { return m_ctx.get(); }
+
+    private:
+      IBackendDevice*     m_backend;
+      Rc<IBackendContext> m_ctx;
+    };
 
     // Staging textures take their initial data straight into their memory.
     void writeStagingInitialData(IBackendImage* image, const D3D11_SUBRESOURCE_DATA* initialData) {
@@ -83,20 +113,18 @@ namespace dxup {
       std::vector<uint8_t> padded((desc->ByteWidth + 255) & ~255u, 0);
       if (initialData && initialData->pSysMem)
         std::memcpy(padded.data(), initialData->pSysMem, desc->ByteWidth);
-      if (auto ctx = m_backend->beginInitialData()) {
+      if (InitialDataScope ctx(m_backend.get()); ctx)
         ctx->updateBuffer(buffer.get(), 0, padded.size(), padded.data());
-        m_backend->endInitialData(ctx.get());
-      }
       return buffer;
     }
 
     if (buffer && initialData && initialData->pSysMem) {
       logMessage(LogLevel::Info, "D3D11BackendDevice::createBuffer - uploading initial data for buffer Size=%u, BindFlags=0x%x",
         desc->ByteWidth, desc->BindFlags);
-      auto ctx = m_backend->beginInitialData();
+      InitialDataScope ctx(m_backend.get());
       if (ctx) {
         ctx->updateBuffer(buffer.get(), 0, desc->ByteWidth, initialData->pSysMem);
-        m_backend->endInitialData(ctx.get());
+        ctx.end();
         // Synchronous GPU check after upload
 #ifdef DXUP_D3D12_BACKEND
         if (m_backendType == BackendType::D3D12) {
@@ -125,7 +153,7 @@ namespace dxup {
     }
 
     if (image && initialData) {
-      auto ctx = m_backend->beginInitialData();
+      InitialDataScope ctx(m_backend.get());
       if (ctx) {
         for (uint32_t arraySlice = 0; arraySlice < desc->ArraySize; arraySlice++) {
           for (uint32_t mip = 0; mip < backendDesc.mipLevels; mip++) {
@@ -172,7 +200,7 @@ namespace dxup {
             }
           }
         }
-        m_backend->endInitialData(ctx.get());
+        ctx.end();
       }
     }
 
@@ -193,7 +221,7 @@ namespace dxup {
     }
 
     if (image && initialData) {
-      auto ctx = m_backend->beginInitialData();
+      InitialDataScope ctx(m_backend.get());
       if (ctx) {
         for (uint32_t arraySlice = 0; arraySlice < desc->ArraySize; arraySlice++) {
           for (uint32_t mip = 0; mip < backendDesc.mipLevels; mip++) {
@@ -245,7 +273,7 @@ namespace dxup {
             }
           }
         }
-        m_backend->endInitialData(ctx.get());
+        ctx.end();
         // Synchronous GPU check after texture upload
 #ifdef DXUP_D3D12_BACKEND
         if (m_backendType == BackendType::D3D12) {
@@ -274,7 +302,7 @@ namespace dxup {
     }
 
     if (image && initialData) {
-      auto ctx = m_backend->beginInitialData();
+      InitialDataScope ctx(m_backend.get());
       if (ctx) {
         for (uint32_t mip = 0; mip < backendDesc.mipLevels; mip++) {
           const auto& sub = initialData[mip];
@@ -327,7 +355,7 @@ namespace dxup {
             ctx->retainTemporaryBuffer(std::move(uploadBuf));
           }
         }
-        m_backend->endInitialData(ctx.get());
+        ctx.end();
       }
     }
 

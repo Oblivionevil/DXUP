@@ -624,6 +624,7 @@ namespace dxup {
       // D3D10 gives the stride of the one buffer; with several buffers each
       // holds one element, as wide as its components.
       UINT strides[D3D10_SO_BUFFER_SLOT_COUNT] = {};
+      UINT entriesPerSlot[D3D10_SO_BUFFER_SLOT_COUNT] = {};
       UINT bufferCount = 0;
       for (UINT i = 0; i < NumEntries; i++) {
         const auto& entry = pSODeclaration[i];
@@ -636,9 +637,18 @@ namespace dxup {
         if (entry.OutputSlot >= D3D10_SO_BUFFER_SLOT_COUNT)
           return E_INVALIDARG;
         strides[entry.OutputSlot] += UINT(entry.ComponentCount) * 4;
+        entriesPerSlot[entry.OutputSlot]++;
         bufferCount = (std::max)(bufferCount, UINT(entry.OutputSlot) + 1);
       }
-      if (bufferCount <= 1) {
+      if (bufferCount > 1) {
+        // As Direct3D 10 wants it: no stride, one entry per buffer.
+        if (OutputStreamStride)
+          return E_INVALIDARG;
+        for (UINT slot = 0; slot < bufferCount; slot++) {
+          if (entriesPerSlot[slot] > 1)
+            return E_INVALIDARG;
+        }
+      } else {
         strides[0] = OutputStreamStride;
         bufferCount = 1;
       }
