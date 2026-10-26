@@ -70,6 +70,12 @@ namespace dxup::d3d9 {
       return { r.left, r.top, r.right, r.bottom };
     }
 
+    // Registers start .. start + count within limit (without the sum
+    // wrapping around).
+    bool inRange(UINT start, UINT count, UINT limit) {
+      return start <= limit && count <= limit - start;
+    }
+
     Surface* asSurface(IDirect3DSurface9* surface) { return static_cast<Surface*>(surface); }
   }
 
@@ -81,6 +87,23 @@ namespace dxup::d3d9 {
   : m_device(device), m_implicit(implicit), m_params(params) {
     if (!m_implicit)
       m_device->addRefPrivate();
+    createBuffers(params);
+  }
+
+  void SwapChain::reset(const D3DPRESENT_PARAMETERS& params, std::vector<Surface*>& retired) {
+    for (Surface* surface : m_backBuffers) {
+      if (surface->heldByApplication())
+        retired.push_back(surface);
+      else
+        surface->destroyContained();
+    }
+    m_backBuffers.clear();
+    m_resolved.reset();
+    createBuffers(params);
+  }
+
+  void SwapChain::createBuffers(const D3DPRESENT_PARAMETERS& params) {
+    m_params = params;
     for (UINT i = 0; i < 256; i++)
       m_gamma.red[i] = m_gamma.green[i] = m_gamma.blue[i] = WORD(i * 257);
     if (m_params.BackBufferFormat == D3DFMT_UNKNOWN)
@@ -188,9 +211,13 @@ namespace dxup::d3d9 {
       interval = 0;
     const HRESULT hr = core->present(source, sourceRect ? &rect : nullptr, target, interval, &m_gamma.red[0]);
     m_presentCount++;
-    if (FAILED(hr))
+    if (FAILED(hr)) {
       logMessage(LogLevel::Warn, "D3D9 Present failed: 0x%08lx", hr);
-    // The application drew; flush its work so the next frame starts fresh.
+      // A removed device: Direct3D 9Ex games make a new one (Direct3D 9
+      // has no way back from it but Reset, which cannot bring it back).
+      if (m_device->removed())
+        return m_device->ex() ? D3DERR_DEVICEREMOVED : D3D_OK;
+    }
     return D3D_OK;
   }
 
@@ -321,11 +348,10 @@ namespace dxup::d3d9 {
     m_fvfDeclarations.clear();
     if (m_autoDepthStencil)
       delete m_autoDepthStencil;
-    delete m_swapChain;
     for (Surface* surface : m_retiredSurfaces)
       delete surface;
-    for (SwapChain* chain : m_retiredSwapChains)
-      delete chain;
+    delete m_swapChain;
+    restoreWindow();
     if (m_cursor)
       DestroyCursor(m_cursor);
     m_resolveTarget.reset();
@@ -351,6 +377,9 @@ namespace dxup::d3d9 {
       m_recording->Release();
       m_recording = nullptr;
     }
+    // A full screen window gets its frame and place back with the last
+    // reference of the application (the device may live on privately).
+    restoreWindow();
   }
 
   HRESULT Device::init(D3DPRESENT_PARAMETERS* params, D3DDISPLAYMODEEX*) {
@@ -373,24 +402,52 @@ namespace dxup::d3d9 {
   }
 
   void Device::applyFullscreen(const D3DPRESENT_PARAMETERS& params) {
-    if (params.Windowed)
+    HWND window = params.hDeviceWindow ? params.hDeviceWindow : m_focusWindow;
+    // Windowed (again), or another window: the one changed comes back.
+    if (params.Windowed || window != m_savedWindow)
+      restoreWindow();
+    if (params.Windowed || !window)
       return;
     // No display mode change: the window covers its monitor, and the swap
     // chain scales the back buffer to it.
-    HWND window = params.hDeviceWindow ? params.hDeviceWindow : m_focusWindow;
-    if (!window)
-      return;
     HMONITOR monitor = MonitorFromWindow(window, MONITOR_DEFAULTTOPRIMARY);
     dpiAwareForFullScreen(monitor);
     MONITORINFO info = { sizeof(info) };
     if (!GetMonitorInfoW(monitor, &info))
       return;
+    // Kept once, before the first change.
+    if (!m_savedWindow) {
+      m_savedWindow = window;
+      m_savedStyle = GetWindowLongW(window, GWL_STYLE);
+      m_savedExStyle = GetWindowLongW(window, GWL_EXSTYLE);
+    }
     LONG style = GetWindowLongW(window, GWL_STYLE);
     style &= ~(WS_CAPTION | WS_THICKFRAME | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX);
     style |= WS_POPUP;
     SetWindowLongW(window, GWL_STYLE, style);
+    // Edges would take pixels of the monitor from the client area.
+    const LONG exStyle = GetWindowLongW(window, GWL_EXSTYLE) & ~(WS_EX_CLIENTEDGE | WS_EX_WINDOWEDGE);
+    SetWindowLongW(window, GWL_EXSTYLE, exStyle);
+    m_fullscreenStyle = style;
+    m_fullscreenExStyle = exStyle;
     SetWindowPos(window, HWND_TOP, info.rcMonitor.left, info.rcMonitor.top, info.rcMonitor.right - info.rcMonitor.left,
                  info.rcMonitor.bottom - info.rcMonitor.top, SWP_FRAMECHANGED | SWP_SHOWWINDOW | SWP_NOACTIVATE);
+  }
+
+  // The style comes back as Windows' D3D9 brings it back (the window stays
+  // where it is: games place it after Reset) - unless the game changed it
+  // meanwhile (some do before a Reset to windowed). Visibility stays.
+  void Device::restoreWindow() {
+    HWND window = m_savedWindow;
+    m_savedWindow = nullptr;
+    if (!window || !IsWindow(window))
+      return;
+    const LONG style = GetWindowLongW(window, GWL_STYLE);
+    if ((style & ~WS_VISIBLE) != (m_fullscreenStyle & ~WS_VISIBLE) || GetWindowLongW(window, GWL_EXSTYLE) != m_fullscreenExStyle)
+      return;
+    SetWindowLongW(window, GWL_STYLE, (m_savedStyle & ~WS_VISIBLE) | (style & WS_VISIBLE));
+    SetWindowLongW(window, GWL_EXSTYLE, m_savedExStyle);
+    SetWindowPos(window, nullptr, 0, 0, 0, 0, SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
   }
 
   HRESULT Device::resetSwapChain(D3DPRESENT_PARAMETERS* params) {
@@ -409,21 +466,23 @@ namespace dxup::d3d9 {
         delete m_autoDepthStencil;
       m_autoDepthStencil = nullptr;
     }
-    if (m_swapChain && m_swapChain->heldByApplication())
-      m_retiredSwapChains.push_back(m_swapChain);
-    else
-      delete m_swapChain;
-    m_swapChain = nullptr;
-
     D3DPRESENT_PARAMETERS p = *params;
     if (!p.hDeviceWindow)
       p.hDeviceWindow = m_focusWindow;
     applyFullscreen(p);
-    m_swapChain = new SwapChain(this, p, true);
-    if (!m_swapChain->valid()) {
-      delete m_swapChain;
-      m_swapChain = nullptr;
-      return D3DERR_NOTAVAILABLE;
+    // The implicit swap chain stays the same object (as with Windows'
+    // D3D9): its back buffers are made anew.
+    if (m_swapChain) {
+      m_swapChain->reset(p, m_retiredSurfaces);
+      if (!m_swapChain->valid())
+        return D3DERR_NOTAVAILABLE;
+    } else {
+      m_swapChain = new SwapChain(this, p, true);
+      if (!m_swapChain->valid()) {
+        delete m_swapChain;
+        m_swapChain = nullptr;
+        return D3DERR_NOTAVAILABLE;
+      }
     }
     // The application sees what was filled in.
     const D3DPRESENT_PARAMETERS& actual = m_swapChain->params();
@@ -471,6 +530,7 @@ namespace dxup::d3d9 {
     m_vertexShader.reset();
     m_pixelShader.reset();
     releaseHeld(true);
+    m_lightSet.clear();
     m_core->resetState();
   }
 
@@ -642,7 +702,10 @@ namespace dxup::d3d9 {
   }
 
   HRESULT Device::GetSwapChain(UINT index, IDirect3DSwapChain9** swapChain) {
-    if (!swapChain || index != 0 || !m_swapChain)
+    if (!swapChain)
+      return D3DERR_INVALIDCALL;
+    DeviceLock lock(this);
+    if (index != 0 || !m_swapChain)
       return D3DERR_INVALIDCALL;
     m_swapChain->AddRef();
     *swapChain = m_swapChain;
@@ -690,6 +753,7 @@ namespace dxup::d3d9 {
   }
 
   HRESULT Device::GetBackBuffer(UINT swapChain, UINT index, D3DBACKBUFFER_TYPE type, IDirect3DSurface9** buffer) {
+    DeviceLock lock(this);
     if (swapChain != 0 || !m_swapChain)
       return D3DERR_INVALIDCALL;
     return m_swapChain->GetBackBuffer(index, type, buffer);
@@ -1128,9 +1192,12 @@ namespace dxup::d3d9 {
     return D3D_OK;
   }
 
+  // Getters of bindings lock too: the reference they give is taken while no
+  // other thread unbinds (and releases) the object.
   HRESULT Device::GetRenderTarget(DWORD index, IDirect3DSurface9** surface) {
     if (!surface || index >= legacy::kMaxRenderTargets)
       return D3DERR_INVALIDCALL;
+    DeviceLock lock(this);
     *surface = m_renderTargets[index].get();
     if (!*surface)
       return D3DERR_NOTFOUND;
@@ -1149,6 +1216,7 @@ namespace dxup::d3d9 {
   HRESULT Device::GetDepthStencilSurface(IDirect3DSurface9** surface) {
     if (!surface)
       return D3DERR_INVALIDCALL;
+    DeviceLock lock(this);
     *surface = m_depthStencil.get();
     if (!*surface)
       return D3DERR_NOTFOUND;
@@ -1273,14 +1341,26 @@ namespace dxup::d3d9 {
     static_assert(sizeof(legacy::Light) == sizeof(D3DLIGHT9), "light layouts");
     legacy::Light l;
     std::memcpy(&l, light, sizeof(l));
-    return m_core->setLight(index, l) ? D3D_OK : E_OUTOFMEMORY;
+    if (!m_core->setLight(index, l))
+      return E_OUTOFMEMORY;
+    markLight(index);
+    return D3D_OK;
   }
 
+  void Device::markLight(DWORD index) {
+    if (index >= m_lightSet.size())
+      m_lightSet.resize(index + 1, false);
+    m_lightSet[index] = true;
+  }
+
+  // Lights never set nor enabled do not exist (the core keeps those below
+  // the largest index): Windows' D3D9 fails for them.
   HRESULT Device::GetLight(DWORD index, D3DLIGHT9* light) {
     if (!light)
       return D3DERR_INVALIDCALL;
+    DeviceLock lock(this);
     legacy::Light l;
-    if (!m_core->getLight(index, &l))
+    if (!lightExists(index) || !m_core->getLight(index, &l))
       return D3DERR_INVALIDCALL;
     std::memcpy(light, &l, sizeof(*light));
     return D3D_OK;
@@ -1292,14 +1372,17 @@ namespace dxup::d3d9 {
       rec->lightEnables[index] = enable;
       return D3D_OK;
     }
-    return m_core->lightEnable(index, enable != FALSE) ? D3D_OK : E_OUTOFMEMORY;
+    if (!m_core->lightEnable(index, enable != FALSE))
+      return E_OUTOFMEMORY;
+    markLight(index);
+    return D3D_OK;
   }
 
   HRESULT Device::GetLightEnable(DWORD index, BOOL* enable) {
     if (!enable)
       return D3DERR_INVALIDCALL;
-    legacy::Light l;
-    if (!m_core->getLight(index, &l))
+    DeviceLock lock(this);
+    if (!lightExists(index))
       return D3DERR_INVALIDCALL;
     *enable = m_core->lightEnabled(index) ? 128 : 0;
     return D3D_OK;
@@ -1352,9 +1435,7 @@ namespace dxup::d3d9 {
       return stage == D3DDMAPSAMPLER ? D3D_OK : D3DERR_INVALIDCALL;
     DeviceLock lock(this);
     if (StateSet* rec = recording()) {
-      if (texture) texture->AddRef();
-      if (rec->textures[index]) rec->textures[index]->Release();
-      rec->textures[index] = texture;
+      setHeld(rec->textures[index], texture);
       rec->texturesSet.set(index);
       return D3D_OK;
     }
@@ -1371,6 +1452,7 @@ namespace dxup::d3d9 {
   HRESULT Device::GetTexture(DWORD stage, IDirect3DBaseTexture9** texture) {
     if (!texture)
       return D3DERR_INVALIDCALL;
+    DeviceLock lock(this);
     const int index = samplerIndex(stage);
     *texture = index >= 0 ? m_textures[index] : nullptr;
     if (*texture)
@@ -1566,12 +1648,12 @@ namespace dxup::d3d9 {
       GetTransform(D3DTRANSFORMSTATETYPE(entry.first), &entry.second);
     if (s.materialSet)
       GetMaterial(&s.material);
-    for (auto& entry : s.lights) {
-      if (FAILED(GetLight(entry.first, &entry.second)))
-        entry.second = {};
-    }
+    // Lights the device does not have (recorded ones) keep their values.
+    for (auto& entry : s.lights)
+      GetLight(entry.first, &entry.second);
     for (auto& entry : s.lightEnables)
-      entry.second = m_core->lightEnabled(entry.first);
+      if (lightExists(entry.first))
+        entry.second = m_core->lightEnabled(entry.first);
     if (s.viewportSet)
       GetViewport(&s.viewport);
     if (s.scissorSet)
@@ -1612,6 +1694,8 @@ namespace dxup::d3d9 {
         SetVertexDeclaration(s.declaration);
       else if (s.fvf)
         SetFVF(s.fvf);
+      else
+        SetVertexDeclaration(nullptr);   // captured without one
     }
     if (s.vertexShaderSet)
       SetVertexShader(s.vertexShader);
@@ -1662,9 +1746,7 @@ namespace dxup::d3d9 {
     DeviceLock lock(this);
     auto* decl = static_cast<VertexDeclaration*>(declaration);
     if (StateSet* rec = recording()) {
-      if (decl) decl->AddRef();
-      if (rec->declaration) rec->declaration->Release();
-      rec->declaration = decl;
+      setHeld(rec->declaration, static_cast<IDirect3DVertexDeclaration9*>(decl));
       rec->fvf = 0;
       rec->declarationSet = true;
       return D3D_OK;
@@ -1679,6 +1761,7 @@ namespace dxup::d3d9 {
   HRESULT Device::GetVertexDeclaration(IDirect3DVertexDeclaration9** declaration) {
     if (!declaration)
       return D3DERR_INVALIDCALL;
+    DeviceLock lock(this);
     *declaration = m_declaration.get();
     if (*declaration)
       (*declaration)->AddRef();
@@ -1688,8 +1771,9 @@ namespace dxup::d3d9 {
   HRESULT Device::SetFVF(DWORD fvf) {
     DeviceLock lock(this);
     if (StateSet* rec = recording()) {
-      if (rec->declaration) rec->declaration->Release();
-      rec->declaration = nullptr;
+      if (!fvf)
+        return D3D_OK;   // not an FVF: nothing to record
+      setHeld(rec->declaration, static_cast<IDirect3DVertexDeclaration9*>(nullptr));
       rec->fvf = fvf;
       rec->declarationSet = true;
       return D3D_OK;
@@ -1727,9 +1811,7 @@ namespace dxup::d3d9 {
     DeviceLock lock(this);
     auto* vb = static_cast<VertexBuffer*>(buffer);
     if (StateSet* rec = recording()) {
-      if (vb) vb->AddRef();
-      if (rec->streams[stream].buffer) rec->streams[stream].buffer->Release();
-      rec->streams[stream].buffer = vb;
+      setHeld(rec->streams[stream].buffer, static_cast<IDirect3DVertexBuffer9*>(vb));
       rec->streams[stream].offset = offset;
       rec->streams[stream].stride = stride;
       rec->streamsSet.set(stream);
@@ -1746,6 +1828,7 @@ namespace dxup::d3d9 {
   HRESULT Device::GetStreamSource(UINT stream, IDirect3DVertexBuffer9** buffer, UINT* offset, UINT* stride) {
     if (stream >= 16 || !buffer || !offset || !stride)
       return D3DERR_INVALIDCALL;
+    DeviceLock lock(this);
     *buffer = m_streams[stream].buffer.get();
     if (*buffer)
       (*buffer)->AddRef();
@@ -1779,9 +1862,7 @@ namespace dxup::d3d9 {
     DeviceLock lock(this);
     auto* ib = static_cast<IndexBuffer*>(indices);
     if (StateSet* rec = recording()) {
-      if (ib) ib->AddRef();
-      if (rec->indices) rec->indices->Release();
-      rec->indices = ib;
+      setHeld(rec->indices, static_cast<IDirect3DIndexBuffer9*>(ib));
       rec->indicesSet = true;
       return D3D_OK;
     }
@@ -1794,6 +1875,7 @@ namespace dxup::d3d9 {
   HRESULT Device::GetIndices(IDirect3DIndexBuffer9** indices) {
     if (!indices)
       return D3DERR_INVALIDCALL;
+    DeviceLock lock(this);
     *indices = m_indices.get();
     if (*indices)
       (*indices)->AddRef();
@@ -1842,9 +1924,7 @@ namespace dxup::d3d9 {
     DeviceLock lock(this);
     auto* vs = static_cast<VertexShader*>(shader);
     if (StateSet* rec = recording()) {
-      if (vs) vs->AddRef();
-      if (rec->vertexShader) rec->vertexShader->Release();
-      rec->vertexShader = vs;
+      setHeld(rec->vertexShader, static_cast<IDirect3DVertexShader9*>(vs));
       rec->vertexShaderSet = true;
       return D3D_OK;
     }
@@ -1857,6 +1937,7 @@ namespace dxup::d3d9 {
   HRESULT Device::GetVertexShader(IDirect3DVertexShader9** shader) {
     if (!shader)
       return D3DERR_INVALIDCALL;
+    DeviceLock lock(this);
     *shader = m_vertexShader.get();
     if (*shader)
       (*shader)->AddRef();
@@ -1867,9 +1948,7 @@ namespace dxup::d3d9 {
     DeviceLock lock(this);
     auto* ps = static_cast<PixelShader*>(shader);
     if (StateSet* rec = recording()) {
-      if (ps) ps->AddRef();
-      if (rec->pixelShader) rec->pixelShader->Release();
-      rec->pixelShader = ps;
+      setHeld(rec->pixelShader, static_cast<IDirect3DPixelShader9*>(ps));
       rec->pixelShaderSet = true;
       return D3D_OK;
     }
@@ -1882,6 +1961,7 @@ namespace dxup::d3d9 {
   HRESULT Device::GetPixelShader(IDirect3DPixelShader9** shader) {
     if (!shader)
       return D3DERR_INVALIDCALL;
+    DeviceLock lock(this);
     *shader = m_pixelShader.get();
     if (*shader)
       (*shader)->AddRef();
@@ -1899,7 +1979,7 @@ namespace dxup::d3d9 {
   }
 
   HRESULT Device::SetVertexShaderConstantF(UINT start, const float* data, UINT count) {
-    if (!data || start + count > 256)
+    if (!data || !inRange(start, count, 256))
       return D3DERR_INVALIDCALL;
     DeviceLock lock(this);
     if (StateSet* rec = recording()) {
@@ -1911,14 +1991,14 @@ namespace dxup::d3d9 {
   }
 
   HRESULT Device::GetVertexShaderConstantF(UINT start, float* data, UINT count) {
-    if (!data || start + count > 256)
+    if (!data || !inRange(start, count, 256))
       return D3DERR_INVALIDCALL;
     m_core->getShaderConstantF(false, start, data, count);
     return D3D_OK;
   }
 
   HRESULT Device::SetVertexShaderConstantI(UINT start, const int* data, UINT count) {
-    if (!data || start + count > 16)
+    if (!data || !inRange(start, count, 16))
       return D3DERR_INVALIDCALL;
     DeviceLock lock(this);
     if (StateSet* rec = recording()) {
@@ -1930,14 +2010,14 @@ namespace dxup::d3d9 {
   }
 
   HRESULT Device::GetVertexShaderConstantI(UINT start, int* data, UINT count) {
-    if (!data || start + count > 16)
+    if (!data || !inRange(start, count, 16))
       return D3DERR_INVALIDCALL;
     m_core->getShaderConstantI(false, start, reinterpret_cast<int32_t*>(data), count);
     return D3D_OK;
   }
 
   HRESULT Device::SetVertexShaderConstantB(UINT start, const BOOL* data, UINT count) {
-    if (!data || start + count > 16)
+    if (!data || !inRange(start, count, 16))
       return D3DERR_INVALIDCALL;
     DeviceLock lock(this);
     if (StateSet* rec = recording()) {
@@ -1952,14 +2032,14 @@ namespace dxup::d3d9 {
   }
 
   HRESULT Device::GetVertexShaderConstantB(UINT start, BOOL* data, UINT count) {
-    if (!data || start + count > 16)
+    if (!data || !inRange(start, count, 16))
       return D3DERR_INVALIDCALL;
     m_core->getShaderConstantB(false, start, reinterpret_cast<uint32_t*>(data), count);
     return D3D_OK;
   }
 
   HRESULT Device::SetPixelShaderConstantF(UINT start, const float* data, UINT count) {
-    if (!data || start + count > 224)
+    if (!data || !inRange(start, count, 224))
       return D3DERR_INVALIDCALL;
     DeviceLock lock(this);
     if (StateSet* rec = recording()) {
@@ -1971,14 +2051,14 @@ namespace dxup::d3d9 {
   }
 
   HRESULT Device::GetPixelShaderConstantF(UINT start, float* data, UINT count) {
-    if (!data || start + count > 224)
+    if (!data || !inRange(start, count, 224))
       return D3DERR_INVALIDCALL;
     m_core->getShaderConstantF(true, start, data, count);
     return D3D_OK;
   }
 
   HRESULT Device::SetPixelShaderConstantI(UINT start, const int* data, UINT count) {
-    if (!data || start + count > 16)
+    if (!data || !inRange(start, count, 16))
       return D3DERR_INVALIDCALL;
     DeviceLock lock(this);
     if (StateSet* rec = recording()) {
@@ -1990,14 +2070,14 @@ namespace dxup::d3d9 {
   }
 
   HRESULT Device::GetPixelShaderConstantI(UINT start, int* data, UINT count) {
-    if (!data || start + count > 16)
+    if (!data || !inRange(start, count, 16))
       return D3DERR_INVALIDCALL;
     m_core->getShaderConstantI(true, start, reinterpret_cast<int32_t*>(data), count);
     return D3D_OK;
   }
 
   HRESULT Device::SetPixelShaderConstantB(UINT start, const BOOL* data, UINT count) {
-    if (!data || start + count > 16)
+    if (!data || !inRange(start, count, 16))
       return D3DERR_INVALIDCALL;
     DeviceLock lock(this);
     if (StateSet* rec = recording()) {
@@ -2012,7 +2092,7 @@ namespace dxup::d3d9 {
   }
 
   HRESULT Device::GetPixelShaderConstantB(UINT start, BOOL* data, UINT count) {
-    if (!data || start + count > 16)
+    if (!data || !inRange(start, count, 16))
       return D3DERR_INVALIDCALL;
     m_core->getShaderConstantB(true, start, reinterpret_cast<uint32_t*>(data), count);
     return D3D_OK;

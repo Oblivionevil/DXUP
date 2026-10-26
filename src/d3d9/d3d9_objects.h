@@ -226,11 +226,13 @@ namespace dxup::d3d9 {
     D3DMULTISAMPLE_TYPE m_multisample;
     DWORD               m_quality;
     bool                m_locked = false;
-    // GetDC: a DIB with the surface's pixels, written back on ReleaseDC.
+    // GetDC: a DIB with the surface's pixels, written back on ReleaseDC
+    // where GDI changed them (m_dcOriginal: the DIB as filled).
     HDC                 m_dc = nullptr;
     HBITMAP             m_bitmap = nullptr;
     HGDIOBJ             m_oldBitmap = nullptr;
     void*               m_bits = nullptr;
+    std::vector<uint32_t> m_dcOriginal;
   };
 
   class Volume final : public Resource<IDirect3DVolume9> {
@@ -410,6 +412,29 @@ namespace dxup::d3d9 {
   using VertexShader = ShaderObject<IDirect3DVertexShader9>;
   using PixelShader = ShaderObject<IDirect3DPixelShader9>;
 
+  // State blocks hold what they refer to with private references (as the
+  // device's bindings: the application's counts stay as Windows' D3D9
+  // shows them). setHeld puts an object into a block's slot.
+  inline RefCounted* refCountedOf(IDirect3DBaseTexture9* texture) {
+    BaseTexture* base = baseTextureOf(texture);
+    return base ? &base->refCounted() : nullptr;
+  }
+  inline RefCounted* refCountedOf(IDirect3DVertexBuffer9* buffer) { return static_cast<VertexBuffer*>(buffer); }
+  inline RefCounted* refCountedOf(IDirect3DIndexBuffer9* buffer) { return static_cast<IndexBuffer*>(buffer); }
+  inline RefCounted* refCountedOf(IDirect3DVertexDeclaration9* declaration) {
+    return static_cast<VertexDeclaration*>(declaration);
+  }
+  inline RefCounted* refCountedOf(IDirect3DVertexShader9* shader) { return static_cast<VertexShader*>(shader); }
+  inline RefCounted* refCountedOf(IDirect3DPixelShader9* shader) { return static_cast<PixelShader*>(shader); }
+  template<typename T>
+  void setHeld(T*& slot, T* object) {
+    RefCounted* next = object ? refCountedOf(object) : nullptr;
+    RefCounted* previous = slot ? refCountedOf(slot) : nullptr;
+    if (next) next->addRefPrivate();
+    slot = object;
+    if (previous) previous->releasePrivate();
+  }
+
   class Query final : public DeviceChild<IDirect3DQuery9> {
   public:
     Query(Device* device, D3DQUERYTYPE type);
@@ -498,6 +523,10 @@ namespace dxup::d3d9 {
     void addRefPrivate() override;
     void releasePrivate() override;
     bool valid() const { return !m_backBuffers.empty(); }
+    // Reset: the same swap chain with new back buffers (none when they
+    // cannot be made). Old ones the application holds (Direct3D 9Ex) go
+    // into retired, the device's to delete.
+    void reset(const D3DPRESENT_PARAMETERS& params, std::vector<Surface*>& retired);
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** object) override;
     ULONG STDMETHODCALLTYPE AddRef() override;
     ULONG STDMETHODCALLTYPE Release() override;
@@ -527,6 +556,8 @@ namespace dxup::d3d9 {
     void setGammaRamp(const D3DGAMMARAMP& ramp) { m_gamma = ramp; }
     const D3DGAMMARAMP& gammaRamp() const { return m_gamma; }
   private:
+    // Fills in the parameters' defaults and makes the back buffers.
+    void createBuffers(const D3DPRESENT_PARAMETERS& params);
     void destroyBuffers();
     Device* m_device;
     bool m_implicit;
@@ -549,6 +580,9 @@ namespace dxup::d3d9 {
     legacy::Device* core() const { return m_core.get(); }
     std::recursive_mutex& mutex() { return m_mutex; }
     bool multithreaded() const { return (m_behavior & D3DCREATE_MULTITHREADED) != 0; }
+    bool ex() const { return m_ex; }
+    // DXUP's D3D11 device under the core was removed (lost work).
+    bool removed() const { return m_core && FAILED(m_core->d3d11()->GetDeviceRemovedReason()); }
     ULONG addRefInternal() { return addRefPublic(); }
     ULONG releaseInternal() { return releasePublic(); }
     // State blocks being recorded take what is set.
@@ -556,6 +590,10 @@ namespace dxup::d3d9 {
     D3DCAPS9 caps() const;
     void applyState(const StateSet& set);
     void captureState(StateSet& set);
+    // Lights set or enabled (others do not exist: GetLight fails, state
+    // blocks leave them out).
+    bool lightExists(DWORD index) const { return index < m_lightSet.size() && m_lightSet[index]; }
+    const std::vector<bool>& lightsSet() const { return m_lightSet; }
 
     // IUnknown
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** object) override;
@@ -706,7 +744,7 @@ namespace dxup::d3d9 {
     HRESULT STDMETHODCALLTYPE CheckResourceResidency(IDirect3DResource9**, UINT32) override { return D3D_OK; }
     HRESULT STDMETHODCALLTYPE SetMaximumFrameLatency(UINT latency) override;
     HRESULT STDMETHODCALLTYPE GetMaximumFrameLatency(UINT* latency) override;
-    HRESULT STDMETHODCALLTYPE CheckDeviceState(HWND) override { return D3D_OK; }
+    HRESULT STDMETHODCALLTYPE CheckDeviceState(HWND) override { return removed() ? D3DERR_DEVICEREMOVED : D3D_OK; }
     HRESULT STDMETHODCALLTYPE CreateRenderTargetEx(UINT width, UINT height, D3DFORMAT format, D3DMULTISAMPLE_TYPE multisample,
                                                    DWORD quality, BOOL lockable, IDirect3DSurface9** surface, HANDLE* shared,
                                                    DWORD usage) override;
@@ -724,7 +762,11 @@ namespace dxup::d3d9 {
                           DWORD quality, IDirect3DSurface9** surface);
     HRESULT resetSwapChain(D3DPRESENT_PARAMETERS* params);
     void resetState();
+    // Full screen: the window covers its monitor without a frame (its
+    // style and extended style kept); windowed: they come back.
     void applyFullscreen(const D3DPRESENT_PARAMETERS& params);
+    void restoreWindow();
+    void markLight(DWORD index);
     legacy::PrimitiveType primitive(D3DPRIMITIVETYPE type) const { return legacy::PrimitiveType(type); }
 
     Interface*                      m_parent;
@@ -740,10 +782,17 @@ namespace dxup::d3d9 {
     std::shared_ptr<legacy::Texture> m_resolveTarget;
     SwapChain*                      m_swapChain = nullptr;   // implicit
     Surface*                        m_autoDepthStencil = nullptr;
-    // Swap chains and depth buffers replaced by Reset that the application
+    // Back buffers and depth buffers replaced by Reset that the application
     // still held (Direct3D 9Ex).
-    std::vector<SwapChain*>         m_retiredSwapChains;
     std::vector<Surface*>           m_retiredSurfaces;
+    // The window's style and extended style before full screen, and those
+    // full screen gave it.
+    HWND                            m_savedWindow = nullptr;
+    LONG                            m_savedStyle = 0;
+    LONG                            m_savedExStyle = 0;
+    LONG                            m_fullscreenStyle = 0;
+    LONG                            m_fullscreenExStyle = 0;
+    std::vector<bool>               m_lightSet;
 
     // Bindings
     std::array<Bound<Surface>, legacy::kMaxRenderTargets> m_renderTargets;

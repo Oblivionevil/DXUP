@@ -301,6 +301,7 @@ namespace dxup::d3d9 {
             static_cast<const uint8_t*>(locked.pBits) + size_t(y) * locked.Pitch + size_t(x) * fi.bytesPerBlock, nullptr);
       UnlockRect();
     }
+    m_dcOriginal.assign(static_cast<const uint32_t*>(m_bits), static_cast<const uint32_t*>(m_bits) + size_t(w) * h);
     *dc = m_dc;
     return D3D_OK;
   }
@@ -311,19 +312,27 @@ namespace dxup::d3d9 {
     GdiFlush();
     const D3DFORMAT f = format();
     const UINT w = width(), h = height();
+    // Only the pixels GDI drew go back, as GDI left them (A8R8G8B8: alpha
+    // 0, as with Windows' D3D9, whose DC draws into the surface): the
+    // others keep their texels, alpha included.
+    const auto* bits = static_cast<const uint32_t*>(m_bits);
+    bool changed = false;
+    for (size_t i = 0; i < m_dcOriginal.size() && !changed; i++)
+      changed = bits[i] != m_dcOriginal[i];
     D3DLOCKED_RECT locked = {};
-    if (SUCCEEDED(LockRect(&locked, nullptr, 0))) {
+    if (changed && SUCCEEDED(LockRect(&locked, nullptr, 0))) {
       const legacy::FormatInfo fi = legacy::formatInfo(legacy::Format(f));
       for (UINT y = 0; y < h; y++)
         for (UINT x = 0; x < w; x++) {
-          uint32_t argb = static_cast<uint32_t*>(m_bits)[y * w + x];
-          if (f == D3DFMT_A8R8G8B8)
-            argb |= 0xff000000u;   // GDI leaves alpha 0
-          legacy::fromArgb(legacy::Format(f), argb,
-            static_cast<uint8_t*>(locked.pBits) + size_t(y) * locked.Pitch + size_t(x) * fi.bytesPerBlock);
+          const size_t i = size_t(y) * w + x;
+          if (bits[i] != m_dcOriginal[i])
+            legacy::fromArgb(legacy::Format(f), bits[i],
+              static_cast<uint8_t*>(locked.pBits) + size_t(y) * locked.Pitch + size_t(x) * fi.bytesPerBlock);
         }
       UnlockRect();
     }
+    m_dcOriginal.clear();
+    m_dcOriginal.shrink_to_fit();
     SelectObject(m_dc, m_oldBitmap);
     DeleteDC(m_dc);
     DeleteObject(m_bitmap);
@@ -978,16 +987,16 @@ namespace dxup::d3d9 {
       D3DRS_SPECULARENABLE, D3DRS_SHADEMODE,
     };
 
-    template<typename T>
-    void retainObject(T* object) {
-      if (object) object->AddRef();
-    }
-
-    template<typename T>
-    void releaseObject(T*& object) {
-      if (object) object->Release();
-      object = nullptr;
-    }
+    // Texture stage states of pixel blocks; vertex blocks hold TEXCOORDINDEX
+    // and TEXTURETRANSFORMFLAGS (also in pixel blocks), as Windows' D3D9
+    // captures them (D3DTSS_CONSTANT in neither).
+    const DWORD kPixelStageStates[] = {
+      D3DTSS_COLOROP, D3DTSS_COLORARG1, D3DTSS_COLORARG2, D3DTSS_ALPHAOP, D3DTSS_ALPHAARG1, D3DTSS_ALPHAARG2,
+      D3DTSS_BUMPENVMAT00, D3DTSS_BUMPENVMAT01, D3DTSS_BUMPENVMAT10, D3DTSS_BUMPENVMAT11, D3DTSS_TEXCOORDINDEX,
+      D3DTSS_BUMPENVLSCALE, D3DTSS_BUMPENVLOFFSET, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTSS_COLORARG0, D3DTSS_ALPHAARG0,
+      D3DTSS_RESULTARG,
+    };
+    const DWORD kVertexStageStates[] = { D3DTSS_TEXCOORDINDEX, D3DTSS_TEXTURETRANSFORMFLAGS };
   }
 
   StateBlock::StateBlock(Device* device, D3DSTATEBLOCKTYPE type)
@@ -1003,10 +1012,15 @@ namespace dxup::d3d9 {
       if (pixel) for (DWORD state : kPixelRenderStates) s.renderStatesSet.set(state);
       if (vertex) for (DWORD state : kVertexRenderStates) s.renderStatesSet.set(state);
     }
+    for (auto& stage : s.stageStatesSet) {
+      if (pixel) for (DWORD t : kPixelStageStates) stage.set(t);
+      if (vertex) for (DWORD t : kVertexStageStates) stage.set(t);
+    }
     if (pixel) {
-      for (auto& stage : s.stageStatesSet) stage.set();
+      // Sampler states but the displacement map's offset (ALL blocks only).
       for (uint32_t sampler = 0; sampler < legacy::kSamplerCount; sampler++)
-        s.samplerStatesSet[sampler].set();
+        for (DWORD t = D3DSAMP_ADDRESSU; t <= D3DSAMP_ELEMENTINDEX; t++)
+          s.samplerStatesSet[sampler].set(t);
       s.pixelShaderSet = true;
       s.psFloatsSet.set();
       s.psIntsSet.set();
@@ -1019,12 +1033,18 @@ namespace dxup::d3d9 {
       s.vsBoolsSet.set();
       s.declarationSet = true;
       s.frequenciesSet.set();
-      for (uint32_t light = 0; light < 8; light++) {
+      // The lights that exist, any index (lights made later stay out).
+      const std::vector<bool>& lights = device->lightsSet();
+      for (uint32_t light = 0; light < lights.size(); light++) {
+        if (!lights[light])
+          continue;
         s.lights[light] = {};
         s.lightEnables[light] = FALSE;
       }
     }
     if (all) {
+      for (uint32_t sampler = 0; sampler < legacy::kSamplerCount; sampler++)
+        s.samplerStatesSet[sampler].set(D3DSAMP_DMAPOFFSET);
       s.texturesSet.set();
       s.streamsSet.set();
       s.indicesSet = true;
@@ -1044,6 +1064,24 @@ namespace dxup::d3d9 {
     releaseObjects();
   }
 
+  namespace {
+    template<typename T>
+    void retainObject(T* object) {
+      if (RefCounted* counted = object ? refCountedOf(object) : nullptr)
+        counted->addRefPrivate();
+    }
+
+    template<typename T>
+    void releaseObject(T*& object) {
+      T* released = object;
+      object = nullptr;
+      if (RefCounted* counted = released ? refCountedOf(released) : nullptr)
+        counted->releasePrivate();
+    }
+  }
+
+  // Private references, as the device's bindings: the application's counts
+  // stay what Windows' D3D9 shows.
   void StateBlock::retain() {
     for (auto* texture : m_set.textures) retainObject(texture);
     for (auto& stream : m_set.streams) retainObject(stream.buffer);
@@ -1075,6 +1113,9 @@ namespace dxup::d3d9 {
   }
 
   HRESULT StateBlock::Capture() {
+    std::unique_lock<std::recursive_mutex> guard(m_device->mutex(), std::defer_lock);
+    if (m_device->multithreaded()) guard.lock();
+    // What the device binds it holds itself: released first, still there.
     releaseObjects();
     m_device->captureState(m_set);
     retain();

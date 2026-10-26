@@ -3115,6 +3115,197 @@ float4 main(float2 t : TEXCOORD0) : COLOR { float v = tex2D(depth, t).r; return 
     return true;
   }
 
+  // Results as pixels in rows from (0, 2): white yes, gray no.
+  void drawBits(IDirect3DDevice9* d, const std::vector<bool>& bits) {
+    d->Clear(0, nullptr, D3DCLEAR_TARGET, 0xff000000u, 1.0f, 0);
+    for (size_t i = 0; i < bits.size(); i++) {
+      const LONG x = LONG(i % kWidth), y = 2 + 2 * LONG(i / kWidth);
+      const D3DRECT r = { x, y, x + 1, y + 1 };
+      d->Clear(1, &r, D3DCLEAR_TARGET, bits[i] ? 0xffffffffu : 0xff404040u, 1.0f, 0);
+    }
+  }
+
+  // What each state block type holds: stage and sampler states (of stage
+  // and sampler 1) in pixel, vertex and ALL blocks; lights of any index,
+  // those that exist (captured again by Capture, never made by Apply); and
+  // no reference of the application's (as bindings: the block keeps what
+  // it holds alive).
+  bool sceneStateBlockContents(IDirect3DDevice9* d) {
+    std::vector<bool> bits;
+    for (D3DSTATEBLOCKTYPE type : { D3DSBT_PIXELSTATE, D3DSBT_VERTEXSTATE, D3DSBT_ALL }) {
+      for (DWORD t = 1; t <= 32; t++) {
+        IDirect3DStateBlock9* block = nullptr;
+        DWORD value = 0;
+        d->SetTextureStageState(1, D3DTEXTURESTAGESTATETYPE(t), 5);
+        if (FAILED(d->CreateStateBlock(type, &block)))
+          return false;
+        d->SetTextureStageState(1, D3DTEXTURESTAGESTATETYPE(t), 6);
+        block->Apply();
+        block->Release();
+        d->GetTextureStageState(1, D3DTEXTURESTAGESTATETYPE(t), &value);
+        bits.push_back(value == 5);
+      }
+      for (DWORD s = D3DSAMP_ADDRESSU; s <= D3DSAMP_DMAPOFFSET; s++) {
+        IDirect3DStateBlock9* block = nullptr;
+        DWORD value = 0;
+        d->SetSamplerState(1, D3DSAMPLERSTATETYPE(s), 2);
+        if (FAILED(d->CreateStateBlock(type, &block)))
+          return false;
+        d->SetSamplerState(1, D3DSAMPLERSTATETYPE(s), 3);
+        block->Apply();
+        block->Release();
+        d->GetSamplerState(1, D3DSAMPLERSTATETYPE(s), &value);
+        bits.push_back(value == 2);
+      }
+    }
+    D3DLIGHT9 light = {}, got = {};
+    light.Type = D3DLIGHT_DIRECTIONAL;
+    light.Direction.z = 1.0f;
+    light.Diffuse.r = 0.25f;
+    d->SetLight(10, &light);
+    BOOL enabled = FALSE;
+    bits.push_back(FAILED(d->GetLight(3, &got)));
+    bits.push_back(FAILED(d->GetLightEnable(3, &enabled)));
+    for (D3DSTATEBLOCKTYPE type : { D3DSBT_ALL, D3DSBT_VERTEXSTATE, D3DSBT_PIXELSTATE }) {
+      IDirect3DStateBlock9* block = nullptr;
+      if (FAILED(d->CreateStateBlock(type, &block)))
+        return false;
+      light.Diffuse.r = 0.5f;
+      d->SetLight(10, &light);
+      d->SetLight(20 + type, &light);   // made after the block
+      block->Capture();
+      light.Diffuse.r = 0.75f;
+      d->SetLight(10, &light);
+      d->SetLight(20 + type, &light);
+      block->Apply();
+      block->Release();
+      d->GetLight(10, &got);
+      bits.push_back(got.Diffuse.r == 0.5f);
+      d->GetLight(20 + type, &got);
+      bits.push_back(got.Diffuse.r == 0.5f);
+      bits.push_back(FAILED(d->GetLight(3, &got)));
+      light.Diffuse.r = 0.25f;
+      d->SetLight(10, &light);
+    }
+    IDirect3DTexture9* texture = nullptr;
+    IDirect3DVertexBuffer9* vb = nullptr;
+    if (FAILED(d->CreateTexture(4, 4, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, &texture, nullptr))
+     || FAILED(d->CreateVertexBuffer(64, 0, 0, D3DPOOL_MANAGED, &vb, nullptr)))
+      return false;
+    auto refs = [](IUnknown* object) { object->AddRef(); return object->Release(); };
+    d->SetTexture(0, texture);
+    d->SetStreamSource(0, vb, 0, 16);
+    IDirect3DStateBlock9 *all = nullptr, *recorded = nullptr;
+    d->CreateStateBlock(D3DSBT_ALL, &all);
+    d->BeginStateBlock();
+    d->SetTexture(1, texture);
+    d->SetStreamSource(1, vb, 0, 16);
+    d->EndStateBlock(&recorded);
+    d->SetTexture(0, nullptr);
+    d->SetStreamSource(0, nullptr, 0, 0);
+    bits.push_back(refs(texture) == 1);
+    bits.push_back(refs(vb) == 1);
+    // Released by the application, kept by the blocks: Apply binds it.
+    d->SetTexture(0, texture);
+    all->Capture();
+    d->SetTexture(0, nullptr);
+    texture->Release();
+    vb->Release();
+    all->Apply();
+    IDirect3DBaseTexture9* bound = nullptr;
+    d->GetTexture(0, &bound);
+    bits.push_back(bound != nullptr && refs(bound) == 1);
+    if (bound) bound->Release();
+    d->SetTexture(0, nullptr);
+    d->SetStreamSource(0, nullptr, 0, 0);
+    recorded->Apply();
+    d->GetTexture(1, &bound);
+    bits.push_back(bound != nullptr);
+    if (bound) bound->Release();
+    d->SetTexture(1, nullptr);
+    d->SetStreamSource(1, nullptr, 0, 0);
+    all->Release();
+    recorded->Release();
+    drawBits(d, bits);
+    return true;
+  }
+
+  // Constant ranges past the registers fail, also when start + count wraps
+  // around (while recording a state block, too).
+  bool sceneConstantRanges(IDirect3DDevice9* d) {
+    const BOOL bools[2] = { TRUE, TRUE };
+    const int ints[8] = {};
+    const float floats[8] = {};
+    std::vector<bool> bits;
+    for (int recording = 0; recording < 2; recording++) {
+      if (recording)
+        d->BeginStateBlock();
+      bits.push_back(FAILED(d->SetVertexShaderConstantB(UINT_MAX, bools, 2)));
+      bits.push_back(FAILED(d->SetPixelShaderConstantB(15, bools, 2)));
+      bits.push_back(FAILED(d->SetPixelShaderConstantI(UINT_MAX, ints, 2)));
+      bits.push_back(FAILED(d->SetVertexShaderConstantF(UINT_MAX - 1, floats, 2)));
+      bits.push_back(SUCCEEDED(d->SetPixelShaderConstantB(14, bools, 2)));
+      if (recording) {
+        IDirect3DStateBlock9* block = nullptr;
+        d->EndStateBlock(&block);
+        if (block) block->Release();
+      }
+    }
+    drawBits(d, bits);
+    return true;
+  }
+
+  // GetDC of an A8R8G8B8 surface: what GDI draws gets alpha 0 (Windows'
+  // DC draws into the surface), untouched texels keep theirs.
+  bool sceneGetDcAlpha(IDirect3DDevice9* d) {
+    IDirect3DSurface9* surface = nullptr;
+    if (FAILED(d->CreateOffscreenPlainSurface(8, 8, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM, &surface, nullptr)))
+      return false;
+    D3DLOCKED_RECT locked = {};
+    surface->LockRect(&locked, nullptr, 0);
+    for (int y = 0; y < 8; y++)
+      for (int x = 0; x < 8; x++)
+        reinterpret_cast<DWORD*>(static_cast<BYTE*>(locked.pBits) + y * locked.Pitch)[x] = 0x5500ff00u;
+    surface->UnlockRect();
+    HDC dc = nullptr;
+    if (SUCCEEDED(surface->GetDC(&dc))) {
+      const RECT r = { 0, 0, 4, 4 };
+      HBRUSH brush = CreateSolidBrush(RGB(255, 0, 0));
+      FillRect(dc, &r, brush);
+      DeleteObject(brush);
+      surface->ReleaseDC(dc);
+    }
+    surface->LockRect(&locked, nullptr, D3DLOCK_READONLY);
+    const DWORD drawn = reinterpret_cast<const DWORD*>(static_cast<const BYTE*>(locked.pBits) + locked.Pitch)[1];
+    const DWORD kept = reinterpret_cast<const DWORD*>(static_cast<const BYTE*>(locked.pBits) + 6 * locked.Pitch)[6];
+    surface->UnlockRect();
+    surface->Release();
+    d->Clear(0, nullptr, D3DCLEAR_TARGET, 0xff000000u, 1.0f, 0);
+    const D3DRECT a = { 4, 4, 20, 20 }, b = { 24, 4, 40, 20 };
+    d->Clear(1, &a, D3DCLEAR_TARGET, drawn, 1.0f, 0);
+    d->Clear(1, &b, D3DCLEAR_TARGET, kept, 1.0f, 0);
+    return true;
+  }
+
+  // Reset keeps the implicit swap chain: the same object, still working.
+  bool sceneResetSameChain(IDirect3DDevice9* d) {
+    d->EndScene();
+    IDirect3DSwapChain9 *before = nullptr, *after = nullptr;
+    D3DPRESENT_PARAMETERS params = {}, again = {};
+    if (FAILED(d->GetSwapChain(0, &before)) || FAILED(before->GetPresentParameters(&params)))
+      return false;
+    D3DPRESENT_PARAMETERS p = params;
+    const HRESULT reset = d->Reset(&p);
+    d->GetSwapChain(0, &after);
+    const HRESULT kept = before->GetPresentParameters(&again);
+    const bool same = before == after;
+    if (after) after->Release();
+    before->Release();
+    d->BeginScene();
+    drawBits(d, { SUCCEEDED(reset), same, SUCCEEDED(kept) && again.BackBufferWidth == params.BackBufferWidth });
+    return true;
+  }
+
   const Scene kScenes[] = {
     { "msaa_resolve", sceneMsaaResolve, 80 },   // edge coverage: NVIDIA's 4x pattern differs
     { "formats", sceneFormats },
@@ -3175,6 +3366,10 @@ float4 main(float2 t : TEXCOORD0) : COLOR { float v = tex2D(depth, t).r; return 
     { "depth_read_bound", sceneDepthReadWhileBound },
     { "depth_bias_formats", sceneDepthBiasFormats },
     { "ffp_add_ops", sceneFfpAddOps, 3 },
+    { "state_block_contents", sceneStateBlockContents },
+    { "getdc_alpha", sceneGetDcAlpha },
+    { "reset_same_chain", sceneResetSameChain },
+    { "constant_ranges", sceneConstantRanges },
   };
 
   // ---- Running ----
@@ -4049,6 +4244,57 @@ VO main(float3 p : POSITION, float4 c : COLOR0) { VO o; o.p = float4(p.xy, 0.5, 
     return !aware ? 1 : !covers ? 2 : 0;
   }
 
+  // Full screen and back: the window gets its style (frame, caption) back on
+  // Reset to windowed and when the device goes; it stays where it is, as
+  // with Windows' D3D9. 0 ok, 1 not back after Reset, 2 not back after
+  // Release, 3 no device. Covers the screen for a moment (no mode change):
+  // run on request only.
+  int windowRestore(Runtime& runtime) {
+    IDirect3D9* d3d = runtime.create(D3D_SDK_VERSION);
+    if (!d3d) return 3;
+    HWND window = createWindow();
+    // Visibility and Windows' topmost flag aside (its Release leaves both).
+    const LONG style = GetWindowLongW(window, GWL_STYLE) & ~WS_VISIBLE;
+    const LONG exStyle = GetWindowLongW(window, GWL_EXSTYLE) & ~WS_EX_TOPMOST;
+    auto restored = [&] {
+      return (GetWindowLongW(window, GWL_STYLE) & ~WS_VISIBLE) == style
+          && (GetWindowLongW(window, GWL_EXSTYLE) & ~WS_EX_TOPMOST) == exStyle;
+    };
+    D3DDISPLAYMODE mode = {};
+    d3d->GetAdapterDisplayMode(D3DADAPTER_DEFAULT, &mode);
+    D3DPRESENT_PARAMETERS windowed = {};
+    windowed.Windowed = TRUE;
+    windowed.SwapEffect = D3DSWAPEFFECT_DISCARD;
+    windowed.BackBufferWidth = kWidth;
+    windowed.BackBufferHeight = kHeight;
+    windowed.BackBufferFormat = D3DFMT_X8R8G8B8;
+    windowed.hDeviceWindow = window;
+    D3DPRESENT_PARAMETERS full = windowed;
+    full.Windowed = FALSE;
+    full.BackBufferWidth = mode.Width;
+    full.BackBufferHeight = mode.Height;
+    full.FullScreen_RefreshRateInHz = mode.RefreshRate;
+    IDirect3DDevice9* device = nullptr;
+    D3DPRESENT_PARAMETERS p = windowed;
+    if (FAILED(d3d->CreateDevice(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, window, D3DCREATE_HARDWARE_VERTEXPROCESSING, &p, &device))) {
+      d3d->Release();
+      DestroyWindow(window);
+      return 3;
+    }
+    p = full;
+    device->Reset(&p);
+    p = windowed;
+    device->Reset(&p);
+    const bool afterReset = restored();
+    p = full;
+    device->Reset(&p);
+    device->Release();
+    const bool afterRelease = restored();
+    d3d->Release();
+    DestroyWindow(window);
+    return !afterReset ? 1 : !afterRelease ? 2 : 0;
+  }
+
   // Runs this program with the arguments; its exit code (-1: not started).
   int runSelf(const char* arguments) {
     wchar_t exe[MAX_PATH];
@@ -4401,6 +4647,16 @@ int main(int argc, char** argv) {
           : code == 2 ? "window not the monitor's size" : "no device");
       ok ? passed++ : failed++;
     }
+  }
+  // A full screen window restored (requested by name: covers the screen).
+  if (filter && std::strstr("window_restore", filter)) {
+    const int code = windowRestore(dxup);
+    const int native = dxupOnly ? 0 : windowRestore(windows);
+    const char* text[] = { "style restored", "not restored after Reset", "not restored after Release", "no device" };
+    const bool ok = code == 0 && native == 0;
+    std::printf("%s %-20s DXUP: %s, Windows: %s\n", ok ? "ok  " : "FAIL", "window_restore", text[code],
+      dxupOnly ? "not run" : text[native]);
+    ok ? passed++ : failed++;
   }
   std::printf("%d passed, %d failed\n", passed, failed);
   return failed ? 1 : 0;
