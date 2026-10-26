@@ -835,6 +835,14 @@ namespace dxup {
     std::atomic<uint64_t> writeFenceValue{0};
   };
 
+  // The buffers one application buffer has had: renames (WRITE_DISCARD into
+  // new memory, whole updates) replace its backend buffer. current is the
+  // one it has at the point of the immediate context's commands being
+  // recorded (it is set in order with them).
+  struct BackendBufferIdentity {
+    std::weak_ptr<IBackendBuffer> current;
+  };
+
   class IBackendBuffer : public BackendRetirable {
   public:
     virtual ~IBackendBuffer() = default;
@@ -844,7 +852,22 @@ namespace dxup {
     // Contents a command list recorded with WRITE_DISCARD: later discards
     // give the buffer other memory instead of replacing this in place.
     bool pinnedContents = false;
+    // Set once the buffer took part in a rename. Command lists recorded with
+    // an earlier buffer use the application buffer as it is when they run
+    // (CsWorkerState::resolve). Only the thread recording the immediate
+    // context's commands touches it.
+    std::shared_ptr<BackendBufferIdentity> identity;
   };
+
+  // previous was replaced by current (on the recording thread).
+  inline void joinBufferIdentity(IBackendBuffer* previous, const Rc<IBackendBuffer>& current) {
+    if (!previous || !current || previous == current.get())
+      return;
+    if (!previous->identity)
+      previous->identity = std::make_shared<BackendBufferIdentity>();
+    current->identity = previous->identity;
+    current->identity->current = current;
+  }
 
   // Where a subresource of a CPU-accessible image lies in its memory.
   struct ImageSubresourceLayout {
@@ -1112,6 +1135,14 @@ namespace dxup {
     // where the application writes; commands recorded before keep reading
     // the old memory. Null when the buffer has to be renamed instead.
     virtual void* discardBuffer(IBackendBuffer* buffer) { (void)buffer; return nullptr; }
+    // An application buffer's backend buffer was replaced, in order with the
+    // commands (see BackendBufferIdentity).
+    virtual void noteBufferRenamed(const Rc<IBackendBuffer>& previous, const Rc<IBackendBuffer>& current) {
+      joinBufferIdentity(previous.get(), current);
+    }
+    // Deferred contexts: contents the command list gives an application
+    // buffer itself (its WRITE_DISCARD), used as recorded when it runs.
+    virtual void noteListContents(IBackendBuffer* buffer) { (void)buffer; }
     // Points views at the buffer that replaced theirs, in order with the
     // commands: those recorded before still read the old buffer.
     virtual void retargetBufferViews(IBackendBuffer* buffer, const std::vector<IBackendBufferView*>& views) {

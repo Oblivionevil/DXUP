@@ -32,6 +32,21 @@ namespace dxup {
     uint32_t            rtCount = 0;
     IBackendImageView*  rtvs[8] = {};
     IBackendImageView*  dsv = nullptr;
+    // Replaying a command list: buffers renamed since it was recorded are
+    // used as the application buffer is now, except contents the list gave
+    // them itself (its own WRITE_DISCARDs).
+    const std::unordered_set<IBackendBuffer*>* replayOwn = nullptr;
+    bool                replaying = false;
+
+    IBackendBuffer* resolve(IBackendBuffer* buffer) const {
+      return replaying && buffer && buffer->identity ? resolveRenamed(buffer) : buffer;
+    }
+    IBackendBuffer* resolveRenamed(IBackendBuffer* buffer) const {
+      if (replayOwn && replayOwn->count(buffer))
+        return buffer;
+      const Rc<IBackendBuffer> current = buffer->identity->current.lock();
+      return current ? current.get() : buffer;
+    }
 
     // Transitions and copies can move a bound render target out of its
     // render target state; bind the output merger again before drawing.
@@ -180,6 +195,7 @@ namespace dxup {
       std::vector<IBackendQuery*>         queries,
       std::vector<BackendGpuUse*>         gpuUses,
       std::vector<std::shared_ptr<void>>  objects,
+      std::unordered_set<IBackendBuffer*> ownContents,
       std::shared_ptr<BackendRetireQueue> retireQueue);
     ~CsCommandList() override;
 
@@ -193,6 +209,7 @@ namespace dxup {
     std::vector<IBackendQuery*>         m_queries;
     std::vector<BackendGpuUse*>         m_gpuUses;
     std::vector<std::shared_ptr<void>>  m_objects;
+    std::unordered_set<IBackendBuffer*> m_ownContents;
     std::shared_ptr<BackendRetireQueue> m_retireQueue;
   };
 
@@ -298,6 +315,8 @@ namespace dxup {
     // thread.
     std::unique_ptr<struct CsSliceCache> m_sliceCache;
     void retargetBufferViews(IBackendBuffer* buffer, const std::vector<IBackendBufferView*>& views) override;
+    void noteBufferRenamed(const Rc<IBackendBuffer>& previous, const Rc<IBackendBuffer>& current) override;
+    void noteListContents(IBackendBuffer* buffer) override;
 
     void beginQuery(IBackendQuery* query) override;
     void endQuery(IBackendQuery* query) override;
@@ -382,6 +401,7 @@ namespace dxup {
     // References to the objects the recorded commands use, and those
     // objects, once each.
     std::vector<std::shared_ptr<void>>          m_recordedObjects;
+    std::unordered_set<IBackendBuffer*>         m_recordedOwnContents;
     std::unordered_set<const BackendRetirable*> m_keptObjects;
 
     // Application thread

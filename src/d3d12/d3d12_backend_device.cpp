@@ -2752,6 +2752,9 @@ namespace dxup::d3d12 {
 
     if (!isReusableUploadBuffer(desc) || desc.size > kMaxRecycledBytes / 4)
       return false;
+    // Handed out again for another application buffer (this runs on the
+    // recording thread, which alone touches identities).
+    buffer->identity.reset();
 
     const RecycledBufferKey key = makeRecycledBufferKey(desc);
     Rc<IBackendBuffer> evicted;   // released after the lock

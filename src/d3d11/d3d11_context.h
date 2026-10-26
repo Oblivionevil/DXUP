@@ -3083,6 +3083,7 @@ namespace dxup {
                   // see bufferSrvForBind), and the buffer gets it when the
                   // list runs on the immediate context.
                   renamedBuffer->pinnedContents = true;
+                  m_backendCtx->noteListContents(renamedBuffer.get());
                   m_recordedDiscards.emplace_back(trackedBuffer, renamedBuffer);
                   m_bufferOverrides[trackedBuffer] = std::move(renamedBuffer);
                   if (bufferDesc.BindFlags & D3D11_BIND_CONSTANT_BUFFER)
@@ -3759,6 +3760,7 @@ namespace dxup {
         // A deferred context running a list keeps the contents to itself
         // too, until its own list runs.
         if (m_isDeferred) {
+          m_backendCtx->noteListContents(discard.contents().get());
           m_recordedDiscards.emplace_back(buffer, discard.contents());
           m_bufferOverrides[buffer] = discard.contents();
           continue;

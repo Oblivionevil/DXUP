@@ -133,11 +133,13 @@ namespace dxup {
       std::vector<IBackendQuery*>         queries,
       std::vector<BackendGpuUse*>         gpuUses,
       std::vector<std::shared_ptr<void>>  objects,
+      std::unordered_set<IBackendBuffer*> ownContents,
       std::shared_ptr<BackendRetireQueue> retireQueue)
   : m_chunks(std::move(chunks))
   , m_queries(std::move(queries))
   , m_gpuUses(std::move(gpuUses))
   , m_objects(std::move(objects))
+  , m_ownContents(std::move(ownContents))
   , m_retireQueue(std::move(retireQueue)) {
   }
 
@@ -161,11 +163,24 @@ namespace dxup {
         logMessage(LogLevel::Error, "CS command list %p nested %u deep: not replayed", static_cast<const void*>(this), s_depth);
       return;
     }
-    // Also when a command throws.
+    // Also when a command throws; a list replayed by another goes back to
+    // the outer one's buffers after.
     struct Depth {
-      Depth() { s_depth++; }
-      ~Depth() { s_depth--; }
-    } depth;
+      CsWorkerState& state;
+      const std::unordered_set<IBackendBuffer*>* own;
+      bool replaying;
+      Depth(CsWorkerState& s, const std::unordered_set<IBackendBuffer*>* listOwn)
+      : state(s), own(s.replayOwn), replaying(s.replaying) {
+        s_depth++;
+        s.replayOwn = listOwn;
+        s.replaying = true;
+      }
+      ~Depth() {
+        s_depth--;
+        state.replayOwn = own;
+        state.replaying = replaying;
+      }
+    } depth(state, &m_ownContents);
     for (CsChunk* chunk : m_chunks)
       chunk->replay(state);
   }
@@ -259,6 +274,7 @@ namespace dxup {
     if (m_retireQueue)
       m_retireQueue->retire(m_recordedObjects);
     m_recordedObjects.clear();
+    m_recordedOwnContents.clear();
   }
 
   void CsThreadContext::keepObject(const BackendRetirable* object) {
@@ -430,24 +446,24 @@ namespace dxup {
 
   void CsThreadContext::bindVertexBuffer(uint32_t slot, IBackendBuffer* buffer, uint32_t offset, uint32_t stride) {
     keep(buffer);
-    emit([=](CsWorkerState& s) { s.ctx->bindVertexBuffer(slot, buffer, offset, stride); });
+    emit([=](CsWorkerState& s) { s.ctx->bindVertexBuffer(slot, s.resolve(buffer), offset, stride); });
   }
 
   void CsThreadContext::bindIndexBuffer(IBackendBuffer* buffer, uint32_t offset, IndexType type) {
     keep(buffer);
-    emit([=](CsWorkerState& s) { s.ctx->bindIndexBuffer(buffer, offset, type); });
+    emit([=](CsWorkerState& s) { s.ctx->bindIndexBuffer(s.resolve(buffer), offset, type); });
   }
 
   void CsThreadContext::bindConstantBuffer(ShaderStage stage, uint32_t slot, IBackendBuffer* buffer) {
     keep(buffer);
-    emit([=](CsWorkerState& s) { s.ctx->bindConstantBuffer(stage, slot, buffer); });
+    emit([=](CsWorkerState& s) { s.ctx->bindConstantBuffer(stage, slot, s.resolve(buffer)); });
   }
 
   void CsThreadContext::bindConstantBufferRange(ShaderStage stage, uint32_t slot, IBackendBuffer* buffer,
                                                 uint32_t firstConstant, uint32_t numConstants) {
     keep(buffer);
     emit([=](CsWorkerState& s) {
-      s.ctx->bindConstantBufferRange(stage, slot, buffer, firstConstant, numConstants);
+      s.ctx->bindConstantBufferRange(stage, slot, s.resolve(buffer), firstConstant, numConstants);
     });
   }
 
@@ -497,6 +513,8 @@ namespace dxup {
     const bool hasBuffers = buffers != nullptr;
     const bool hasOffsets = offsets != nullptr;
     emit([=](CsWorkerState& s) mutable {
+      for (IBackendBuffer*& buffer : bufferCopy)
+        buffer = s.resolve(buffer);
       s.ctx->bindStreamOutputTargets(
         clamped,
         hasBuffers ? bufferCopy.data() : nullptr,
@@ -517,7 +535,7 @@ namespace dxup {
     // command lists.
     emit([=](CsWorkerState& s) {
       s.rebindOutputMergerIfNeeded();
-      s.ctx->drawAuto(vertexBuffer, stride);
+      s.ctx->drawAuto(s.resolve(vertexBuffer), stride);
     });
   }
 
@@ -642,7 +660,7 @@ namespace dxup {
     keep(buffer);
     emit([=](CsWorkerState& s) {
       s.rebindOutputMergerIfNeeded();
-      s.ctx->drawIndirect(buffer, offset);
+      s.ctx->drawIndirect(s.resolve(buffer), offset);
     });
   }
 
@@ -650,13 +668,13 @@ namespace dxup {
     keep(buffer);
     emit([=](CsWorkerState& s) {
       s.rebindOutputMergerIfNeeded();
-      s.ctx->drawIndexedIndirect(buffer, offset);
+      s.ctx->drawIndexedIndirect(s.resolve(buffer), offset);
     });
   }
 
   void CsThreadContext::dispatchIndirect(IBackendBuffer* buffer, uint64_t offset) {
     keep(buffer);
-    emit([=](CsWorkerState& s) { s.ctx->dispatchIndirect(buffer, offset); });
+    emit([=](CsWorkerState& s) { s.ctx->dispatchIndirect(s.resolve(buffer), offset); });
   }
 
   // ============================================================
@@ -670,7 +688,7 @@ namespace dxup {
     BackendGpuUse* dstUse = trackGpuUse(stagingGpuUse(dst));
     BackendGpuUse* srcUse = trackGpuUse(stagingGpuUse(src));
     emit([=](CsWorkerState& s) {
-      s.ctx->copyBuffer(dst, dstOffset, src, srcOffset, size);
+      s.ctx->copyBuffer(s.resolve(dst), dstOffset, s.resolve(src), srcOffset, size);
       releaseGpuUse(dstUse);
       releaseGpuUse(srcUse);
     });
@@ -713,7 +731,7 @@ namespace dxup {
     BackendGpuUse* dstUse = trackGpuUse(stagingGpuUse(dst));
     BackendGpuUse* srcUse = trackGpuUse(stagingGpuUse(src));
     emit([=](CsWorkerState& s) {
-      s.ctx->copyBufferToImage(dst, dstSubres, src, srcOffset, hasRegion ? &regionCopy : nullptr);
+      s.ctx->copyBufferToImage(dst, dstSubres, s.resolve(src), srcOffset, hasRegion ? &regionCopy : nullptr);
       releaseGpuUse(dstUse);
       releaseGpuUse(srcUse);
     });
@@ -726,7 +744,7 @@ namespace dxup {
     BackendGpuUse* dstUse = trackGpuUse(stagingGpuUse(dst));
     BackendGpuUse* srcUse = trackGpuUse(stagingGpuUse(src));
     emit([=](CsWorkerState& s) {
-      s.ctx->copyImageToBuffer(dst, dstOffset, src, srcSubres);
+      s.ctx->copyImageToBuffer(s.resolve(dst), dstOffset, src, srcSubres);
       releaseGpuUse(dstUse);
       releaseGpuUse(srcUse);
     });
@@ -737,7 +755,7 @@ namespace dxup {
     noteBufferGpuWrite(dst);
     BackendGpuUse* dstUse = trackGpuUse(stagingGpuUse(dst));
     emit([=](CsWorkerState& s) {
-      s.ctx->copyStructureCount(dst, dstOffset, view);
+      s.ctx->copyStructureCount(s.resolve(dst), dstOffset, view);
       releaseGpuUse(dstUse);
     });
   }
@@ -880,7 +898,7 @@ namespace dxup {
       keep(staged.target);
       // Commands of command lists run again: keep the references.
       emit([target = staged.target, staging = std::move(staged.staging), size = staged.size](CsWorkerState& s) {
-        s.ctx->copyBuffer(target, 0, staging.get(), 0, size);
+        s.ctx->copyBuffer(s.resolve(target), 0, staging.get(), 0, size);
         s.ctx->retainTemporaryBuffer(staging);
       });
       return;
@@ -900,14 +918,14 @@ namespace dxup {
         return;
     }
     if (!data || !size) {
-      emit([=](CsWorkerState& s) { s.ctx->updateBuffer(buffer, offset, size, data); });
+      emit([=](CsWorkerState& s) { s.ctx->updateBuffer(s.resolve(buffer), offset, size, data); });
       return;
     }
 
     BackendGpuUse* use = trackGpuUse(stagingGpuUse(buffer));
     emitArray(static_cast<const uint8_t*>(data), static_cast<size_t>(size),
       [buffer, offset, use](CsWorkerState& s, const uint8_t* copy, size_t n) {
-        s.ctx->updateBuffer(buffer, offset, n, copy);
+        s.ctx->updateBuffer(s.resolve(buffer), offset, n, copy);
         releaseGpuUse(use);
       });
   }
@@ -952,12 +970,12 @@ namespace dxup {
     BackendGpuUse* use = trackGpuUse(stagingGpuUse(buffer));
     if (inlineBlock) {
       emit([buffer, table, regionCount, use](CsWorkerState& s) {
-        s.ctx->updateBufferRegions(buffer, table, regionCount);
+        s.ctx->updateBufferRegions(s.resolve(buffer), table, regionCount);
         releaseGpuUse(use);
       });
     } else {
       emit([buffer, regionCount, use, heapBlock = std::move(heapBlock)](CsWorkerState& s) {
-        s.ctx->updateBufferRegions(buffer,
+        s.ctx->updateBufferRegions(s.resolve(buffer),
           reinterpret_cast<const BufferUpdateRegion*>(heapBlock.data()), regionCount);
         releaseGpuUse(use);
       });
@@ -971,6 +989,17 @@ namespace dxup {
     for (IBackendBufferView* view : views)
       keep(view);
     emit([buffer, views](CsWorkerState& s) { s.ctx->retargetBufferViews(buffer, views); });
+  }
+
+  void CsThreadContext::noteBufferRenamed(const Rc<IBackendBuffer>& previous, const Rc<IBackendBuffer>& current) {
+    if (m_recording || !previous || !current)
+      return;
+    emit([previous, current](CsWorkerState&) { joinBufferIdentity(previous.get(), current); });
+  }
+
+  void CsThreadContext::noteListContents(IBackendBuffer* buffer) {
+    if (m_recording && buffer)
+      m_recordedOwnContents.insert(buffer);
   }
 
   void CsThreadContext::noteBufferGpuWrite(IBackendBuffer* buffer) {
@@ -1492,7 +1521,8 @@ namespace dxup {
     submitChunk();
     auto list = std::make_shared<CsCommandList>(
       std::move(m_recordedChunks), std::move(m_recordedQueries), std::move(m_recordedGpuUses),
-      std::move(m_recordedObjects), m_retireQueue);
+      std::move(m_recordedObjects), std::move(m_recordedOwnContents), m_retireQueue);
+    m_recordedOwnContents.clear();
     m_recordedChunks.clear();
     m_recordedQueries.clear();
     m_recordedGpuUses.clear();

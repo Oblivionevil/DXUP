@@ -1435,6 +1435,10 @@ namespace dxup {
       }
       if (!views.empty() && context)
         context->retargetBufferViews(m_buffer.get(), views);
+      // Command lists recorded with the old one use the new one when they
+      // run (BackendBufferIdentity).
+      if (context && oldBuffer && m_buffer)
+        context->noteBufferRenamed(oldBuffer, m_buffer);
       return oldBuffer;
     }
 

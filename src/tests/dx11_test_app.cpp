@@ -426,6 +426,7 @@ void main(uint2 id : SV_DispatchThreadID) {
         {"deferred_discard_isolation", &Dx11TestApp::testDeferredDiscardIsolation},
         {"command_list_keeps_objects", &Dx11TestApp::testCommandListKeepsObjects},
         {"command_list_retirement", &Dx11TestApp::testCommandListRetirement},
+        {"command_list_buffer_renames", &Dx11TestApp::testCommandListBufferRenames},
         {"deferred_discard_views", &Dx11TestApp::testDeferredDiscardViews},
         {"copy_within_and_clear_rules", &Dx11TestApp::testCopyWithinAndClearRules},
         {"texture_creation_validation", &Dx11TestApp::testTextureCreationValidation},
@@ -12259,6 +12260,129 @@ float4 main(float4 position : SV_Position) : SV_Target { return value; }
         error = "immediate context: " + error;
         return false;
       }
+      m_context->ClearState();
+      return true;
+    }
+
+    // A command list draws with what a buffer holds when it runs: a vertex
+    // buffer too large for DXUP to discard in place, given new memory by the
+    // immediate context after the list was recorded, and the contents a
+    // list's own WRITE_DISCARD gave it, every time the list runs.
+    bool testCommandListBufferRenames(std::string& error) {
+      static const char* kVertexColorVs = R"(
+struct Output { float4 position : SV_Position; float4 color : COLOR; };
+Output main(float4 color : COLOR, uint id : SV_VertexID) {
+  Output output;
+  float2 uv = float2((id << 1) & 2, id & 2);
+  output.position = float4(uv * float2(2.0f, -2.0f) + float2(-1.0f, 1.0f), 0.0f, 1.0f);
+  output.color = color;
+  return output;
+}
+)";
+      static const char* kVertexColorPs = R"(
+float4 main(float4 position : SV_Position, float4 color : COLOR) : SV_Target { return color; }
+)";
+      TextureTarget target;
+      ComPtr<ID3D11VertexShader> vertexShader;
+      ComPtr<ID3DBlob> vertexBytecode;
+      ComPtr<ID3D11PixelShader> pixelShader;
+      if (!createColorTarget(8, 8, D3D11_BIND_RENDER_TARGET, target, error)
+       || !createVertexShader(kVertexColorVs, "main", vertexShader, vertexBytecode, error)
+       || !createPixelShader(kVertexColorPs, "main", pixelShader, error))
+        return false;
+      const D3D11_INPUT_ELEMENT_DESC element = { "COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 0,
+                                                 D3D11_INPUT_PER_VERTEX_DATA, 0 };
+      ComPtr<ID3D11InputLayout> layout;
+      HRESULT hr = m_device->CreateInputLayout(&element, 1, vertexBytecode->GetBufferPointer(),
+        vertexBytecode->GetBufferSize(), layout.GetAddressOf());
+      // 128 KB: more than DXUP gives memory in place.
+      const D3D11_BUFFER_DESC desc = { 128u << 10, D3D11_USAGE_DYNAMIC, D3D11_BIND_VERTEX_BUFFER,
+                                       D3D11_CPU_ACCESS_WRITE, 0, 0 };
+      ComPtr<ID3D11Buffer> vertices;
+      if (SUCCEEDED(hr))
+        hr = m_device->CreateBuffer(&desc, nullptr, vertices.GetAddressOf());
+      ComPtr<ID3D11DeviceContext> deferred;
+      if (SUCCEEDED(hr))
+        hr = m_device->CreateDeferredContext(0, deferred.GetAddressOf());
+      if (FAILED(hr)) {
+        error = "setup failed: " + formatHResult(hr);
+        return false;
+      }
+
+      auto writeColor = [&](ID3D11DeviceContext* context, const float (&color)[4]) {
+        D3D11_MAPPED_SUBRESOURCE mapped = {};
+        if (FAILED(context->Map(vertices.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped)))
+          return false;
+        for (int i = 0; i < 3; i++)
+          std::memcpy(static_cast<uint8_t*>(mapped.pData) + i * sizeof(color), color, sizeof(color));
+        context->Unmap(vertices.Get(), 0);
+        return true;
+      };
+      auto recordDraw = [&](ID3D11DeviceContext* context) {
+        ID3D11RenderTargetView* rtv = target.rtv.Get();
+        context->OMSetRenderTargets(1, &rtv, nullptr);
+        D3D11_VIEWPORT viewport = { 0.0f, 0.0f, 8.0f, 8.0f, 0.0f, 1.0f };
+        context->RSSetViewports(1, &viewport);
+        context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        context->IASetInputLayout(layout.Get());
+        const UINT stride = 16, offset = 0;
+        context->IASetVertexBuffers(0, 1, vertices.GetAddressOf(), &stride, &offset);
+        context->VSSetShader(vertexShader.Get(), nullptr, 0);
+        context->PSSetShader(pixelShader.Get(), nullptr, 0);
+        context->Draw(3, 0);
+      };
+      auto expect = [&](const char* what, Rgba8 color) {
+        if (expectTexturePixel(target.texture.Get(), 4, 4, color, 1, error))
+          return true;
+        error = std::string(what) + ": " + error;
+        return false;
+      };
+
+      const float red[4] = { 1.0f, 0.0f, 0.0f, 1.0f };
+      const float green[4] = { 0.0f, 1.0f, 0.0f, 1.0f };
+      const float blue[4] = { 0.0f, 0.0f, 1.0f, 1.0f };
+      ComPtr<ID3D11CommandList> plain, own;
+      if (!writeColor(m_context.Get(), blue)) {
+        error = "immediate Map failed";
+        return false;
+      }
+      recordDraw(deferred.Get());
+      if (FAILED(hr = deferred->FinishCommandList(FALSE, plain.GetAddressOf()))) {
+        error = "FinishCommandList failed: " + formatHResult(hr);
+        return false;
+      }
+      if (!writeColor(deferred.Get(), red)) {
+        error = "deferred Map failed";
+        return false;
+      }
+      recordDraw(deferred.Get());
+      if (FAILED(hr = deferred->FinishCommandList(FALSE, own.GetAddressOf()))) {
+        error = "FinishCommandList failed: " + formatHResult(hr);
+        return false;
+      }
+
+      // New memory after the list was recorded: the list draws with it.
+      if (!writeColor(m_context.Get(), green))
+        return error = "immediate Map failed", false;
+      m_context->ExecuteCommandList(plain.Get(), FALSE);
+      if (!expect("list recorded before the discard", Rgba8{0, 255, 0, 255}))
+        return false;
+      // The list's own discard, again after the immediate context's.
+      m_context->ExecuteCommandList(own.Get(), FALSE);
+      if (!expect("list with its own discard", Rgba8{255, 0, 0, 255}))
+        return false;
+      if (!writeColor(m_context.Get(), green))
+        return error = "immediate Map failed", false;
+      m_context->ExecuteCommandList(own.Get(), FALSE);
+      if (!expect("list with its own discard, run again", Rgba8{255, 0, 0, 255}))
+        return false;
+      // It left the buffer its contents, which the other list draws with.
+      m_context->ExecuteCommandList(plain.Get(), FALSE);
+      if (!expect("list after the other one", Rgba8{255, 0, 0, 255}))
+        return false;
+      recordDraw(m_context.Get());
+      if (!expect("immediate context", Rgba8{255, 0, 0, 255}))
+        return false;
       m_context->ClearState();
       return true;
     }
