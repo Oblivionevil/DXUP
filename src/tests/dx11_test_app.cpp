@@ -392,10 +392,12 @@ void main(uint2 id : SV_DispatchThreadID) {
         {"streaming_deferred_frames", &Dx11TestApp::testStreamingDeferredFrames},
         {"append_buffer_and_structure_count", &Dx11TestApp::testAppendBufferAndStructureCount},
         {"dispatch_indirect", &Dx11TestApp::testDispatchIndirect},
+        {"bound_uav_indirect_and_counter", &Dx11TestApp::testBoundUavIndirectAndCounter},
         {"depth_and_scissor", &Dx11TestApp::testDepthAndScissor},
         {"rasterizer_blend_rules", &Dx11TestApp::testRasterizerBlendRules},
         {"copy_clear_query_rules", &Dx11TestApp::testCopyClearQueryRules},
         {"output_merger_uav_rules", &Dx11TestApp::testOutputMergerUavRules},
+        {"vertex_shader_output_merger_uav", &Dx11TestApp::testVertexShaderOutputMergerUav},
         {"deferred_dynamic_defaults", &Dx11TestApp::testDeferredDynamicDefaults},
         {"deferred_map_rules", &Dx11TestApp::testDeferredMapRules},
         {"device_creation_rules", &Dx11TestApp::testDeviceCreationRules},
@@ -1534,6 +1536,31 @@ float4 main(PSInput input) : SV_Target {
         return false;
       }
 
+      return true;
+    }
+
+    // The first count 32-bit values of a buffer, through a staging copy.
+    bool readBackUints(ID3D11Buffer* buffer, UINT count, std::vector<uint32_t>& values, std::string& error) {
+      D3D11_BUFFER_DESC desc = {};
+      buffer->GetDesc(&desc);
+      desc.Usage = D3D11_USAGE_STAGING;
+      desc.BindFlags = 0;
+      desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+      desc.MiscFlags = 0;
+      desc.StructureByteStride = 0;
+      ComPtr<ID3D11Buffer> staging;
+      if (!createBuffer(desc, nullptr, 0, staging, error))
+        return false;
+      m_context->CopyResource(staging.Get(), buffer);
+      D3D11_MAPPED_SUBRESOURCE mapped = {};
+      const HRESULT hr = m_context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped);
+      if (FAILED(hr)) {
+        error = "Map(staging buffer) failed: " + formatHResult(hr);
+        return false;
+      }
+      const auto* data = static_cast<const uint32_t*>(mapped.pData);
+      values.assign(data, data + count);
+      m_context->Unmap(staging.Get(), 0);
       return true;
     }
 
@@ -4772,6 +4799,90 @@ void main(uint3 tid : SV_DispatchThreadID) {
       return ok;
     }
 
+    // Buffers that stay bound for unordered access while commands read them
+    // otherwise: arguments a dispatch writes for the indirect dispatch after
+    // it, twice, and an append counter CopyStructureCount reads between two
+    // dispatches that append.
+    bool testBoundUavIndirectAndCounter(std::string& error) {
+      static const char* kWriteArgs = R"(
+RWBuffer<uint> args : register(u0);
+[numthreads(1, 1, 1)] void main() { args[0] = GROUPS; args[1] = 1; args[2] = 1; }
+)";
+      static const char* kCount = R"(
+RWBuffer<uint> total : register(u1);
+[numthreads(1, 1, 1)] void main() { InterlockedAdd(total[0], 1); }
+)";
+      static const char* kAppend = R"(
+AppendStructuredBuffer<uint> output : register(u0);
+[numthreads(4, 1, 1)] void main(uint id : SV_GroupIndex) { output.Append(id + 1); }
+)";
+      std::string twoGroups = std::string("#define GROUPS 2\n") + kWriteArgs;
+      std::string fiveGroups = std::string("#define GROUPS 5\n") + kWriteArgs;
+      ComPtr<ID3D11ComputeShader> writeTwo, writeFive, count, append;
+      if (!createComputeShader(twoGroups.c_str(), "main", writeTwo, error)
+       || !createComputeShader(fiveGroups.c_str(), "main", writeFive, error)
+       || !createComputeShader(kCount, "main", count, error) || !createComputeShader(kAppend, "main", append, error))
+        return false;
+      D3D11_BUFFER_DESC argsDesc = { 12, D3D11_USAGE_DEFAULT, D3D11_BIND_UNORDERED_ACCESS, 0,
+        D3D11_RESOURCE_MISC_DRAWINDIRECT_ARGS, 0 };
+      D3D11_BUFFER_DESC totalDesc = { 4, D3D11_USAGE_DEFAULT, D3D11_BIND_UNORDERED_ACCESS, 0, 0, 0 };
+      D3D11_BUFFER_DESC appendDesc = { 64, D3D11_USAGE_DEFAULT, D3D11_BIND_UNORDERED_ACCESS, 0,
+        D3D11_RESOURCE_MISC_BUFFER_STRUCTURED, 4 };
+      D3D11_BUFFER_DESC countDesc = { 8, D3D11_USAGE_DEFAULT, 0, 0, 0, 0 };
+      const uint32_t zeros[16] = {};
+      ComPtr<ID3D11Buffer> args, total, appendBuffer, counts;
+      if (!createBuffer(argsDesc, zeros, 0, args, error) || !createBuffer(totalDesc, zeros, 0, total, error)
+       || !createBuffer(appendDesc, nullptr, 0, appendBuffer, error) || !createBuffer(countDesc, nullptr, 0, counts, error))
+        return false;
+      D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc = {};
+      uavDesc.Format = DXGI_FORMAT_R32_UINT;
+      uavDesc.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
+      uavDesc.Buffer.NumElements = 3;
+      ComPtr<ID3D11UnorderedAccessView> argsUav, totalUav, appendUav;
+      HRESULT hr = m_device->CreateUnorderedAccessView(args.Get(), &uavDesc, argsUav.GetAddressOf());
+      uavDesc.Buffer.NumElements = 1;
+      if (SUCCEEDED(hr))
+        hr = m_device->CreateUnorderedAccessView(total.Get(), &uavDesc, totalUav.GetAddressOf());
+      uavDesc.Format = DXGI_FORMAT_UNKNOWN;
+      uavDesc.Buffer.NumElements = 16;
+      uavDesc.Buffer.Flags = D3D11_BUFFER_UAV_FLAG_APPEND;
+      if (SUCCEEDED(hr))
+        hr = m_device->CreateUnorderedAccessView(appendBuffer.Get(), &uavDesc, appendUav.GetAddressOf());
+      if (FAILED(hr)) {
+        error = "CreateUnorderedAccessView failed: " + formatHResult(hr);
+        return false;
+      }
+
+      m_context->ClearState();
+      ID3D11UnorderedAccessView* uavs[2] = { argsUav.Get(), totalUav.Get() };
+      m_context->CSSetUnorderedAccessViews(0, 2, uavs, nullptr);
+      for (ID3D11ComputeShader* write : { writeTwo.Get(), writeFive.Get() }) {
+        m_context->CSSetShader(write, nullptr, 0);
+        m_context->Dispatch(1, 1, 1);
+        m_context->CSSetShader(count.Get(), nullptr, 0);
+        m_context->DispatchIndirect(args.Get(), 0);
+      }
+      m_context->ClearState();
+      const UINT zero = 0;
+      m_context->CSSetShader(append.Get(), nullptr, 0);
+      m_context->CSSetUnorderedAccessViews(0, 1, appendUav.GetAddressOf(), &zero);
+      m_context->Dispatch(1, 1, 1);
+      m_context->CopyStructureCount(counts.Get(), 0, appendUav.Get());
+      m_context->Dispatch(1, 1, 1);
+      m_context->CopyStructureCount(counts.Get(), 4, appendUav.Get());
+      m_context->ClearState();
+
+      std::vector<uint32_t> totals, appended;
+      if (!readBackUints(total.Get(), 1, totals, error) || !readBackUints(counts.Get(), 2, appended, error))
+        return false;
+      if (totals[0] != 7 || appended[0] != 4 || appended[1] != 8) {
+        error = formatString("indirect groups %u (expected 7), append counts %u %u (expected 4 8)", totals[0],
+          appended[0], appended[1]);
+        return false;
+      }
+      return true;
+    }
+
     // Rasterizer and blend rules the native runtime applies: more than 16
     // scissor rects are ignored, scissoring with no rects draws nothing,
     // a NULL blend factor is {1, 1, 1, 1}, and the getters zero the
@@ -6173,6 +6284,61 @@ float4 main(float4 position : SV_Position) : SV_Target { return float4(1.0f, 1.0
           error = "a UAV at output-merger slot 40 was not bound";
           return false;
         }
+      }
+      return true;
+    }
+
+    // Output-merger UAVs serve every graphics stage (feature level 11.1): a
+    // vertex shader writes the one bound beside the render target.
+    bool testVertexShaderOutputMergerUav(std::string& error) {
+      if (m_device->GetFeatureLevel() < D3D_FEATURE_LEVEL_11_1)
+        return true;
+      static const char* kVs = R"(
+RWBuffer<uint> written : register(u1);
+float4 main(uint id : SV_VertexID) : SV_Position {
+  written[id] = id + 1;
+  return float4(id == 2 ? 3.0f : -1.0f, id == 1 ? 3.0f : -1.0f, 0.0f, 1.0f);
+}
+)";
+      ComPtr<ID3D11VertexShader> vs;
+      ComPtr<ID3DBlob> vsBytecode;
+      ComPtr<ID3D11PixelShader> ps;
+      TextureTarget target;
+      if (!createVertexShader(kVs, "main", vs, vsBytecode, error)
+       || !createPixelShader("float4 main() : SV_Target { return 1.0f; }", "main", ps, error)
+       || !createColorTarget(4, 4, D3D11_BIND_RENDER_TARGET, target, error))
+        return false;
+      const D3D11_BUFFER_DESC desc = { 16, D3D11_USAGE_DEFAULT, D3D11_BIND_UNORDERED_ACCESS, 0, 0, 0 };
+      D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc = {};
+      uavDesc.Format = DXGI_FORMAT_R32_UINT;
+      uavDesc.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
+      uavDesc.Buffer.NumElements = 4;
+      const uint32_t zeros[4] = {};
+      ComPtr<ID3D11Buffer> buffer;
+      ComPtr<ID3D11UnorderedAccessView> uav;
+      if (!createBuffer(desc, zeros, 0, buffer, error))
+        return false;
+      HRESULT hr = m_device->CreateUnorderedAccessView(buffer.Get(), &uavDesc, uav.GetAddressOf());
+      if (FAILED(hr)) {
+        error = "CreateUnorderedAccessView failed: " + formatHResult(hr);
+        return false;
+      }
+      m_context->ClearState();
+      ID3D11RenderTargetView* rtv = target.rtv.Get();
+      m_context->OMSetRenderTargetsAndUnorderedAccessViews(1, &rtv, nullptr, 1, 1, uav.GetAddressOf(), nullptr);
+      setViewport(4, 4);
+      m_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+      m_context->VSSetShader(vs.Get(), nullptr, 0);
+      m_context->PSSetShader(ps.Get(), nullptr, 0);
+      m_context->Draw(3, 0);
+      m_context->ClearState();
+      std::vector<uint32_t> values;
+      if (!readBackUints(buffer.Get(), 4, values, error))
+        return false;
+      if (values[0] != 1 || values[1] != 2 || values[2] != 3 || values[3] != 0) {
+        error = formatString("vertex shader UAV holds %u %u %u %u, expected 1 2 3 0", values[0], values[1], values[2],
+          values[3]);
+        return false;
       }
       return true;
     }
@@ -9198,8 +9364,11 @@ float4 main(float4 position : SV_Position, float4 t0 : TEXCOORD0, float4 t : TEX
         return false;
       const float positions[9] = { -1.0f, -1.0f, 0.0f, -1.0f, 3.0f, 0.0f, 3.0f, -1.0f, 0.0f };
       D3D11_BUFFER_DESC vbDesc = { sizeof(positions), D3D11_USAGE_DEFAULT, D3D11_BIND_VERTEX_BUFFER, 0, 0, 0 };
-      ComPtr<ID3D11Buffer> vb;
-      if (!createBuffer(vbDesc, positions, 0, vb, error))
+      // Slot 31 (the one DXUP keeps empty for the missing element): the
+      // same value at every vertex.
+      const float constants[9] = { 0.75f, 0.75f, 0.75f, 0.75f, 0.75f, 0.75f, 0.75f, 0.75f, 0.75f };
+      ComPtr<ID3D11Buffer> vb, constantVb;
+      if (!createBuffer(vbDesc, positions, 0, vb, error) || !createBuffer(vbDesc, constants, 0, constantVb, error))
         return false;
       D3D11_TEXTURE2D_DESC targetDesc = { 1, 1, 1, 1, DXGI_FORMAT_R32G32B32A32_FLOAT, { 1, 0 }, D3D11_USAGE_DEFAULT,
         D3D11_BIND_RENDER_TARGET, 0, 0 };
@@ -9217,7 +9386,7 @@ float4 main(float4 position : SV_Position, float4 t0 : TEXCOORD0, float4 t : TEX
         error = "target creation failed: " + formatHResult(hr);
         return false;
       }
-      auto draw = [&](ID3D11VertexShader* vs, ID3D11PixelShader* ps, float out[4]) {
+      auto draw = [&](ID3D11VertexShader* vs, ID3D11PixelShader* ps, float out[4], ID3D11ComputeShader* between = nullptr) {
         const float clear[4] = { 0.5f, 0.5f, 0.5f, 0.5f };
         m_context->ClearState();
         m_context->ClearRenderTargetView(rtv.Get(), clear);
@@ -9229,10 +9398,19 @@ float4 main(float4 position : SV_Position, float4 t0 : TEXCOORD0, float4 t : TEX
         const UINT stride = 12, offset = 0;
         m_context->IASetVertexBuffers(0, 1, vb.GetAddressOf(), &stride, &offset);
         // A buffer in a slot the layout does not use changes nothing.
-        m_context->IASetVertexBuffers(31, 1, vb.GetAddressOf(), &stride, &offset);
+        m_context->IASetVertexBuffers(31, 1, constantVb.GetAddressOf(), &stride, &offset);
         m_context->VSSetShader(vs, nullptr, 0);
         m_context->PSSetShader(ps, nullptr, 0);
         m_context->Draw(3, 0);
+        if (between) {
+          // A submission, a dispatch first after it, the draw again: the
+          // submission binds slot 31's buffer again on the next list.
+          m_context->Flush();
+          m_context->CSSetShader(between, nullptr, 0);
+          m_context->Dispatch(1, 1, 1);
+          m_context->ClearRenderTargetView(rtv.Get(), clear);
+          m_context->Draw(3, 0);
+        }
         m_context->ClearState();
         m_context->CopyResource(staging.Get(), target.Get());
         D3D11_MAPPED_SUBRESOURCE mapped = {};
@@ -9242,9 +9420,13 @@ float4 main(float4 position : SV_Position, float4 t0 : TEXCOORD0, float4 t : TEX
         m_context->Unmap(staging.Get(), 0);
         return true;
       };
-      float missingElement[4], semantic[4], unwritten[4], noRegister[4];
+      ComPtr<ID3D11ComputeShader> emptyCs;
+      if (!createComputeShader("[numthreads(1, 1, 1)] void main() {}", "main", emptyCs, error))
+        return false;
+      float missingElement[4], semantic[4], unwritten[4], noRegister[4], afterDispatch[4];
       if (!draw(colorVs.Get(), colorPs.Get(), missingElement) || !draw(texcoordVs.Get(), texcoord6Ps.Get(), semantic)
-       || !draw(texcoord0Vs.Get(), texcoord6Ps.Get(), unwritten) || !draw(texcoord0Vs.Get(), unwrittenPs.Get(), noRegister)) {
+       || !draw(texcoord0Vs.Get(), texcoord6Ps.Get(), unwritten) || !draw(texcoord0Vs.Get(), unwrittenPs.Get(), noRegister)
+       || !draw(colorVs.Get(), colorPs.Get(), afterDispatch, emptyCs.Get())) {
         error = "Map failed";
         return false;
       }
@@ -9256,6 +9438,11 @@ float4 main(float4 position : SV_Position, float4 t0 : TEXCOORD0, float4 t : TEX
       if (!same(missingElement, 0.0f, 0.0f, 0.0f, 1.0f)) {
         error = formatString("missing layout element read %g %g %g %g", missingElement[0], missingElement[1],
           missingElement[2], missingElement[3]);
+        return false;
+      }
+      if (!same(afterDispatch, 0.0f, 0.0f, 0.0f, 1.0f)) {
+        error = formatString("missing layout element read %g %g %g %g after a submission and a dispatch",
+          afterDispatch[0], afterDispatch[1], afterDispatch[2], afterDispatch[3]);
         return false;
       }
       if (!same(noRegister, 0.0f, 0.0f, 0.0f, 1.0f)) {

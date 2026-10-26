@@ -1070,6 +1070,7 @@ namespace dxup::d3d12 {
       const D3D12_VERTEX_BUFFER_VIEW none = {};
       m_cmdList->IASetVertexBuffers(slot, 1, &none);
     }
+    m_vertexBuffersRebound = false;
 #else
     (void)slot;
 #endif
@@ -1768,9 +1769,14 @@ namespace dxup::d3d12 {
       std::array<uint64_t, kMaxUAVs> srcVersions;
       uint32_t descriptorCount = 0;
 
-      const uint32_t bindingEnd = m_uavBindingEnd[stageIdx];
+      // D3D11's output-merger UAVs serve every graphics stage; they are
+      // bound with the pixel stage, and each stage's table holds them up to
+      // what its own shader declares.
+      const uint32_t bindingStage = compute ? stageIdx : static_cast<uint32_t>(ShaderStage::Pixel);
+      const auto& bindings = m_uavBindings[bindingStage];
+      const uint32_t bindingEnd = m_uavBindingEnd[bindingStage];
       for (uint32_t slot = 0; slot < bindingEnd; slot++) {
-        const auto& binding = m_uavBindings[stageIdx][slot];
+        const auto& binding = bindings[slot];
         if (binding.handle.ptr || binding.nullHandle.ptr)
           descriptorCount = slot + 1;
       }
@@ -1784,7 +1790,7 @@ namespace dxup::d3d12 {
       const uint8_t* dimensions = limits && limits->known && limits->dimensions ? limits->dimensions + 128 : nullptr;
       uint64_t fingerprint = descriptorTableFingerprintSeed(descriptorCount);
       for (uint32_t slot = 0; slot < descriptorCount; slot++) {
-        const auto& binding = m_uavBindings[stageIdx][slot];
+        const auto& binding = bindings[slot];
         srcHandles[slot] = binding.bound && binding.handle.ptr
           ? binding.handle
           : m_device->getNullUav(dimensions ? dimensions[slot] : 11);
@@ -1880,9 +1886,9 @@ namespace dxup::d3d12 {
             "commitUavBindings: stage=%u slot=%u bound=%u handle=%p null=%p src=%p",
             stageIdx,
             slot,
-            m_uavBindings[stageIdx][slot].bound ? 1u : 0u,
-            reinterpret_cast<void*>(m_uavBindings[stageIdx][slot].handle.ptr),
-            reinterpret_cast<void*>(m_uavBindings[stageIdx][slot].nullHandle.ptr),
+            bindings[slot].bound ? 1u : 0u,
+            reinterpret_cast<void*>(bindings[slot].handle.ptr),
+            reinterpret_cast<void*>(bindings[slot].nullHandle.ptr),
             reinterpret_cast<void*>(srcHandles[slot].ptr));
         }
 
@@ -1892,9 +1898,9 @@ namespace dxup::d3d12 {
             stageIdx,
             slot,
             rootIndex,
-            m_uavBindings[stageIdx][slot].bound ? 1u : 0u,
-            reinterpret_cast<void*>(m_uavBindings[stageIdx][slot].handle.ptr),
-            reinterpret_cast<void*>(m_uavBindings[stageIdx][slot].nullHandle.ptr),
+            bindings[slot].bound ? 1u : 0u,
+            reinterpret_cast<void*>(bindings[slot].handle.ptr),
+            reinterpret_cast<void*>(bindings[slot].nullHandle.ptr),
             reinterpret_cast<void*>(srcHandles[slot].ptr));
           return;
         }
@@ -2053,10 +2059,10 @@ namespace dxup::d3d12 {
         m_perfIntervalPsoBinds++;
       m_cmdList->SetPipelineState(m_currentPSO);
       m_psoDirtyAfterFlush = false;
-      // The reset bound every tracked vertex buffer again.
-      if (!m_isComputePipeline)
-        applyNullVertexSlot(m_nullVertexSlot);
     }
+    // The reset bound every tracked vertex buffer again.
+    if (m_vertexBuffersRebound && !m_isComputePipeline)
+      applyNullVertexSlot(m_nullVertexSlot);
 
     if (collectTiming)
       QueryPerformanceCounter(&stepStart);
@@ -2360,13 +2366,12 @@ namespace dxup::d3d12 {
       binding.nullHandle = {};
       binding.descriptorVersion = 0;
       binding.bound = false;
+      binding.counterResourceHeld = nullptr;
       m_currentUavResources[stageIdx][slot] = nullptr;
       m_uavImageViews[stageIdx][slot] = nullptr;
       m_currentUavFormats[stageIdx][slot] = DXGI_FORMAT_UNKNOWN;
       DXUP_RECENT_OP("BindUAVImage %s[%u]=null", shaderStageName(stage), slot);
-      m_uavDirty = true;
-      m_uavStageDirty[stageIdx] = true;
-      m_descriptorDirtyStageMask |= 1u << stageIdx;
+      markUavBindingDirty(stageIdx);
       return;
     }
 
@@ -2379,13 +2384,12 @@ namespace dxup::d3d12 {
       binding.nullHandle = {};
       binding.descriptorVersion = 0;
       binding.bound = false;
+      binding.counterResourceHeld = nullptr;
       m_currentUavResources[stageIdx][slot] = nullptr;
       m_uavImageViews[stageIdx][slot] = nullptr;
       m_currentUavFormats[stageIdx][slot] = DXGI_FORMAT_UNKNOWN;
       DXUP_RECENT_OP("BindUAVImage %s[%u]=nullHandle", shaderStageName(stage), slot);
-      m_uavDirty = true;
-      m_uavStageDirty[stageIdx] = true;
-      m_descriptorDirtyStageMask |= 1u << stageIdx;
+      markUavBindingDirty(stageIdx);
       return;
     }
 
@@ -2394,6 +2398,7 @@ namespace dxup::d3d12 {
     holdBatchResourceOnce(d3d12Image->getResource(),
       binding.resourceHeld,
       binding.resourceHeldGeneration);
+    binding.counterResourceHeld = nullptr;
 
     D3D12_CPU_DESCRIPTOR_HANDLE handle = d3d12View->getUavHandle();
     D3D12_CPU_DESCRIPTOR_HANDLE nullHandle = d3d12View->getNullUavHandle();
@@ -2447,9 +2452,7 @@ namespace dxup::d3d12 {
       viewDesc.baseArrayLayer,
       viewDesc.arrayLayerCount,
       static_cast<uint32_t>(viewDesc.usage));
-    m_uavDirty = true;
-    m_uavStageDirty[stageIdx] = true;
-    m_descriptorDirtyStageMask |= 1u << stageIdx;
+    markUavBindingDirty(stageIdx);
 #endif
   }
 
@@ -2475,13 +2478,12 @@ namespace dxup::d3d12 {
       binding.nullHandle = {};
       binding.descriptorVersion = 0;
       binding.bound = false;
+      binding.counterResourceHeld = nullptr;
       m_currentUavResources[stageIdx][slot] = nullptr;
       m_uavImageViews[stageIdx][slot] = nullptr;
       m_currentUavFormats[stageIdx][slot] = DXGI_FORMAT_UNKNOWN;
       DXUP_RECENT_OP("BindUAVBuffer %s[%u]=null", shaderStageName(stage), slot);
-      m_uavDirty = true;
-      m_uavStageDirty[stageIdx] = true;
-      m_descriptorDirtyStageMask |= 1u << stageIdx;
+      markUavBindingDirty(stageIdx);
       return;
     }
 
@@ -2494,13 +2496,12 @@ namespace dxup::d3d12 {
       binding.nullHandle = {};
       binding.descriptorVersion = 0;
       binding.bound = false;
+      binding.counterResourceHeld = nullptr;
       m_currentUavResources[stageIdx][slot] = nullptr;
       m_uavImageViews[stageIdx][slot] = nullptr;
       m_currentUavFormats[stageIdx][slot] = DXGI_FORMAT_UNKNOWN;
       DXUP_RECENT_OP("BindUAVBuffer %s[%u]=nullHandle", shaderStageName(stage), slot);
-      m_uavDirty = true;
-      m_uavStageDirty[stageIdx] = true;
-      m_descriptorDirtyStageMask |= 1u << stageIdx;
+      markUavBindingDirty(stageIdx);
       return;
     }
 
@@ -2510,13 +2511,17 @@ namespace dxup::d3d12 {
       binding.resourceHeld,
       binding.resourceHeldGeneration);
 
-    // Also transition the counter buffer if present
+    // Also transition the counter buffer if present. A view without one
+    // drops the previous view's: snapshots would hold a released resource,
+    // and restoreBoundBufferState would keep it in the UAV state.
     if (d3d12View->getCounterBuffer()) {
       auto* d3d12Counter = static_cast<D3D12BackendBuffer*>(d3d12View->getCounterBuffer());
       transitionResource(d3d12Counter, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
       holdBatchResourceOnce(d3d12Counter->getResource(),
         binding.counterResourceHeld,
         binding.counterResourceHeldGeneration);
+    } else {
+      binding.counterResourceHeld = nullptr;
     }
 
     D3D12_CPU_DESCRIPTOR_HANDLE handle = d3d12View->getUavHandle();
@@ -2562,9 +2567,7 @@ namespace dxup::d3d12 {
       viewDesc.raw ? 1u : 0u,
       static_cast<unsigned long long>(viewDesc.offset),
       static_cast<unsigned long long>(viewDesc.size));
-    m_uavDirty = true;
-    m_uavStageDirty[stageIdx] = true;
-    m_descriptorDirtyStageMask |= 1u << stageIdx;
+    markUavBindingDirty(stageIdx);
 #endif
   }
 
@@ -2699,22 +2702,22 @@ namespace dxup::d3d12 {
     if (bindingsAlreadyCurrent && dsv) {
       auto* d3d12View = static_cast<D3D12BackendImageView*>(dsv);
       auto* d3d12Image = static_cast<D3D12BackendImage*>(d3d12View->getImage());
-      const auto& dsvViewDesc = d3d12View->getDesc();
-      D3D12_RESOURCE_STATES dsvState = D3D12_RESOURCE_STATE_DEPTH_WRITE;
-      if (d3d12View->hasReadOnlyDepthStencil()) {
-        dsvState = D3D12_RESOURCE_STATE_DEPTH_READ;
-        if (static_cast<uint32_t>(dsvViewDesc.usage & ImageViewUsage::ShaderResource)) {
-          dsvState = static_cast<D3D12_RESOURCE_STATES>(
-            dsvState
-            | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
-            | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-        }
-      }
+      // The states the bind below transitions to: planes in states of
+      // their own have no uniform state and take that path.
+      D3D12_RESOURCE_STATES readState = D3D12_RESOURCE_STATE_DEPTH_READ;
+      if ((d3d12Image->getDesc().bindFlags & BindFlags::ShaderResource) != BindFlags::None)
+        readState |= D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+      const D3D12_RESOURCE_STATES depthState = d3d12View->isReadOnlyDepth()
+        ? readState : D3D12_RESOURCE_STATE_DEPTH_WRITE;
+      const D3D12_RESOURCE_STATES stencilState = d3d12View->isReadOnlyStencil()
+        ? readState : D3D12_RESOURCE_STATE_DEPTH_WRITE;
+      const bool splitPlanes = d3d12Image->getPlaneCount() > 1 && depthState != stencilState;
 
-      bindingsAlreadyCurrent = d3d12View->getDsvHandle().ptr == m_trackedDSV.ptr
+      bindingsAlreadyCurrent = !splitPlanes
+        && d3d12View->getDsvHandle().ptr == m_trackedDSV.ptr
         && d3d12Image->getResource() == m_currentDepthStencilResource
         && d3d12Image->hasUniformState()
-        && d3d12Image->getCurrentState() == dsvState;
+        && d3d12Image->getCurrentState() == depthState;
     } else if (bindingsAlreadyCurrent) {
       bindingsAlreadyCurrent = m_currentDepthStencilResource == nullptr;
     }
@@ -3138,6 +3141,7 @@ namespace dxup::d3d12 {
 
     if (!m_isComputePipeline
      && !m_psoDirtyAfterFlush
+     && !m_vertexBuffersRebound
      && newPSO == m_currentPSO
      && newRootSig == m_currentRootSignature) {
       if (m_perfStatsEnabled && !m_copyOnly)
@@ -3168,7 +3172,6 @@ namespace dxup::d3d12 {
     m_currentPSO = newPSO;
     m_isComputePipeline = false;
 
-    const bool rebindVertexBuffers = m_psoDirtyAfterFlush;
     if (bindPSO) {
       if (m_perfStatsEnabled && !m_copyOnly)
         m_perfIntervalPsoBinds++;
@@ -3177,7 +3180,9 @@ namespace dxup::d3d12 {
     } else if (m_perfStatsEnabled && !m_copyOnly) {
       m_perfIntervalPsoSkips++;
     }
-    if (gfxPipeline->getNullVertexSlot() != m_nullVertexSlot || rebindVertexBuffers)
+    // Also after a dispatch that came first after a reset: it set the
+    // pipeline then, but the reset bound the null slot's buffer again.
+    if (gfxPipeline->getNullVertexSlot() != m_nullVertexSlot || m_vertexBuffersRebound)
       applyNullVertexSlot(gfxPipeline->getNullVertexSlot());
 
     // D3D12 keeps graphics and compute root signatures and their arguments
@@ -3479,6 +3484,9 @@ namespace dxup::d3d12 {
     if (m_recentOpsEnabled)
       DXUP_RECENT_OP("DrawIndirect buffer=%p offset=%llu", d3d12Buffer, static_cast<unsigned long long>(offset));
 
+    // A buffer bound for unordered access returns to that state after the
+    // command, as after copies: a dispatch writing it next gets no barrier.
+    const auto restoreArguments = restoreAfterCopy(d3d12Buffer, false);
     transitionResource(d3d12Buffer, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
     holdBatchResource(d3d12Buffer->getResource());
     // As draws: nothing to commit or flush in the steady state.
@@ -3511,6 +3519,9 @@ namespace dxup::d3d12 {
     if (m_recentOpsEnabled)
       DXUP_RECENT_OP("DrawIndexedIndirect buffer=%p offset=%llu", d3d12Buffer, static_cast<unsigned long long>(offset));
 
+    // A buffer bound for unordered access returns to that state after the
+    // command, as after copies: a dispatch writing it next gets no barrier.
+    const auto restoreArguments = restoreAfterCopy(d3d12Buffer, false);
     transitionResource(d3d12Buffer, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
     holdBatchResource(d3d12Buffer->getResource());
     // As draws: nothing to commit or flush in the steady state.
@@ -3645,6 +3656,9 @@ namespace dxup::d3d12 {
     if (m_recentOpsEnabled)
       DXUP_RECENT_OP("DispatchIndirect buffer=%p offset=%llu", d3d12Buffer, static_cast<unsigned long long>(offset));
 
+    // A buffer bound for unordered access returns to that state after the
+    // command, as after copies: a dispatch writing it next gets no barrier.
+    const auto restoreArguments = restoreAfterCopy(d3d12Buffer, false);
     transitionResource(d3d12Buffer, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
     holdBatchResource(d3d12Buffer->getResource());
     // As dispatches: nothing to commit or flush in the steady state.
@@ -4568,11 +4582,13 @@ namespace dxup::d3d12 {
       }
     }
     // A buffer bound for unordered access is written by shaders: that state
-    // excludes the read states.
+    // excludes the read states. So is the counter of a bound UAV (copied
+    // from by CopyStructureCount).
     bool unordered = false;
     for (uint32_t stage = 0; stage < kShaderStages; stage++) {
       for (uint32_t slot = 0; slot < m_uavBindingEnd[stage]; slot++) {
-        if (m_currentUavResources[stage][slot] == resource)
+        if (m_currentUavResources[stage][slot] == resource
+         || (m_uavBindings[stage][slot].bound && m_uavBindings[stage][slot].counterResourceHeld == resource))
           unordered = true;
       }
     }
@@ -5664,6 +5680,19 @@ namespace dxup::d3d12 {
     m_uavStageDirty[stage] = true;
     m_samplerStageDirty[stage] = true;
     m_descriptorDirtyStageMask |= 1u << stage;
+#else
+    (void)stage;
+#endif
+  }
+
+  void D3D12BackendContext::markUavBindingDirty(uint32_t stage) {
+#ifdef _WIN32
+    m_uavDirty = true;
+    const uint32_t first = stage == static_cast<uint32_t>(ShaderStage::Pixel) ? 0u : stage;
+    for (uint32_t dirty = first; dirty <= stage; dirty++) {
+      m_uavStageDirty[dirty] = true;
+      m_descriptorDirtyStageMask |= 1u << dirty;
+    }
 #else
     (void)stage;
 #endif
@@ -7275,6 +7304,7 @@ namespace dxup::d3d12 {
         if (m_trackedVBs[i].bound)
           m_cmdList->IASetVertexBuffers(i, 1, &m_trackedVBs[i].view);
       }
+      m_vertexBuffersRebound = true;
       if (m_trackedIBBound)
         m_cmdList->IASetIndexBuffer(&m_trackedIB);
       if (m_trackedViewportCount)
@@ -9668,6 +9698,7 @@ namespace dxup::d3d12 {
       if (m_trackedVBs[i].bound)
         m_cmdList->IASetVertexBuffers(i, 1, &m_trackedVBs[i].view);
     }
+    m_vertexBuffersRebound = true;
     if (m_trackedIBBound)
       m_cmdList->IASetIndexBuffer(&m_trackedIB);
 

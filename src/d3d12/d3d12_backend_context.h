@@ -773,6 +773,10 @@ namespace dxup::d3d12 {
     // Kept unbound for the current pipeline's inputs missing from its
     // input layout (UINT32_MAX: none).
     uint32_t m_nullVertexSlot = UINT32_MAX;
+    // Every tracked vertex buffer was bound again (command list reset,
+    // foreign commands), the null slot's too: the next graphics pipeline
+    // unbinds it. Apart from m_psoDirtyAfterFlush, which dispatches clear.
+    bool m_vertexBuffersRebound = false;
     void applyNullVertexSlot(uint32_t slot);
     D3D12_INDEX_BUFFER_VIEW  m_trackedIB = {};
     bool                     m_trackedIBBound = false;
@@ -818,6 +822,7 @@ namespace dxup::d3d12 {
       bool bound = false;
       ID3D12Resource* resourceHeld = nullptr;
       uint64_t resourceHeldGeneration = 0;
+      // The counter of the bound UAV (null without one).
       ID3D12Resource* counterResourceHeld = nullptr;
       uint64_t counterResourceHeldGeneration = 0;
     };
@@ -1064,6 +1069,9 @@ namespace dxup::d3d12 {
                                       D3D12_RESOURCE_STATES depthState, D3D12_RESOURCE_STATES stencilState);
     void markDescriptorStageDirty(uint32_t stage);
     void markAllDescriptorStagesDirty();
+    // A UAV binding of the stage changed (the pixel stage's: every graphics
+    // stage's tables, see commitUavBindings).
+    void markUavBindingDirty(uint32_t stage);
     void perfRecordFlush(uint32_t drawOps, uint32_t copyOps, uint32_t cbvSrvUavOff, uint32_t samplerOff,
                          double execMs, double totalMs);
     void perfRecordResetWait(double waitMs);

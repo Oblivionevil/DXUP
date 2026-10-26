@@ -850,6 +850,7 @@ namespace dxup::d3d12 {
       if (m_trackedVBs[i].bound)
         m_cmdList->IASetVertexBuffers(i, 1, &m_trackedVBs[i].view);
     }
+    m_vertexBuffersRebound = true;
     if (m_trackedIBBound)
       m_cmdList->IASetIndexBuffer(&m_trackedIB);
     if (m_trackedViewportCount)
