@@ -2834,10 +2834,13 @@ namespace dxup::legacy {
       // Two 32-bit lanes over 32-bit words: 64-bit multiplies are calls on
       // x86, and these run whenever a draw changed a state.
       static_assert(sizeof(T) % 4 == 0, "state descriptions are whole words");
-      uint32_t words[sizeof(T) / 4];
-      std::memcpy(words, &value, sizeof(T));
+      // Word by word from the value (sampler states were just written word
+      // by word: a wide copy first would wait for those stores).
+      const auto* bytes = reinterpret_cast<const uint8_t*>(&value);
       uint32_t a = 2166136261u, b = 0x9e3779b9u;
-      for (uint32_t word : words) {
+      for (size_t i = 0; i < sizeof(T); i += 4) {
+        uint32_t word;
+        std::memcpy(&word, bytes + i, 4);
         a = (a ^ word) * 16777619u;
         b = (b ^ word) * 0x85ebca6bu + 0x27d4eb2fu;
       }
