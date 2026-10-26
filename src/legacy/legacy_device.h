@@ -126,7 +126,7 @@ namespace dxup::legacy {
     // Depth textures sampled with a comparison.
     bool shadow() const { return m_shadow; }
     // The shader's texture type: 0 none, 1 2D, 2 cube, 3 volume.
-    uint32_t type() const { return !m_srv ? 0u : m_desc.volume ? 3u : m_desc.cube ? 2u : 1u; }
+    uint32_t type() const { return m_srv ? m_kind : 0u; }
 
     // GPU contents changed (rendered to): locks read them back first.
     void markGpuWritten();
@@ -162,19 +162,24 @@ namespace dxup::legacy {
     size_t levelSize(uint32_t subresource) const;
 
     Device*                m_device;
+    // What binding reads (setTexture, bindTextures), together at the start:
+    // games bind hundreds of textures a frame, each a cache miss per line.
+    Ref<ID3D11ShaderResourceView> m_srv;
+    Ref<ID3D11ShaderResourceView> m_srvSrgb;
+    DXGI_FORMAT            m_srgbFormat = DXGI_FORMAT_UNKNOWN;
+    bool                   m_anyDirty = false;
+    bool                   m_mipsDirty = false;
+    bool                   m_shadow = false;
+    uint8_t                m_kind = 1;      // type() with a view: 1 2D, 2 cube, 3 volume
     TextureDesc            m_desc;
     bool                   m_valid = false;
     DXGI_FORMAT            m_dxgiFormat = DXGI_FORMAT_UNKNOWN;   // views
-    DXGI_FORMAT            m_srgbFormat = DXGI_FORMAT_UNKNOWN;
     bool                   m_convert = false;
-    bool                   m_shadow = false;
     Ref<ID3D11Texture2D>   m_texture;
     Ref<ID3D11Texture3D>   m_volume;
     Ref<ID3D11Texture2D>   m_resolved;      // multisampled targets read back
     std::unique_ptr<Texture> m_copy;        // copySrv
     bool                   m_copyFailed = false;
-    Ref<ID3D11ShaderResourceView> m_srv;
-    Ref<ID3D11ShaderResourceView> m_srvSrgb;
     Ref<ID3D11DepthStencilView>   m_dsv;
     Ref<ID3D11DepthStencilView>   m_dsvReadOnly;
     std::vector<ID3D11RenderTargetView*> m_rtvs;
@@ -185,8 +190,6 @@ namespace dxup::legacy {
     bool                   m_colorKeyEnabled = false;
     uint32_t               m_colorKey = 0;
     bool                   m_gpuWritten = false;
-    bool                   m_anyDirty = false;
-    bool                   m_mipsDirty = false;
   };
 
   // A vertex or index buffer, kept in application memory. A draw uploads
@@ -399,7 +402,7 @@ namespace dxup::legacy {
     // ---- States ----
     // Games set most states to what the device holds, thousands of times a
     // frame: compared here, changes in changeRenderState/SamplerState.
-    void     setRenderState(uint32_t state, uint32_t value) {
+    __forceinline void setRenderState(uint32_t state, uint32_t value) {
       if (state >= RsCount || m_renderStates[state] != value)
         changeRenderState(state, value);
     }
@@ -407,7 +410,7 @@ namespace dxup::legacy {
     void     setTextureStageState(uint32_t stage, uint32_t type, uint32_t value);
     uint32_t textureStageState(uint32_t stage, uint32_t type) const;
     // Samplers 0-15, and 16-19 of vertex shaders.
-    void     setSamplerState(uint32_t sampler, uint32_t type, uint32_t value) {
+    __forceinline void setSamplerState(uint32_t sampler, uint32_t type, uint32_t value) {
       if (sampler >= kSamplerCount || type >= SampCount || m_samplerStatesValues[sampler][type] != value)
         changeSamplerState(sampler, type, value);
     }

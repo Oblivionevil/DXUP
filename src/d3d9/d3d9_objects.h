@@ -52,6 +52,9 @@ namespace dxup::d3d9 {
     // Device::hold, on the device's thread only: the frame its held set
     // last saw the object bound (0: not in the set).
     uint32_t heldEpoch = 0;
+    // What a binding of it gives the core (textures: their legacy::Texture),
+    // next to heldEpoch: SetTexture reads one cache line of the object.
+    void* boundCore = nullptr;
   protected:
     static constexpr uint64_t kPrivateOne = uint64_t(1) << 32;
     ULONG addRefPublic() {
@@ -336,6 +339,8 @@ namespace dxup::d3d9 {
 
   // The legacy texture behind any texture interface.
   BaseTexture* baseTextureOf(IDirect3DBaseTexture9* texture);
+  // The same object's reference counts (without BaseTexture's virtual call).
+  RefCounted* textureObjectOf(IDirect3DBaseTexture9* texture);
 
   template<typename Base, typename Desc>
   class BufferCommon : public Resource<Base> {
@@ -415,10 +420,7 @@ namespace dxup::d3d9 {
   // State blocks hold what they refer to with private references (as the
   // device's bindings: the application's counts stay as Windows' D3D9
   // shows them). setHeld puts an object into a block's slot.
-  inline RefCounted* refCountedOf(IDirect3DBaseTexture9* texture) {
-    BaseTexture* base = baseTextureOf(texture);
-    return base ? &base->refCounted() : nullptr;
-  }
+  inline RefCounted* refCountedOf(IDirect3DBaseTexture9* texture) { return textureObjectOf(texture); }
   inline RefCounted* refCountedOf(IDirect3DVertexBuffer9* buffer) { return static_cast<VertexBuffer*>(buffer); }
   inline RefCounted* refCountedOf(IDirect3DIndexBuffer9* buffer) { return static_cast<IndexBuffer*>(buffer); }
   inline RefCounted* refCountedOf(IDirect3DVertexDeclaration9* declaration) {
@@ -798,7 +800,7 @@ namespace dxup::d3d9 {
     std::array<Bound<Surface>, legacy::kMaxRenderTargets> m_renderTargets;
     Bound<Surface>                  m_depthStencil;
     std::array<IDirect3DBaseTexture9*, legacy::kSamplerCount> m_textures = {};
-    std::array<BaseTexture*, legacy::kSamplerCount> m_textureBases = {};   // the same (held)
+    std::array<RefCounted*, legacy::kSamplerCount> m_textureObjects = {};   // the same (held)
     struct Stream { Held<VertexBuffer> buffer; UINT offset = 0, stride = 0, frequency = 1; };
     std::array<Stream, 16>          m_streams;
     Held<IndexBuffer>               m_indices;

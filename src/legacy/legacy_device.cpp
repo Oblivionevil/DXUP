@@ -264,7 +264,7 @@ namespace dxup::legacy {
   // ============================================================
 
   Texture::Texture(Device* device, const TextureDesc& desc)
-  : m_device(device), m_desc(desc) {
+  : m_device(device), m_kind(desc.volume ? 3 : desc.cube ? 2 : 1), m_desc(desc) {
     if (!m_desc.width || !m_desc.height)
       return;
     if (!m_desc.levels)

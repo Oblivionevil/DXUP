@@ -374,7 +374,7 @@ namespace dxup::d3d9 {
     m_depthStencil.reset();
     for (uint32_t i = 0; i < m_textures.size(); i++) {
       m_textures[i] = nullptr;
-      m_textureBases[i] = nullptr;
+      m_textureObjects[i] = nullptr;
     }
     for (auto& stream : m_streams) stream.buffer.reset();
     m_indices.reset();
@@ -526,7 +526,7 @@ namespace dxup::d3d9 {
   void Device::resetState() {
     for (uint32_t i = 0; i < m_textures.size(); i++) {
       m_textures[i] = nullptr;
-      m_textureBases[i] = nullptr;
+      m_textureObjects[i] = nullptr;
     }
     for (auto& stream : m_streams) {
       stream.buffer.reset();
@@ -546,8 +546,8 @@ namespace dxup::d3d9 {
   void Device::releaseHeld(bool all) {
     if (!all) {
       // Bound now: kept.
-      for (BaseTexture* texture : m_textureBases)
-        if (texture) texture->refCounted().heldEpoch = m_heldEpoch;
+      for (RefCounted* texture : m_textureObjects)
+        if (texture) texture->heldEpoch = m_heldEpoch;
       for (auto& stream : m_streams)
         if (stream.buffer) stream.buffer->heldEpoch = m_heldEpoch;
       if (m_indices) m_indices->heldEpoch = m_heldEpoch;
@@ -1421,7 +1421,13 @@ namespace dxup::d3d9 {
   HRESULT Device::SetRenderState(D3DRENDERSTATETYPE state, DWORD value) {
     if (uint32_t(state) >= 256)
       return D3DERR_INVALIDCALL;
-    auto body = [&]() [[msvc::forceinline]] -> HRESULT {
+    // The usual call (thousands a frame) written out: a lambda's captures
+    // went through the stack even inlined.
+    if (!multithreaded() && !m_recording) {
+      m_core->setRenderState(uint32_t(state), value);
+      return D3D_OK;
+    }
+    auto body = [&]() -> HRESULT {
       if (StateSet* rec = recording()) {
         rec->renderStates[state] = value;
         rec->renderStatesSet.set(state);
@@ -1430,7 +1436,7 @@ namespace dxup::d3d9 {
       m_core->setRenderState(uint32_t(state), value);
       return D3D_OK;
     };
-    return multithreaded() ? withLock(this, body) : body();
+    return withLock(this, body);
   }
 
   HRESULT Device::GetRenderState(D3DRENDERSTATETYPE state, DWORD* value) {
@@ -1452,11 +1458,11 @@ namespace dxup::d3d9 {
       }
       if (m_textures[index] == texture)
         return D3D_OK;
-      BaseTexture* next = baseTextureOf(texture);
-      if (next) hold(&next->refCounted());
+      RefCounted* next = textureObjectOf(texture);
+      if (next) hold(next);
       m_textures[index] = texture;
-      m_textureBases[index] = next;
-      m_core->setTexture(uint32_t(index), next ? next->texture() : nullptr);
+      m_textureObjects[index] = next;
+      m_core->setTexture(uint32_t(index), next ? static_cast<legacy::Texture*>(next->boundCore) : nullptr);
       return D3D_OK;
     };
     return multithreaded() ? withLock(this, body) : body();
@@ -1501,7 +1507,11 @@ namespace dxup::d3d9 {
       return D3DERR_INVALIDCALL;
     if (index < 0)
       return sampler == D3DDMAPSAMPLER ? D3D_OK : D3DERR_INVALIDCALL;
-    auto body = [&]() [[msvc::forceinline]] -> HRESULT {
+    if (!multithreaded() && !m_recording) {
+      m_core->setSamplerState(uint32_t(index), uint32_t(type), value);
+      return D3D_OK;
+    }
+    auto body = [&]() -> HRESULT {
       if (StateSet* rec = recording()) {
         rec->samplerStates[index][type] = value;
         rec->samplerStatesSet[index].set(type);
@@ -1510,7 +1520,7 @@ namespace dxup::d3d9 {
       m_core->setSamplerState(uint32_t(index), uint32_t(type), value);
       return D3D_OK;
     };
-    return multithreaded() ? withLock(this, body) : body();
+    return withLock(this, body);
   }
 
   HRESULT Device::GetSamplerState(DWORD sampler, D3DSAMPLERSTATETYPE type, DWORD* value) {
@@ -2010,7 +2020,11 @@ namespace dxup::d3d9 {
   HRESULT Device::SetVertexShaderConstantF(UINT start, const float* data, UINT count) {
     if (!data || !inRange(start, count, 256))
       return D3DERR_INVALIDCALL;
-    auto body = [&]() [[msvc::forceinline]] -> HRESULT {
+    if (!multithreaded() && !m_recording) {
+      m_core->setShaderConstantF(false, start, data, count);
+      return D3D_OK;
+    }
+    auto body = [&]() -> HRESULT {
       if (StateSet* rec = recording()) {
         recordConstants(rec->vsFloats, rec->vsFloatsSet, start, data, count);
         return D3D_OK;
@@ -2018,7 +2032,7 @@ namespace dxup::d3d9 {
       m_core->setShaderConstantF(false, start, data, count);
       return D3D_OK;
     };
-    return multithreaded() ? withLock(this, body) : body();
+    return withLock(this, body);
   }
 
   HRESULT Device::GetVertexShaderConstantF(UINT start, float* data, UINT count) {
@@ -2072,7 +2086,11 @@ namespace dxup::d3d9 {
   HRESULT Device::SetPixelShaderConstantF(UINT start, const float* data, UINT count) {
     if (!data || !inRange(start, count, 224))
       return D3DERR_INVALIDCALL;
-    auto body = [&]() [[msvc::forceinline]] -> HRESULT {
+    if (!multithreaded() && !m_recording) {
+      m_core->setShaderConstantF(true, start, data, count);
+      return D3D_OK;
+    }
+    auto body = [&]() -> HRESULT {
       if (StateSet* rec = recording()) {
         recordConstants(rec->psFloats, rec->psFloatsSet, start, data, count);
         return D3D_OK;
@@ -2080,7 +2098,7 @@ namespace dxup::d3d9 {
       m_core->setShaderConstantF(true, start, data, count);
       return D3D_OK;
     };
-    return multithreaded() ? withLock(this, body) : body();
+    return withLock(this, body);
   }
 
   HRESULT Device::GetPixelShaderConstantF(UINT start, float* data, UINT count) {

@@ -445,6 +445,7 @@ namespace dxup::d3d9 {
   Texture2D::Texture2D(Device* device, std::shared_ptr<legacy::Texture> texture, D3DPOOL pool, DWORD usage)
   : TextureCommon(device, pool) {
     m_texture = std::move(texture);
+    this->boundCore = m_texture.get();
     m_usage = usage;
     const uint32_t levels = GetLevelCount();
     for (uint32_t level = 0; level < levels; level++)
@@ -500,6 +501,7 @@ namespace dxup::d3d9 {
   CubeTexture::CubeTexture(Device* device, std::shared_ptr<legacy::Texture> texture, D3DPOOL pool, DWORD usage)
   : TextureCommon(device, pool) {
     m_texture = std::move(texture);
+    this->boundCore = m_texture.get();
     m_usage = usage;
     const uint32_t levels = m_texture->desc().levels;
     for (uint32_t face = 0; face < 6; face++)
@@ -560,6 +562,7 @@ namespace dxup::d3d9 {
   VolumeTexture::VolumeTexture(Device* device, std::shared_ptr<legacy::Texture> texture, D3DPOOL pool, DWORD usage)
   : TextureCommon(device, pool) {
     m_texture = std::move(texture);
+    this->boundCore = m_texture.get();
     m_usage = usage;
     for (uint32_t level = 0; level < m_texture->desc().levels; level++)
       m_volumes.push_back(new Volume(device, m_texture, level, static_cast<IDirect3DVolumeTexture9*>(this), this));
@@ -617,6 +620,17 @@ namespace dxup::d3d9 {
   }
 
   BaseTexture* baseTextureOf(IDirect3DBaseTexture9* texture) {
+    if (!texture)
+      return nullptr;
+    switch (texture->GetType()) {
+      case D3DRTYPE_TEXTURE:       return static_cast<Texture2D*>(static_cast<IDirect3DTexture9*>(texture));
+      case D3DRTYPE_CUBETEXTURE:   return static_cast<CubeTexture*>(static_cast<IDirect3DCubeTexture9*>(texture));
+      case D3DRTYPE_VOLUMETEXTURE: return static_cast<VolumeTexture*>(static_cast<IDirect3DVolumeTexture9*>(texture));
+      default:                     return nullptr;
+    }
+  }
+
+  RefCounted* textureObjectOf(IDirect3DBaseTexture9* texture) {
     if (!texture)
       return nullptr;
     switch (texture->GetType()) {
