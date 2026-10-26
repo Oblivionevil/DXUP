@@ -147,9 +147,23 @@ namespace dxup {
     }
 
     // Runs the commands and keeps them, for command lists executed again.
+    // Commands of command lists run again: a failed one is skipped as in
+    // executeAll, and the rest still run (they count queries and staging
+    // uses down, which Map and GetData wait for).
     void replay(CsWorkerState& state) {
-      for (CsCommand* cmd = m_head; cmd; cmd = cmd->next)
-        cmd->invoke(cmd, &state, CsOp::Run);
+      CsCommand* cmd = m_head;
+      while (cmd) {
+        try {
+          for (; cmd; cmd = cmd->next)
+            cmd->invoke(cmd, &state, CsOp::Run);
+        } catch (const std::exception& e) {
+          reportFailedCommand(cmd, e.what());
+          cmd = cmd->next;
+        } catch (...) {
+          reportFailedCommand(cmd, "unknown exception");
+          cmd = cmd->next;
+        }
+      }
     }
 
     void clearCommands() {
@@ -173,6 +187,7 @@ namespace dxup {
   private:
     // Logs the exception, destroys the command and returns the next one.
     static CsCommand* skipFailedCommand(CsCommand* cmd, const char* what);
+    static void reportFailedCommand(const CsCommand* cmd, const char* what);
 
     alignas(64) unsigned char m_data[kSize];
     size_t      m_used = 0;
@@ -476,6 +491,21 @@ namespace dxup {
       if (use)
         use->queuedOps.fetch_sub(1, std::memory_order_release);
     }
+    // In a command: releases its staging uses (or its query) when it ends,
+    // also when it throws (the worker skips it then, Map and GetData must
+    // not wait for it forever).
+    struct GpuUseRelease {
+      BackendGpuUse* first = nullptr;
+      BackendGpuUse* second = nullptr;
+      ~GpuUseRelease() {
+        releaseGpuUse(first);
+        releaseGpuUse(second);
+      }
+    };
+    struct QueryRelease {
+      IBackendQuery* query;
+      ~QueryRelease() { query->queuedOps.fetch_sub(1, std::memory_order_release); }
+    };
     void discardRecording();
     // Deferred contexts: the command list keeps these objects alive.
     template<typename... Objects>

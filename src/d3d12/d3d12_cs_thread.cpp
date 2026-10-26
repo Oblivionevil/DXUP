@@ -119,10 +119,14 @@ namespace dxup {
     delete chunk;
   }
 
-  CsCommand* CsChunk::skipFailedCommand(CsCommand* cmd, const char* what) {
+  void CsChunk::reportFailedCommand(const CsCommand* cmd, const char* what) {
     static std::atomic<uint32_t> s_reported{ 0 };
     if (s_reported.fetch_add(1) < 8)
       logMessage(LogLevel::Error, "CS worker: command %p threw (%s); skipped", reinterpret_cast<void*>(cmd->invoke), what);
+  }
+
+  CsCommand* CsChunk::skipFailedCommand(CsCommand* cmd, const char* what) {
+    reportFailedCommand(cmd, what);
     CsCommand* next = cmd->next;
     cmd->invoke(cmd, nullptr, CsOp::Destroy);
     return next;
@@ -689,9 +693,8 @@ namespace dxup {
     BackendGpuUse* dstUse = trackGpuUse(stagingGpuUse(dst));
     BackendGpuUse* srcUse = trackGpuUse(stagingGpuUse(src));
     emit([=](CsWorkerState& s) {
+      const GpuUseRelease release{ dstUse, srcUse };
       s.ctx->copyBuffer(s.resolve(dst), dstOffset, s.resolve(src), srcOffset, size);
-      releaseGpuUse(dstUse);
-      releaseGpuUse(srcUse);
     });
   }
 
@@ -701,9 +704,8 @@ namespace dxup {
     BackendGpuUse* dstUse = trackGpuUse(stagingGpuUse(dst));
     BackendGpuUse* srcUse = trackGpuUse(stagingGpuUse(src));
     emit([=](CsWorkerState& s) {
+      const GpuUseRelease release{ dstUse, srcUse };
       s.ctx->copyImage(dst, dstSubres, src, srcSubres);
-      releaseGpuUse(dstUse);
-      releaseGpuUse(srcUse);
     });
   }
 
@@ -717,9 +719,8 @@ namespace dxup {
     BackendGpuUse* dstUse = trackGpuUse(stagingGpuUse(dst));
     BackendGpuUse* srcUse = trackGpuUse(stagingGpuUse(src));
     emit([=](CsWorkerState& s) {
+      const GpuUseRelease release{ dstUse, srcUse };
       s.ctx->copyImageRegion(dst, dstSubres, dstX, dstY, dstZ, src, srcSubres, hasRegion ? &region : nullptr);
-      releaseGpuUse(dstUse);
-      releaseGpuUse(srcUse);
     });
   }
 
@@ -732,9 +733,8 @@ namespace dxup {
     BackendGpuUse* dstUse = trackGpuUse(stagingGpuUse(dst));
     BackendGpuUse* srcUse = trackGpuUse(stagingGpuUse(src));
     emit([=](CsWorkerState& s) {
+      const GpuUseRelease release{ dstUse, srcUse };
       s.ctx->copyBufferToImage(dst, dstSubres, s.resolve(src), srcOffset, hasRegion ? &regionCopy : nullptr);
-      releaseGpuUse(dstUse);
-      releaseGpuUse(srcUse);
     });
   }
 
@@ -745,9 +745,8 @@ namespace dxup {
     BackendGpuUse* dstUse = trackGpuUse(stagingGpuUse(dst));
     BackendGpuUse* srcUse = trackGpuUse(stagingGpuUse(src));
     emit([=](CsWorkerState& s) {
+      const GpuUseRelease release{ dstUse, srcUse };
       s.ctx->copyImageToBuffer(s.resolve(dst), dstOffset, src, srcSubres);
-      releaseGpuUse(dstUse);
-      releaseGpuUse(srcUse);
     });
   }
 
@@ -756,8 +755,8 @@ namespace dxup {
     noteBufferGpuWrite(dst);
     BackendGpuUse* dstUse = trackGpuUse(stagingGpuUse(dst));
     emit([=](CsWorkerState& s) {
+      const GpuUseRelease release{ dstUse };
       s.ctx->copyStructureCount(s.resolve(dst), dstOffset, view);
-      releaseGpuUse(dstUse);
     });
   }
 
@@ -926,8 +925,8 @@ namespace dxup {
     BackendGpuUse* use = trackGpuUse(stagingGpuUse(buffer));
     emitArray(static_cast<const uint8_t*>(data), static_cast<size_t>(size),
       [buffer, offset, use](CsWorkerState& s, const uint8_t* copy, size_t n) {
+        const GpuUseRelease release{ use };
         s.ctx->updateBuffer(s.resolve(buffer), offset, n, copy);
-        releaseGpuUse(use);
       });
   }
 
@@ -971,14 +970,14 @@ namespace dxup {
     BackendGpuUse* use = trackGpuUse(stagingGpuUse(buffer));
     if (inlineBlock) {
       emit([buffer, table, regionCount, use](CsWorkerState& s) {
+        const GpuUseRelease release{ use };
         s.ctx->updateBufferRegions(s.resolve(buffer), table, regionCount);
-        releaseGpuUse(use);
       });
     } else {
       emit([buffer, regionCount, use, heapBlock = std::move(heapBlock)](CsWorkerState& s) {
+        const GpuUseRelease release{ use };
         s.ctx->updateBufferRegions(s.resolve(buffer),
           reinterpret_cast<const BufferUpdateRegion*>(heapBlock.data()), regionCount);
-        releaseGpuUse(use);
       });
     }
   }
@@ -1228,8 +1227,8 @@ namespace dxup {
       keep(query);
       m_recordedQueries.push_back(query);
       emit([=](CsWorkerState& s) {
+        const QueryRelease release{ query };
         s.ctx->beginQuery(query);
-        query->queuedOps.fetch_sub(1, std::memory_order_release);
       });
       return;
     }
@@ -1237,8 +1236,8 @@ namespace dxup {
     // recorded this.
     query->queuedOps.fetch_add(1, std::memory_order_relaxed);
     emit([=](CsWorkerState& s) {
+      const QueryRelease release{ query };
       s.ctx->beginQuery(query);
-      query->queuedOps.fetch_sub(1, std::memory_order_release);
     });
   }
 
@@ -1249,15 +1248,15 @@ namespace dxup {
       keep(query);
       m_recordedQueries.push_back(query);
       emit([=](CsWorkerState& s) {
+        const QueryRelease release{ query };
         s.ctx->endQuery(query);
-        query->queuedOps.fetch_sub(1, std::memory_order_release);
       });
       return;
     }
     query->queuedOps.fetch_add(1, std::memory_order_relaxed);
     emit([=](CsWorkerState& s) {
+      const QueryRelease release{ query };
       s.ctx->endQuery(query);
-      query->queuedOps.fetch_sub(1, std::memory_order_release);
     });
   }
 
@@ -1313,8 +1312,8 @@ namespace dxup {
     keep(buffer);
     BackendGpuUse* bufferUse = trackGpuUse(stagingGpuUse(buffer));
     emit([=](CsWorkerState& s) {
+      const GpuUseRelease release{ bufferUse };
       s.ctx->copyTiles(resource, coordinate, size, buffer, bufferOffset, flags);
-      releaseGpuUse(bufferUse);
     });
   }
 

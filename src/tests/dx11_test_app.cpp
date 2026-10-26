@@ -12384,6 +12384,47 @@ float4 main(float4 position : SV_Position, float4 color : COLOR) : SV_Target { r
       recordDraw(m_context.Get());
       if (!expect("immediate context", Rgba8{255, 0, 0, 255}))
         return false;
+
+      // A list run later than the GPU took to finish with the old memory:
+      // DXUP hands memory of buffers it renamed away to new buffers of the
+      // same size, but not memory a command list still uses.
+      ComPtr<ID3D11Query> event;
+      if (!createQueryObject(D3D11_QUERY_EVENT, event, error))
+        return false;
+      auto gpuDone = [&] {
+        for (int i = 0; i < 3; i++) {
+          m_context->End(event.Get());
+          m_context->Flush();
+          while (m_context->GetData(event.Get(), nullptr, 0, 0) != S_OK)
+            Sleep(1);
+        }
+      };
+      ComPtr<ID3D11CommandList> later;
+      if (!writeColor(m_context.Get(), blue))
+        return error = "immediate Map failed", false;
+      recordDraw(deferred.Get());
+      if (FAILED(hr = deferred->FinishCommandList(FALSE, later.GetAddressOf()))) {
+        error = "FinishCommandList failed: " + formatHResult(hr);
+        return false;
+      }
+      if (!writeColor(m_context.Get(), green))
+        return error = "immediate Map failed", false;
+      gpuDone();
+      std::vector<float> reds((128u << 10) / sizeof(float));
+      for (size_t i = 0; i < reds.size(); i += 4)
+        std::memcpy(&reds[i], red, sizeof(red));
+      const D3D11_SUBRESOURCE_DATA redData = { reds.data(), 0, 0 };
+      std::vector<ComPtr<ID3D11Buffer>> others(8);
+      for (auto& other : others) {
+        if (FAILED(hr = m_device->CreateBuffer(&desc, &redData, other.GetAddressOf()))) {
+          error = "CreateBuffer failed: " + formatHResult(hr);
+          return false;
+        }
+      }
+      gpuDone();
+      m_context->ExecuteCommandList(later.Get(), FALSE);
+      if (!expect("list run after the old memory was free", Rgba8{0, 255, 0, 255}))
+        return false;
       m_context->ClearState();
       return true;
     }

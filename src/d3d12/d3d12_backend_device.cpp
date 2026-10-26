@@ -2755,6 +2755,12 @@ namespace dxup::d3d12 {
 
     if (!isReusableUploadBuffer(desc) || desc.size > kMaxRecycledBytes / 4)
       return false;
+    // Command lists and buffer views keep buffers through the retire owner
+    // (which the reference count above does not see): one they still hold
+    // is no temporary of the context's any more. Held only by the Rc's
+    // deleter (and this lock), it is.
+    if (const std::shared_ptr<void> owner = buffer->retireOwner(); owner && owner.use_count() > 2)
+      return false;
     // Handed out again for another application buffer (this runs on the
     // recording thread, which alone touches identities).
     buffer->identity.reset();
