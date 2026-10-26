@@ -274,9 +274,10 @@ namespace dxup::d3d12 {
     return true;
   }
 
-  bool D3D12BackendContext::createVelocityCalibration(D3D12BackendImage* color) {
+  bool D3D12BackendContext::createVelocityCalibration(D3D12BackendImage* color, bool& created) {
     auto* device = m_device->getDevice();
     const D3D12_RESOURCE_DESC colorDesc = color->getResource()->GetDesc();
+    created = false;
     if (m_velocityCalPrevious) {
       const D3D12_RESOURCE_DESC have = m_velocityCalPrevious->GetDesc();
       if (have.Width == colorDesc.Width && have.Height == colorDesc.Height && have.Format == colorDesc.Format)
@@ -368,6 +369,7 @@ namespace dxup::d3d12 {
       logMessage(LogLevel::Error, "upscalerAuto: velocity calibration color copy failed: 0x%08x", static_cast<unsigned>(hr));
       return false;
     }
+    created = true;
     return true;
   }
 
@@ -401,10 +403,15 @@ namespace dxup::d3d12 {
       m_velocityCalReadback->Unmap(0, &none);
     }
 
-    const bool first = !m_velocityCalPrevious;
-    if (!createVelocityCalibration(color))
+    // A new previous color (the first, or after a size change) holds no
+    // frame to compare with yet.
+    bool first = false;
+    if (!createVelocityCalibration(color, first))
       return;
     ensureDescriptorHeapSpace();
+    // DXUP's own measurement, whatever the application's predicate says
+    // (restoreAfterForeignCommands applies it again).
+    pausePredication();
     holdBatchResource(color->getResource());
     holdBatchResource(velocity->getResource());
     const uint32_t slot = m_velocityCalSlot;
@@ -524,7 +531,10 @@ namespace dxup::d3d12 {
     if (!m_injectDepth)
       return nullptr;
     auto* copy = static_cast<D3D12BackendImage*>(m_injectDepth.get());
+    // DXUP's own copy: whatever the application's predicate.
+    const bool paused = pausePredication();
     copyImage(copy, ImageSubresource{}, depth, ImageSubresource{});
+    resumePredication(paused);
     return copy;
   }
 
@@ -565,8 +575,8 @@ namespace dxup::d3d12 {
       const D3D12_RANGE none = { 0, 0 };
       m_velocityCalReadback->Unmap(0, &none);
     }
-    const bool first = !m_velocityCalPrevious;
-    if (!createVelocityCalibration(color))
+    bool first = false;
+    if (!createVelocityCalibration(color, first))
       return;
     auto* device = m_device->getDevice();
     if (!m_cameraCalPso) {
@@ -630,6 +640,7 @@ namespace dxup::d3d12 {
       }
     }
     ensureDescriptorHeapSpace();
+    pausePredication();
     holdBatchResource(color->getResource());
     holdBatchResource(depth->getResource());
     const uint32_t slot = m_velocityCalSlot;

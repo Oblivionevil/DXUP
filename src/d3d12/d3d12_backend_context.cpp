@@ -289,12 +289,19 @@ namespace dxup::d3d12 {
       box.bottom = (box.bottom + blockHeight - 1) / blockHeight * blockHeight;
     }
 
+    // The footprint of a region in whole blocks, as alignCopyBox copies it:
+    // a block format smaller than a block (small mips) is no valid texture
+    // size for GetCopyableFootprints.
     inline D3D12_RESOURCE_DESC getCopyableRegionDesc(
         const D3D12BackendImage* image,
         const ImageCopyRegion&   region) {
       D3D12_RESOURCE_DESC desc = image->getTextureDesc();
-      desc.Width = (std::max)(static_cast<uint64_t>(region.width), uint64_t(1));
-      desc.Height = (std::max)(static_cast<uint32_t>(region.height), uint32_t(1));
+      uint32_t blockWidth = 1, blockHeight = 1;
+      getCopyBlockExtent(desc.Format, blockWidth, blockHeight);
+      const uint32_t width = (std::max)(region.width, 1u);
+      const uint32_t height = (std::max)(region.height, 1u);
+      desc.Width = uint64_t((width + blockWidth - 1) / blockWidth) * blockWidth;
+      desc.Height = (height + blockHeight - 1) / blockHeight * blockHeight;
       desc.MipLevels = 1;
       desc.SampleDesc.Count = 1;
       desc.SampleDesc.Quality = 0;
@@ -5020,11 +5027,20 @@ namespace dxup::d3d12 {
         requiresUnmap = true;
       }
 
-      m_stagedMap.target    = buffer;
-      m_stagedMap.staging   = std::move(staging);
-      m_stagedMap.mappedPtr = ptr;
-      m_stagedMap.size      = bufSize;
-      m_stagedMap.requiresUnmap = requiresUnmap;
+      // Mapped again without an unmap: the new contents replace the old.
+      auto staged = std::find_if(m_stagedMaps.begin(), m_stagedMaps.end(),
+        [buffer](const StagedMap& map) { return map.target == buffer; });
+      if (staged == m_stagedMaps.end()) {
+        staged = m_stagedMaps.emplace(m_stagedMaps.end());
+      } else if (staged->requiresUnmap) {
+        const D3D12_RANGE none = { 0, 0 };
+        static_cast<D3D12BackendBuffer*>(staged->staging.get())->getResource()->Unmap(0, &none);
+      }
+      staged->target    = buffer;
+      staged->staging   = std::move(staging);
+      staged->mappedPtr = ptr;
+      staged->size      = bufSize;
+      staged->requiresUnmap = requiresUnmap;
       return ptr;
     }
 
@@ -5096,21 +5112,23 @@ namespace dxup::d3d12 {
     auto* d3d12Buffer = static_cast<D3D12BackendBuffer*>(buffer);
 
     // If this was a staged WriteDiscard, copy from staging to target
-    if (m_stagedMap.target == buffer && m_stagedMap.staging) {
-      auto* stagingRes = static_cast<D3D12BackendBuffer*>(m_stagedMap.staging.get())->getResource();
-      if (m_stagedMap.requiresUnmap) {
-        D3D12_RANGE writtenRange = { 0, static_cast<SIZE_T>(m_stagedMap.size) };
+    auto staged = std::find_if(m_stagedMaps.begin(), m_stagedMaps.end(),
+      [buffer](const StagedMap& map) { return map.target == buffer; });
+    if (staged != m_stagedMaps.end()) {
+      StagedMap map = std::move(*staged);
+      m_stagedMaps.erase(staged);
+      auto* stagingRes = static_cast<D3D12BackendBuffer*>(map.staging.get())->getResource();
+      if (map.requiresUnmap) {
+        D3D12_RANGE writtenRange = { 0, static_cast<SIZE_T>(map.size) };
         stagingRes->Unmap(0, &writtenRange);
       }
 
-      // Copy staging → target via GPU
-      copyBuffer(buffer, 0, m_stagedMap.staging.get(), 0, m_stagedMap.size);
-      retainTemporaryBuffer(std::move(m_stagedMap.staging));
-
-      m_stagedMap.target    = nullptr;
-      m_stagedMap.mappedPtr = nullptr;
-      m_stagedMap.size      = 0;
-      m_stagedMap.requiresUnmap = false;
+      // Copy staging → target via GPU. Unmap is no command the application's
+      // predicate applies to.
+      const bool paused = pausePredication();
+      copyBuffer(buffer, 0, map.staging.get(), 0, map.size);
+      resumePredication(paused);
+      retainTemporaryBuffer(std::move(map.staging));
       return;
     }
 
@@ -5154,18 +5172,27 @@ namespace dxup::d3d12 {
         return false;
     }
 
-    ID3D12Resource* uploads[2] = {};
-    uint64_t uploadOffsets[2] = {};
+    // The planes in one allocation: one that submits the list in between
+    // would leave the first plane in the upload slot of the list before,
+    // which the GPU may reuse before the copies recorded after it ran.
+    uint64_t planeOffsets[2] = {};
+    uint64_t uploadSize = 0;
+    for (UINT plane = 0; plane < planes; plane++) {
+      constexpr uint64_t kAlignment = D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT;
+      planeOffsets[plane] = (uploadSize + kAlignment - 1) / kAlignment * kAlignment;
+      uploadSize = planeOffsets[plane] + totalSizes[plane];
+    }
+    ID3D12Resource* upload = nullptr;
+    uint64_t uploadOffset = 0;
+    void* uploadData = nullptr;
+    if (!allocateUploadScratch(uploadSize, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT, &upload, &uploadOffset, &uploadData))
+      return false;
     const auto* srcBytes = static_cast<const uint8_t*>(data);
     for (UINT plane = 0; plane < planes; plane++) {
-      void* uploadPtr = nullptr;
-      if (!allocateUploadScratch(totalSizes[plane], D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT, &uploads[plane],
-                                 &uploadOffsets[plane], &uploadPtr))
-        return false;
       const D3D12_PLACED_SUBRESOURCE_FOOTPRINT& footprint = footprints[plane];
       const uint32_t depth = footprint.Footprint.Depth;
       const uint64_t sourceSlicePitch = depthPitch ? depthPitch : uint64_t(rowPitch) * numRows[plane];
-      auto* dstBytes = static_cast<uint8_t*>(uploadPtr);
+      auto* dstBytes = static_cast<uint8_t*>(uploadData) + planeOffsets[plane];
       for (uint32_t z = 0; z < depth; z++) {
         for (UINT row = 0; row < numRows[plane]; row++) {
           std::memcpy(dstBytes + (uint64_t(z) * numRows[plane] + row) * footprint.Footprint.RowPitch,
@@ -5189,10 +5216,10 @@ namespace dxup::d3d12 {
       dstLoc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
       dstLoc.SubresourceIndex = subresources[plane];
       D3D12_TEXTURE_COPY_LOCATION srcLoc = {};
-      srcLoc.pResource = uploads[plane];
+      srcLoc.pResource = upload;
       srcLoc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
       srcLoc.PlacedFootprint = footprints[plane];
-      srcLoc.PlacedFootprint.Offset = uploadOffsets[plane];
+      srcLoc.PlacedFootprint.Offset = uploadOffset + planeOffsets[plane];
       m_cmdList->CopyTextureRegion(&dstLoc, 0, 0, 0, &srcLoc, nullptr);
       m_copyOpsSinceFlush++;
     }
@@ -5959,7 +5986,10 @@ namespace dxup::d3d12 {
     auto* d3d12Buffer = static_cast<D3D12BackendBuffer*>(buffer);
     if (!d3d12Buffer || !regions || !regionCount)
       return;
-    markGpuUse(stagingGpuUse(buffer));
+    // A staging buffer's use is marked where the copies are recorded: an
+    // upload allocation before may submit the list, and Map would wait for
+    // that submission only.
+    BackendGpuUse* const stagingUse = stagingGpuUse(buffer);
 
     struct UploadedRegion {
       uint64_t dstOffset = 0;
@@ -6119,6 +6149,7 @@ namespace dxup::d3d12 {
             }
           }
 
+          markGpuUse(stagingUse);
           transitionResource(d3d12Buffer, D3D12_RESOURCE_STATE_COPY_DEST);
           holdBatchResource(d3d12Buffer->getResource());
           flushBarriers();
@@ -6151,6 +6182,7 @@ namespace dxup::d3d12 {
             return;
           }
           std::memcpy(ptr, static_cast<const uint8_t*>(regions[i].data) + done, static_cast<size_t>(piece));
+          markGpuUse(stagingUse);
           transitionResource(d3d12Buffer, D3D12_RESOURCE_STATE_COPY_DEST);
           holdBatchResource(d3d12Buffer->getResource());
           flushBarriers();
@@ -6191,6 +6223,7 @@ namespace dxup::d3d12 {
     if (perfStatsEnabled() && !m_copyOnly)
       m_perfIntervalCopiedBufferUpdateCalls += static_cast<uint64_t>(uploadedRegions.size());
 
+    markGpuUse(stagingUse);
     transitionResource(d3d12Buffer, D3D12_RESOURCE_STATE_COPY_DEST);
     holdBatchResource(d3d12Buffer->getResource());
     flushBarriers();
@@ -8564,7 +8597,10 @@ namespace dxup::d3d12 {
     m_cmdList->RSSetViewports(1, &viewport);
     D3D12_RECT scissor = { 0, 0, static_cast<LONG>(dstDesc.width), static_cast<LONG>(dstDesc.height) };
     m_cmdList->RSSetScissorRects(1, &scissor);
+    // DXUP's own copy of the image: whatever the application's predicate.
+    const bool paused = pausePredication();
     m_cmdList->DrawInstanced(3, 1, 0, 0);
+    resumePredication(paused);
 
     // Give the application its state back.
     restoreAfterInternalPass();
@@ -8768,6 +8804,9 @@ namespace dxup::d3d12 {
       + srvIndex * m_cbvSrvUavDescSize;
     const uint32_t width = layout.Footprint.Width, height = layout.Footprint.Height;
     const uint32_t constants[4] = { width, height, layout.Footprint.RowPitch, 0 };
+    // DXUP's own copy of the plane: whatever the application's predicate
+    // (restoreAfterForeignCommands applies it again).
+    pausePredication();
     ID3D12DescriptorHeap* heaps[] = { m_shaderVisibleCbvSrvUavHeap.Get(), m_shaderVisibleSamplerHeap.Get() };
     m_cmdList->SetDescriptorHeaps(2, heaps);
     m_cmdList->SetComputeRootSignature(m_stencilResolveRootSignature.Get());
@@ -8862,6 +8901,8 @@ namespace dxup::d3d12 {
     m_cmdList.drain();
     device->CreateDepthStencilView(dst->getResource(), &dsvDesc, m_msaaPassDsv);
     m_cmdList->OMSetRenderTargets(0, nullptr, FALSE, &m_msaaPassDsv);
+    // DXUP's own copy of the plane: whatever the application's predicate.
+    const bool paused = pausePredication();
     m_cmdList->ClearDepthStencilView(m_msaaPassDsv, D3D12_CLEAR_FLAG_STENCIL, 0.0f, 0, 0, nullptr);
 
     m_cmdList->SetGraphicsRootSignature(m_mipGenRootSignature.Get());
@@ -8883,6 +8924,7 @@ namespace dxup::d3d12 {
       m_cmdList->SetGraphicsRoot32BitConstant(1, 1u << bit, 0);
       m_cmdList->DrawInstanced(3, 1, 0, 0);
     }
+    resumePredication(paused);
 
     // Give the application its state back.
     m_cmdList->OMSetStencilRef(m_trackedStencilRef);

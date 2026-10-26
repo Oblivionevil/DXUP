@@ -696,7 +696,9 @@ namespace dxup::d3d12 {
       uint64_t size = 0;                   // size of the staging buffer
       bool requiresUnmap = false;
     };
-    StagedMap m_stagedMap;  // at most one active staged map at a time
+    // One per mapped buffer: without a CS thread several threads may each
+    // have a buffer mapped at once.
+    std::vector<StagedMap> m_stagedMaps;
 
     // Keep temporary upload resources alive until GPU finishes
     std::vector<Rc<IBackendBuffer>> m_pendingUploads;  // current CL's uploads
@@ -1142,7 +1144,8 @@ namespace dxup::d3d12 {
     uint64_t                    m_velocityCalFence[16] = {};
     uint32_t                    m_velocityCalSlot = 0;
     uint32_t                    m_cameraCalGeneration[16] = {};
-    bool createVelocityCalibration(D3D12BackendImage* color);
+    // created: the previous color is new (nothing to compare with yet).
+    bool createVelocityCalibration(D3D12BackendImage* color, bool& created);
     ComPtr<ID3D12RootSignature> m_cameraCalRootSignature;
     ComPtr<ID3D12PipelineState> m_cameraCalPso;
     ComPtr<ID3D12Resource>      m_cameraCalRows;       // per result slot: the candidates' rows

@@ -9047,15 +9047,17 @@ float4 main(float4 position : SV_Position) : SV_Target { return t0.Load(int3(0, 
               }
             }
           }
-          // Boxes ending at the edge of mips smaller than a block.
+          // Boxes ending at the edge of mips smaller than a block: at the
+          // block's edge and at the mip's.
           for (UINT layer = 0; layer < arraySize; layer++) {
-            for (UINT mip = mips - 2; mip < mips; mip++) {
+            for (UINT edge = 0; edge < 4; edge++) {
+              const UINT mip = mips - 2 + (edge & 1);
               const UINT sub = layer * mips + mip;
               const UINT extent = (std::max)(1u, size >> mip);
               std::vector<uint8_t> data(blockBytes);
               for (UINT i = 0; i < blockBytes; i++)
-                data[i] = uint8_t(0xA5 ^ (i * 13 + sub));
-              const UINT boxExtent = (extent + 3) / 4 * 4;
+                data[i] = uint8_t(0xA5 ^ (i * 13 + sub + edge));
+              const UINT boxExtent = edge < 2 ? (extent + 3) / 4 * 4 : extent;
               const D3D11_BOX box = { 0, 0, 0, boxExtent, boxExtent, 1 };
               m_context->UpdateSubresource(roundTrip.Get(), sub, &box, data.data(), blockBytes, 0);
               m_context->CopySubresourceRegion(readBack.Get(), sub, 0, 0, 0, roundTrip.Get(), sub, &box);
@@ -9067,8 +9069,8 @@ float4 main(float4 position : SV_Position) : SV_Target { return t0.Load(int3(0, 
               const bool same = !std::memcmp(mapped.pData, data.data(), blockBytes);
               m_context->Unmap(readBack.Get(), sub);
               if (!same) {
-                error = formatString("format %u array %u boxed copy of %ux%u mip %u differs", format, arraySize,
-                  extent, extent, mip);
+                error = formatString("format %u array %u boxed copy (box %u) of %ux%u mip %u differs", format, arraySize,
+                  boxExtent, extent, extent, mip);
                 return false;
               }
             }
