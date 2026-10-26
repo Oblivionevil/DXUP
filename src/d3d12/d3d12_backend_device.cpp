@@ -940,11 +940,12 @@ namespace dxup::d3d12 {
   }
 
   void D3D12BackendImage::initStaging(std::shared_ptr<D3D12BackendBuffer> buffer, StagingLayout layout, uint8_t* mapped,
-                                      ID3D12Device* device) {
+                                      ID3D12Device* device, std::shared_ptr<D3D12StagingSpareRegistry> spareRegistry) {
     m_stagingBuffer = std::move(buffer);
     m_staging = std::move(layout);
     m_mappedData = mapped;
     m_stagingDevice = device;
+    m_spareRegistry = std::move(spareRegistry);
     switch (m_staging.textureDesc.Format) {
       case DXGI_FORMAT_R24G8_TYPELESS:
       case DXGI_FORMAT_D24_UNORM_S8_UINT:
@@ -967,16 +968,18 @@ namespace dxup::d3d12 {
 
   bool D3D12BackendImage::renameStaging(uint64_t readFence, uint64_t completedFence) {
     // Copying the contents costs less than waiting up to this size; the
-    // spares cover the frames the GPU may lag behind.
+    // spares cover the frames the GPU may lag behind. Mapped spares are
+    // address space in a 32-bit process: fewer there.
     constexpr uint64_t kMaxSize = 4ull << 20;
-    constexpr uint64_t kMaxSpareBytes = 16ull << 20;
-    constexpr size_t kMaxSpares = 6;
+    constexpr uint64_t kMaxSpareBytes = kSmallAddressSpace ? (4ull << 20) : (16ull << 20);
+    constexpr size_t kMaxSpares = kSmallAddressSpace ? 2 : 6;
     if (!m_stagingBuffer || !m_stagingDevice || m_interleavedTexelSize || m_stagingMaps)
       return false;
     const uint64_t size = m_stagingBuffer->getDesc().size;
     if (size > kMaxSize)
       return false;
 
+    std::unique_lock<std::mutex> lock(m_stagingMutex);
     StagingSpare next;
     for (auto it = m_stagingSpares.begin(); it != m_stagingSpares.end(); ++it) {
       if (it->fence <= completedFence) {
@@ -1005,13 +1008,40 @@ namespace dxup::d3d12 {
     old.buffer = std::move(m_stagingBuffer);
     old.mapped = m_mappedData;
     old.fence = readFence;
+    old.epoch = m_spareRegistry ? m_spareRegistry->epoch.load() : 0;
     m_stagingSpares.push_back(std::move(old));
     m_stagingBuffer = std::move(next.buffer);
     m_mappedData = next.mapped;
     m_resource = m_stagingBuffer->getResource();
+    const size_t spares = m_stagingSpares.size();
+    const bool registerSpares = m_spareRegistry && !m_spareRegistered;
+    m_spareRegistered = m_spareRegistered || registerSpares;
+    lock.unlock();
+    // Not under the image's mutex: the trim takes the registry's first.
+    if (registerSpares) {
+      std::lock_guard<std::mutex> registryLock(m_spareRegistry->mutex);
+      m_spareRegistry->images.push_back(weak_from_this());
+    }
     logMessage(LogLevel::Info, "renameStaging: image %p, %llu bytes, %zu spares", static_cast<void*>(this),
-      static_cast<unsigned long long>(size), m_stagingSpares.size());
+      static_cast<unsigned long long>(size), spares);
     return true;
+  }
+
+  bool D3D12BackendImage::trimStagingSpares(uint64_t releaseEpoch, size_t& released) {
+    std::vector<StagingSpare> going;   // freed after the lock
+    std::lock_guard<std::mutex> lock(m_stagingMutex);
+    for (auto it = m_stagingSpares.begin(); it != m_stagingSpares.end();) {
+      if (it->epoch <= releaseEpoch) {
+        going.push_back(std::move(*it));
+        it = m_stagingSpares.erase(it);
+      } else {
+        ++it;
+      }
+    }
+    released += going.size();
+    // The device drops an image without spares; the next rename adds it again.
+    m_spareRegistered = !m_stagingSpares.empty();
+    return m_spareRegistered;
   }
 
   uint8_t* D3D12BackendImage::mapStaging(uint32_t subresource, MapMode mode, ImageSubresourceLayout& layout) {
@@ -1161,6 +1191,9 @@ namespace dxup::d3d12 {
       if (m_nullUavHandle.ptr)
         m_device->CreateUnorderedAccessView(nullptr, nullptr, &uavDesc, m_nullUavHandle);
     }
+    // The clear view must follow the rename too, or clears hit the old bytes.
+    if (m_rawClearUavHandle.ptr)
+      writeRawClearUav(d3d12Buffer);
 
     m_buffer = buffer;
     m_descriptorVersion = nextDescriptorVersion();
@@ -1189,21 +1222,28 @@ namespace dxup::d3d12 {
     if (m_rawClearUavHandle.ptr || !m_heapMgr || !m_device || !m_buffer)
       return m_rawClearUavHandle;
     auto* d3d12Buffer = static_cast<D3D12BackendBuffer*>(m_buffer);
-    // The view counts structures; the raw view counts 32-bit words.
-    const uint64_t stride = d3d12Buffer->getDesc().structStride;
-    if (!stride)
+    if (!d3d12Buffer->getDesc().structStride)
       return m_rawClearUavHandle;
+    m_rawClearUavHandle = m_heapMgr->allocateCbvSrvUav();
+    if (m_rawClearUavHandle.ptr)
+      writeRawClearUav(d3d12Buffer);
+    return m_rawClearUavHandle;
+  }
+
+  void D3D12BackendBufferView::writeRawClearUav(D3D12BackendBuffer* buffer) {
+    // The view counts structures; the raw view counts 32-bit words.
+    const uint64_t stride = buffer->getDesc().structStride;
+    if (!stride)
+      return;
     const uint64_t firstByte = m_desc.offset * stride;
-    const uint64_t byteCount = m_desc.size ? m_desc.size * stride : d3d12Buffer->getDesc().size - firstByte;
+    const uint64_t byteCount = m_desc.size ? m_desc.size * stride : buffer->getDesc().size - firstByte;
     D3D12_UNORDERED_ACCESS_VIEW_DESC desc = {};
     desc.Format = DXGI_FORMAT_R32_TYPELESS;
     desc.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
     desc.Buffer.FirstElement = firstByte / 4;
     desc.Buffer.NumElements = static_cast<UINT>(byteCount / 4);
     desc.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
-    m_rawClearUavHandle = m_heapMgr->allocateCbvSrvUav();
-    m_device->CreateUnorderedAccessView(d3d12Buffer->getResource(), nullptr, &desc, m_rawClearUavHandle);
-    return m_rawClearUavHandle;
+    m_device->CreateUnorderedAccessView(buffer->getResource(), nullptr, &desc, m_rawClearUavHandle);
   }
 #endif
 
@@ -1881,8 +1921,6 @@ namespace dxup::d3d12 {
     m_bufferAllocator->shutdown();
     m_dynamicBufferAllocator->shutdown();
     logPsoStats("device destroyed");
-    if (m_fenceEvent)
-      CloseHandle(m_fenceEvent);
 #endif
   }
 
@@ -2172,7 +2210,9 @@ namespace dxup::d3d12 {
       logMessage(LogLevel::Error, "commitLazyImage: CreateHeap of %u tiles failed (hr=0x%08x)", tiles, static_cast<unsigned>(hr));
       return false;
     }
-    // In queue order before the command list that writes it.
+    // In queue order now, ahead of every command list still recording: a
+    // list that already read the target would read the mapped memory
+    // before the caller's clear, so callers commit before any list uses it.
     D3D12_TILED_RESOURCE_COORDINATE start = {};
     D3D12_TILE_REGION_SIZE region = {};
     region.NumTiles = tiles;
@@ -2206,10 +2246,6 @@ namespace dxup::d3d12 {
     HRESULT hr = m_device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&m_fence));
     if (FAILED(hr))
       throw std::runtime_error("Failed to create fence");
-
-    m_fenceEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
-    if (!m_fenceEvent)
-      throw std::runtime_error("Failed to create fence event");
   }
 
   void D3D12BackendDevice::createNullDescriptors() {
@@ -2568,32 +2604,47 @@ namespace dxup::d3d12 {
     logMessage(LogLevel::Debug, "D3D12BackendDevice: Command signatures created");
   }
 
+  uint64_t D3D12BackendDevice::signalFence(uint64_t* ticket, HRESULT* result) {
+    ID3D12Fence* fence = m_fence.Get();
+    std::lock_guard<std::mutex> lock(m_fenceMutex);
+    const uint64_t value = ++m_fenceValue;
+    const uint64_t queued = m_submitQueue.enqueue([fence, value, result](ID3D12CommandQueue* queue) {
+      const HRESULT hr = queue->Signal(fence, value);
+      if (result)
+        *result = hr;
+    });
+    if (ticket)
+      *ticket = queued;
+    return value;
+  }
+
+  bool D3D12BackendDevice::waitForFence(uint64_t value, DWORD timeoutMs) {
+    if (m_fence->GetCompletedValue() >= value)
+      return true;
+    // An event per wait: other threads may wait at the same time.
+    HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!event)
+      return timeoutMs == INFINITE && SUCCEEDED(m_fence->SetEventOnCompletion(value, nullptr));
+    const bool reached = SUCCEEDED(m_fence->SetEventOnCompletion(value, event))
+      && WaitForSingleObject(event, timeoutMs) == WAIT_OBJECT_0;
+    CloseHandle(event);
+    return reached || m_fence->GetCompletedValue() >= value;
+  }
+
   void D3D12BackendDevice::waitForGpu() {
     if (!m_commandQueue || !m_fence)
       return;
-
-    m_fenceValue++;
-    ID3D12Fence* fence = m_fence.Get();
-    const uint64_t value = m_fenceValue;
-    m_submitQueue.enqueue([fence, value](ID3D12CommandQueue* queue) { queue->Signal(fence, value); });
-
-    if (m_fence->GetCompletedValue() < m_fenceValue) {
-      m_fence->SetEventOnCompletion(m_fenceValue, m_fenceEvent);
-      WaitForSingleObject(m_fenceEvent, INFINITE);
-    }
+    waitForFence(signalFence(), INFINITE);
   }
 
   HRESULT D3D12BackendDevice::flushAndCheckGpu(const char* tag) {
     if (!m_gpuSyncValidationEnabled || !m_commandQueue || !m_fence || !m_device)
       return S_OK;
 
-    m_fenceValue++;
     HRESULT hr = S_OK;
-    ID3D12Fence* fence = m_fence.Get();
-    const uint64_t value = m_fenceValue;
-    m_submitQueue.waitFor(m_submitQueue.enqueue([fence, value, &hr](ID3D12CommandQueue* queue) {
-      hr = queue->Signal(fence, value);
-    }));
+    uint64_t ticket = 0;
+    const uint64_t value = signalFence(&ticket, &hr);
+    m_submitQueue.waitFor(ticket);
     if (FAILED(hr)) {
       logMessage(LogLevel::Error, "GPU-SYNC [%s]: Signal failed hr=0x%08X", tag, hr);
       HRESULT reason = m_device->GetDeviceRemovedReason();
@@ -2601,15 +2652,11 @@ namespace dxup::d3d12 {
       return reason;
     }
 
-    if (m_fence->GetCompletedValue() < m_fenceValue) {
-      m_fence->SetEventOnCompletion(m_fenceValue, m_fenceEvent);
-      DWORD wait = WaitForSingleObject(m_fenceEvent, 5000); // 5 second timeout
-      if (wait == WAIT_TIMEOUT) {
-        logMessage(LogLevel::Error, "GPU-SYNC [%s]: fence wait TIMED OUT (5s)", tag);
-        HRESULT reason = m_device->GetDeviceRemovedReason();
-        logMessage(LogLevel::Error, "GPU-SYNC [%s]: DeviceRemovedReason=0x%08X", tag, reason);
-        return reason;
-      }
+    if (!waitForFence(value, 5000)) {   // 5 second timeout
+      logMessage(LogLevel::Error, "GPU-SYNC [%s]: fence wait TIMED OUT (5s)", tag);
+      HRESULT reason = m_device->GetDeviceRemovedReason();
+      logMessage(LogLevel::Error, "GPU-SYNC [%s]: DeviceRemovedReason=0x%08X", tag, reason);
+      return reason;
     }
 
     HRESULT reason = m_device->GetDeviceRemovedReason();
@@ -2671,6 +2718,9 @@ namespace dxup::d3d12 {
     adjustRecycledBytes(-int64_t(desc.size));
     if (it->second.empty())
       m_recycledBuffers.erase(it);
+    // Its entry in the order stays behind: rebuilt once they are most of it.
+    if (m_recycleOrder.size() > 2 * m_recycledBufferCount + 256)
+      compactRecycleOrder();
 
     static_cast<D3D12BackendBuffer*>(buffer.get())->setCurrentState(D3D12_RESOURCE_STATE_GENERIC_READ);
     return buffer;
@@ -2690,39 +2740,60 @@ namespace dxup::d3d12 {
     if (!isReusableUploadBuffer(desc) || desc.size > kMaxRecycledBytes / 4)
       return false;
 
+    const RecycledBufferKey key = makeRecycledBufferKey(desc);
     Rc<IBackendBuffer> evicted;   // released after the lock
     std::lock_guard<std::mutex> lock(m_recycledBufferMutex);
-    auto& bucket = m_recycledBuffers[makeRecycledBufferKey(desc)];
-    if (bucket.size() >= kMaxRecycledBuffersPerKey)
+    auto existing = m_recycledBuffers.find(key);
+    if (existing != m_recycledBuffers.end() && existing->second.size() >= kMaxRecycledBuffersPerKey)
       return false;
 
     if (m_recycledBufferCount >= kMaxRecycledBuffers) {
       // Buffers left over from a load spike must not keep the sizes a
       // frame uses every time from being recycled: the one waiting
-      // longest goes.
-      auto oldest = oldestRecycledBucket();
-      if (oldest == m_recycledBuffers.end())
+      // longest goes (which may empty and remove this buffer's bucket: it
+      // is looked up again below).
+      evicted = evictOldestRecycled();
+      if (!evicted)
         return false;
-      evicted = std::move(oldest->second.front().buffer);
-      oldest->second.erase(oldest->second.begin());
-      m_recycledBufferCount--;
-      adjustRecycledBytes(-int64_t(oldest->first.size));
     }
 
-    bucket.push_back({ std::move(buffer), ++m_recycleSequence });
+    const uint64_t sequence = ++m_recycleSequence;
+    m_recycledBuffers[key].push_back({ std::move(buffer), sequence });
+    m_recycleOrder.emplace_back(sequence, key);
     m_recycledBufferCount++;
     adjustRecycledBytes(int64_t(desc.size));
     return true;
   }
 
-  D3D12BackendDevice::RecycledBufferMap::iterator D3D12BackendDevice::oldestRecycledBucket() {
-    auto oldest = m_recycledBuffers.end();
-    for (auto it = m_recycledBuffers.begin(); it != m_recycledBuffers.end(); ++it) {
-      if (!it->second.empty()
-       && (oldest == m_recycledBuffers.end() || it->second.front().sequence < oldest->second.front().sequence))
-        oldest = it;
+  Rc<IBackendBuffer> D3D12BackendDevice::evictOldestRecycled(uint64_t maxSequence) {
+    // Each entry comes up once: entries of buffers taken again are dropped
+    // on the way.
+    while (!m_recycleOrder.empty() && m_recycleOrder.front().first <= maxSequence) {
+      const auto [sequence, key] = m_recycleOrder.front();
+      m_recycleOrder.pop_front();
+      auto it = m_recycledBuffers.find(key);
+      // The oldest of its bucket, as the order is the order they came back.
+      if (it == m_recycledBuffers.end() || it->second.empty() || it->second.front().sequence != sequence)
+        continue;
+      Rc<IBackendBuffer> buffer = std::move(it->second.front().buffer);
+      it->second.pop_front();
+      m_recycledBufferCount--;
+      adjustRecycledBytes(-int64_t(key.size));
+      if (it->second.empty())
+        m_recycledBuffers.erase(it);
+      return buffer;
     }
-    return oldest;
+    return nullptr;
+  }
+
+  void D3D12BackendDevice::compactRecycleOrder() {
+    m_recycleOrder.clear();
+    for (const auto& [key, bucket] : m_recycledBuffers) {
+      for (const auto& entry : bucket)
+        m_recycleOrder.emplace_back(entry.sequence, key);
+    }
+    std::sort(m_recycleOrder.begin(), m_recycleOrder.end(),
+      [](const auto& a, const auto& b) { return a.first < b.first; });
   }
 
   void D3D12BackendDevice::trimRecycledBuffers() {
@@ -2739,31 +2810,63 @@ namespace dxup::d3d12 {
     std::vector<Rc<IBackendBuffer>> released;   // after the lock
     std::lock_guard<std::mutex> lock(m_recycledBufferMutex);
     if (idleTrim) {
-      for (auto it = m_recycledBuffers.begin(); it != m_recycledBuffers.end();) {
-        auto& bucket = it->second;
-        size_t idle = 0;
-        while (idle < bucket.size() && bucket[idle].sequence <= m_recycleTrimMark)
-          released.push_back(std::move(bucket[idle++].buffer));
-        if (idle) {
-          bucket.erase(bucket.begin(), bucket.begin() + idle);
-          m_recycledBufferCount -= idle;
-          adjustRecycledBytes(-int64_t(idle * it->first.size));
-        }
-        it = bucket.empty() ? m_recycledBuffers.erase(it) : std::next(it);
-      }
+      // Those back before the last trim lead the order.
+      while (auto buffer = evictOldestRecycled(m_recycleTrimMark))
+        released.push_back(std::move(buffer));
       m_recycleTrimMark = m_recycleSequence;
     }
     while (m_recycledBufferBytes.load(std::memory_order_relaxed) > kMaxRecycledBytes) {
-      auto oldest = oldestRecycledBucket();
-      if (oldest == m_recycledBuffers.end())
+      auto buffer = evictOldestRecycled();
+      if (!buffer)
         break;
-      released.push_back(std::move(oldest->second.front().buffer));
-      oldest->second.erase(oldest->second.begin());
-      m_recycledBufferCount--;
-      adjustRecycledBytes(-int64_t(oldest->first.size));
-      if (oldest->second.empty())
-        m_recycledBuffers.erase(oldest);
+      released.push_back(std::move(buffer));
     }
+  }
+
+  void D3D12BackendDevice::trimStagingSpares() {
+    // Every trim interval. A spare made in round r is memory of a staging
+    // image the GPU used in a command list submitted by the present that
+    // ran round r at the latest, so before the fence signaled in round
+    // r + 1: once that fence passed, the spares of round r and before go,
+    // which nothing took again for a whole interval.
+    const uint64_t now = GetTickCount64();
+    uint64_t last = m_lastStagingTrim.load(std::memory_order_relaxed);
+    if (now - last < trimIntervalMs()
+     || !m_lastStagingTrim.compare_exchange_strong(last, now, std::memory_order_relaxed))
+      return;
+    D3D12StagingSpareRegistry& registry = *m_stagingSpareRegistry;
+    std::vector<std::weak_ptr<D3D12BackendImage>> images;
+    uint64_t releaseEpoch = 0;
+    {
+      std::lock_guard<std::mutex> lock(registry.mutex);
+      if (registry.images.empty() || !m_fence || !m_commandQueue)
+        return;
+      // The GPU is that far behind: the round waits.
+      if (m_stagingTrimFence && m_fence->GetCompletedValue() < m_stagingTrimFence)
+        return;
+      const uint64_t round = registry.epoch.fetch_add(1);
+      m_stagingTrimFence = signalFence();
+      // The fence of the round before passed: the spares of the round
+      // before that go.
+      if (round < 3)
+        return;
+      releaseEpoch = round - 2;
+      images.swap(registry.images);
+    }
+    std::vector<std::weak_ptr<D3D12BackendImage>> kept;
+    size_t released = 0;
+    for (auto& weak : images) {
+      if (auto image = weak.lock()) {
+        if (image->trimStagingSpares(releaseEpoch, released))
+          kept.push_back(std::move(weak));
+      }
+    }
+    {
+      std::lock_guard<std::mutex> lock(registry.mutex);
+      registry.images.insert(registry.images.end(), kept.begin(), kept.end());
+    }
+    if (released)
+      logMessage(LogLevel::Info, "trimStagingSpares: %zu spares of %zu staging images go back", released, images.size());
   }
 #endif
 
@@ -2914,10 +3017,11 @@ namespace dxup::d3d12 {
       buffer->setSharedSync(std::make_shared<D3D12SharedSync>());
 
     if (m_gpuSyncValidationEnabled) {
-      static uint32_t s_bufCount = 0;
-      s_bufCount++;
+      // Resources are created on any thread.
+      static std::atomic<uint32_t> s_bufCount{ 0 };
+      const uint32_t bufferId = ++s_bufCount;
       char tag[64];
-      snprintf(tag, sizeof(tag), "createBuffer#%u-%lluB-flags0x%x", s_bufCount, static_cast<unsigned long long>(desc.size), static_cast<uint32_t>(desc.bindFlags));
+      snprintf(tag, sizeof(tag), "createBuffer#%u-%lluB-flags0x%x", bufferId, static_cast<unsigned long long>(desc.size), static_cast<uint32_t>(desc.bindFlags));
       flushAndCheckGpu(tag);
     }
 
@@ -3181,14 +3285,15 @@ namespace dxup::d3d12 {
       }
     };
 
-    static uint32_t s_imageCreateLogCount = 0;
-    s_imageCreateLogCount++;
-    if (s_imageCreateLogCount <= 256
+    // Images are created on any thread: each takes a number of its own.
+    static std::atomic<uint32_t> s_imageCreateLogCount{ 0 };
+    const uint32_t imageLogId = ++s_imageCreateLogCount;
+    if (imageLogId <= 256
      || isTrackedDebugFormat(desc.format)
      || isTrackedDebugFormat(resourceDesc.Format)) {
       logMessage(LogLevel::Info,
         "createImage-ok: id=%u img=%p res=%p %ux%ux%u mip=%u array=%u sample=%u origFmt=%u resFmt=%u bind=0x%x usage=%u cpu=0x%x misc=0x%x flags=0x%x state=0x%x",
-        s_imageCreateLogCount,
+        imageLogId,
         image.get(),
         image->getResource(),
         desc.width,
@@ -3209,16 +3314,16 @@ namespace dxup::d3d12 {
 
     // Post-creation sync check: force GPU completion every 10th image
     // to catch async hangs with precise timing.
-    static uint32_t s_imageCount = 0;
-    s_imageCount++;
+    static std::atomic<uint32_t> s_imageCount{ 0 };
+    const uint32_t imageId = ++s_imageCount;
     {
       HRESULT postHr = m_device->GetDeviceRemovedReason();
       if (FAILED(postHr)) {
         logMessage(LogLevel::Error, "createImage #%u - device removed AFTER creation! reason=0x%08X, %ux%u, Format=%d, resFormat=%d, Flags=0x%x",
-          s_imageCount, postHr, desc.width, desc.height, desc.format, resourceDesc.Format, resourceDesc.Flags);
-      } else if (m_gpuSyncValidationEnabled && s_imageCount % 10 == 0) {
+          imageId, postHr, desc.width, desc.height, desc.format, resourceDesc.Format, resourceDesc.Flags);
+      } else if (m_gpuSyncValidationEnabled && imageId % 10 == 0) {
         char tag[64];
-        snprintf(tag, sizeof(tag), "createImage#%u-%ux%u-fmt%d", s_imageCount, desc.width, desc.height, desc.format);
+        snprintf(tag, sizeof(tag), "createImage#%u-%ux%u-fmt%d", imageId, desc.width, desc.height, desc.format);
         flushAndCheckGpu(tag);
       }
     }
@@ -3289,7 +3394,8 @@ namespace dxup::d3d12 {
     stagingBufferDesc.size = totalSize;
     auto buffer = std::make_shared<D3D12BackendBuffer>(resource, stagingBufferDesc);
     auto image = std::make_shared<D3D12BackendImage>(std::move(resource), desc, false);
-    image->initStaging(std::move(buffer), std::move(layout), static_cast<uint8_t*>(mapped), m_device.Get());
+    image->initStaging(std::move(buffer), std::move(layout), static_cast<uint8_t*>(mapped), m_device.Get(),
+      m_stagingSpareRegistry);
     return BackendRetireQueue::wrap<IBackendImage>(m_retireQueue, std::move(image));
 #else
     (void)textureDesc;
@@ -3333,21 +3439,16 @@ namespace dxup::d3d12 {
     D3D12_CPU_DESCRIPTOR_HANDLE nullSrvHandle = {};
     D3D12_CPU_DESCRIPTOR_HANDLE nullUavHandle = {};
 
+    // Everything that can fail comes before the descriptors are taken.
     D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
     if (!fillBufferShaderResourceViewDesc(buffer->getDesc(), desc, srvDesc))
       return nullptr;
-
-    srvHandle = m_descriptorHeapManager.allocateCbvSrvUav();
-    m_device->CreateShaderResourceView(d3d12Buffer->getResource(), &srvDesc, srvHandle);
-    nullSrvHandle = m_descriptorHeapManager.allocateCbvSrvUav();
-    m_device->CreateShaderResourceView(nullptr, &srvDesc, nullSrvHandle);
-
-    if (static_cast<uint32_t>(buffer->getDesc().bindFlags & BindFlags::UnorderedAccess)) {
-      D3D12_UNORDERED_ACCESS_VIEW_DESC uavDesc = {};
+    const bool unorderedAccess = static_cast<uint32_t>(buffer->getDesc().bindFlags & BindFlags::UnorderedAccess) != 0;
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uavDesc = {};
+    ID3D12Resource* counterResource = nullptr;
+    if (unorderedAccess) {
       if (!fillBufferUnorderedAccessViewDesc(buffer->getDesc(), desc, uavDesc))
         return nullptr;
-
-      ID3D12Resource* counterResource = nullptr;
       if (desc.hasCounter) {
         BufferDesc counterDesc = {};
         counterDesc.size = D3D12_UAV_COUNTER_PLACEMENT_ALIGNMENT;
@@ -3359,7 +3460,14 @@ namespace dxup::d3d12 {
 
         counterResource = static_cast<D3D12BackendBuffer*>(counterBuffer.get())->getResource();
       }
+    }
 
+    srvHandle = m_descriptorHeapManager.allocateCbvSrvUav();
+    m_device->CreateShaderResourceView(d3d12Buffer->getResource(), &srvDesc, srvHandle);
+    nullSrvHandle = m_descriptorHeapManager.allocateCbvSrvUav();
+    m_device->CreateShaderResourceView(nullptr, &srvDesc, nullSrvHandle);
+
+    if (unorderedAccess) {
       uavHandle = m_descriptorHeapManager.allocateCbvSrvUav();
       m_device->CreateUnorderedAccessView(d3d12Buffer->getResource(), counterResource, &uavDesc, uavHandle);
       nullUavHandle = m_descriptorHeapManager.allocateCbvSrvUav();
@@ -3456,8 +3564,6 @@ namespace dxup::d3d12 {
       // Check if the D3D12 resource actually supports UAV
       D3D12_RESOURCE_DESC resDesc = d3d12Image->getResource()->GetDesc();
       if (resDesc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) {
-        D3D12_CPU_DESCRIPTOR_HANDLE uavHandle = m_descriptorHeapManager.allocateCbvSrvUav();
-        D3D12_CPU_DESCRIPTOR_HANDLE nullUavHandle = m_descriptorHeapManager.allocateCbvSrvUav();
         D3D12_UNORDERED_ACCESS_VIEW_DESC uavDesc = {};
         if (!fillUnorderedAccessViewDesc(desc, imageDesc, uavDesc)) {
           logMessage(LogLevel::Warn,
@@ -3468,6 +3574,9 @@ namespace dxup::d3d12 {
             imageDesc.arraySize,
             imageDesc.mipLevels);
         } else {
+          // Taken only for a view that is made: the view frees what it holds.
+          const D3D12_CPU_DESCRIPTOR_HANDLE uavHandle = m_descriptorHeapManager.allocateCbvSrvUav();
+          const D3D12_CPU_DESCRIPTOR_HANDLE nullUavHandle = m_descriptorHeapManager.allocateCbvSrvUav();
           uavDesc.Format = getValidatedViewFormat(uavDesc.Format, d3d12Image->getResource());
           m_device->CreateUnorderedAccessView(d3d12Image->getResource(), nullptr, &uavDesc, uavHandle);
           const D3D12_UNORDERED_ACCESS_VIEW_DESC nullUavDesc = nullViewDesc(uavDesc, imageDesc.format);
@@ -3559,7 +3668,13 @@ namespace dxup::d3d12 {
         auto buffer = createBuffer(bufferDesc);
         if (buffer) {
           if (auto ctx = beginInitialData()) {
-            ctx->updateBuffer(buffer.get(), 0, padded.size(), padded.data());
+            // The initial data (and its lock) ends also when the upload throws.
+            try {
+              ctx->updateBuffer(buffer.get(), 0, padded.size(), padded.data());
+            } catch (...) {
+              endInitialData(ctx.get());
+              throw;
+            }
             endInitialData(ctx.get());
           }
           entry.slot = shader->getIcbSlot();
@@ -3611,6 +3726,30 @@ namespace dxup::d3d12 {
       hr = E_FAIL;
     }
     logMessage(LogLevel::Debug, "safeCreateGraphicsPSO: EXITING hr=0x%08X pso=%p", hr, *ppPSO);
+    return hr;
+  }
+
+  // The same for compute pipelines, which also start from cached blobs a
+  // driver may choke on.
+  __declspec(noinline)
+  static HRESULT safeCreateComputePSO(
+      ID3D12Device* device,
+      const D3D12_COMPUTE_PIPELINE_STATE_DESC* psoDesc,
+      ID3D12PipelineState** ppPSO) {
+    *ppPSO = nullptr;
+    HRESULT removeReason = device->GetDeviceRemovedReason();
+    if (FAILED(removeReason)) {
+      logMessage(LogLevel::Error, "safeCreateComputePSO: device already removed (0x%08X), skipping PSO creation", removeReason);
+      return removeReason;
+    }
+    HRESULT hr = E_FAIL;
+    __try {
+      hr = device->CreateComputePipelineState(psoDesc, IID_PPV_ARGS(ppPSO));
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+      logMessage(LogLevel::Error, "CreateComputePipelineState CRASHED (SEH exception 0x%08X)", GetExceptionCode());
+      *ppPSO = nullptr;
+      hr = E_FAIL;
+    }
     return hr;
   }
 #endif
@@ -4189,8 +4328,10 @@ namespace dxup::d3d12 {
       if (us >= 4000)
         logSlowPipeline(desc, us);
     }
+    // The description as the application made it, which the key stands for:
+    // a later run then finds the record and precompiles the same pipeline.
     if (pipeline)
-      storePipelineRecord(desc, key);
+      storePipelineRecord(source, key);
     {
       std::lock_guard<std::mutex> lock(m_psoCacheMutex);
       // Failures stay cached too: the state is not tried again for every draw.
@@ -4209,6 +4350,11 @@ namespace dxup::d3d12 {
     // Compiler threads count too.
     static std::atomic<int> gfxPipeCreateLogCount{0};
     if (gfxPipeCreateLogCount < 128) {
+      size_t cacheSize = 0;
+      {
+        std::lock_guard<std::mutex> lock(m_psoCacheMutex);
+        cacheSize = m_psoCache.size();
+      }
       logMessage(LogLevel::Info,
         "createGfxPipeline: CACHE MISS rootSig=%p vs=%p(%zu) ps=%p(%zu) numRT=%u dsvFmt=%u topo=%u sample=%u cacheSize=%zu",
         m_graphicsRootSignature.Get(),
@@ -4218,7 +4364,7 @@ namespace dxup::d3d12 {
         static_cast<uint32_t>(desc.dsvFormat),
         static_cast<uint32_t>(desc.topology),
         desc.sampleCount,
-        m_psoCache.size());
+        cacheSize);
       gfxPipeCreateLogCount++;
     }
 
@@ -4704,17 +4850,26 @@ namespace dxup::d3d12 {
   Rc<IBackendPipeline> D3D12BackendDevice::createComputePipeline(const ComputePipelineDesc& desc) {
     HitchScope hitch("createComputePipeline");
 #ifdef _WIN32
-    static int csCreateLogCount = 0;
+    // Several threads may create compute pipelines: each dump takes a
+    // number of its own.
+    static std::atomic<int> csCreateLogs{0};
+    int csCreateLogCount = 0;
     if (computeShaderDumpEnabled()
-     && csCreateLogCount < 3
      && desc.csBytecode
-     && desc.csBytecodeSize >= 28) {
+     && desc.csBytecodeSize >= 28
+     && (csCreateLogCount = csCreateLogs.fetch_add(1, std::memory_order_relaxed)) < 3) {
       const uint8_t* bc = static_cast<const uint8_t*>(desc.csBytecode);
+      const size_t bcSize = desc.csBytecodeSize;
+      auto readU32 = [bc](size_t at) {
+        uint32_t value = 0;
+        std::memcpy(&value, bc + at, sizeof(value));
+        return value;
+      };
       logMessage(LogLevel::Info, "createComputePSO #%d: bytecodeSize=%zu magic=%c%c%c%c totalSize=%u",
         csCreateLogCount,
-        desc.csBytecodeSize,
+        bcSize,
         bc[0], bc[1], bc[2], bc[3],
-        *reinterpret_cast<const uint32_t*>(bc + 24));
+        readU32(24));
 
       // Save first shader to file for offline analysis
       if (csCreateLogCount == 0) {
@@ -4727,22 +4882,24 @@ namespace dxup::d3d12 {
         }
       }
 
-      // Find and dump SHEX chunk tokens (resource declarations)
-      if (desc.csBytecodeSize >= 32) {
-        uint32_t chunkCount = *reinterpret_cast<const uint32_t*>(bc + 28);
-        if (32 + chunkCount * 4 <= desc.csBytecodeSize) {
+      // Find and dump SHEX chunk tokens (resource declarations). The
+      // application's container is checked like any input: 64-bit offsets,
+      // chunks cut to the bytes there are.
+      if (bcSize >= 32) {
+        const uint32_t chunkCount = readU32(28);
+        if (32 + uint64_t(chunkCount) * 4 <= bcSize) {
           for (uint32_t i = 0; i < chunkCount && i < 20; i++) {
-            uint32_t offset = *reinterpret_cast<const uint32_t*>(bc + 32 + i * 4);
-            if (offset + 8 <= desc.csBytecodeSize) {
+            const uint32_t offset = readU32(32 + size_t(i) * 4);
+            if (uint64_t(offset) + 8 <= bcSize) {
               char tag[5] = {};
               memcpy(tag, bc + offset, 4);
-              uint32_t chunkSize = *reinterpret_cast<const uint32_t*>(bc + offset + 4);
+              const uint32_t chunkSize = readU32(offset + 4);
               logMessage(LogLevel::Info, "  chunk[%u]: '%s' offset=%u size=%u", i, tag, offset, chunkSize);
 
               // Dump SHEX tokens
               if (memcmp(tag, "SHEX", 4) == 0 || memcmp(tag, "SHDR", 4) == 0) {
-                const uint32_t* tokens = reinterpret_cast<const uint32_t*>(bc + offset + 8);
-                uint32_t tokenCount = chunkSize / 4;
+                const uint64_t available = (std::min)(uint64_t(chunkSize), uint64_t(bcSize) - offset - 8);
+                const uint32_t tokenCount = uint32_t(available / 4);
                 // Dump first 60 tokens (includes version, length, and all declarations)
                 uint32_t dumpCount = tokenCount < 60 ? tokenCount : 60;
                 for (uint32_t t = 0; t < dumpCount; t += 4) {
@@ -4750,7 +4907,7 @@ namespace dxup::d3d12 {
                   char hexBuf[256] = {};
                   int pos = 0;
                   for (uint32_t tt = t; tt < end; tt++)
-                    pos += sprintf(hexBuf + pos, " %08X", tokens[tt]);
+                    pos += snprintf(hexBuf + pos, sizeof(hexBuf) - size_t(pos), " %08X", readU32(offset + 8 + size_t(tt) * 4));
                   logMessage(LogLevel::Info, "  SHEX[%u]:%s", t, hexBuf);
                 }
               }
@@ -4758,7 +4915,6 @@ namespace dxup::d3d12 {
           }
         }
       }
-      csCreateLogCount++;
     }
 
     if (!desc.csBytecode || !desc.csBytecodeSize)
@@ -4874,19 +5030,18 @@ namespace dxup::d3d12 {
     }
 
     ComPtr<ID3D12PipelineState> pso;
-    HRESULT hr = m_device->CreateComputePipelineState(&psoDesc, IID_PPV_ARGS(&pso));
+    HRESULT hr = safeCreateComputePSO(m_device.Get(), &psoDesc, pso.ReleaseAndGetAddressOf());
     if (FAILED(hr) && hadDiskCache) {
       logMessage(LogLevel::Warn,
         "Compute PSO disk cache: cached blob failed, retrying without cache hash=%llx",
         static_cast<unsigned long long>(psoKeyHash));
       psoDesc.CachedPSO = {};
-      pso.Reset();
-      hr = m_device->CreateComputePipelineState(&psoDesc, IID_PPV_ARGS(&pso));
+      hr = safeCreateComputePSO(m_device.Get(), &psoDesc, pso.ReleaseAndGetAddressOf());
 
       DeleteFileA(psoDiskPath(psoKeyHash).c_str());
       hadDiskCache = false;
     }
-    if (FAILED(hr)) {
+    if (FAILED(hr) || !pso) {
       logMessage(LogLevel::Error, "CreateComputePipelineState FAILED hr=0x%08X size=%zu", hr, desc.csBytecodeSize);
       return nullptr;
     }
@@ -5133,14 +5288,21 @@ namespace dxup::d3d12 {
   }
 
   Rc<IBackendContext> D3D12BackendDevice::beginInitialData() {
-    m_initDataMutex.lock();
+    // Held until endInitialData, which callers only call with a context:
+    // without one (its creation threw or failed) the lock goes now.
+    std::unique_lock<std::mutex> lock(m_initDataMutex);
     if (!m_initDataContext)
       m_initDataContext = createCopyContext();
+    if (!m_initDataContext)
+      return nullptr;
+    lock.release();
     return m_initDataContext;
   }
 
   void D3D12BackendDevice::endInitialData(IBackendContext* context) {
     (void)context;
+    // Taken over from beginInitialData; released also when the flush throws.
+    std::unique_lock<std::mutex> lock(m_initDataMutex, std::adopt_lock);
     m_initDataPending.store(true, std::memory_order_release);
     // Loading many resources at once still submits now and then.
     if (++m_initDataRecorded >= 128 && m_initDataContext) {
@@ -5148,7 +5310,6 @@ namespace dxup::d3d12 {
       m_initDataRecorded = 0;
       m_initDataPending.store(false, std::memory_order_release);
     }
-    m_initDataMutex.unlock();
   }
 
   void D3D12BackendDevice::submitInitialData() {
@@ -5416,14 +5577,26 @@ namespace dxup::d3d12 {
       return;
     }
 
+    // Written beside it and renamed: a run that ends meanwhile, or another
+    // process reading the cache, never finds a partial blob under the name.
     const std::string path = psoDiskPath(keyHash);
-
-    std::ofstream f(path, std::ios::binary);
-    if (f) {
-      f.write(static_cast<const char*>(rawBlob->GetBufferPointer()),
-              static_cast<std::streamsize>(rawBlob->GetBufferSize()));
+    const std::string temp = path + ".tmp" + std::to_string(GetCurrentProcessId()) + "_"
+      + std::to_string(GetCurrentThreadId());
+    bool written = false;
+    {
+      std::ofstream f(temp, std::ios::binary | std::ios::trunc);
+      if (f) {
+        f.write(static_cast<const char*>(rawBlob->GetBufferPointer()),
+                static_cast<std::streamsize>(rawBlob->GetBufferSize()));
+        f.close();
+        written = !f.fail();
+      }
+    }
+    if (written && MoveFileExA(temp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING)) {
       logMessage(LogLevel::Debug, "PSO disk cache: saved %zu bytes to %s",
         rawBlob->GetBufferSize(), path.c_str());
+    } else {
+      DeleteFileA(temp.c_str());
     }
     rawBlob->Release();
 #endif

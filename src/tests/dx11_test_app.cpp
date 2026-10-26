@@ -10089,8 +10089,9 @@ float4 main(float4 position : SV_Position, float4 t0 : TEXCOORD0, float4 t : TEX
 
     // Video memory a burst took goes back once it is released: 1 GB of
     // textures and 250 MB of renamed dynamic buffers (Trine 4 kept 460-680 MB
-    // of upload blocks after loading). DXUP_TRIM_INTERVAL_MS shortens DXUP's
-    // 10 seconds between trims (see runIdleMemoryTrimChild).
+    // of upload blocks after loading); renamed staging memory goes too.
+    // DXUP_TRIM_INTERVAL_MS shortens DXUP's 10 seconds between trims (see
+    // runIdleMemoryTrimChild).
     bool testIdleMemoryTrim(std::string& error) {
       SetEnvironmentVariableA("DXUP_TRIM_INTERVAL_MS", "100");
       const bool passed = runChildProcess("--idle-memory-trim-child", error);
@@ -22898,7 +22899,8 @@ float4 main(float4 position : SV_Position) : SV_Target {
   // dispatches never miss, and releasing shaders and input layouts while
   // their pipeline compiles does no harm.
   // Draws with shaders unique to the seed: four pipelines (two pixel
-  // shaders, two blend states), each checked.
+  // shaders, two blend states) and a stream output of the vertex shader,
+  // each checked.
   int runPrecompileChild(unsigned long long seed) {
     ComPtr<ID3D11Device> device;
     ComPtr<ID3D11DeviceContext> context;
@@ -22983,6 +22985,55 @@ float4 main(uint id : SV_VertexID) : SV_Position {
           return 20 + blend * 2 + i;
       }
     }
+
+    // Stream output from the vertex shader with more than 64 declaration
+    // entries (D3D11 takes up to 512): stored once like any pipeline.
+    const std::string soSource = formatString(R"(
+struct Output { float4 data[20] : DATA; };
+Output main(uint id : SV_VertexID) {
+  Output output;
+  [unroll] for (int i = 0; i < 20; i++)
+    output.data[i] = float4(i * 4, i * 4 + 1, i * 4 + 2, i * 4 + 3) + float(id) * 1000.0f + %llu.0f * 1e-30f;
+  return output;
+}
+)", seed % 1000000ull);
+    ComPtr<ID3DBlob> soCode;
+    if (!compiler.compile(soSource.c_str(), "main", "vs_5_0", soCode, compileError))
+      return 30;
+    D3D11_SO_DECLARATION_ENTRY entries[80] = {};
+    for (UINT i = 0; i < 80; i++)
+      entries[i] = { 0, "DATA", i / 4, BYTE(i % 4), 1, 0 };
+    const UINT soStride = 80 * sizeof(float);
+    ComPtr<ID3D11VertexShader> soVs;
+    ComPtr<ID3D11GeometryShader> soGs;
+    if (FAILED(device->CreateVertexShader(soCode->GetBufferPointer(), soCode->GetBufferSize(), nullptr, soVs.GetAddressOf()))
+     || FAILED(device->CreateGeometryShaderWithStreamOutput(soCode->GetBufferPointer(), soCode->GetBufferSize(), entries, 80,
+          &soStride, 1, D3D11_SO_NO_RASTERIZED_STREAM, nullptr, soGs.GetAddressOf())))
+      return 31;
+    D3D11_BUFFER_DESC soDesc = { soStride, D3D11_USAGE_DEFAULT, D3D11_BIND_STREAM_OUTPUT, 0, 0, 0 };
+    D3D11_BUFFER_DESC soReadDesc = { soStride, D3D11_USAGE_STAGING, 0, D3D11_CPU_ACCESS_READ, 0, 0 };
+    ComPtr<ID3D11Buffer> soBuffer, soRead;
+    if (FAILED(device->CreateBuffer(&soDesc, nullptr, soBuffer.GetAddressOf()))
+     || FAILED(device->CreateBuffer(&soReadDesc, nullptr, soRead.GetAddressOf())))
+      return 32;
+    const UINT soOffset = 0;
+    context->OMSetRenderTargets(0, nullptr, nullptr);
+    context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_POINTLIST);
+    context->VSSetShader(soVs.Get(), nullptr, 0);
+    context->GSSetShader(soGs.Get(), nullptr, 0);
+    context->PSSetShader(nullptr, nullptr, 0);
+    context->SOSetTargets(1, soBuffer.GetAddressOf(), &soOffset);
+    context->Draw(1, 0);
+    context->SOSetTargets(0, nullptr, nullptr);
+    context->GSSetShader(nullptr, nullptr, 0);
+    context->CopyResource(soRead.Get(), soBuffer.Get());
+    D3D11_MAPPED_SUBRESOURCE soMapped = {};
+    if (FAILED(context->Map(soRead.Get(), 0, D3D11_MAP_READ, 0, &soMapped)))
+      return 33;
+    const float streamed = static_cast<const float*>(soMapped.pData)[77];
+    context->Unmap(soRead.Get(), 0);
+    if (streamed != 77.0f)
+      return 34;
     return 0;
   }
 
@@ -24422,9 +24473,58 @@ float4 main() : SV_Target { return color; }
     present(160, 20);
     const int64_t after = usage();
     std::printf("  idle memory: %lld MB after\n", static_cast<long long>(after));
+    if (after > before + 256)
+      return 8;
+
+    // A staging texture mapped again while a copy from it waits gets other
+    // memory (DXUP renames it); the trims free the old memory, and later
+    // uploads through the texture still arrive whole.
+    D3D11_TEXTURE2D_DESC uploadDesc = { 256, 256, 1, 1, DXGI_FORMAT_R8G8B8A8_UINT, { 1, 0 }, D3D11_USAGE_STAGING, 0,
+      D3D11_CPU_ACCESS_READ | D3D11_CPU_ACCESS_WRITE, 0 };
+    D3D11_TEXTURE2D_DESC targetDesc = uploadDesc;
+    targetDesc.Usage = D3D11_USAGE_DEFAULT;
+    targetDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    targetDesc.CPUAccessFlags = 0;
+    D3D11_TEXTURE2D_DESC readDesc = uploadDesc;
+    readDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    ComPtr<ID3D11Texture2D> upload, target, readback;
+    if (FAILED(device->CreateTexture2D(&uploadDesc, nullptr, upload.GetAddressOf()))
+     || FAILED(device->CreateTexture2D(&targetDesc, nullptr, target.GetAddressOf()))
+     || FAILED(device->CreateTexture2D(&readDesc, nullptr, readback.GetAddressOf())))
+      return 9;
+    auto uploadRows = [&](uint32_t value) {
+      D3D11_MAPPED_SUBRESOURCE mapped = {};
+      if (FAILED(context->Map(upload.Get(), 0, D3D11_MAP_WRITE, 0, &mapped)))
+        return false;
+      for (UINT y = 0; y < 256; y++) {
+        auto* row = reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(mapped.pData) + y * mapped.RowPitch);
+        for (UINT x = 0; x < 256; x++)
+          row[x] = value + y;
+      }
+      context->Unmap(upload.Get(), 0);
+      context->CopyResource(target.Get(), upload.Get());
+      return true;
+    };
+    for (uint32_t i = 0; i < 8; i++) {
+      if (!uploadRows(i << 16))
+        return 10;
+    }
+    present(40, 20);
+    if (!uploadRows(0x0abc0000u))
+      return 10;
+    context->CopyResource(readback.Get(), target.Get());
+    D3D11_MAPPED_SUBRESOURCE mapped = {};
+    if (FAILED(context->Map(readback.Get(), 0, D3D11_MAP_READ, 0, &mapped)))
+      return 11;
+    const uint32_t texel = reinterpret_cast<const uint32_t*>(static_cast<const uint8_t*>(mapped.pData) + 100 * mapped.RowPitch)[37];
+    context->Unmap(readback.Get(), 0);
+    if (texel != 0x0abc0000u + 100) {
+      std::fprintf(stderr, "staging upload after the trims reads 0x%08X\n", texel);
+      return 12;
+    }
     swapChain.Reset();
     DestroyWindow(window);
-    return after <= before + 256 ? 0 : 8;
+    return 0;
   }
 
   // Counts the module's DisableProcessWindowsGhosting calls instead of

@@ -22,6 +22,8 @@ namespace dxup::d3d12 {
     // A record larger than this is not a pipeline description: the file
     // is damaged from there on.
     constexpr uint32_t kMaxRecordSize      = 64u << 10;
+    // D3D11 streams out up to 128 components to each of 4 streams.
+    constexpr uint32_t kMaxSoEntries       = 4 * 128;
 
     uint64_t shaderId(uint64_t hash, uint64_t size) {
       return hash ^ (size * 0x9e3779b97f4a7c15ull);
@@ -302,7 +304,7 @@ namespace dxup::d3d12 {
       desc.sampleQuality = r.get<uint32_t>();
 
       const uint32_t soCount = r.get<uint32_t>();
-      if (soCount > 64)
+      if (soCount > kMaxSoEntries)
         return false;
       soEntries.resize(soCount);
       for (auto& e : soEntries) {
@@ -369,10 +371,12 @@ namespace dxup::d3d12 {
         break;
       std::vector<uint8_t> record(contents.begin() + ptrdiff_t(offset + sizeof(uint32_t)),
                                   contents.begin() + ptrdiff_t(offset + sizeof(uint32_t) + size));
+      offset += sizeof(uint32_t) + size;
+      // A whole record this build cannot read is skipped: the ones after it
+      // stay, and the file is not cut there on the next append.
       DecodedPipeline decoded;
       if (!decoded.decode(record))
-        break;
-      offset += sizeof(uint32_t) + size;
+        continue;
       if (!m_storedPipelineKeys.insert(graphicsPipelineKey(decoded.desc)).second)
         continue;
 
@@ -475,6 +479,9 @@ namespace dxup::d3d12 {
     }
     DeferredPsoDiskWrite write;
     write.record = encodePipeline(desc);
+    // Loading would take a larger record for damage and stop there.
+    if (write.record.size() > kMaxRecordSize)
+      return;
     {
       std::lock_guard<std::mutex> lock(m_psoDiskWriteMutex);
       m_deferredPsoDiskWrites.push_back(std::move(write));

@@ -288,6 +288,12 @@ namespace dxup::d3d12::dxbc {
     return (opcode >= 0x58 && opcode <= 0x6a) || (opcode >= 0x8f && opcode <= 0xa2) || opcode == 0xce || opcode == 0x35;
   }
 
+  // hs_decls and the hull shader phase markers: a hull shader's global
+  // declarations (resources among them) follow hs_decls.
+  inline bool isHullShaderSection(uint32_t opcode) {
+    return opcode >= 0x71 && opcode <= 0x74;
+  }
+
   // Code chunk tokens with outputs added that the shader sets to (0, 0, 0, 1)
   // before anything else: declarations after the existing ones, moves first.
   inline bool addConstantOutputCode(const uint8_t* data, uint32_t size, const std::vector<SignatureElement>& outputs,
@@ -464,7 +470,7 @@ namespace dxup::d3d12::dxbc {
       const uint32_t length = instructionLength(tokens, at);
       if (!length)
         return false;
-      if (!isDeclaration(opcode))
+      if (!isDeclaration(opcode) && !isHullShaderSection(opcode))
         break;
       // dcl_resource, dcl_resource_raw, dcl_resource_structured: a resource
       // operand with a one-dimensional immediate index.
@@ -504,7 +510,7 @@ namespace dxup::d3d12::dxbc {
       const uint32_t length = instructionLength(tokens, at);
       if (!length)
         return false;
-      if (!isDeclaration(opcode))
+      if (!isDeclaration(opcode) && !isHullShaderSection(opcode))
         break;
       // dcl_resource(_raw, _structured), dcl_uav_typed(_raw, _structured):
       // a register operand with a one-dimensional immediate index.
@@ -805,7 +811,7 @@ namespace dxup::d3d12::dxbc {
         // their own changes what goes where) and the *_FEEDBACK loads and
         // samples write a status besides: they stay whole.
         const bool keepWhole = (opcode >= 0xbf && opcode <= 0xca) || (opcode >= 0xd2 && opcode <= 0xd9)
-          || (opcode >= 0xdd && opcode <= 0xec);
+          || (opcode >= 0xdb && opcode <= 0xec);
         const bool keepInstruction = keepWhole || opcode == 0x26 || opcode == 0x4d || opcode == 0x4e || opcode == 0x51
           || opcode == 0x84 || opcode == 0x85 || opcode == 0x8e || (opcode >= 0xb2 && opcode <= 0xbd);
         bool writesNothing = false;

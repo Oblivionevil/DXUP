@@ -434,6 +434,18 @@ namespace dxup::d3d12 {
   // ============================================================
   class D3D12BackendImageView;
 
+#ifdef _WIN32
+  // The staging images of a device that hold renamed memory (spares, see
+  // D3D12BackendImage::renameStaging): the device's trim frees the spares
+  // nothing took again for a while.
+  struct D3D12StagingSpareRegistry {
+    std::mutex                                    mutex;
+    std::vector<std::weak_ptr<D3D12BackendImage>> images;
+    // Advanced by every trim round; a spare carries the round it was made in.
+    std::atomic<uint64_t>                         epoch{ 1 };
+  };
+#endif
+
   class D3D12BackendImage : public IBackendImage, public std::enable_shared_from_this<D3D12BackendImage> {
   public:
 #ifdef _WIN32
@@ -492,10 +504,14 @@ namespace dxup::d3d12 {
       std::vector<UINT64>                             rowSizes;
     };
     void initStaging(std::shared_ptr<D3D12BackendBuffer> buffer, StagingLayout layout, uint8_t* mapped,
-                     ID3D12Device* device);
+                     ID3D12Device* device, std::shared_ptr<D3D12StagingSpareRegistry> spareRegistry);
     // Swaps in memory holding the current contents; the old memory stays a
     // spare until the GPU passed readFence (renameStagingImage).
     bool renameStaging(uint64_t readFence, uint64_t completedFence);
+    // Frees the spares made in trim round releaseEpoch and before (the
+    // device's trim knows the GPU is done with them), adding their count to
+    // released; true while some stay.
+    bool trimStagingSpares(uint64_t releaseEpoch, size_t& released);
     bool isStaging() const { return m_stagingBuffer != nullptr; }
     D3D12BackendBuffer* getStagingBuffer() const { return m_stagingBuffer.get(); }
     const StagingLayout& getStagingLayout() const { return m_staging; }
@@ -577,8 +593,13 @@ namespace dxup::d3d12 {
       std::shared_ptr<D3D12BackendBuffer> buffer;
       uint8_t*                            mapped = nullptr;
       uint64_t                            fence = 0;
+      uint64_t                            epoch = 0;   // D3D12StagingSpareRegistry::epoch when made
     };
+    // The spares, also trimmed by the device at present (on the CS worker).
+    std::mutex                m_stagingMutex;
     std::vector<StagingSpare> m_stagingSpares;
+    std::shared_ptr<D3D12StagingSpareRegistry> m_spareRegistry;
+    bool                      m_spareRegistered = false;   // in m_spareRegistry->images
     ComPtr<ID3D12Device>      m_stagingDevice;
     uint32_t                  m_stagingMaps = 0;
     // Depth-stencil staging images: D3D11 maps depth and stencil
@@ -636,6 +657,10 @@ namespace dxup::d3d12 {
 #endif
 
   private:
+#ifdef _WIN32
+    void writeRawClearUav(D3D12BackendBuffer* buffer);
+#endif
+
     IBackendBuffer*           m_buffer;
     BufferViewDesc            m_desc;
     Rc<IBackendBuffer>        m_counterBuffer;
@@ -1138,8 +1163,10 @@ namespace dxup::d3d12 {
     ComPtr<ID3D12Device>         m_device;
     ComPtr<ID3D12CommandQueue>   m_commandQueue;
     ComPtr<ID3D12Fence>          m_fence;
+    // Values go to the queue in the order they are handed out: several
+    // threads signal (GPU sync validation in resource creation, the trim).
+    std::mutex                   m_fenceMutex;
     uint64_t                     m_fenceValue = 0;
-    HANDLE                       m_fenceEvent = nullptr;
     // Stopped before the queue and the fences go.
     SubmitQueue                  m_submitQueue;
 
@@ -1183,9 +1210,16 @@ namespace dxup::d3d12 {
       Rc<IBackendBuffer> buffer;
       uint64_t sequence = 0;
     };
-    using RecycledBufferMap = std::unordered_map<RecycledBufferKey, std::vector<RecycledBuffer>, RecycledBufferKeyHash>;
+    using RecycledBufferMap = std::unordered_map<RecycledBufferKey, std::deque<RecycledBuffer>, RecycledBufferKeyHash>;
     RecycledBufferMap m_recycledBuffers;
-    RecycledBufferMap::iterator oldestRecycledBucket();   // under the mutex
+    // Every recycled buffer in the order it came back, for evicting the one
+    // waiting longest without a search; entries of buffers taken again stay
+    // until they come up (or the queue is rebuilt without them).
+    std::deque<std::pair<uint64_t, RecycledBufferKey>> m_recycleOrder;
+    // Under the mutex: the buffer waiting longest leaves its bucket (null
+    // when none waits); with maxSequence, only one back by then.
+    Rc<IBackendBuffer> evictOldestRecycled(uint64_t maxSequence = ~0ull);
+    void compactRecycleOrder();
     std::mutex m_recycledBufferMutex;
     size_t m_recycledBufferCount = 0;
     // Upload memory kept for reuse past a present: in a 32-bit process each
@@ -1203,6 +1237,11 @@ namespace dxup::d3d12 {
     uint64_t m_recycleTrimMark = 0;          // buffers back before the last trim
     std::atomic<uint64_t> m_lastRecycleTrim{ 0 };
     void trimRecycledBuffers();
+
+    std::shared_ptr<D3D12StagingSpareRegistry> m_stagingSpareRegistry = std::make_shared<D3D12StagingSpareRegistry>();
+    std::atomic<uint64_t> m_lastStagingTrim{ 0 };
+    uint64_t m_stagingTrimFence = 0;          // signaled by the last round, under the registry's mutex
+    void trimStagingSpares();
 
     static bool isReusableUploadBuffer(const BufferDesc& desc);
     static RecycledBufferKey makeRecycledBufferKey(const BufferDesc& desc);
@@ -1230,6 +1269,7 @@ namespace dxup::d3d12 {
     void trimIdleMemory() {
 #ifdef _WIN32
       trimRecycledBuffers();
+      trimStagingSpares();
 #endif
       m_uploadSuballocator.trim();
       m_textureAllocator->trim();
@@ -1259,10 +1299,12 @@ namespace dxup::d3d12 {
     // PCI vendor of the adapter (0x1002 AMD, 0x10DE NVIDIA, 0x8086 Intel).
     uint32_t getVendorId() const { return m_vendorId; }
   public:
-    // Gives a lazily committed render target its memory before the first
-    // command that writes it: a heap of its own mapped onto all its tiles.
-    // True when this call mapped them; the caller then initializes the
-    // target (D3D12BackendContext::commitLazyImage).
+    // Gives a lazily committed render target its memory: a heap of its own
+    // mapped onto all its tiles, on the queue at once. Unmapped tiles read
+    // as zero; once mapped they hold garbage until the caller's clear, so
+    // the call comes before any command list uses the target. True when
+    // this call mapped them; the caller then initializes the target
+    // (D3D12BackendContext::commitLazyImage).
     bool commitLazyImage(D3D12BackendImage* image);
   private:
     // Whether render targets are committed on their first write
@@ -1287,6 +1329,11 @@ namespace dxup::d3d12 {
     void createCommonRootSignature();
     void createCommandSignatures();
     void waitForGpu();
+    // Signals the device fence after the work queued so far: the value it
+    // reaches then; ticket and result (once the ticket ran) of the signal.
+    uint64_t signalFence(uint64_t* ticket = nullptr, HRESULT* result = nullptr);
+    // Waits for the device fence; false when the time ran out first.
+    bool waitForFence(uint64_t value, DWORD timeoutMs);
 
     ComPtr<ID3D12CommandSignature> m_drawIndirectSignature;
     ComPtr<ID3D12CommandSignature> m_drawIndexedIndirectSignature;
