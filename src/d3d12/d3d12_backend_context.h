@@ -560,6 +560,10 @@ namespace dxup::d3d12 {
     uint64_t                          m_fenceValue = 0;
     uint64_t                          m_lastSignaledFenceValue = 0;
     HANDLE                            m_fenceEvent = nullptr;
+    // Waits until the GPU reached the value; false when it ended because
+    // the device is lost (a Signal the submit thread could not make never
+    // brings its value).
+    bool waitForFence(uint64_t value);
 
     // Fence value covering each recent frame's work, indexed by present
     // count, for the D3D11 maximum frame latency (at most 16 frames).
@@ -705,6 +709,10 @@ namespace dxup::d3d12 {
     };
     std::vector<std::shared_ptr<void>> m_pendingRetired;
     std::vector<FencedRetired> m_inFlightRetired;
+    // A resource of the context's own that it replaces: the old one goes
+    // once the GPU finished the commands recorded so far, which may still
+    // use it (holdBatchResource keeps nothing behind a CS thread).
+    void retireResource(ComPtr<ID3D12Resource>& resource);
 
     struct FencedSlices {
       uint64_t fenceValue;

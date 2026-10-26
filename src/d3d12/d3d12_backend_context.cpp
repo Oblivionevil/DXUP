@@ -716,18 +716,29 @@ namespace dxup::d3d12 {
       }
     }
 
+    // A fence value that is never signaled leaves its waits (Map, queries,
+    // allocator reuse) hanging: the device is removed instead, which ends
+    // them and tells the application.
     __declspec(noinline)
-    void safeExecuteAndSignal(ID3D12CommandQueue* queue, ID3D12CommandList* list, ID3D12Fence* fence, uint64_t value,
-                              SubmitQueue* submit) {
-      if (!safeExecute(queue, list))
-        submit->removeDevice("a command list faulted in ExecuteCommandLists (resource states unknown)");
+    void safeSignal(ID3D12CommandQueue* queue, ID3D12Fence* fence, uint64_t value, SubmitQueue* submit) {
       HRESULT hr = E_FAIL;
       __try {
         hr = queue->Signal(fence, value);
       } __except (EXCEPTION_EXECUTE_HANDLER) {
         logMessage(LogLevel::Error, "submit thread: Signal CRASHED (SEH=0x%08X)", GetExceptionCode());
       }
-      submit->checkResult(hr, "Signal");
+      if (FAILED(hr)) {
+        submit->checkResult(hr, "Signal");
+        submit->removeDevice("a fence value could not be signaled");
+      }
+    }
+
+    __declspec(noinline)
+    void safeExecuteAndSignal(ID3D12CommandQueue* queue, ID3D12CommandList* list, ID3D12Fence* fence, uint64_t value,
+                              SubmitQueue* submit) {
+      if (!safeExecute(queue, list))
+        submit->removeDevice("a command list faulted in ExecuteCommandLists (resource states unknown)");
+      safeSignal(queue, fence, value, submit);
       submit->checkDevice("ExecuteCommandLists");
     }
 
@@ -4695,8 +4706,7 @@ namespace dxup::d3d12 {
       return true;
     if (doNotWait)
       return false;
-    if (SUCCEEDED(m_fence->SetEventOnCompletion(value, m_fenceEvent)))
-      WaitForSingleObject(m_fenceEvent, INFINITE);
+    waitForFence(value);
     return true;
 #else
     (void)use;
@@ -5253,6 +5263,16 @@ namespace dxup::d3d12 {
         m_pendingRetired.push_back(std::move(object));
     }
     objects.clear();
+  }
+
+  void D3D12BackendContext::retireResource(ComPtr<ID3D12Resource>& resource) {
+#ifdef _WIN32
+    // Released with the submission the open command list becomes.
+    if (ID3D12Resource* raw = resource.Detach())
+      m_pendingRetired.emplace_back(raw, [](ID3D12Resource* r) { r->Release(); });
+#else
+    (void)resource;
+#endif
   }
 
   void D3D12BackendContext::retainTemporaryBuffer(Rc<IBackendBuffer> buffer) {
@@ -7221,6 +7241,13 @@ namespace dxup::d3d12 {
       m_psoDirtyAfterFlush = true;  // PSO must be re-bound on new command list
       m_pendingUploads.clear();
       m_pendingUploadBytes = 0;
+      // As resetCommandList: the lost list's uploads start the slot over,
+      // the fresh list has no predication, and the queries that were
+      // active continue (an End without its Begin fails the next list).
+      m_uploadScratchOffsets[m_currentAllocatorIndex] = 0;
+      m_predicationApplied = false;
+      resumeActiveQueries();
+      applyPredication();
       // Release batch resource refs — command list was never executed
       for (auto* res : m_batchResourceRefs) res->Release();
       m_batchResourceRefs.clear();
@@ -7273,7 +7300,7 @@ namespace dxup::d3d12 {
         const uint64_t value = m_fenceValue;
         SubmitQueue* owner = &m_device->submitQueue();
         owner->enqueue([fence, value, owner](ID3D12CommandQueue* queue) {
-          owner->checkResult(queue->Signal(fence, value), "Signal");
+          safeSignal(queue, fence, value, owner);
         });
         m_lastSignaledFenceValue = m_fenceValue;
         m_submittedFence->store(m_fenceValue, std::memory_order_release);
@@ -7413,6 +7440,33 @@ namespace dxup::d3d12 {
 #endif
   }
 
+  bool D3D12BackendContext::waitForFence(uint64_t value) {
+#ifdef _WIN32
+    if (m_fence->GetCompletedValue() >= value)
+      return true;
+    if (FAILED(m_fence->SetEventOnCompletion(value, m_fenceEvent)))
+      return false;
+    // No time limit while the work can still come (a long frame, a busy
+    // GPU), but a lost device ends the wait: the submit thread's failures
+    // remove it, and without ID3D12Device5 they only record the reason.
+    // The event is waited for until it comes otherwise: left set, it would
+    // end the next wait on it early.
+    DWORD result;
+    while ((result = WaitForSingleObject(m_fenceEvent, 100)) == WAIT_TIMEOUT) {
+      if (m_deviceRemoved || FAILED(m_device->submitQueue().lostReason())
+       || FAILED(m_device->getDevice()->GetDeviceRemovedReason())) {
+        logMessage(LogLevel::Error, "waitForFence: the device is lost, fence %llu not reached (at %llu)",
+          static_cast<unsigned long long>(value), static_cast<unsigned long long>(m_fence->GetCompletedValue()));
+        return false;
+      }
+    }
+    return result == WAIT_OBJECT_0;
+#else
+    (void)value;
+    return true;
+#endif
+  }
+
   void D3D12BackendContext::synchronize() {
     HitchScope hitch("backend synchronize");
 #ifdef _WIN32
@@ -7490,8 +7544,9 @@ namespace dxup::d3d12 {
       });
     }
     m_submittedFence->store(m_fenceValue, std::memory_order_release);
-    m_fence->SetEventOnCompletion(m_fenceValue, m_fenceEvent);
-    WaitForSingleObject(m_fenceEvent, INFINITE);
+    m_lastSignaledFenceValue = m_fenceValue;
+    if (!waitForFence(m_fenceValue))
+      m_deviceRemoved = true;
 
     decayPromotedImageStates();
 
@@ -8607,9 +8662,8 @@ namespace dxup::d3d12 {
       }
     }
     if (m_stencilResolveBufferSize < total) {
-      if (m_stencilResolveBuffer)
-        holdBatchResource(m_stencilResolveBuffer.Get());
-      m_stencilResolveBuffer.Reset();
+      // Resolves recorded before may still copy from the smaller one.
+      retireResource(m_stencilResolveBuffer);
       m_stencilResolveBufferSize = 0;
       D3D12_HEAP_PROPERTIES heap = {};
       heap.Type = D3D12_HEAP_TYPE_DEFAULT;

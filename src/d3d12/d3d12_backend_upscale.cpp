@@ -281,8 +281,8 @@ namespace dxup::d3d12 {
       const D3D12_RESOURCE_DESC have = m_velocityCalPrevious->GetDesc();
       if (have.Width == colorDesc.Width && have.Height == colorDesc.Height && have.Format == colorDesc.Format)
         return true;
-      holdBatchResource(m_velocityCalPrevious.Get());
-      m_velocityCalPrevious.Reset();
+      // Calibrations recorded before may still read the old one.
+      retireResource(m_velocityCalPrevious);
     }
     if (!m_velocityCalPso) {
       D3D12_DESCRIPTOR_RANGE ranges[2] = {};
@@ -787,13 +787,9 @@ namespace dxup::d3d12 {
   bool D3D12BackendContext::ensureUpscaleTextures(uint32_t width, uint32_t height) {
     if (m_upscaleMotion && m_upscaleTextureSize[0] == width && m_upscaleTextureSize[1] == height)
       return true;
-    // Commands of the open list may still use the previous ones.
-    if (m_upscaleMotion)
-      holdBatchResource(m_upscaleMotion.Get());
-    if (m_upscaleDepth)
-      holdBatchResource(m_upscaleDepth.Get());
-    m_upscaleMotion.Reset();
-    m_upscaleDepth.Reset();
+    // Commands recorded before may still use the previous ones.
+    retireResource(m_upscaleMotion);
+    retireResource(m_upscaleDepth);
 
     D3D12_HEAP_PROPERTIES heap = {};
     heap.Type = D3D12_HEAP_TYPE_DEFAULT;
