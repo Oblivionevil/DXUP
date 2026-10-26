@@ -3115,12 +3115,13 @@ float4 main(float2 t : TEXCOORD0) : COLOR { float v = tex2D(depth, t).r; return 
     return true;
   }
 
-  // Results as pixels in rows from (0, 2): white yes, gray no.
+  // Results as 4x4 squares, 16 to a row (up to 192): white yes, gray no.
+  // One square differing is more than the pixels scenes may differ by.
   void drawBits(IDirect3DDevice9* d, const std::vector<bool>& bits) {
     d->Clear(0, nullptr, D3DCLEAR_TARGET, 0xff000000u, 1.0f, 0);
     for (size_t i = 0; i < bits.size(); i++) {
-      const LONG x = LONG(i % kWidth), y = 2 + 2 * LONG(i / kWidth);
-      const D3DRECT r = { x, y, x + 1, y + 1 };
+      const LONG x = 4 * LONG(i % 16), y = 4 * LONG(i / 16);
+      const D3DRECT r = { x, y, x + 4, y + 4 };
       d->Clear(1, &r, D3DCLEAR_TARGET, bits[i] ? 0xffffffffu : 0xff404040u, 1.0f, 0);
     }
   }
