@@ -39,6 +39,9 @@ namespace dxup::d3d12 {
   // the GPU is done with it (32 MB instead of 6).
   constexpr uint32_t kInitialCbvSrvUavHeapSize = 3 * 65536;
   constexpr uint32_t kShaderVisibleSamplerHeapSize = 2048;
+  // The CBV/SRV/UAV descriptors left before ensureDescriptorHeapSpace moves
+  // on: a draw's tables at most (CBV 70 + SRV 640 + UAV 320 = 1030).
+  constexpr uint32_t kCbvSrvUavDescriptorReserve = 1100;
   constexpr size_t kMaxCachedCbvDescriptors = 16384;
 
   // Flush after this many draw/dispatch ops to bound command list size.
@@ -579,8 +582,9 @@ namespace dxup::d3d12 {
     uint32_t                         m_cbvSrvUavHeapSize = kShaderVisibleCbvSrvUavHeapSize;
     // Heaps replaced by a bigger one, until the GPU is done with them.
     std::vector<std::pair<ComPtr<ID3D12DescriptorHeap>, uint64_t>> m_retiredDescriptorHeaps;
-    bool createShaderVisibleCbvSrvUavHeap(uint32_t size);
-    void growDescriptorHeap();
+    ComPtr<ID3D12DescriptorHeap> createShaderVisibleCbvSrvUavHeap(uint32_t size);
+    // False when no bigger heap could be made: nothing changed then.
+    bool growDescriptorHeap();
     uint32_t                          m_cbvSrvUavHeapOffset = 0;
     uint32_t                          m_cbvSrvUavHeapBaseOffset = 0;
     uint32_t                          m_cbvSrvUavDescSize   = 0;

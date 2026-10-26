@@ -237,6 +237,8 @@ namespace dxup::d3d12 {
       scaled = static_cast<D3D12BackendImage*>(m_scaleIntermediate.get());
     }
 
+    // Its descriptors before any state is set (see ensureDescriptorHeapSpace).
+    ensureDescriptorHeapSpace();
     if (m_gpuProfiler.capturing())
       m_gpuProfiler.onInternal(m_cmdList.raw(), "spatial upscale", dst->getResource(), dstFormat);
     drawScalePass(scalePso, scaled, dstFormat, src, srcFormat, 0);

@@ -373,6 +373,7 @@ void main(uint2 id : SV_DispatchThreadID) {
         {"copy_region_and_update_subresource", &Dx11TestApp::testCopyRegionAndUpdateSubresource},
         {"generate_mips", &Dx11TestApp::testGenerateMips},
         {"generate_mips_arrays_and_state", &Dx11TestApp::testGenerateMipsArraysAndState},
+        {"generate_mips_large_array", &Dx11TestApp::testGenerateMipsLargeArray},
         {"generate_mips_1d_3d", &Dx11TestApp::testGenerateMips1D3D},
         {"initial_full_mip_chain", &Dx11TestApp::testInitialFullMipChain},
         {"raw_buffer_srv_compute", &Dx11TestApp::testRawBufferSrvCompute},
@@ -2809,6 +2810,63 @@ float4 main(float4 position : SV_Position) : SV_Target { return float4(0.0f, 0.0
           error = formatString("mip 3 of slice %u is %u,%u,%u", slice, pixel.r, pixel.g, pixel.b);
           return false;
         }
+      }
+      return true;
+    }
+
+    // GenerateMips of an array with a view per mip and layer, more than a
+    // draw's descriptors, again and again: the shader-visible heap moves on
+    // to its next part in the middle of the pass.
+    bool testGenerateMipsLargeArray(std::string& error) {
+      constexpr UINT kLayers = 2048, kMips = 3;
+      D3D11_TEXTURE2D_DESC desc = { 4, 4, kMips, kLayers, DXGI_FORMAT_R8G8B8A8_UNORM, { 1, 0 }, D3D11_USAGE_DEFAULT,
+        D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET, 0, D3D11_RESOURCE_MISC_GENERATE_MIPS };
+      auto color = [](UINT layer) { return Rgba8{ uint8_t(layer), uint8_t(layer >> 3), 77, 255 }; };
+      // Mip 0 of each layer in a color of its own, the smaller mips black.
+      std::vector<Rgba8> pixels(kLayers * 16), black(16);
+      std::vector<D3D11_SUBRESOURCE_DATA> init(kLayers * kMips);
+      for (UINT layer = 0; layer < kLayers; layer++) {
+        for (UINT i = 0; i < 16; i++)
+          pixels[layer * 16 + i] = color(layer);
+        for (UINT mip = 0; mip < kMips; mip++)
+          init[layer * kMips + mip] = { mip ? black.data() : &pixels[layer * 16], 16, 0 };
+      }
+      ComPtr<ID3D11Texture2D> texture, staging;
+      ComPtr<ID3D11ShaderResourceView> srv;
+      HRESULT hr = m_device->CreateTexture2D(&desc, init.data(), texture.GetAddressOf());
+      if (SUCCEEDED(hr))
+        hr = m_device->CreateShaderResourceView(texture.Get(), nullptr, srv.GetAddressOf());
+      desc.Usage = D3D11_USAGE_STAGING;
+      desc.BindFlags = 0;
+      desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+      desc.MiscFlags = 0;
+      if (SUCCEEDED(hr))
+        hr = m_device->CreateTexture2D(&desc, nullptr, staging.GetAddressOf());
+      if (FAILED(hr)) {
+        error = "texture setup failed: " + formatHResult(hr);
+        return false;
+      }
+      m_context->ClearState();
+      for (UINT i = 0; i < 24; i++)
+        m_context->GenerateMips(srv.Get());
+      m_context->CopyResource(staging.Get(), texture.Get());
+      for (UINT layer = 0; layer < kLayers; layer++) {
+        D3D11_MAPPED_SUBRESOURCE mapped = {};
+        if (FAILED(hr = m_context->Map(staging.Get(), layer * kMips + kMips - 1, D3D11_MAP_READ, 0, &mapped))) {
+          error = "Map failed: " + formatHResult(hr);
+          return false;
+        }
+        Rgba8 pixel;
+        std::memcpy(&pixel, mapped.pData, 4);
+        m_context->Unmap(staging.Get(), layer * kMips + kMips - 1);
+        if (!pixelNear(pixel, color(layer), 1)) {
+          error = formatString("mip %u of layer %u is %s", kMips - 1, layer, pixelToString(pixel).c_str());
+          return false;
+        }
+      }
+      if (m_device->GetDeviceRemovedReason() != S_OK) {
+        error = "device removed: " + formatHResult(m_device->GetDeviceRemovedReason());
+        return false;
       }
       return true;
     }

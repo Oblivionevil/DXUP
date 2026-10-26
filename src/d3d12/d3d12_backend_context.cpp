@@ -906,8 +906,8 @@ namespace dxup::d3d12 {
     if (!copyOnly) {
       // Create shader-visible CBV/SRV/UAV heap: small while partitions
       // recycle it (it grows when they do not), whole without them.
-      createShaderVisibleCbvSrvUavHeap(descriptorPartitionCount() > 1
-        ? kInitialCbvSrvUavHeapSize : kShaderVisibleCbvSrvUavHeapSize);
+      m_cbvSrvUavHeapSize = descriptorPartitionCount() > 1 ? kInitialCbvSrvUavHeapSize : kShaderVisibleCbvSrvUavHeapSize;
+      m_shaderVisibleCbvSrvUavHeap = createShaderVisibleCbvSrvUavHeap(m_cbvSrvUavHeapSize);
 
       // Create shader-visible sampler heap
       D3D12_DESCRIPTOR_HEAP_DESC samplerHeapDesc = {};
@@ -935,7 +935,9 @@ namespace dxup::d3d12 {
       m_computeRootSignature = device->getComputeRootSignature();
       m_cmdList->SetGraphicsRootSignature(m_currentRootSignature);
       m_cmdList->SetComputeRootSignature(m_computeRootSignature);
-      invalidateRootTableCache();
+      // Every root table set, as after a command list reset: the first
+      // draws commit only the stages that have bindings.
+      initNullDescriptorsAndRootTables();
 
       // Create query heaps
       D3D12_QUERY_HEAP_DESC queryHeapDesc = {};
@@ -1262,8 +1264,12 @@ namespace dxup::d3d12 {
     // SetGraphicsRootConstantBufferView after a scaled Present).
     if (m_currentRootSignature)
       m_cmdList->SetGraphicsRootSignature(m_currentRootSignature);
+    // Every root table again, as after a command list reset: draws commit
+    // only the stages with bindings. Room for their descriptors first (the
+    // pass took some; a submission sets the whole state itself).
+    ensureDescriptorHeapSpace();
+    initNullDescriptorsAndRootTables();
     markAllDescriptorStagesDirty();
-    invalidateRootTableCache();
     m_psoDirtyAfterFlush = true;
 #endif
   }
@@ -2931,6 +2937,10 @@ namespace dxup::d3d12 {
     resetBindingTracking();
     m_trackedOmBindingValid = omSetSucceeded;
 
+    // Room for the null tables' descriptors: past the partition's end they
+    // would overwrite the next partition's (or run past the heap).
+    if (!m_deviceRemoved && !m_closedForSubmission)
+      ensureDescriptorHeapSpace();
     initNullDescriptorsAndRootTables();
 #endif
   }
@@ -8245,20 +8255,30 @@ namespace dxup::d3d12 {
     uint32_t arrayCount = viewDesc.arrayLayerCount ? viewDesc.arrayLayerCount : layers - baseArrayLayer;
     arrayCount = (std::min)(arrayCount, layers - baseArrayLayer);
 
-    m_cmdList->SetPipelineState(pso);
-    m_cmdList->SetGraphicsRootSignature(m_mipGenRootSignature.Get());
-    invalidateRootTableCache();
-    m_cmdList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-
-    ID3D12DescriptorHeap* heaps[] = {
-      m_shaderVisibleCbvSrvUavHeap.Get(),
-      m_shaderVisibleSamplerHeap.Get()
+    auto setPassState = [&]() {
+      m_cmdList->SetPipelineState(pso);
+      m_cmdList->SetGraphicsRootSignature(m_mipGenRootSignature.Get());
+      invalidateRootTableCache();
+      m_cmdList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+      ID3D12DescriptorHeap* heaps[] = {
+        m_shaderVisibleCbvSrvUavHeap.Get(),
+        m_shaderVisibleSamplerHeap.Get()
+      };
+      m_cmdList->SetDescriptorHeaps(2, heaps);
     };
-    m_cmdList->SetDescriptorHeaps(2, heaps);
+    setPassState();
 
     for (uint32_t arraySlice = 0; arraySlice < arrayCount; arraySlice++) {
       const uint32_t layer = baseArrayLayer + arraySlice;
       for (uint32_t mip = 1; mip < mipCount; mip++) {
+        // A view per mip and layer: large arrays take more than the reserve
+        // made above. Room is made with the application's state on the list
+        // (a new partition sets its root tables, a submission all of it),
+        // then the pass goes on.
+        if (m_cbvSrvUavHeapOffset + kCbvSrvUavDescriptorReserve >= cbvSrvUavPartitionEnd()) {
+          restoreAfterInternalPass();
+          setPassState();
+        }
         const uint32_t srcMip = baseMip + mip - 1;
         const uint32_t dstMip = baseMip + mip;
         const uint32_t dstWidth  = (std::max)(imageDesc.width >> dstMip, 1u);
@@ -9782,10 +9802,11 @@ namespace dxup::d3d12 {
     // The heap is too small for this game: a bigger one instead of waiting
     // (tests make it grow with DXUP_TEST_GROW_DESCRIPTORS).
     const bool testGrow = GetEnvironmentVariableA("DXUP_TEST_GROW_DESCRIPTORS", nullptr, 0) > 0;
-    if (((fenceValue && completed < fenceValue) || testGrow) && m_cbvSrvUavHeapSize < kShaderVisibleCbvSrvUavHeapSize) {
-      growDescriptorHeap();
+    if (((fenceValue && completed < fenceValue) || testGrow) && m_cbvSrvUavHeapSize < kShaderVisibleCbvSrvUavHeapSize
+     && growDescriptorHeap())
       return;
-    }
+    // Without a bigger heap the partition is waited for: allocations must
+    // not run on into one the GPU still reads.
     if (fenceValue && completed < fenceValue) {
       m_fence->SetEventOnCompletion(fenceValue, m_fenceEvent);
       WaitForSingleObject(m_fenceEvent, 10000);
@@ -9812,34 +9833,37 @@ namespace dxup::d3d12 {
 #endif
   }
 
-  bool D3D12BackendContext::createShaderVisibleCbvSrvUavHeap(uint32_t size) {
+  ComPtr<ID3D12DescriptorHeap> D3D12BackendContext::createShaderVisibleCbvSrvUavHeap(uint32_t size) {
+    ComPtr<ID3D12DescriptorHeap> heap;
 #ifdef _WIN32
     D3D12_DESCRIPTOR_HEAP_DESC desc = {};
     desc.NumDescriptors = size;
     desc.Type           = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
     desc.Flags          = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
-    ComPtr<ID3D12DescriptorHeap> heap;
     if (FAILED(m_device->getDevice()->CreateDescriptorHeap(&desc, IID_PPV_ARGS(heap.GetAddressOf()))))
-      return false;
-    m_shaderVisibleCbvSrvUavHeap = std::move(heap);
-    m_cbvSrvUavHeapSize = size;
-    memstats::attach(m_shaderVisibleCbvSrvUavHeap.Get(), memstats::Internal, false,
-      uint64_t(size) * m_cbvSrvUavDescSize);
-    return true;
+      return nullptr;
+    memstats::attach(heap.Get(), memstats::Internal, false, uint64_t(size) * m_cbvSrvUavDescSize);
 #else
     (void)size;
-    return false;
 #endif
+    return heap;
   }
 
-  void D3D12BackendContext::growDescriptorHeap() {
+  bool D3D12BackendContext::growDescriptorHeap() {
 #ifdef _WIN32
-    // The submitted lists keep the old heap until the GPU is done with them.
+    // Made before anything changes: without it the caller waits instead.
+    ComPtr<ID3D12DescriptorHeap> heap = createShaderVisibleCbvSrvUavHeap(kShaderVisibleCbvSrvUavHeapSize);
+    if (!heap) {
+      logMessage(LogLevel::Warn, "descriptor heap: %u descriptors not available, partitions wait for the GPU",
+        kShaderVisibleCbvSrvUavHeapSize);
+      return false;
+    }
+    // The submitted lists keep the old heap until the GPU is done with them,
+    // and so does the one the submission opens (it was set on it).
     flush();
-    ComPtr<ID3D12DescriptorHeap> old = m_shaderVisibleCbvSrvUavHeap;
-    if (!createShaderVisibleCbvSrvUavHeap(kShaderVisibleCbvSrvUavHeapSize))
-      return;
-    m_retiredDescriptorHeaps.emplace_back(std::move(old), m_fenceValue);
+    m_retiredDescriptorHeaps.emplace_back(std::move(m_shaderVisibleCbvSrvUavHeap), m_fenceValue + 1);
+    m_shaderVisibleCbvSrvUavHeap = std::move(heap);
+    m_cbvSrvUavHeapSize = kShaderVisibleCbvSrvUavHeapSize;
     logMessage(LogLevel::Info, "descriptor heap: grown to %u descriptors", m_cbvSrvUavHeapSize);
     m_descriptorPartitionFences.fill(0);
     m_descriptorPartition = 0;
@@ -9849,6 +9873,9 @@ namespace dxup::d3d12 {
     m_cmdList->SetDescriptorHeaps(2, heaps);
     initNullDescriptorsAndRootTables();
     markAllDescriptorStagesDirty();
+    return true;
+#else
+    return false;
 #endif
   }
 
@@ -10061,7 +10088,7 @@ namespace dxup::d3d12 {
   void D3D12BackendContext::ensureDescriptorHeapSpace() {
     // Worst case per draw: CBV 70 + SRV 640 + UAV 320 = 1030, Sampler 80
     // Flush mid-frame if heaps are too full to avoid out-of-bounds descriptors.
-    constexpr uint32_t kCbvSrvUavReserve = 1100;
+    constexpr uint32_t kCbvSrvUavReserve = kCbvSrvUavDescriptorReserve;
     // Called for most draws: the usual case without a hitch scope (its
     // check and destructor were 2 % of the worker in draw-heavy work).
     if (m_samplerDescriptorsInBatch <= kShaderVisibleSamplerHeapSize / 2
