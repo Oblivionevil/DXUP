@@ -155,8 +155,14 @@ namespace dxup {
         if (!m_resolved) {
           m_resolved = true;
           m_canonical = canonicalFolder(m_folder);
+          m_remote = isRemote(m_canonical);
         }
         if (m_canonical.empty())
+          return false;
+        // Network folders only for a DLL on the network: a local game's
+        // folder is none, and a share that is not reachable would hold the
+        // game's start up.
+        if (!m_remote && isRemote(dir))
           return false;
         if (sameFolder(dir, m_canonical))
           return true;
@@ -168,9 +174,22 @@ namespace dxup {
       }
 
     private:
+      // A share, or a drive of one (also a mapped drive that is not
+      // connected); asked without touching the drive.
+      static bool isRemote(const std::wstring& path) {
+        if (path.size() >= 2 && (path[0] == L'\\' || path[0] == L'/') && (path[1] == L'\\' || path[1] == L'/'))
+          return true;
+        if (path.size() < 2 || path[1] != L':')
+          return false;
+        const wchar_t root[] = { path[0], L':', L'\\', 0 };
+        const UINT type = GetDriveTypeW(root);
+        return type == DRIVE_REMOTE || type == DRIVE_NO_ROOT_DIR;
+      }
+
       std::wstring m_folder;
       std::wstring m_canonical;
       bool         m_resolved = false;
+      bool         m_remote = false;
     };
 
     bool readFile(const std::wstring& path, std::string& text) {
@@ -239,19 +258,28 @@ namespace dxup {
         else
           blocks.back().settings += key + " = " + value + "\n";
       }
-      const Block* best = nullptr;
-      FolderMatch matches(dllFolder);
-      for (const auto& block : blocks) {
-        if (!matches(widen(block.dir)))
-          continue;
-        const std::wstring exe = widen(block.exe);
-        if (!exe.empty() && CompareStringOrdinal(exe.data(), static_cast<int>(exe.size()), exeName.data(),
-              static_cast<int>(exeName.size()), TRUE) == CSTR_EQUAL) {
-          best = &block;
-          break;
+      // The block of the folder, the one of the executable among several.
+      auto pick = [&](auto&& matches) -> const Block* {
+        const Block* best = nullptr;
+        for (const auto& block : blocks) {
+          if (!matches(widen(block.dir)))
+            continue;
+          const std::wstring exe = widen(block.exe);
+          if (!exe.empty() && CompareStringOrdinal(exe.data(), static_cast<int>(exe.size()), exeName.data(),
+                static_cast<int>(exeName.size()), TRUE) == CSTR_EQUAL)
+            return &block;
+          if (!best)
+            best = &block;
         }
-        if (!best)
-          best = &block;
+        return best;
+      };
+      // Blocks that name the folder as it is first: the usual case opens no
+      // folder at all. Only without one are the dirs compared as the file
+      // system names them (FolderMatch), which opens folders.
+      const Block* best = pick([&](const std::wstring& dir) { return sameFolder(dir, dllFolder); });
+      if (!best) {
+        FolderMatch aliases(dllFolder);
+        best = pick(aliases);
       }
       if (!best)
         return {};

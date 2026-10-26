@@ -567,6 +567,8 @@ namespace dxup::d3d12 {
     // the device is lost (a Signal the submit thread could not make never
     // brings its value).
     bool waitForFence(uint64_t value);
+    // The device is removed, or DXUP gave it up (submit queue's lostReason).
+    bool deviceLost() const;
 
     // Fence value covering each recent frame's work, indexed by present
     // count, for the D3D11 maximum frame latency (at most 16 frames).

@@ -427,6 +427,7 @@ void main(uint2 id : SV_DispatchThreadID) {
         {"command_list_keeps_objects", &Dx11TestApp::testCommandListKeepsObjects},
         {"command_list_retirement", &Dx11TestApp::testCommandListRetirement},
         {"command_list_buffer_renames", &Dx11TestApp::testCommandListBufferRenames},
+        {"command_list_keeps_buffer_views", &Dx11TestApp::testCommandListKeepsBufferViews},
         {"deferred_discard_views", &Dx11TestApp::testDeferredDiscardViews},
         {"copy_within_and_clear_rules", &Dx11TestApp::testCopyWithinAndClearRules},
         {"texture_creation_validation", &Dx11TestApp::testTextureCreationValidation},
@@ -12383,6 +12384,100 @@ float4 main(float4 position : SV_Position, float4 color : COLOR) : SV_Target { r
       recordDraw(m_context.Get());
       if (!expect("immediate context", Rgba8{255, 0, 0, 255}))
         return false;
+      m_context->ClearState();
+      return true;
+    }
+
+    // A command list keeps the buffer behind a buffer view it binds, as on
+    // Windows: the application releases view and buffer after recording,
+    // makes buffers of the same size (which may take their place) and runs
+    // the list later, more than once.
+    bool testCommandListKeepsBufferViews(std::string& error) {
+      static const char* kBufferColorPs = R"(
+Buffer<float4> colors : register(t0);
+float4 main(float4 position : SV_Position) : SV_Target { return colors[0]; }
+)";
+      TextureTarget target;
+      ComPtr<ID3D11VertexShader> vertexShader;
+      ComPtr<ID3DBlob> vertexBytecode;
+      ComPtr<ID3D11PixelShader> pixelShader;
+      ComPtr<ID3D11DeviceContext> deferred;
+      if (!createColorTarget(8, 8, D3D11_BIND_RENDER_TARGET, target, error)
+       || !createVertexShader(kFullscreenTriangleVs, "main", vertexShader, vertexBytecode, error)
+       || !createPixelShader(kBufferColorPs, "main", pixelShader, error))
+        return false;
+      HRESULT hr = m_device->CreateDeferredContext(0, deferred.GetAddressOf());
+      if (FAILED(hr)) {
+        error = "CreateDeferredContext failed: " + formatHResult(hr);
+        return false;
+      }
+      // 256 KB: a buffer of its own, not a slice of a shared block.
+      const D3D11_BUFFER_DESC desc = { 256u << 10, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, 0, 0 };
+      D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+      srvDesc.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+      srvDesc.ViewDimension = D3D11_SRV_DIMENSION_BUFFER;
+      srvDesc.Buffer.NumElements = 1;
+      auto makeColors = [&](const float (&color)[4], ComPtr<ID3D11Buffer>& buffer, ComPtr<ID3D11ShaderResourceView>& srv) {
+        std::vector<float> data((256u << 10) / sizeof(float));
+        for (size_t i = 0; i < data.size(); i += 4)
+          std::memcpy(&data[i], color, sizeof(color));
+        const D3D11_SUBRESOURCE_DATA initial = { data.data(), 0, 0 };
+        return SUCCEEDED(m_device->CreateBuffer(&desc, &initial, buffer.GetAddressOf()))
+            && SUCCEEDED(m_device->CreateShaderResourceView(buffer.Get(), &srvDesc, srv.GetAddressOf()));
+      };
+      const float green[4] = { 0.0f, 1.0f, 0.0f, 1.0f };
+      const float red[4] = { 1.0f, 0.0f, 0.0f, 1.0f };
+      ComPtr<ID3D11CommandList> list;
+      {
+        ComPtr<ID3D11Buffer> buffer;
+        ComPtr<ID3D11ShaderResourceView> srv;
+        if (!makeColors(green, buffer, srv)) {
+          error = "creating the buffer failed";
+          return false;
+        }
+        ID3D11RenderTargetView* rtv = target.rtv.Get();
+        deferred->OMSetRenderTargets(1, &rtv, nullptr);
+        D3D11_VIEWPORT viewport = { 0.0f, 0.0f, 8.0f, 8.0f, 0.0f, 1.0f };
+        deferred->RSSetViewports(1, &viewport);
+        deferred->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        deferred->VSSetShader(vertexShader.Get(), nullptr, 0);
+        deferred->PSSetShader(pixelShader.Get(), nullptr, 0);
+        deferred->PSSetShaderResources(0, 1, srv.GetAddressOf());
+        deferred->Draw(3, 0);
+        if (FAILED(hr = deferred->FinishCommandList(FALSE, list.GetAddressOf()))) {
+          error = "FinishCommandList failed: " + formatHResult(hr);
+          return false;
+        }
+        // Released here, with the deferred context's binding.
+      }
+      deferred.Reset();
+      std::vector<ComPtr<ID3D11Buffer>> others(8);
+      std::vector<ComPtr<ID3D11ShaderResourceView>> otherViews(8);
+      for (int round = 0; round < 3; round++) {
+        // Work the released objects retire behind, then buffers that may
+        // take their memory and places.
+        const float clear[4] = { 0.0f, 0.0f, 1.0f, 1.0f };
+        m_context->ClearRenderTargetView(target.rtv.Get(), clear);
+        m_context->Flush();
+        for (size_t i = 0; i < others.size(); i++) {
+          others[i].Reset();
+          otherViews[i].Reset();
+          if (!makeColors(red, others[i], otherViews[i])) {
+            error = "creating another buffer failed";
+            return false;
+          }
+        }
+        m_context->ExecuteCommandList(list.Get(), FALSE);
+        if (!expectTexturePixel(target.texture.Get(), 4, 4, Rgba8{0, 255, 0, 255}, 1, error)) {
+          error = formatString("execution %d: ", round + 1) + error;
+          return false;
+        }
+      }
+      HRESULT removed = m_device->GetDeviceRemovedReason();
+      if (FAILED(removed)) {
+        error = "device removed: " + formatHResult(removed);
+        return false;
+      }
       m_context->ClearState();
       return true;
     }

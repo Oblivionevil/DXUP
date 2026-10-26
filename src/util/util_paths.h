@@ -6,7 +6,6 @@
 #include <share.h>
 
 #include <cstdio>
-#include <cstring>
 #include <string>
 
 namespace dxup {
@@ -45,69 +44,6 @@ namespace dxup {
       return std::wstring();
     path.resize(slash + 1);
     return path;
-  }
-
-  // A wide path in the code page of the narrow file functions (fopen,
-  // CreateFileA); false when a character has none there: it would become
-  // '?' or a look-alike (best fit) and name another file.
-  inline bool dxupNarrowPath(const std::wstring& wide, std::string& narrow) {
-    narrow.clear();
-    if (wide.empty())
-      return true;
-    const UINT codePage = AreFileApisANSI() ? GetACP() : GetOEMCP();
-    // UTF-8 as the process's code page holds every character.
-    const DWORD flags = codePage == CP_UTF8 ? WC_ERR_INVALID_CHARS : WC_NO_BEST_FIT_CHARS;
-    BOOL lossy = FALSE;
-    BOOL* lossyOut = codePage == CP_UTF8 ? nullptr : &lossy;
-    const int length = WideCharToMultiByte(codePage, flags, wide.data(), static_cast<int>(wide.size()),
-      nullptr, 0, nullptr, lossyOut);
-    if (length <= 0 || lossy)
-      return false;
-    narrow.resize(static_cast<size_t>(length));
-    WideCharToMultiByte(codePage, flags, wide.data(), static_cast<int>(wide.size()), &narrow[0], length, nullptr, nullptr);
-    return true;
-  }
-
-  // The DLL's folder for the narrow file functions: as it is, else in its
-  // short (8.3) form where the volume has one; empty when neither can name
-  // it. The wide functions below take any folder.
-  inline std::string dxupModuleFolderA() {
-    const std::wstring folder = dxupModuleFolderW();
-    std::string narrow;
-    if (folder.empty())
-      return std::string();
-    if (dxupNarrowPath(folder, narrow))
-      return narrow;
-    const DWORD size = GetShortPathNameW(folder.c_str(), nullptr, 0);
-    if (!size)
-      return std::string();
-    std::wstring shortFolder(size, L'\0');
-    const DWORD length = GetShortPathNameW(folder.c_str(), &shortFolder[0], size);
-    if (!length || length >= size)
-      return std::string();
-    shortFolder.resize(length);
-    return dxupNarrowPath(shortFolder, narrow) ? narrow : std::string();
-  }
-
-  // The path of a file next to the DLL, for the narrow file functions;
-  // empty when the folder cannot be named so (see dxupModuleFolderA). Code
-  // that can should take dxupSiblingPathW, which names any folder.
-  inline std::string dxupSiblingPath(const char* name) {
-    const std::string folder = dxupModuleFolderA();
-    return folder.empty() || !name ? std::string() : folder + name;
-  }
-
-  // The same into a buffer; false when it is unknown or does not fit.
-  inline bool dxupSiblingPathTo(char* path, size_t pathSize, const char* name) {
-    if (!path || !pathSize || !name)
-      return false;
-    const std::string full = dxupSiblingPath(name);
-    if (full.empty() || full.size() >= pathSize) {
-      path[0] = '\0';
-      return false;
-    }
-    std::memcpy(path, full.c_str(), full.size() + 1);
-    return true;
   }
 
   // A wide path (any characters, any length); empty when the DLL's path is

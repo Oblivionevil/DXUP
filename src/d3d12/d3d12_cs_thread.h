@@ -402,7 +402,10 @@ namespace dxup {
     // objects, once each.
     std::vector<std::shared_ptr<void>>          m_recordedObjects;
     std::unordered_set<IBackendBuffer*>         m_recordedOwnContents;
-    std::unordered_set<const BackendRetirable*> m_keptObjects;
+    // This recording's number, which marks the objects it keeps (each
+    // command list's recording has another).
+    uint64_t                                    m_recordingId = 0;
+    void nextRecording();
 
     // Application thread
     CsChunk*                m_chunk = nullptr;

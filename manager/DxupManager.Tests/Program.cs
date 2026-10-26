@@ -679,7 +679,7 @@ namespace Dxup.Tests
                 Check(deployer.Install(game, out error) && File.ReadAllText(backup) == "reshade 2" && !File.Exists(backup + ".2"),
                     "a copy of the backup is not backed up twice " + error);
                 Check(deployer.Remove(game, new[] { game }, out error) && File.ReadAllText(target) == "reshade 2"
-                    && File.ReadAllText(backup + ".1") == "reshade 1", "removing restores the newest foreign DLL " + error);
+                    && !File.Exists(backup + ".1") && !File.Exists(backup), "removing restores the newest foreign DLL, the older ones go " + error);
             }
             finally
             {

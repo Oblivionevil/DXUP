@@ -60,9 +60,20 @@ namespace dxup {
     // Null for objects not made by wrap().
     std::shared_ptr<void> retireOwner() const { return m_retireOwner.lock(); }
 
+    // Whether a recording (a number of its own) takes the object for the
+    // first time: it marks it as its own. Recordings on other threads may
+    // take it again meanwhile, which only keeps it twice.
+    bool keepFor(uint64_t recording) const {
+      if (m_keptBy.load(std::memory_order_relaxed) == recording)
+        return false;
+      m_keptBy.store(recording, std::memory_order_relaxed);
+      return true;
+    }
+
   private:
     friend class BackendRetireQueue;
     std::weak_ptr<void> m_retireOwner;
+    mutable std::atomic<uint64_t> m_keptBy{0};
   };
 
   // Defers the destruction of backend objects while commands queued for a

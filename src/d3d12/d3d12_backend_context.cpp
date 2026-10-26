@@ -7521,27 +7521,50 @@ namespace dxup::d3d12 {
 #endif
   }
 
+  bool D3D12BackendContext::deviceLost() const {
+#ifdef _WIN32
+    return m_deviceRemoved || FAILED(m_device->submitQueue().lostReason())
+        || FAILED(m_device->getDevice()->GetDeviceRemovedReason());
+#else
+    return false;
+#endif
+  }
+
   bool D3D12BackendContext::waitForFence(uint64_t value) {
 #ifdef _WIN32
     if (m_fence->GetCompletedValue() >= value)
       return true;
-    if (FAILED(m_fence->SetEventOnCompletion(value, m_fenceEvent)))
-      return false;
     // No time limit while the work can still come (a long frame, a busy
     // GPU), but a lost device ends the wait: the submit thread's failures
     // remove it, and without ID3D12Device5 they only record the reason.
     // The event is waited for until it comes otherwise: left set, it would
-    // end the next wait on it early.
-    DWORD result;
-    while ((result = WaitForSingleObject(m_fenceEvent, 100)) == WAIT_TIMEOUT) {
-      if (m_deviceRemoved || FAILED(m_device->submitQueue().lostReason())
-       || FAILED(m_device->getDevice()->GetDeviceRemovedReason())) {
-        logMessage(LogLevel::Error, "waitForFence: the device is lost, fence %llu not reached (at %llu)",
-          static_cast<unsigned long long>(value), static_cast<unsigned long long>(m_fence->GetCompletedValue()));
-        return false;
+    // end the next wait on it early. One set by an earlier wait that ended
+    // without it (a timeout elsewhere) is told apart by the fence's value.
+    if (SUCCEEDED(m_fence->SetEventOnCompletion(value, m_fenceEvent))) {
+      for (;;) {
+        const DWORD result = WaitForSingleObject(m_fenceEvent, 100);
+        if (result == WAIT_OBJECT_0) {
+          if (m_fence->GetCompletedValue() >= value)
+            return true;
+          continue;
+        }
+        if (result != WAIT_TIMEOUT)
+          break;
+        if (deviceLost()) {
+          logMessage(LogLevel::Error, "waitForFence: the device is lost, fence %llu not reached (at %llu)",
+            static_cast<unsigned long long>(value), static_cast<unsigned long long>(m_fence->GetCompletedValue()));
+          return false;
+        }
       }
     }
-    return result == WAIT_OBJECT_0;
+    // The event could not be used (out of memory, a failed wait): the
+    // value is polled for instead, which ends the same way.
+    while (m_fence->GetCompletedValue() < value) {
+      if (deviceLost())
+        return false;
+      Sleep(1);
+    }
+    return true;
 #else
     (void)value;
     return true;
@@ -7626,6 +7649,7 @@ namespace dxup::d3d12 {
     }
     m_submittedFence->store(m_fenceValue, std::memory_order_release);
     m_lastSignaledFenceValue = m_fenceValue;
+    // False only for a lost device (waitForFence): no more work then.
     if (!waitForFence(m_fenceValue))
       m_deviceRemoved = true;
 

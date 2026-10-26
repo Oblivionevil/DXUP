@@ -208,6 +208,8 @@ namespace dxup {
   , m_retireQueue(std::move(retireQueue))
   , m_recording(true) {
     m_chunk = allocCsChunk();
+    // Never 0, which objects not kept yet carry.
+    nextRecording();
   }
 
   CsThreadContext::CsThreadContext(
@@ -270,25 +272,24 @@ namespace dxup {
     m_recordedQueries.clear();
     m_recordedGpuUses.clear();
     m_stagedMaps.clear();
-    m_keptObjects.clear();
+    nextRecording();
     if (m_retireQueue)
       m_retireQueue->retire(m_recordedObjects);
     m_recordedObjects.clear();
     m_recordedOwnContents.clear();
   }
 
+  void CsThreadContext::nextRecording() {
+    static std::atomic<uint64_t> s_recordings{0};
+    m_recordingId = s_recordings.fetch_add(1, std::memory_order_relaxed) + 1;
+  }
+
   void CsThreadContext::keepObject(const BackendRetirable* object) {
-    if (!object)
+    // Once per recording: the object carries the mark (binds repeat).
+    if (!object || !object->keepFor(m_recordingId))
       return;
-    auto [entry, added] = m_keptObjects.insert(object);
-    if (!added)
-      return;
-    // Objects without an owner are left out: one may go, and another take
-    // its address.
     if (std::shared_ptr<void> owner = object->retireOwner())
       m_recordedObjects.push_back(std::move(owner));
-    else
-      m_keptObjects.erase(entry);
   }
 
   void CsThreadContext::workerMain() {
@@ -1527,7 +1528,7 @@ namespace dxup {
     m_recordedQueries.clear();
     m_recordedGpuUses.clear();
     m_recordedObjects.clear();
-    m_keptObjects.clear();
+    nextRecording();
     m_stagedMaps.clear();
     return list;
   }

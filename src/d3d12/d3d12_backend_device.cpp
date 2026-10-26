@@ -1142,6 +1142,7 @@ namespace dxup::d3d12 {
 #endif
   )
   : m_buffer(buffer)
+  , m_bufferOwner(buffer ? buffer->retireOwner() : nullptr)
   , m_desc(desc)
   , m_counterBuffer(std::move(counterBuffer))
   , m_heapMgr(heapMgr)
@@ -1197,10 +1198,12 @@ namespace dxup::d3d12 {
       writeRawClearUav(d3d12Buffer);
 
     m_buffer = buffer;
+    m_bufferOwner = buffer->retireOwner();
     m_descriptorVersion = nextDescriptorVersion();
     return true;
 #else
     m_buffer = buffer;
+    m_bufferOwner = buffer ? buffer->retireOwner() : nullptr;
     m_descriptorVersion = nextDescriptorVersion();
     return true;
 #endif

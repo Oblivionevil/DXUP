@@ -2247,6 +2247,8 @@ static int compileRecords(const char* path) {
 }
 
 int main(int argc, char** argv) {
+  // Each line as it is printed: a run that ends early shows where.
+  std::setvbuf(stdout, nullptr, _IONBF, 0);
   bool dumpAll = false, compileBench = false, floatEmulation = false, dxbcBackend = false, dxupReference = false;
   for (int i = 1; i + 1 < argc; i++) {
     if (std::strcmp(argv[i], "--compile-records") == 0) return compileRecords(argv[i + 1]);

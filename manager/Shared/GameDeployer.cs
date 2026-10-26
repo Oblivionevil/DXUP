@@ -348,6 +348,17 @@ namespace Dxup.Shared
             return exeError == null;
         }
 
+        // The older backups of another program's DLL (OlderBackupName).
+        static IEnumerable<string> OlderBackups(string target)
+        {
+            string folder = Path.GetDirectoryName(target);
+            string prefix = Path.GetFileName(target) + BackupSuffix + ".";
+            return Directory.GetFiles(folder, prefix + "*")
+                .Where(path => Path.GetFileName(path).Length > prefix.Length
+                    && Path.GetFileName(path).Substring(prefix.Length).All(char.IsDigit))
+                .ToList();
+        }
+
         // A name for an older backup of another program's DLL: *.dxup-backup.1, .2, ...
         static string OlderBackupName(string target)
         {
@@ -379,6 +390,12 @@ namespace Dxup.Shared
                     string backup = target + BackupSuffix;
                     if (File.Exists(backup) && !File.Exists(target))
                         File.Move(backup, target);
+                    // Older versions of the other program's DLL, kept by
+                    // repairs (OlderBackupName): the newest is back.
+                    foreach (string older in OlderBackups(target))
+                    {
+                        try { MoveAside(older); } catch (Exception) { }
+                    }
                 }
                 // What DXUP left in the folder: its pipeline cache and logs.
                 try { Directory.Delete(Path.Combine(game.Dir, "dxup_pso_cache"), true); } catch (Exception) { }

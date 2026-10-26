@@ -662,6 +662,10 @@ namespace dxup::d3d12 {
 #endif
 
     IBackendBuffer*           m_buffer;
+    // Views keep their buffer, as image views their image: command lists
+    // keep the views they bind, which reach the buffer when they run, also
+    // after the application released it.
+    std::shared_ptr<void>     m_bufferOwner;
     BufferViewDesc            m_desc;
     Rc<IBackendBuffer>        m_counterBuffer;
     D3D12DescriptorHeapManager* m_heapMgr = nullptr;
