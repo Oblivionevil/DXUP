@@ -384,11 +384,13 @@ namespace dxup {
   }
 
   // castable: a swap chain proxy, typeless underneath (sRGB views of UNORM
-  // back buffers).
+  // back buffers). Views of a plane of a video texture are in the plane's
+  // format, which pipelines render to.
   inline DXGI_FORMAT validateImageViewFormat(DXGI_FORMAT viewFormat, DXGI_FORMAT resourceFormat, bool castable = false) {
     DXGI_FORMAT resolvedFormat = resolveImageViewFormat(viewFormat, resourceFormat);
 
-    if (castable || resourceFormat == DXGI_FORMAT_UNKNOWN || isTypelessFormat(resourceFormat))
+    if (castable || resourceFormat == DXGI_FORMAT_UNKNOWN || isTypelessFormat(resourceFormat)
+     || getVideoViewPlane(resourceFormat, resolvedFormat) >= 0)
       return resolvedFormat;
 
     return resolvedFormat == resourceFormat ? resolvedFormat : resourceFormat;
@@ -583,8 +585,13 @@ namespace dxup {
     s_initialFingerprintCount++;
 
     uint32_t blockBytes = isBc1FingerprintFormat(pDesc->Format) ? 8u : 16u;
-    uint32_t blockCols = (pDesc->Width + 3u) / 4u;
+    // Rows as far as the application's pitch reaches: a pitch shorter than
+    // the row (God of War) gives no more bytes, the last row included.
+    const size_t pitch = pInitialData[0].SysMemPitch;
+    uint32_t blockCols = static_cast<uint32_t>((std::min)(size_t((pDesc->Width + 3u) / 4u), pitch / blockBytes));
     uint32_t blockRows = (pDesc->Height + 3u) / 4u;
+    if (!blockCols)
+      return;
     uint64_t rowSizeBytes = static_cast<uint64_t>(blockCols) * blockBytes;
     const uint8_t* base = static_cast<const uint8_t*>(pInitialData[0].pSysMem);
 
@@ -592,7 +599,7 @@ namespace dxup {
     uint64_t zeroCount = 0;
     uint64_t ffCount = 0;
     for (uint32_t row = 0; row < blockRows; row++) {
-      const uint8_t* rowPtr = base + row * pInitialData[0].SysMemPitch;
+      const uint8_t* rowPtr = base + row * pitch;
       for (uint64_t column = 0; column < rowSizeBytes; column++) {
         uint8_t value = rowPtr[column];
         hash ^= static_cast<uint64_t>(value);
@@ -609,7 +616,7 @@ namespace dxup {
         blockY = blockRows - 1u;
       return sampleInitialFingerprintBlock(
         pDesc->Format,
-        base + blockY * pInitialData[0].SysMemPitch + blockX * blockBytes);
+        base + blockY * pitch + blockX * blockBytes);
     };
 
     FingerprintColorSample topLeft = sampleAt(0u, 0u);
@@ -698,7 +705,10 @@ namespace dxup {
       case ImageType::Tex2D:
       default:
         if (usage == ImageViewUsage::ShaderResource && (imgDesc.miscFlags & D3D11_RESOURCE_MISC_TEXTURECUBE)) {
-          viewDesc.type = imgDesc.arraySize > 6 ? ImageViewType::ViewCubeArray : ImageViewType::ViewCube;
+          // Whole cubes; one cube up to 11 slices, as D3D11's default view.
+          const uint32_t cubes = imgDesc.arraySize / 6;
+          viewDesc.type = cubes > 1 ? ImageViewType::ViewCubeArray : ImageViewType::ViewCube;
+          viewDesc.arrayLayerCount = (cubes ? cubes : 1u) * 6;
         } else if (imgDesc.sampleCount > 1) {
           viewDesc.type = imgDesc.arraySize > 1 ? ImageViewType::View2DMSArray : ImageViewType::View2DMS;
         } else if (imgDesc.arraySize > 1) {
@@ -1191,8 +1201,9 @@ namespace dxup {
     D3D11DxgiResource(const D3D11DxgiResource&) = delete;
     D3D11DxgiResource& operator=(const D3D11DxgiResource&) = delete;
 
-    // Answers the DXGI interfaces for the owning resource; surfaces only for
-    // 2D textures with one subresource.
+    // Answers the DXGI interfaces for the owning resource. Surfaces as the
+    // native runtime answers them: buffers and 1D and 2D textures with one
+    // subresource, no volumes.
     bool queryInterface(REFIID riid, void** ppvObject, bool surface) {
       if (riid == __uuidof(IDXGIObject) || riid == __uuidof(IDXGIDeviceSubObject)
        || riid == __uuidof(IDXGIResource) || riid == __uuidof(IDXGIResource1)) {
@@ -1206,10 +1217,18 @@ namespace dxup {
         AddRef();
         return true;
       }
-      if (riid == __uuidof(IDXGIKeyedMutex) && m_shared && m_shared->hasKeyedMutex()) {
-        *ppvObject = static_cast<IDXGIKeyedMutex*>(this);
-        AddRef();
-        return true;
+      if (riid == __uuidof(IDXGIKeyedMutex) && m_shared) {
+        if (m_shared->hasKeyedMutex()) {
+          *ppvObject = static_cast<IDXGIKeyedMutex*>(this);
+          AddRef();
+          return true;
+        }
+        // D3D12 tells nothing of the keyed mutex another process or runtime
+        // may have created the resource with (see D3D11SharedResource).
+        static std::atomic<bool> s_logged{false};
+        if (m_shared->foreign && !s_logged.exchange(true))
+          logMessage(LogLevel::Warn, "IDXGIKeyedMutex: not available on resources opened from handles of other "
+            "processes or runtimes; synchronize them otherwise");
       }
       return false;
     }
@@ -1921,6 +1940,8 @@ namespace dxup {
         m_resource->GetType(&dim);
       if (dim == D3D11_RESOURCE_DIMENSION_TEXTURE2D && static_cast<D3D11Texture2D*>(m_resource)->GetMsaaShadow())
         m_forcedMsaaTexture = static_cast<D3D11Texture2D*>(m_resource);
+      if (IBackendImage* image = m_imageView ? m_imageView->getImage() : nullptr)
+        m_planeSlice = getViewPlaneSlice(image->getDesc().format, m_desc.Format);
     }
 
     D3D11ShaderResourceView(D3D11Device* pDevice,
@@ -1978,7 +1999,8 @@ namespace dxup {
       *pDesc = m_desc;
     }
 
-    // Planar formats are not supported, so the plane slice is always 0.
+    // The plane slice is the one the format names (chroma views of video
+    // textures), also for views created without one.
     void STDMETHODCALLTYPE GetDesc1(D3D11_SHADER_RESOURCE_VIEW_DESC1* pDesc) override {
       std::memset(pDesc, 0, sizeof(*pDesc));
       pDesc->Format        = m_desc.Format;
@@ -1987,12 +2009,14 @@ namespace dxup {
         case D3D11_SRV_DIMENSION_TEXTURE2D:
           pDesc->Texture2D.MostDetailedMip = m_desc.Texture2D.MostDetailedMip;
           pDesc->Texture2D.MipLevels       = m_desc.Texture2D.MipLevels;
+          pDesc->Texture2D.PlaneSlice      = m_planeSlice;
           break;
         case D3D11_SRV_DIMENSION_TEXTURE2DARRAY:
           pDesc->Texture2DArray.MostDetailedMip = m_desc.Texture2DArray.MostDetailedMip;
           pDesc->Texture2DArray.MipLevels       = m_desc.Texture2DArray.MipLevels;
           pDesc->Texture2DArray.FirstArraySlice = m_desc.Texture2DArray.FirstArraySlice;
           pDesc->Texture2DArray.ArraySize       = m_desc.Texture2DArray.ArraySize;
+          pDesc->Texture2DArray.PlaneSlice      = m_planeSlice;
           break;
         default:
           // The other members have the same layout in both structures.
@@ -2015,6 +2039,7 @@ namespace dxup {
     Rc<IBackendImageView>           m_imageView;
     Rc<IBackendBufferView>          m_bufferView;
     D3D11Texture2D*                 m_forcedMsaaTexture = nullptr;
+    UINT                            m_planeSlice = 0;
 
     D3D10ShaderResourceView m_d3d10{this};
   };
@@ -2048,6 +2073,7 @@ namespace dxup {
         m_sampleQuality = image->getDesc().sampleQuality;
       }
       m_pipelineFormat = validateImageViewFormat(m_desc.Format, resourceFormat, castable);
+      m_planeSlice = getViewPlaneSlice(resourceFormat, m_desc.Format);
     }
 
     ~D3D11RenderTargetView() {
@@ -2094,12 +2120,14 @@ namespace dxup {
       pDesc->ViewDimension = m_desc.ViewDimension;
       switch (m_desc.ViewDimension) {
         case D3D11_RTV_DIMENSION_TEXTURE2D:
-          pDesc->Texture2D.MipSlice = m_desc.Texture2D.MipSlice;
+          pDesc->Texture2D.MipSlice   = m_desc.Texture2D.MipSlice;
+          pDesc->Texture2D.PlaneSlice = m_planeSlice;
           break;
         case D3D11_RTV_DIMENSION_TEXTURE2DARRAY:
           pDesc->Texture2DArray.MipSlice        = m_desc.Texture2DArray.MipSlice;
           pDesc->Texture2DArray.FirstArraySlice = m_desc.Texture2DArray.FirstArraySlice;
           pDesc->Texture2DArray.ArraySize       = m_desc.Texture2DArray.ArraySize;
+          pDesc->Texture2DArray.PlaneSlice      = m_planeSlice;
           break;
         default:
           std::memcpy(&pDesc->Buffer, &m_desc.Buffer, sizeof(m_desc) - offsetof(D3D11_RENDER_TARGET_VIEW_DESC, Buffer));
@@ -2129,6 +2157,7 @@ namespace dxup {
     DXGI_FORMAT                   m_pipelineFormat = DXGI_FORMAT_UNKNOWN;
     uint32_t                      m_sampleCount = 0;
     uint32_t                      m_sampleQuality = 0;
+    UINT                          m_planeSlice = 0;
 
     D3D10RenderTargetView m_d3d10{this};
   };
@@ -2251,6 +2280,8 @@ namespace dxup {
       , m_imageView(std::move(view)) {
       addResourcePrivateRef(m_resource);
       this->setBindData(m_resource, m_imageView.get());
+      if (IBackendImage* image = m_imageView ? m_imageView->getImage() : nullptr)
+        m_planeSlice = getViewPlaneSlice(image->getDesc().format, m_desc.Format);
     }
 
     D3D11UnorderedAccessView(D3D11Device* pDevice,
@@ -2306,12 +2337,14 @@ namespace dxup {
       pDesc->ViewDimension = m_desc.ViewDimension;
       switch (m_desc.ViewDimension) {
         case D3D11_UAV_DIMENSION_TEXTURE2D:
-          pDesc->Texture2D.MipSlice = m_desc.Texture2D.MipSlice;
+          pDesc->Texture2D.MipSlice   = m_desc.Texture2D.MipSlice;
+          pDesc->Texture2D.PlaneSlice = m_planeSlice;
           break;
         case D3D11_UAV_DIMENSION_TEXTURE2DARRAY:
           pDesc->Texture2DArray.MipSlice        = m_desc.Texture2DArray.MipSlice;
           pDesc->Texture2DArray.FirstArraySlice = m_desc.Texture2DArray.FirstArraySlice;
           pDesc->Texture2DArray.ArraySize       = m_desc.Texture2DArray.ArraySize;
+          pDesc->Texture2DArray.PlaneSlice      = m_planeSlice;
           break;
         default:
           std::memcpy(&pDesc->Buffer, &m_desc.Buffer, sizeof(m_desc) - offsetof(D3D11_UNORDERED_ACCESS_VIEW_DESC, Buffer));
@@ -2327,6 +2360,7 @@ namespace dxup {
     ID3D11Resource*                  m_resource;
     Rc<IBackendImageView>            m_imageView;
     Rc<IBackendBufferView>           m_bufferView;
+    UINT                             m_planeSlice = 0;
   };
 
   // ============================================================
@@ -3293,10 +3327,19 @@ namespace dxup {
       }
     }
 
+    // As in D3D11, creation calls clear the object pointer before they check
+    // anything: a refused call leaves no stale object behind.
+    template<typename T>
+    static void clearOutput(T** ppObject) {
+      if (ppObject)
+        *ppObject = nullptr;
+    }
+
     HRESULT STDMETHODCALLTYPE CreateBuffer(
         const D3D11_BUFFER_DESC*      pDesc,
         const D3D11_SUBRESOURCE_DATA* pInitialData,
         ID3D11Buffer**                ppBuffer) override {
+      clearOutput(ppBuffer);
       if (!pDesc) return E_INVALIDARG;
       if (HRESULT hr = validateBufferDesc(*pDesc, pInitialData && pInitialData->pSysMem); FAILED(hr))
         return rejectInvalidCall("validateBufferDesc", hr);
@@ -3507,6 +3550,7 @@ namespace dxup {
         const D3D11_TEXTURE1D_DESC*   pDesc,
         const D3D11_SUBRESOURCE_DATA* pInitialData,
         ID3D11Texture1D**             ppTexture1D) override {
+      clearOutput(ppTexture1D);
       if (!pDesc) return E_INVALIDARG;
       if (HRESULT hr = validateTextureDesc(D3D11_RESOURCE_DIMENSION_TEXTURE1D, pDesc->Width, 1, 1,
             pDesc->MipLevels, pDesc->ArraySize, pDesc->Format, DXGI_SAMPLE_DESC{ 1, 0 }, pDesc->Usage,
@@ -3533,6 +3577,7 @@ namespace dxup {
         const D3D11_TEXTURE2D_DESC*   pDesc,
         const D3D11_SUBRESOURCE_DATA* pInitialData,
         ID3D11Texture2D**             ppTexture2D) override {
+      clearOutput(ppTexture2D);
       if (!pDesc) return E_INVALIDARG;
       if (HRESULT hr = validateTextureDesc(D3D11_RESOURCE_DIMENSION_TEXTURE2D, pDesc->Width, pDesc->Height, 1,
             pDesc->MipLevels, pDesc->ArraySize, pDesc->Format, pDesc->SampleDesc, pDesc->Usage,
@@ -3674,6 +3719,7 @@ namespace dxup {
         const D3D11_TEXTURE3D_DESC*   pDesc,
         const D3D11_SUBRESOURCE_DATA* pInitialData,
         ID3D11Texture3D**             ppTexture3D) override {
+      clearOutput(ppTexture3D);
       if (!pDesc) return E_INVALIDARG;
       if (HRESULT hr = validateTextureDesc(D3D11_RESOURCE_DIMENSION_TEXTURE3D, pDesc->Width, pDesc->Height,
             pDesc->Depth, pDesc->MipLevels, 1, pDesc->Format, DXGI_SAMPLE_DESC{ 1, 0 }, pDesc->Usage,
@@ -3712,6 +3758,7 @@ namespace dxup {
         const D3D11_SHADER_RESOURCE_VIEW_DESC* pDesc,
         UINT                                   ComponentMapping,
         ID3D11ShaderResourceView**             ppSRView) {
+      clearOutput(ppSRView);
       if (!pResource) return E_INVALIDARG;
       D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
       if (HRESULT hr = resolveSrvDesc(pResource, pDesc, formatSupportQuery(), srvDesc); FAILED(hr))
@@ -3776,6 +3823,7 @@ namespace dxup {
         ID3D11Resource*                         pResource,
         const D3D11_UNORDERED_ACCESS_VIEW_DESC* pDesc,
         ID3D11UnorderedAccessView**             ppUAView) override {
+      clearOutput(ppUAView);
       if (!pResource) return E_INVALIDARG;
       D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc = {};
       if (HRESULT hr = resolveUavDesc(pResource, pDesc, formatSupportQuery(), uavDesc); FAILED(hr))
@@ -3840,6 +3888,7 @@ namespace dxup {
         ID3D11RenderTargetView**              ppRTView) override {
       logMessage(LogLevel::Trace, "CreateRenderTargetView(Format=%d)",
         pDesc ? pDesc->Format : -1);
+      clearOutput(ppRTView);
       if (!pResource) return E_INVALIDARG;
       D3D11_RENDER_TARGET_VIEW_DESC rtvDesc = {};
       if (HRESULT hr = resolveRtvDesc(pResource, pDesc, formatSupportQuery(), rtvDesc); FAILED(hr))
@@ -3899,6 +3948,7 @@ namespace dxup {
         ID3D11Resource*                       pResource,
         const D3D11_DEPTH_STENCIL_VIEW_DESC*  pDesc,
         ID3D11DepthStencilView**              ppDSView) override {
+      clearOutput(ppDSView);
       if (!pResource) return E_INVALIDARG;
       D3D11_DEPTH_STENCIL_VIEW_DESC dsvDesc = {};
       if (HRESULT hr = resolveDsvDesc(pResource, pDesc, formatSupportQuery(), dsvDesc); FAILED(hr))
@@ -3950,6 +4000,7 @@ namespace dxup {
         ID3D11InputLayout**             ppInputLayout) override {
       // No elements make an empty layout, for shaders that read only
       // system values; the array is still required.
+      clearOutput(ppInputLayout);
       if (!pInputElementDescs) return E_INVALIDARG;
       if (HRESULT hr = validateInputLayout(pInputElementDescs, NumElements, pShaderBytecodeWithInputSignature,
             BytecodeLength, formatSupportQuery()); FAILED(hr))
@@ -3988,6 +4039,7 @@ namespace dxup {
         SIZE_T                       BytecodeLength,
         ID3D11ClassLinkage*          pClassLinkage,
         ID3D11VertexShader**         ppVertexShader) override {
+      clearOutput(ppVertexShader);
       if (!pShaderBytecode || BytecodeLength == 0) return E_INVALIDARG;
       if (HRESULT hr = validateShaderBytecode(pShaderBytecode, BytecodeLength, { DxbcProgramType::Vertex }); FAILED(hr))
         return rejectInvalidCall("validateShaderBytecode", hr);
@@ -4015,6 +4067,7 @@ namespace dxup {
         SIZE_T                       BytecodeLength,
         ID3D11ClassLinkage*          pClassLinkage,
         ID3D11PixelShader**          ppPixelShader) override {
+      clearOutput(ppPixelShader);
       if (!pShaderBytecode || BytecodeLength == 0) return E_INVALIDARG;
       if (HRESULT hr = validateShaderBytecode(pShaderBytecode, BytecodeLength, { DxbcProgramType::Pixel }); FAILED(hr))
         return rejectInvalidCall("validateShaderBytecode", hr);
@@ -4040,6 +4093,7 @@ namespace dxup {
         SIZE_T                       BytecodeLength,
         ID3D11ClassLinkage*          pClassLinkage,
         ID3D11GeometryShader**       ppGeometryShader) override {
+      clearOutput(ppGeometryShader);
       if (!pShaderBytecode || BytecodeLength == 0) return E_INVALIDARG;
       if (HRESULT hr = validateShaderBytecode(pShaderBytecode, BytecodeLength, { DxbcProgramType::Geometry }); FAILED(hr))
         return rejectInvalidCall("validateShaderBytecode", hr);
@@ -4062,16 +4116,139 @@ namespace dxup {
         UINT                            RasterizedStream,
         ID3D11ClassLinkage*             pClassLinkage,
         ID3D11GeometryShader**          ppGeometryShader) override {
+      clearOutput(ppGeometryShader);
       if (!pShaderBytecode || BytecodeLength == 0) return E_INVALIDARG;
       if (HRESULT hr = validateShaderBytecode(pShaderBytecode, BytecodeLength, { DxbcProgramType::Geometry, DxbcProgramType::Vertex, DxbcProgramType::Domain }); FAILED(hr))
         return rejectInvalidCall("validateShaderBytecode", hr);
+      std::vector<UINT> strides;
+      if (HRESULT hr = validateStreamOutput(pShaderBytecode, BytecodeLength, pSODeclaration, NumEntries, pBufferStrides,
+            NumStrides, RasterizedStream, strides); FAILED(hr))
+        return rejectInvalidCall("validateStreamOutput", hr);
       if (!ppGeometryShader) return S_FALSE;
 
       auto shader = m_backendDevice.createGeometryShaderWithStreamOutput(pShaderBytecode, BytecodeLength);
       if (!shader) return E_FAIL;
 
       *ppGeometryShader = new D3D11GeometryShader(this, std::move(shader),
-        pSODeclaration, NumEntries, pBufferStrides, NumStrides, RasterizedStream);
+        pSODeclaration, NumEntries, strides.data(), UINT(strides.size()), RasterizedStream);
+      return S_OK;
+    }
+
+    // An output of a shader, which stream output entries name.
+    struct StreamOutputElement {
+      std::string name;
+      UINT        semanticIndex = 0;
+      UINT        stream        = 0;
+      uint8_t     mask          = 0;
+      uint8_t     written       = 0;
+    };
+
+    // The output signature of a shader (OSGN, or OSG5 and OSG1 with the
+    // stream of each output); false without a readable one.
+    static bool getStreamOutputSignature(const void* bytecode, SIZE_T length,
+                                         std::vector<StreamOutputElement>& elements) {
+      std::vector<DxbcChunk> chunks;
+      if (!parseDxbc(bytecode, length, &chunks))
+        return false;
+      for (const auto& chunk : chunks) {
+        const bool osg5 = chunk.fourCC == makeFourCC('O', 'S', 'G', '5');
+        const bool osg1 = chunk.fourCC == makeFourCC('O', 'S', 'G', '1');
+        if (chunk.fourCC != makeFourCC('O', 'S', 'G', 'N') && !osg5 && !osg1)
+          continue;
+        if (chunk.size < 8)
+          return false;
+        auto read = [&](uint32_t offset) { uint32_t value; std::memcpy(&value, chunk.data + offset, 4); return value; };
+        const uint32_t count = read(0);
+        const uint32_t first = read(4);
+        const bool streams = osg5 || osg1;
+        const uint32_t stride = osg1 ? 32u : osg5 ? 28u : 24u;
+        if (uint64_t(first) + uint64_t(count) * stride > chunk.size)
+          return false;
+        for (uint32_t i = 0; i < count; i++) {
+          const uint32_t base = first + i * stride;
+          const uint32_t fields = base + (streams ? 4u : 0u);
+          const uint32_t nameOffset = read(fields);
+          if (nameOffset >= chunk.size)
+            return false;
+          StreamOutputElement element;
+          const char* name = reinterpret_cast<const char*>(chunk.data + nameOffset);
+          element.name.assign(name, strnlen(name, chunk.size - nameOffset));
+          element.semanticIndex = read(fields + 4);
+          element.stream = streams ? read(base) : 0u;
+          element.mask = chunk.data[fields + 20] & 0xfu;
+          elements.push_back(std::move(element));
+        }
+        return true;
+      }
+      return false;
+    }
+
+    // Stream output declarations as the native runtime checks them: each
+    // entry names an output of the shader on its stream (case-insensitive),
+    // with components the output has and no other entry writes; gaps start
+    // at the first component and may span registers. Entries of a stream
+    // follow those of lower streams, each buffer belongs to one stream and
+    // holds an entry, and its stride is a multiple of 4 of at most 2048 bytes
+    // that holds its entries (unused buffers' strides are not checked).
+    // Without strides the buffers are packed. strides: the ones to use.
+    static HRESULT validateStreamOutput(const void* bytecode, SIZE_T length, const D3D11_SO_DECLARATION_ENTRY* entries,
+                                        UINT numEntries, const UINT* bufferStrides, UINT numStrides,
+                                        UINT rasterizedStream, std::vector<UINT>& strides) {
+      if (!entries || !numEntries || numStrides > D3D11_SO_BUFFER_SLOT_COUNT || (numStrides && !bufferStrides)
+       || (rasterizedStream != D3D11_SO_NO_RASTERIZED_STREAM && rasterizedStream >= D3D11_SO_STREAM_COUNT))
+        return E_INVALIDARG;
+      std::vector<StreamOutputElement> outputs;
+      if (!getStreamOutputSignature(bytecode, length, outputs))
+        return E_INVALIDARG;
+
+      constexpr UINT kUnused = ~0u;
+      UINT slotStream[D3D11_SO_BUFFER_SLOT_COUNT] = { kUnused, kUnused, kUnused, kUnused };
+      uint64_t slotBytes[D3D11_SO_BUFFER_SLOT_COUNT] = {};
+      bool slotWritten[D3D11_SO_BUFFER_SLOT_COUNT] = {};
+      UINT streamEntries[D3D11_SO_STREAM_COUNT] = {};
+      UINT lastStream = 0;
+      for (UINT i = 0; i < numEntries; i++) {
+        const D3D11_SO_DECLARATION_ENTRY& entry = entries[i];
+        const UINT slot = entry.OutputSlot;
+        if (entry.Stream >= D3D11_SO_STREAM_COUNT || entry.Stream < lastStream
+         || slot >= D3D11_SO_BUFFER_SLOT_COUNT || (numStrides && slot >= numStrides)
+         || (slotStream[slot] != kUnused && slotStream[slot] != entry.Stream)
+         || ++streamEntries[entry.Stream] > D3D11_SO_OUTPUT_COMPONENT_COUNT)
+          return E_INVALIDARG;
+        lastStream = entry.Stream;
+        slotStream[slot] = entry.Stream;
+        if (!entry.SemanticName) {
+          if (!entry.ComponentCount || entry.StartComponent)
+            return E_INVALIDARG;
+        } else {
+          if (!entry.ComponentCount || entry.ComponentCount > 4 || UINT(entry.StartComponent) + entry.ComponentCount > 4)
+            return E_INVALIDARG;
+          const uint8_t mask = uint8_t(((1u << entry.ComponentCount) - 1u) << entry.StartComponent);
+          auto output = std::find_if(outputs.begin(), outputs.end(), [&](const StreamOutputElement& element) {
+            return element.stream == entry.Stream && element.semanticIndex == entry.SemanticIndex
+                && _stricmp(element.name.c_str(), entry.SemanticName) == 0;
+          });
+          if (output == outputs.end() || (mask & ~output->mask) || (mask & output->written))
+            return E_INVALIDARG;
+          output->written |= mask;
+          slotWritten[slot] = true;
+        }
+        slotBytes[slot] += uint64_t(entry.ComponentCount) * 4u;
+      }
+
+      UINT slotCount = numStrides;
+      for (UINT slot = 0; !numStrides && slot < D3D11_SO_BUFFER_SLOT_COUNT; slot++) {
+        if (slotStream[slot] != kUnused)
+          slotCount = slot + 1;
+      }
+      strides.clear();
+      for (UINT slot = 0; slot < slotCount; slot++) {
+        const uint64_t stride = numStrides ? bufferStrides[slot] : slotBytes[slot];
+        if (slotStream[slot] != kUnused && (!slotWritten[slot] || !stride || (stride & 3u)
+         || stride > D3D11_SO_BUFFER_MAX_STRIDE_IN_BYTES || stride < slotBytes[slot]))
+          return E_INVALIDARG;
+        strides.push_back(UINT(stride));
+      }
       return S_OK;
     }
 
@@ -4080,6 +4257,7 @@ namespace dxup {
         SIZE_T                       BytecodeLength,
         ID3D11ClassLinkage*          pClassLinkage,
         ID3D11HullShader**           ppHullShader) override {
+      clearOutput(ppHullShader);
       if (!pShaderBytecode || BytecodeLength == 0) return E_INVALIDARG;
       if (HRESULT hr = validateShaderBytecode(pShaderBytecode, BytecodeLength, { DxbcProgramType::Hull }); FAILED(hr))
         return rejectInvalidCall("validateShaderBytecode", hr);
@@ -4097,6 +4275,7 @@ namespace dxup {
         SIZE_T                       BytecodeLength,
         ID3D11ClassLinkage*          pClassLinkage,
         ID3D11DomainShader**         ppDomainShader) override {
+      clearOutput(ppDomainShader);
       if (!pShaderBytecode || BytecodeLength == 0) return E_INVALIDARG;
       if (HRESULT hr = validateShaderBytecode(pShaderBytecode, BytecodeLength, { DxbcProgramType::Domain }); FAILED(hr))
         return rejectInvalidCall("validateShaderBytecode", hr);
@@ -4114,6 +4293,7 @@ namespace dxup {
         SIZE_T                       BytecodeLength,
         ID3D11ClassLinkage*          pClassLinkage,
         ID3D11ComputeShader**        ppComputeShader) override {
+      clearOutput(ppComputeShader);
       if (!pShaderBytecode || BytecodeLength == 0) return E_INVALIDARG;
       if (HRESULT hr = validateShaderBytecode(pShaderBytecode, BytecodeLength, { DxbcProgramType::Compute }); FAILED(hr))
         return rejectInvalidCall("validateShaderBytecode", hr);
@@ -4231,6 +4411,7 @@ namespace dxup {
     HRESULT STDMETHODCALLTYPE CreateBlendState(
         const D3D11_BLEND_DESC*   pBlendStateDesc,
         ID3D11BlendState**        ppBlendState) override {
+      clearOutput(ppBlendState);
       if (!pBlendStateDesc) return E_INVALIDARG;
       if (HRESULT hr = validateBlendDesc(*pBlendStateDesc); FAILED(hr)) return rejectInvalidCall("validateBlendDesc", hr);
       if (!ppBlendState) return S_FALSE;
@@ -4243,6 +4424,7 @@ namespace dxup {
     HRESULT STDMETHODCALLTYPE CreateDepthStencilState(
         const D3D11_DEPTH_STENCIL_DESC*  pDepthStencilDesc,
         ID3D11DepthStencilState**        ppDepthStencilState) override {
+      clearOutput(ppDepthStencilState);
       if (!pDepthStencilDesc) return E_INVALIDARG;
       if (HRESULT hr = validateDepthStencilDesc(*pDepthStencilDesc); FAILED(hr)) return rejectInvalidCall("validateDepthStencilDesc", hr);
       if (!ppDepthStencilState) return S_FALSE;
@@ -4255,6 +4437,7 @@ namespace dxup {
     HRESULT STDMETHODCALLTYPE CreateRasterizerState(
         const D3D11_RASTERIZER_DESC*  pRasterizerDesc,
         ID3D11RasterizerState**       ppRasterizerState) override {
+      clearOutput(ppRasterizerState);
       if (!pRasterizerDesc) return E_INVALIDARG;
       if (HRESULT hr = validateRasterizerDesc(*pRasterizerDesc); FAILED(hr)) return rejectInvalidCall("validateRasterizerDesc", hr);
       if (!ppRasterizerState) return S_FALSE;
@@ -4273,6 +4456,7 @@ namespace dxup {
     // DXUPCreateSamplerState: also the anisotropic filter with point mips.
     HRESULT createSamplerState(const D3D11_SAMPLER_DESC* pSamplerDesc, ID3D11SamplerState** ppSamplerState,
                                bool pointMipAnisotropic) {
+      clearOutput(ppSamplerState);
       if (!pSamplerDesc) return E_INVALIDARG;
       if (HRESULT hr = validateSamplerDesc(*pSamplerDesc, pointMipAnisotropic); FAILED(hr))
         return rejectInvalidCall("validateSamplerDesc", hr, describeSamplerDesc(*pSamplerDesc));
@@ -4359,10 +4543,12 @@ namespace dxup {
     HRESULT STDMETHODCALLTYPE CreateQuery(
         const D3D11_QUERY_DESC*  pQueryDesc,
         ID3D11Query**            ppQuery) override {
+      clearOutput(ppQuery);
       if (!pQueryDesc) return E_INVALIDARG;
 
+      // The predicate hint is the only flag (native runtime).
       QueryDesc desc;
-      if (!translateQueryDesc(*pQueryDesc, desc))
+      if (!translateQueryDesc(*pQueryDesc, desc) || (pQueryDesc->MiscFlags & ~UINT(D3D11_QUERY_MISC_PREDICATEHINT)))
         return E_INVALIDARG;
       if (!ppQuery) return S_FALSE;
 
@@ -4378,10 +4564,15 @@ namespace dxup {
     HRESULT STDMETHODCALLTYPE CreatePredicate(
         const D3D11_QUERY_DESC*  pPredicateDesc,
         ID3D11Predicate**        ppPredicate) override {
+      // Native D3D11 keeps the pointer for a missing description and for
+      // queries that are no predicates, and clears it from then on.
       if (!pPredicateDesc) return E_INVALIDARG;
 
       QueryDesc desc;
       if (!isPredicateQuery(pPredicateDesc->Query) || !translateQueryDesc(*pPredicateDesc, desc))
+        return E_INVALIDARG;
+      clearOutput(ppPredicate);
+      if (pPredicateDesc->MiscFlags & ~UINT(D3D11_QUERY_MISC_PREDICATEHINT))
         return E_INVALIDARG;
       if (!ppPredicate) return S_FALSE;
 
@@ -4435,6 +4626,7 @@ namespace dxup {
     HRESULT STDMETHODCALLTYPE CreateBlendState1(
         const D3D11_BLEND_DESC1* pBlendStateDesc,
         ID3D11BlendState1**      ppBlendState) override {
+      clearOutput(ppBlendState);
       if (!pBlendStateDesc) return E_INVALIDARG;
       D3D11_BLEND_DESC baseDesc = downgradeBlendDesc1(pBlendStateDesc);
       if (HRESULT hr = validateBlendDesc(baseDesc); FAILED(hr)) return rejectInvalidCall("validateBlendDesc", hr);
@@ -4459,6 +4651,7 @@ namespace dxup {
     HRESULT STDMETHODCALLTYPE CreateRasterizerState1(
         const D3D11_RASTERIZER_DESC1* pRasterizerDesc,
         ID3D11RasterizerState1**      ppRasterizerState) override {
+      clearOutput(ppRasterizerState);
       if (!pRasterizerDesc) return E_INVALIDARG;
       D3D11_RASTERIZER_DESC baseDesc = downgradeRasterizerDesc1(pRasterizerDesc);
       if (HRESULT hr = validateRasterizerDesc(baseDesc); FAILED(hr)) return rejectInvalidCall("validateRasterizerDesc", hr);
@@ -4533,14 +4726,23 @@ namespace dxup {
       }
     }
 
-    // D3D11 has tiers 1 to 3, numbered like D3D12's.
-    D3D11_TILED_RESOURCES_TIER tiledResourcesTier() {
+    // D3D11 has tiers 1 to 3, numbered like D3D12's: the GPU's tier.
+    D3D11_TILED_RESOURCES_TIER gpuTiledResourcesTier() {
       D3D12_FEATURE_DATA_D3D12_OPTIONS options = {};
       ID3D12Device* device = nativeDevice();
       if (!device || FAILED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options))))
         return D3D11_TILED_RESOURCES_NOT_SUPPORTED;
       const UINT tier = static_cast<UINT>(options.TiledResourcesTier);
       return static_cast<D3D11_TILED_RESOURCES_TIER>(tier > 3 ? 3 : tier);
+    }
+
+    // The tier of this device, as the native runtime grants it per feature
+    // level: none below 11_0, tier 1 at most at 11_0.
+    D3D11_TILED_RESOURCES_TIER tiledResourcesTier() {
+      if (m_featureLevel < D3D_FEATURE_LEVEL_11_0)
+        return D3D11_TILED_RESOURCES_NOT_SUPPORTED;
+      const D3D11_TILED_RESOURCES_TIER tier = gpuTiledResourcesTier();
+      return m_featureLevel < D3D_FEATURE_LEVEL_11_1 ? (std::min)(tier, D3D11_TILED_RESOURCES_TIER_1) : tier;
     }
 
     HRESULT STDMETHODCALLTYPE CheckMultisampleQualityLevels1(
@@ -4569,6 +4771,7 @@ namespace dxup {
         const D3D11_TEXTURE2D_DESC1*  pDesc1,
         const D3D11_SUBRESOURCE_DATA* pInitialData,
         ID3D11Texture2D1**            ppTexture2D) override {
+      clearOutput(ppTexture2D);
       if (!pDesc1) return E_INVALIDARG;
       // Only the driver-chosen layout exists without map-on-default support.
       if (pDesc1->TextureLayout != D3D11_TEXTURE_LAYOUT_UNDEFINED) return E_INVALIDARG;
@@ -4590,6 +4793,7 @@ namespace dxup {
         const D3D11_TEXTURE3D_DESC1*  pDesc1,
         const D3D11_SUBRESOURCE_DATA* pInitialData,
         ID3D11Texture3D1**            ppTexture3D) override {
+      clearOutput(ppTexture3D);
       if (!pDesc1) return E_INVALIDARG;
       if (pDesc1->TextureLayout != D3D11_TEXTURE_LAYOUT_UNDEFINED) return E_INVALIDARG;
       D3D11_TEXTURE3D_DESC desc = {};
@@ -4608,6 +4812,7 @@ namespace dxup {
     HRESULT STDMETHODCALLTYPE CreateRasterizerState2(
         const D3D11_RASTERIZER_DESC2* pRasterizerDesc,
         ID3D11RasterizerState2**      ppRasterizerState) override {
+      clearOutput(ppRasterizerState);
       if (!pRasterizerDesc) return E_INVALIDARG;
       const bool conservative = pRasterizerDesc->ConservativeRaster != D3D11_CONSERVATIVE_RASTERIZATION_MODE_OFF;
       if (conservative && conservativeRasterizationTier() == D3D12_CONSERVATIVE_RASTERIZATION_TIER_NOT_SUPPORTED)
@@ -4625,25 +4830,37 @@ namespace dxup {
       return S_OK;
     }
 
-    // Planar formats are not supported, so plane slices other than 0 are
-    // invalid; the rest of the descriptions match.
+    // The plane slice a view of a 2D texture names is the one its format
+    // names (chroma formats of video textures: 1; everything else: 0), as
+    // the native runtime checks it; the plane follows from the format, and
+    // the rest of the descriptions match.
+    static HRESULT checkViewPlaneSlice(ID3D11Resource* resource, DXGI_FORMAT viewFormat, UINT planeSlice) {
+      ViewResourceInfo info;
+      if (!resource || !getViewResourceInfo(resource, info))
+        return planeSlice ? E_INVALIDARG : S_OK;
+      const DXGI_FORMAT format = viewFormat == DXGI_FORMAT_UNKNOWN ? info.format : viewFormat;
+      return planeSlice == getViewPlaneSlice(info.format, format) ? S_OK : E_INVALIDARG;
+    }
+
     HRESULT STDMETHODCALLTYPE CreateShaderResourceView1(
         ID3D11Resource*                          pResource,
         const D3D11_SHADER_RESOURCE_VIEW_DESC1*  pDesc1,
         ID3D11ShaderResourceView1**              ppSRView1) override {
+      clearOutput(ppSRView1);
       if (!pDesc1)
         return CreateShaderResourceView(pResource, nullptr, reinterpret_cast<ID3D11ShaderResourceView**>(ppSRView1));
       D3D11_SHADER_RESOURCE_VIEW_DESC desc = {};
       desc.Format        = pDesc1->Format;
       desc.ViewDimension = pDesc1->ViewDimension;
+      UINT planeSlice = 0;
       switch (pDesc1->ViewDimension) {
         case D3D11_SRV_DIMENSION_TEXTURE2D:
-          if (pDesc1->Texture2D.PlaneSlice) return E_INVALIDARG;
+          planeSlice = pDesc1->Texture2D.PlaneSlice;
           desc.Texture2D.MostDetailedMip = pDesc1->Texture2D.MostDetailedMip;
           desc.Texture2D.MipLevels       = pDesc1->Texture2D.MipLevels;
           break;
         case D3D11_SRV_DIMENSION_TEXTURE2DARRAY:
-          if (pDesc1->Texture2DArray.PlaneSlice) return E_INVALIDARG;
+          planeSlice = pDesc1->Texture2DArray.PlaneSlice;
           desc.Texture2DArray.MostDetailedMip = pDesc1->Texture2DArray.MostDetailedMip;
           desc.Texture2DArray.MipLevels       = pDesc1->Texture2DArray.MipLevels;
           desc.Texture2DArray.FirstArraySlice = pDesc1->Texture2DArray.FirstArraySlice;
@@ -4653,6 +4870,8 @@ namespace dxup {
           std::memcpy(&desc.Buffer, &pDesc1->Buffer, sizeof(desc) - offsetof(D3D11_SHADER_RESOURCE_VIEW_DESC, Buffer));
           break;
       }
+      if (HRESULT hr = checkViewPlaneSlice(pResource, desc.Format, planeSlice); FAILED(hr))
+        return rejectInvalidView("checkViewPlaneSlice", hr, pResource, pDesc1);
       return CreateShaderResourceView(pResource, &desc, reinterpret_cast<ID3D11ShaderResourceView**>(ppSRView1));
     }
 
@@ -4660,18 +4879,20 @@ namespace dxup {
         ID3D11Resource*                           pResource,
         const D3D11_UNORDERED_ACCESS_VIEW_DESC1*  pDesc1,
         ID3D11UnorderedAccessView1**              ppUAView1) override {
+      clearOutput(ppUAView1);
       if (!pDesc1)
         return CreateUnorderedAccessView(pResource, nullptr, reinterpret_cast<ID3D11UnorderedAccessView**>(ppUAView1));
       D3D11_UNORDERED_ACCESS_VIEW_DESC desc = {};
       desc.Format        = pDesc1->Format;
       desc.ViewDimension = pDesc1->ViewDimension;
+      UINT planeSlice = 0;
       switch (pDesc1->ViewDimension) {
         case D3D11_UAV_DIMENSION_TEXTURE2D:
-          if (pDesc1->Texture2D.PlaneSlice) return E_INVALIDARG;
+          planeSlice = pDesc1->Texture2D.PlaneSlice;
           desc.Texture2D.MipSlice = pDesc1->Texture2D.MipSlice;
           break;
         case D3D11_UAV_DIMENSION_TEXTURE2DARRAY:
-          if (pDesc1->Texture2DArray.PlaneSlice) return E_INVALIDARG;
+          planeSlice = pDesc1->Texture2DArray.PlaneSlice;
           desc.Texture2DArray.MipSlice        = pDesc1->Texture2DArray.MipSlice;
           desc.Texture2DArray.FirstArraySlice = pDesc1->Texture2DArray.FirstArraySlice;
           desc.Texture2DArray.ArraySize       = pDesc1->Texture2DArray.ArraySize;
@@ -4680,6 +4901,8 @@ namespace dxup {
           std::memcpy(&desc.Buffer, &pDesc1->Buffer, sizeof(desc) - offsetof(D3D11_UNORDERED_ACCESS_VIEW_DESC, Buffer));
           break;
       }
+      if (HRESULT hr = checkViewPlaneSlice(pResource, desc.Format, planeSlice); FAILED(hr))
+        return rejectInvalidView("checkViewPlaneSlice", hr, pResource, pDesc1);
       return CreateUnorderedAccessView(pResource, &desc, reinterpret_cast<ID3D11UnorderedAccessView**>(ppUAView1));
     }
 
@@ -4687,18 +4910,20 @@ namespace dxup {
         ID3D11Resource*                        pResource,
         const D3D11_RENDER_TARGET_VIEW_DESC1*  pDesc1,
         ID3D11RenderTargetView1**              ppRTView1) override {
+      clearOutput(ppRTView1);
       if (!pDesc1)
         return CreateRenderTargetView(pResource, nullptr, reinterpret_cast<ID3D11RenderTargetView**>(ppRTView1));
       D3D11_RENDER_TARGET_VIEW_DESC desc = {};
       desc.Format        = pDesc1->Format;
       desc.ViewDimension = pDesc1->ViewDimension;
+      UINT planeSlice = 0;
       switch (pDesc1->ViewDimension) {
         case D3D11_RTV_DIMENSION_TEXTURE2D:
-          if (pDesc1->Texture2D.PlaneSlice) return E_INVALIDARG;
+          planeSlice = pDesc1->Texture2D.PlaneSlice;
           desc.Texture2D.MipSlice = pDesc1->Texture2D.MipSlice;
           break;
         case D3D11_RTV_DIMENSION_TEXTURE2DARRAY:
-          if (pDesc1->Texture2DArray.PlaneSlice) return E_INVALIDARG;
+          planeSlice = pDesc1->Texture2DArray.PlaneSlice;
           desc.Texture2DArray.MipSlice        = pDesc1->Texture2DArray.MipSlice;
           desc.Texture2DArray.FirstArraySlice = pDesc1->Texture2DArray.FirstArraySlice;
           desc.Texture2DArray.ArraySize       = pDesc1->Texture2DArray.ArraySize;
@@ -4707,12 +4932,15 @@ namespace dxup {
           std::memcpy(&desc.Buffer, &pDesc1->Buffer, sizeof(desc) - offsetof(D3D11_RENDER_TARGET_VIEW_DESC, Buffer));
           break;
       }
+      if (HRESULT hr = checkViewPlaneSlice(pResource, desc.Format, planeSlice); FAILED(hr))
+        return rejectInvalidView("checkViewPlaneSlice", hr, pResource, pDesc1);
       return CreateRenderTargetView(pResource, &desc, reinterpret_cast<ID3D11RenderTargetView**>(ppRTView1));
     }
 
     HRESULT STDMETHODCALLTYPE CreateQuery1(
         const D3D11_QUERY_DESC1* pQueryDesc1,
         ID3D11Query1**           ppQuery1) override {
+      clearOutput(ppQuery1);
       if (!pQueryDesc1) return E_INVALIDARG;
       // Queries count work of every kind on the single queue.
       D3D11_QUERY_DESC desc = { pQueryDesc1->Query, pQueryDesc1->MiscFlags };
@@ -4787,9 +5015,21 @@ namespace dxup {
       if (!ppFence) return E_INVALIDARG;
       *ppFence = nullptr;
       if (!device) return E_FAIL;
-      // D3D11 and D3D12 fence flags have the same values.
+      // D3D11 numbers the flags one bit higher than D3D12 (SHARED is 0x2,
+      // not 0x1). As in the native runtime, bit 0x1 is ignored, unknown bits
+      // fail, and sharing across adapters needs sharing.
+      const UINT flags = static_cast<UINT>(Flags);
+      if ((flags & ~0xfu) || ((flags & D3D11_FENCE_FLAG_SHARED_CROSS_ADAPTER) && !(flags & D3D11_FENCE_FLAG_SHARED)))
+        return E_INVALIDARG;
+      D3D12_FENCE_FLAGS flags12 = D3D12_FENCE_FLAG_NONE;
+      if (flags & D3D11_FENCE_FLAG_SHARED)
+        flags12 |= D3D12_FENCE_FLAG_SHARED;
+      if (flags & D3D11_FENCE_FLAG_SHARED_CROSS_ADAPTER)
+        flags12 |= D3D12_FENCE_FLAG_SHARED_CROSS_ADAPTER;
+      if (flags & D3D11_FENCE_FLAG_NON_MONITORED)
+        flags12 |= D3D12_FENCE_FLAG_NON_MONITORED;
       ComPtr<ID3D12Fence> fence;
-      HRESULT hr = device->CreateFence(InitialValue, static_cast<D3D12_FENCE_FLAGS>(Flags), IID_PPV_ARGS(&fence));
+      HRESULT hr = device->CreateFence(InitialValue, flags12, IID_PPV_ARGS(&fence));
       if (FAILED(hr)) return hr;
       auto* wrapper = new D3D11Fence(this, std::move(fence));
       hr = wrapper->QueryInterface(ReturnedInterface, ppFence);
@@ -4870,6 +5110,9 @@ namespace dxup {
       shared->dimension = dimension;
       std::memcpy(&shared->desc, desc, descSize);
       shared->sync = std::move(sync);
+      static std::atomic<bool> s_logged{false};
+      if (shared->hasKeyedMutex() && !s_logged.exchange(true))
+        logMessage(LogLevel::Warn, "shared resource with keyed mutex: it synchronizes the devices of this process only");
       D3D11SharedResourceRegistry::add(shared);
       dxgi.setShared(std::move(shared));
     }
@@ -4880,8 +5123,14 @@ namespace dxup {
       *ppResource = nullptr;
       ID3D12Device* device = nativeDevice();
       ComPtr<ID3D12Resource> resource;
-      if (!handle || !device || FAILED(device->OpenSharedHandle(handle, IID_PPV_ARGS(&resource))))
+      if (!handle || !device)
         return E_INVALIDARG;
+      // Among others, legacy handles DXUP handed out in another process.
+      if (HRESULT hr = device->OpenSharedHandle(handle, IID_PPV_ARGS(&resource)); FAILED(hr)) {
+        char detail[64];
+        snprintf(detail, sizeof(detail), "handle %p nt %d (0x%08x)", handle, ntHandle ? 1 : 0, unsigned(hr));
+        return rejectInvalidCall("OpenSharedHandle", E_INVALIDARG, detail);
+      }
 
       // Resources of this process report their description; others one
       // derived from the D3D12 resource.
@@ -4892,6 +5141,7 @@ namespace dxup {
         shared = describeSharedResource(resource->GetDesc(), ntHandle);
         if (!shared)
           return E_INVALIDARG;
+        shared->foreign = true;
         if (D3D11SharedResource::isNtHandle(handle))
           shared->addHandle(handle);
         else
@@ -5088,25 +5338,29 @@ namespace dxup {
       return DXGI_ERROR_UNSUPPORTED;
     }
 
-    // The highest D3D11 feature level the D3D12 device has (11_1 to 12_1).
+    // The highest D3D11 feature level the D3D12 device has (11_0 to 12_1):
+    // D3D12 devices of level 11_0 exist, and D3D11 grants no higher one.
     D3D_FEATURE_LEVEL maxFeatureLevel() {
-      static const D3D_FEATURE_LEVEL levels[] = { D3D_FEATURE_LEVEL_12_1, D3D_FEATURE_LEVEL_12_0, D3D_FEATURE_LEVEL_11_1 };
+      static const D3D_FEATURE_LEVEL levels[] = { D3D_FEATURE_LEVEL_12_1, D3D_FEATURE_LEVEL_12_0, D3D_FEATURE_LEVEL_11_1,
+                                                  D3D_FEATURE_LEVEL_11_0 };
       D3D12_FEATURE_DATA_FEATURE_LEVELS data = {};
-      data.NumFeatureLevels = 3;
+      data.NumFeatureLevels = UINT(std::size(levels));
       data.pFeatureLevelsRequested = levels;
       ID3D12Device* device = nativeDevice();
       if (!device || FAILED(device->CheckFeatureSupport(D3D12_FEATURE_FEATURE_LEVELS, &data, sizeof(data))))
-        return D3D_FEATURE_LEVEL_11_1;
-      return (std::max)(data.MaxSupportedFeatureLevel, D3D_FEATURE_LEVEL_11_1);
+        return D3D_FEATURE_LEVEL_11_0;
+      return (std::min)((std::max)(data.MaxSupportedFeatureLevel, D3D_FEATURE_LEVEL_11_0), D3D_FEATURE_LEVEL_12_1);
     }
 
     // Before the device is handed out (D3D11CreateDevice).
     void setFeatureLevel(D3D_FEATURE_LEVEL level) { m_featureLevel = level; }
 
+    // A feature of level 11_1 and up, as the native runtime grants it.
     D3D12_CONSERVATIVE_RASTERIZATION_TIER conservativeRasterizationTier() {
       D3D12_FEATURE_DATA_D3D12_OPTIONS options = {};
       ID3D12Device* device = nativeDevice();
-      if (!device || FAILED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options))))
+      if (m_featureLevel < D3D_FEATURE_LEVEL_11_1 || !device
+       || FAILED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options))))
         return D3D12_CONSERVATIVE_RASTERIZATION_TIER_NOT_SUPPORTED;
       return options.ConservativeRasterizationTier;
     }
@@ -5139,6 +5393,11 @@ namespace dxup {
       D3D12_FEATURE_DATA_D3D12_OPTIONS options = {};
       if (device)
         device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options));
+      // Features the native runtime reports from feature level 11_0 or 11_1
+      // on only, however capable the GPU (a device of level 11_0 has no
+      // rasterizer ordered views, for one).
+      const bool level11 = m_featureLevel >= D3D_FEATURE_LEVEL_11_0;
+      const bool level11_1 = m_featureLevel >= D3D_FEATURE_LEVEL_11_1;
 
       auto expectSize = [&](size_t size) { return FeatureSupportDataSize == size; };
 
@@ -5204,7 +5463,7 @@ namespace dxup {
           auto* data = static_cast<D3D11_FEATURE_DATA_D3D11_OPTIONS*>(pFeatureSupportData);
           std::memset(data, 0, sizeof(*data));
           data->OutputMergerLogicOp                    = options.OutputMergerLogicOp;
-          data->UAVOnlyRenderingForcedSampleCount      = TRUE;
+          data->UAVOnlyRenderingForcedSampleCount      = level11;
           data->DiscardAPIsSeenByDriver                = TRUE;
           data->FlagsForUpdateAndCopySeenByDriver      = TRUE;
           data->ClearView                              = TRUE;
@@ -5214,8 +5473,8 @@ namespace dxup {
           data->MapNoOverwriteOnDynamicConstantBuffer  = TRUE;
           data->MapNoOverwriteOnDynamicBufferSRV       = TRUE;
           data->MultisampleRTVWithForcedSampleCountOne = FALSE;
-          data->SAD4ShaderInstructions                 = TRUE;
-          data->ExtendedDoublesShaderInstructions      = options.DoublePrecisionFloatShaderOps;
+          data->SAD4ShaderInstructions                 = level11;
+          data->ExtendedDoublesShaderInstructions      = level11 && options.DoublePrecisionFloatShaderOps;
           data->ExtendedResourceSharing                = TRUE;
           return S_OK;
         }
@@ -5250,9 +5509,10 @@ namespace dxup {
           if (!expectSize(sizeof(D3D11_FEATURE_DATA_D3D11_OPTIONS1)))
             return E_INVALIDARG;
           auto* data = static_cast<D3D11_FEATURE_DATA_D3D11_OPTIONS1*>(pFeatureSupportData);
-          data->TiledResourcesTier                    = tiledResourcesTier();
+          // This D3D11.2 query names tiers up to 2 (native runtime).
+          data->TiledResourcesTier                    = (std::min)(tiledResourcesTier(), D3D11_TILED_RESOURCES_TIER_2);
           // D3D12 has min/max filtering from tiled resources tier 2.
-          data->MinMaxFiltering                       = data->TiledResourcesTier >= D3D11_TILED_RESOURCES_TIER_2;
+          data->MinMaxFiltering                       = gpuTiledResourcesTier() >= D3D11_TILED_RESOURCES_TIER_2;
           data->ClearViewAlsoSupportsDepthOnlyFormats = FALSE;
           data->MapOnDefaultBuffers                   = FALSE;
           return S_OK;
@@ -5287,10 +5547,10 @@ namespace dxup {
             device->CheckFeatureSupport(D3D12_FEATURE_ARCHITECTURE, &architecture, sizeof(architecture));
           auto* data = static_cast<D3D11_FEATURE_DATA_D3D11_OPTIONS2*>(pFeatureSupportData);
           data->PSSpecifiedStencilRefSupported = options.PSSpecifiedStencilRefSupported;
-          data->TypedUAVLoadAdditionalFormats  = options.TypedUAVLoadAdditionalFormats;
-          data->ROVsSupported                  = options.ROVsSupported;
+          data->TypedUAVLoadAdditionalFormats  = level11 && options.TypedUAVLoadAdditionalFormats;
+          data->ROVsSupported                  = level11_1 && options.ROVsSupported;
           // D3D11 and D3D12 number the tiers the same way.
-          data->ConservativeRasterizationTier  = static_cast<D3D11_CONSERVATIVE_RASTERIZATION_TIER>(options.ConservativeRasterizationTier);
+          data->ConservativeRasterizationTier  = static_cast<D3D11_CONSERVATIVE_RASTERIZATION_TIER>(conservativeRasterizationTier());
           data->TiledResourcesTier             = tiledResourcesTier();
           data->MapOnDefaultTextures           = FALSE;
           data->StandardSwizzle                = FALSE;
@@ -5380,9 +5640,14 @@ namespace dxup {
     UINT m_creationFlags = 0;
 
     // Created for Direct3D 10 (d3d10.dll asks the device for ID3D10Device).
+    // Direct3D 10 devices are thread-safe unless created single-threaded:
+    // every call of the immediate context, which all D3D10 drawing goes
+    // through, holds the device lock.
     void enableD3D10(UINT flags) {
       m_d3d10 = true;
       m_d3d10Device.setCreationFlags(flags);
+      if (!(flags & D3D10_CREATE_DEVICE_SINGLETHREADED))
+        m_multithread.SetMultithreadProtected(TRUE);
     }
 
     // Why the device was lost, so that games notice a GPU fault and create
@@ -5963,7 +6228,8 @@ namespace dxup {
   }
 
   // Resources shared without NT handles have a legacy handle, the same
-  // every time.
+  // every time. It is an NT handle of this process (D3D12 makes no others),
+  // which other processes cannot open.
   inline HRESULT STDMETHODCALLTYPE D3D11DxgiResource::GetSharedHandle(HANDLE* pSharedHandle) {
     if (!pSharedHandle)
       return E_INVALIDARG;
@@ -5987,6 +6253,9 @@ namespace dxup {
     });
     if (!handle)
       return E_FAIL;
+    static std::atomic<bool> s_logged{false};
+    if (!s_logged.exchange(true))
+      logMessage(LogLevel::Warn, "GetSharedHandle: DXUP's legacy shared handles are valid in this process only");
     *pSharedHandle = handle;
     return S_OK;
   }

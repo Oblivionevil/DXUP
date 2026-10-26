@@ -140,6 +140,47 @@ namespace dxup {
     return isTypelessFormat(format);
   }
 
+  // Video textures with a luma and a chroma plane, which views see one at a
+  // time.
+  inline bool isVideoPlanarFormat(DXGI_FORMAT format) {
+    switch (format) {
+      case DXGI_FORMAT_NV12:
+      case DXGI_FORMAT_NV11:
+      case DXGI_FORMAT_P010:
+      case DXGI_FORMAT_P016:
+      case DXGI_FORMAT_420_OPAQUE:
+        return true;
+      default:
+        return false;
+    }
+  }
+
+  // The plane of a video texture a view format names: 0 for the luma
+  // formats, 1 for the chroma ones, -1 for formats that name none (the
+  // texture's own format among them).
+  inline int getVideoViewPlane(DXGI_FORMAT resourceFormat, DXGI_FORMAT viewFormat) {
+    switch (resourceFormat) {
+      case DXGI_FORMAT_NV12:
+      case DXGI_FORMAT_NV11:
+        if (viewFormat == DXGI_FORMAT_R8_UNORM || viewFormat == DXGI_FORMAT_R8_UINT)
+          return 0;
+        return viewFormat == DXGI_FORMAT_R8G8_UNORM || viewFormat == DXGI_FORMAT_R8G8_UINT ? 1 : -1;
+      case DXGI_FORMAT_P010:
+      case DXGI_FORMAT_P016:
+        if (viewFormat == DXGI_FORMAT_R16_UNORM || viewFormat == DXGI_FORMAT_R16_UINT)
+          return 0;
+        return viewFormat == DXGI_FORMAT_R16G16_UNORM || viewFormat == DXGI_FORMAT_R16G16_UINT ? 1 : -1;
+      default:
+        return -1;
+    }
+  }
+
+  // The PlaneSlice of a texture view (D3D11_TEX2D_SRV1 and the like). D3D11
+  // views every other texture as one plane, depth-stencil ones too.
+  inline UINT getViewPlaneSlice(DXGI_FORMAT resourceFormat, DXGI_FORMAT viewFormat) {
+    return getVideoViewPlane(resourceFormat, viewFormat) == 1 ? 1u : 0u;
+  }
+
   // The format a texture view has: its own, or the resource's for UNKNOWN.
   // Typed resources are viewed in their format, typeless ones in a format
   // of their family.
@@ -148,21 +189,13 @@ namespace dxup {
       format = info.format;
     if (isFamilyOnlyFormat(format))
       return E_INVALIDARG;
+    // Video textures are viewed per plane, in luma and chroma formats only:
+    // a view in the texture's own format fails, as in D3D11 (D3D12 would
+    // remove the device).
+    if (isVideoPlanarFormat(info.format))
+      return getVideoViewPlane(info.format, format) >= 0 ? S_OK : E_INVALIDARG;
     if (format == info.format)
       return S_OK;
-    // Video textures are viewed per plane: luma and chroma formats.
-    switch (info.format) {
-      case DXGI_FORMAT_NV12:
-      case DXGI_FORMAT_NV11:
-        return format == DXGI_FORMAT_R8_UNORM || format == DXGI_FORMAT_R8_UINT
-          || format == DXGI_FORMAT_R8G8_UNORM || format == DXGI_FORMAT_R8G8_UINT ? S_OK : E_INVALIDARG;
-      case DXGI_FORMAT_P010:
-      case DXGI_FORMAT_P016:
-        return format == DXGI_FORMAT_R16_UNORM || format == DXGI_FORMAT_R16_UINT
-          || format == DXGI_FORMAT_R16G16_UNORM || format == DXGI_FORMAT_R16G16_UINT ? S_OK : E_INVALIDARG;
-      default:
-        break;
-    }
     if (info.swapChainBuffer)
       return getFormatFamily(format) == getFormatFamily(info.format) ? S_OK : E_INVALIDARG;
     return isFamilyOnlyFormat(info.format) && getFormatFamily(format) == info.format ? S_OK : E_INVALIDARG;
@@ -280,7 +313,9 @@ namespace dxup {
             } else {
               out.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DMS;
             }
-          } else if (cube && info.arraySize > 6) {
+          } else if (cube && info.arraySize >= 12) {
+            // Two whole cubes or more; up to 11 slices view as one cube
+            // (native runtime).
             out.ViewDimension = D3D11_SRV_DIMENSION_TEXTURECUBEARRAY;
             out.TextureCubeArray = { 0, info.mipLevels, 0, info.arraySize / 6 };
           } else if (cube) {

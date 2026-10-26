@@ -36,11 +36,14 @@ namespace dxup {
       return *this;
     }
 
+    // The new pointer is referenced before the old one is released: the
+    // old object may hold the only reference to the new one.
     ComPtr& operator=(T* ptr) {
       if (m_ptr != ptr) {
+        if (ptr)
+          ptr->AddRef();
         internalRelease();
         m_ptr = ptr;
-        internalAddRef();
       }
       return *this;
     }
@@ -51,10 +54,12 @@ namespace dxup {
       return *this;
     }
 
+    // Taken before the old object goes, which may own other.
     ComPtr& operator=(ComPtr&& other) noexcept {
       if (this != &other) {
+        T* ptr = other.detach();
         internalRelease();
-        m_ptr = other.detach();
+        m_ptr = ptr;
       }
       return *this;
     }

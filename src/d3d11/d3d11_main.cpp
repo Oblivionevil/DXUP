@@ -108,7 +108,8 @@ namespace {
     return adapterWrapper;
   }
 
-  // 12_0 and 12_1 only when the D3D12 device has them (maxLevel).
+  // Levels above 11_0 need the D3D12 device to have them (maxLevel); every
+  // D3D12 device has 11_0 and the levels below it.
   HRESULT chooseFeatureLevel(const D3D_FEATURE_LEVEL* requestedLevels,
                              UINT requestedLevelCount,
                              D3D_FEATURE_LEVEL maxLevel,
@@ -123,27 +124,32 @@ namespace {
       return S_OK;
     }
 
+    // As in D3D11, a value that is no D3D11 level fails the whole array;
+    // 12_2 is one but D3D11 never grants it.
     for (UINT i = 0; i < requestedLevelCount; i++) {
       switch (requestedLevels[i]) {
+        case D3D_FEATURE_LEVEL_12_2:
         case D3D_FEATURE_LEVEL_12_1:
         case D3D_FEATURE_LEVEL_12_0:
-          if (requestedLevels[i] <= maxLevel) {
-            *chosenLevel = requestedLevels[i];
-            return S_OK;
-          }
-          break;
         case D3D_FEATURE_LEVEL_11_1:
         case D3D_FEATURE_LEVEL_11_0:
         case D3D_FEATURE_LEVEL_10_1:
         case D3D_FEATURE_LEVEL_10_0:
-        // As on every D3D11 GPU (God of War asks for each level in turn).
         case D3D_FEATURE_LEVEL_9_3:
         case D3D_FEATURE_LEVEL_9_2:
         case D3D_FEATURE_LEVEL_9_1:
-          *chosenLevel = requestedLevels[i];
-          return S_OK;
-        default:
           break;
+        default:
+          return E_INVALIDARG;
+      }
+    }
+
+    for (UINT i = 0; i < requestedLevelCount; i++) {
+      const D3D_FEATURE_LEVEL level = requestedLevels[i];
+      // As on every D3D11 GPU (God of War asks for each level in turn).
+      if (level != D3D_FEATURE_LEVEL_12_2 && (level <= D3D_FEATURE_LEVEL_11_0 || level <= maxLevel)) {
+        *chosenLevel = level;
+        return S_OK;
       }
     }
 
@@ -179,6 +185,10 @@ HRESULT STDMETHODCALLTYPE D3D11Device::QueryInterface(REFIID riid, void** ppvObj
   }
 
   if (riid == __uuidof(ID3D11Multithread) || riid == __uuidof(ID3D10Multithread)) {
+    // Devices created single-threaded have no lock to offer (native D3D10
+    // and D3D11 answer neither interface).
+    if (m_creationFlags & D3D11_CREATE_DEVICE_SINGLETHREADED)
+      return E_NOINTERFACE;
     // Both interfaces declare the same methods in the same order.
     *ppvObject = static_cast<ID3D11Multithread*>(&m_multithread);
     AddRef();
@@ -278,6 +288,13 @@ HRESULT D3D11Device::CreateDeferredContext(
     UINT                    ContextFlags,
     ID3D11DeviceContext**   ppDeferredContext) {
   if (!ppDeferredContext) return E_INVALIDARG;
+  // As D3D11 refuses them, before it touches the pointer: flags (none
+  // exist), and devices created single-threaded, which have no deferred
+  // contexts.
+  if (ContextFlags)
+    return E_INVALIDARG;
+  if (m_creationFlags & D3D11_CREATE_DEVICE_SINGLETHREADED)
+    return DXGI_ERROR_INVALID_CALL;
 
   try {
     auto backendCtx = m_backendDevice.createDeferredContext();
@@ -536,6 +553,15 @@ HRESULT __stdcall D3D11CreateDevice(
   (void)Software;
   (void)SDKVersion;
 
+  // As in D3D11, every output is cleared first: failures leave no level and
+  // no objects behind.
+  if (ppDevice)
+    *ppDevice = nullptr;
+  if (ppImmediateContext)
+    *ppImmediateContext = nullptr;
+  if (pFeatureLevel)
+    *pFeatureLevel = D3D_FEATURE_LEVEL(0);
+
   // As in D3D11: an explicit adapter goes with D3D_DRIVER_TYPE_UNKNOWN only.
   if ((pAdapter != nullptr) != (DriverType == D3D_DRIVER_TYPE_UNKNOWN))
     return E_INVALIDARG;
@@ -567,12 +593,12 @@ HRESULT __stdcall D3D11CreateDevice(
     return nullptr;
   };
 
-  // Levels 12_0 and 12_1 depend on the GPU: the device first, then the
-  // level (some games ask for 12_x only).
+  // Levels above 11_0 depend on the GPU (D3D12 devices of level 11_0
+  // exist): the device first, then the level (some games ask for 12_x only).
   D3D11Device* device = nullptr;
-  D3D_FEATURE_LEVEL maxLevel = D3D_FEATURE_LEVEL_11_1;
+  D3D_FEATURE_LEVEL maxLevel = D3D_FEATURE_LEVEL_11_0;
   for (UINT i = 0; pFeatureLevels && i < FeatureLevels; i++) {
-    if (pFeatureLevels[i] >= D3D_FEATURE_LEVEL_12_0 && !device) {
+    if (pFeatureLevels[i] > D3D_FEATURE_LEVEL_11_0 && pFeatureLevels[i] <= D3D_FEATURE_LEVEL_12_1 && !device) {
       device = createDevice(D3D_FEATURE_LEVEL_11_0);
       if (!device)
         return createNativeDevice(pAdapter, DriverType, Software, Flags, pFeatureLevels, FeatureLevels,
@@ -632,7 +658,8 @@ HRESULT __stdcall D3D11CreateDevice(
     // Out of memory for its command list or descriptor heaps.
     if (!*ppImmediateContext) {
       device->Release();
-      if (ppDevice) *ppDevice = nullptr;
+      if (pFeatureLevel)
+        *pFeatureLevel = D3D_FEATURE_LEVEL(0);
       return E_OUTOFMEMORY;
     }
   }
@@ -661,6 +688,15 @@ HRESULT __stdcall D3D11CreateDeviceAndSwapChain(
     ID3D11DeviceContext**       ppImmediateContext) {
 
   logMessage(LogLevel::Info, "D3D11CreateDeviceAndSwapChain called");
+
+  // As in D3D11, the outputs are cleared first. A swap chain pointer without
+  // a description gets none, and the call still succeeds (native runtime).
+  if (ppSwapChain)
+    *ppSwapChain = nullptr;
+  if (ppDevice)
+    *ppDevice = nullptr;
+  if (ppImmediateContext)
+    *ppImmediateContext = nullptr;
 
   // First create the device
   ID3D11Device* device = nullptr;

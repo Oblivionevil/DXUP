@@ -401,6 +401,9 @@ void main(uint2 id : SV_DispatchThreadID) {
         {"deferred_dynamic_defaults", &Dx11TestApp::testDeferredDynamicDefaults},
         {"deferred_map_rules", &Dx11TestApp::testDeferredMapRules},
         {"device_creation_rules", &Dx11TestApp::testDeviceCreationRules},
+        {"native_creation_answers", &Dx11TestApp::testNativeCreationAnswers},
+        {"stream_output_declarations", &Dx11TestApp::testStreamOutputDeclarations},
+        {"video_plane_views", &Dx11TestApp::testVideoPlaneViews},
         {"stream_output_gap", &Dx11TestApp::testStreamOutputGap},
         {"planar_initial_data", &Dx11TestApp::testPlanarInitialData},
         {"planar_region_copy", &Dx11TestApp::testPlanarRegionCopy},
@@ -6094,6 +6097,380 @@ float4 main(float4 position : SV_Position) : SV_Target { return float4(1.0f, 1.0
       const char* expected = "srvArray-1=ok srvArraySize=10 srvCubes-1=ok numCubes=2 rtvArray-1=ok uavArray-1=ok dsvArray-1=ok cube8=ok standardPattern=ok standardDraw=255 centerPattern=ok centerDraw=255 msaaInitialData=inval logicOpIndependent=inval filter54=inval flags=0x20";
       if (observed != expected) {
         error = "creation results: " + observed;
+        return false;
+      }
+      return true;
+    }
+
+    static std::string resultName(HRESULT hr) {
+      return SUCCEEDED(hr) ? (hr == S_FALSE ? "false" : "ok") : hr == E_INVALIDARG ? "inval"
+        : hr == E_NOINTERFACE ? "nointerface" : hr == DXGI_ERROR_INVALID_CALL ? "invalidcall" : formatString("0x%08x", unsigned(hr));
+    }
+
+    // What creation calls answer, as the native runtime does: object
+    // pointers cleared when they fail (some kept), deferred context and
+    // feature level rules, fence flags, the default view of cubes, the
+    // locks of single-threaded and Direct3D 10 devices, and features of a
+    // level 11_0 device.
+    bool testNativeCreationAnswers(std::string& error) {
+      std::string observed;
+      void* const kStale = reinterpret_cast<void*>(uintptr_t(0x1230));
+      auto state = [&](void* object) { return object == kStale ? "stale" : object ? "set" : "null"; };
+      auto probe = [&](const char* name, auto&& call) {
+        void* object = kStale;
+        const HRESULT hr = call(&object);
+        observed += formatString("%s=%s/%s ", name, resultName(hr).c_str(), state(object));
+        if (SUCCEEDED(hr) && object && object != kStale)
+          static_cast<IUnknown*>(object)->Release();
+      };
+      probe("buffer", [&](void** p) { return m_device->CreateBuffer(nullptr, nullptr, reinterpret_cast<ID3D11Buffer**>(p)); });
+      const D3D11_TEXTURE2D_DESC emptyDesc = { 0, 4, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, { 1, 0 }, D3D11_USAGE_DEFAULT,
+        D3D11_BIND_SHADER_RESOURCE, 0, 0 };
+      probe("texture", [&](void** p) { return m_device->CreateTexture2D(&emptyDesc, nullptr, reinterpret_cast<ID3D11Texture2D**>(p)); });
+      probe("srv", [&](void** p) {
+        return m_device->CreateShaderResourceView(nullptr, nullptr, reinterpret_cast<ID3D11ShaderResourceView**>(p)); });
+      probe("vs", [&](void** p) { return m_device->CreateVertexShader(nullptr, 0, nullptr, reinterpret_cast<ID3D11VertexShader**>(p)); });
+      probe("blend", [&](void** p) { return m_device->CreateBlendState(nullptr, reinterpret_cast<ID3D11BlendState**>(p)); });
+      const D3D11_QUERY_DESC badMisc = { D3D11_QUERY_OCCLUSION, 0x10 };
+      probe("queryMisc", [&](void** p) { return m_device->CreateQuery(&badMisc, reinterpret_cast<ID3D11Query**>(p)); });
+      const D3D11_QUERY_DESC occlusion = { D3D11_QUERY_OCCLUSION, 0 };
+      probe("predicateType", [&](void** p) { return m_device->CreatePredicate(&occlusion, reinterpret_cast<ID3D11Predicate**>(p)); });
+      probe("deferredFlags", [&](void** p) { return m_device->CreateDeferredContext(1, reinterpret_cast<ID3D11DeviceContext**>(p)); });
+
+      // Device creation: outputs cleared, values that are no level fail,
+      // 12_2 is never granted, a swap chain needs a description.
+      {
+        void* device = kStale;
+        void* context = kStale;
+        D3D_FEATURE_LEVEL level = D3D_FEATURE_LEVEL(0x1111);
+        const HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_UNKNOWN, nullptr, 0, nullptr, 0, D3D11_SDK_VERSION,
+          reinterpret_cast<ID3D11Device**>(&device), &level, reinterpret_cast<ID3D11DeviceContext**>(&context));
+        observed += formatString("device=%s/%s/%s/0x%x ", resultName(hr).c_str(), state(device), state(context), unsigned(level));
+      }
+      for (const D3D_FEATURE_LEVEL first : { D3D_FEATURE_LEVEL(0x1234), D3D_FEATURE_LEVEL_12_2 }) {
+        const D3D_FEATURE_LEVEL levels[2] = { first, D3D_FEATURE_LEVEL_11_0 };
+        D3D_FEATURE_LEVEL level = D3D_FEATURE_LEVEL(0x1111);
+        const HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, levels, 2, D3D11_SDK_VERSION,
+          nullptr, &level, nullptr);
+        observed += formatString("levels%x=%s/0x%x ", unsigned(first), resultName(hr).c_str(), unsigned(level));
+      }
+      {
+        void* swapChain = kStale;
+        ComPtr<ID3D11Device> device;
+        const HRESULT hr = D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, nullptr, 0,
+          D3D11_SDK_VERSION, nullptr, reinterpret_cast<IDXGISwapChain**>(&swapChain), device.GetAddressOf(), nullptr, nullptr);
+        observed += formatString("noSwapDesc=%s/%s/%s ", resultName(hr).c_str(), state(swapChain), device ? "set" : "null");
+      }
+      // Single-threaded devices: no deferred contexts, no lock.
+      ComPtr<ID3D11Device> single;
+      if (SUCCEEDED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, D3D11_CREATE_DEVICE_SINGLETHREADED, nullptr,
+            0, D3D11_SDK_VERSION, single.GetAddressOf(), nullptr, nullptr))) {
+        probe("singleDeferred", [&](void** p) {
+          return single->CreateDeferredContext(0, reinterpret_cast<ID3D11DeviceContext**>(p)); });
+        ComPtr<ID3D11Multithread> lock;
+        observed += formatString("singleLock=%s ", resultName(single.As(&lock)).c_str());
+      }
+      // Direct3D 10 devices hold their lock unless single-threaded.
+      for (const UINT flags : { 0u, UINT(D3D10_CREATE_DEVICE_SINGLETHREADED) }) {
+        ComPtr<ID3D10Device> device10;
+        ComPtr<ID3D10Multithread> lock;
+        if (FAILED(D3D10CreateDevice(nullptr, D3D10_DRIVER_TYPE_HARDWARE, nullptr, flags, D3D10_SDK_VERSION,
+              device10.GetAddressOf())))
+          continue;
+        const HRESULT hr = device10.As(&lock);
+        observed += formatString("d3d10lock%u=%s/%d ", flags, resultName(hr).c_str(), lock ? lock->GetMultithreadProtected() : -1);
+      }
+
+      // Fences: D3D11's flag values, sharing across adapters needs sharing.
+      ComPtr<ID3D11Device5> device5;
+      if (SUCCEEDED(m_device.As(&device5))) {
+        for (const UINT flags : { 0x1u, 0x2u, 0x6u, 0x4u, 0x10u }) {
+          ComPtr<ID3D11Fence> fence;
+          HRESULT hr = device5->CreateFence(0, D3D11_FENCE_FLAG(flags), __uuidof(ID3D11Fence),
+            reinterpret_cast<void**>(fence.GetAddressOf()));
+          HANDLE handle = nullptr;
+          const HRESULT share = fence ? fence->CreateSharedHandle(nullptr, GENERIC_ALL, nullptr, &handle) : E_FAIL;
+          if (handle)
+            CloseHandle(handle);
+          observed += formatString("fence%x=%s/%s ", flags, resultName(hr).c_str(), fence ? resultName(share).c_str() : "-");
+        }
+      }
+
+      // The default view of a cube with 7 slices is one cube.
+      for (const UINT slices : { 7u, 12u }) {
+        const D3D11_TEXTURE2D_DESC cubeDesc = { 8, 8, 1, slices, DXGI_FORMAT_R8G8B8A8_UNORM, { 1, 0 }, D3D11_USAGE_DEFAULT,
+          D3D11_BIND_SHADER_RESOURCE, 0, D3D11_RESOURCE_MISC_TEXTURECUBE };
+        ComPtr<ID3D11Texture2D> cube;
+        ComPtr<ID3D11ShaderResourceView> view;
+        D3D11_SHADER_RESOURCE_VIEW_DESC viewDesc = {};
+        if (SUCCEEDED(m_device->CreateTexture2D(&cubeDesc, nullptr, cube.GetAddressOf()))
+         && SUCCEEDED(m_device->CreateShaderResourceView(cube.Get(), nullptr, view.GetAddressOf())))
+          view->GetDesc(&viewDesc);
+        observed += formatString("cube%u=%u/%u ", slices, unsigned(viewDesc.ViewDimension),
+          viewDesc.ViewDimension == D3D11_SRV_DIMENSION_TEXTURECUBEARRAY ? viewDesc.TextureCubeArray.NumCubes : 0u);
+      }
+
+      // A level 11_0 device has no features of 11_1 (rasterizer ordered
+      // views, conservative rasterization, tiled resources above tier 1).
+      ComPtr<ID3D11Device> device11;
+      const D3D_FEATURE_LEVEL level11 = D3D_FEATURE_LEVEL_11_0;
+      if (SUCCEEDED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, &level11, 1, D3D11_SDK_VERSION,
+            device11.GetAddressOf(), nullptr, nullptr))) {
+        D3D11_FEATURE_DATA_D3D11_OPTIONS2 options2 = {};
+        device11->CheckFeatureSupport(D3D11_FEATURE_D3D11_OPTIONS2, &options2, sizeof(options2));
+        observed += formatString("level11=%d/%d/%d", options2.ROVsSupported, int(options2.ConservativeRasterizationTier),
+          options2.TiledResourcesTier <= D3D11_TILED_RESOURCES_TIER_1 ? 1 : 0);
+      }
+
+      const char* expected = "buffer=inval/null texture=inval/null srv=inval/null vs=inval/null blend=inval/null "
+        "queryMisc=inval/null predicateType=inval/stale deferredFlags=inval/stale device=inval/null/null/0x0 "
+        "levels1234=inval/0x0 levelsc200=false/0xb000 noSwapDesc=ok/null/set singleDeferred=invalidcall/stale "
+        "singleLock=nointerface d3d10lock0=ok/1 d3d10lock1=nointerface/-1 fence1=ok/inval fence2=ok/ok fence6=ok/ok "
+        "fence4=inval/- fence10=inval/- cube7=9/0 cube12=10/2 level11=0/0/1";
+      if (observed != expected) {
+        error = "creation answers: " + observed;
+        return false;
+      }
+      return true;
+    }
+
+    // Stream output declarations as the native runtime checks them, and
+    // buffers without strides, which are packed.
+    bool testStreamOutputDeclarations(std::string& error) {
+      static const char* kVs = R"(
+struct VO { float4 position : SV_Position; float4 value : TEXCOORD0; float2 uv : TEXCOORD1; };
+VO main(uint id : SV_VertexID) { VO o; o.position = float4(0, 0, 0, 1); o.value = float4(1, 2, 3, 4) + id * 10; o.uv = id; return o; }
+)";
+      static const char* kGs = R"(
+struct G0 { float4 position : SV_Position; float4 a : TEXCOORD0; };
+struct G1 { float4 b : TEXCOORD1; };
+[maxvertexcount(1)] void main(point float4 p[1] : SV_Position, inout PointStream<G0> s0, inout PointStream<G1> s1) {
+  G0 o; o.position = p[0]; o.a = p[0]; s0.Append(o); G1 q; q.b = p[0]; s1.Append(q); }
+)";
+      ComPtr<ID3D11VertexShader> vs;
+      ComPtr<ID3DBlob> vsCode, gsCode;
+      if (!createVertexShader(kVs, "main", vs, vsCode, error) || !m_compiler.compile(kGs, "main", "gs_5_0", gsCode, error))
+        return false;
+      std::string observed;
+      using Decl = std::vector<D3D11_SO_DECLARATION_ENTRY>;
+      auto declare = [&](const char* name, ID3DBlob* code, const Decl& decl, std::vector<UINT> strides, UINT rasterized) {
+        ComPtr<ID3D11GeometryShader> gs;
+        const HRESULT hr = m_device->CreateGeometryShaderWithStreamOutput(code->GetBufferPointer(), code->GetBufferSize(),
+          decl.empty() ? nullptr : decl.data(), UINT(decl.size()), strides.empty() ? nullptr : strides.data(),
+          UINT(strides.size()), rasterized, nullptr, gs.GetAddressOf());
+        observed += formatString("%s=%s ", name, resultName(hr).c_str());
+      };
+      const UINT none = D3D11_SO_NO_RASTERIZED_STREAM;
+      const D3D11_SO_DECLARATION_ENTRY value = { 0, "TEXCOORD", 0, 0, 4, 0 };
+      ID3DBlob* v = vsCode.Get();
+      declare("valid", v, { value }, { 16 }, none);
+      declare("rasterized4", v, { value }, { 16 }, 4);
+      declare("fiveStrides", v, { value }, { 16, 16, 16, 16, 16 }, none);
+      declare("stride18", v, { value }, { 18 }, none);
+      declare("strideShort", v, { value }, { 8 }, none);
+      declare("stride2052", v, { value }, { 2052 }, none);
+      declare("noStrides", v, { value }, {}, none);
+      declare("noEntries", v, {}, { 16 }, none);
+      declare("slotPastStrides", v, { { 0, "TEXCOORD", 0, 0, 4, 1 } }, { 16 }, none);
+      declare("vsStream1", v, { { 1, "TEXCOORD", 0, 0, 4, 0 } }, { 16 }, none);
+      declare("components", v, { { 0, "TEXCOORD", 0, 3, 2, 0 } }, { 16 }, none);
+      declare("float2Of4", v, { { 0, "TEXCOORD", 1, 0, 4, 0 } }, { 16 }, none);
+      declare("unknownName", v, { { 0, "FOO", 0, 0, 4, 0 } }, { 16 }, none);
+      declare("lowercase", v, { { 0, "texcoord", 0, 0, 4, 0 } }, { 16 }, none);
+      declare("overlap", v, { { 0, "TEXCOORD", 0, 0, 2, 0 }, { 0, "TEXCOORD", 0, 1, 2, 0 } }, { 16 }, none);
+      declare("gapOnly", v, { { 0, nullptr, 0, 0, 4, 0 } }, { 16 }, none);
+      declare("gapStart", v, { { 0, nullptr, 0, 3, 1, 0 }, value }, { 20 }, none);
+      declare("wideGap", v, { { 0, nullptr, 0, 0, 5, 0 }, value }, { 36 }, none);
+      ID3DBlob* g = gsCode.Get();
+      const D3D11_SO_DECLARATION_ENTRY stream0 = { 0, "TEXCOORD", 0, 0, 4, 0 };
+      const D3D11_SO_DECLARATION_ENTRY stream1 = { 1, "TEXCOORD", 1, 0, 4, 1 };
+      declare("streams", g, { stream0, stream1 }, { 16, 16 }, 1);
+      declare("streamsDown", g, { stream1, { 0, "TEXCOORD", 0, 0, 4, 0 } }, { 16, 16 }, none);
+      declare("streamsShareSlot", g, { stream0, { 1, "TEXCOORD", 1, 0, 4, 0 } }, { 32 }, none);
+      declare("wrongStream", g, { { 1, "TEXCOORD", 0, 0, 4, 0 } }, { 16 }, none);
+      const char* expected = "valid=ok rasterized4=inval fiveStrides=inval stride18=inval strideShort=inval stride2052=inval "
+        "noStrides=ok noEntries=inval slotPastStrides=inval vsStream1=inval components=inval float2Of4=inval "
+        "unknownName=inval lowercase=ok overlap=inval gapOnly=inval gapStart=inval wideGap=ok streams=ok "
+        "streamsDown=inval streamsShareSlot=inval wrongStream=inval ";
+      if (observed != expected) {
+        error = "stream output declarations: " + observed;
+        return false;
+      }
+
+      // Without strides: the buffer of slot 1 holds whole vertices.
+      ComPtr<ID3D11GeometryShader> gs;
+      const D3D11_SO_DECLARATION_ENTRY slot1 = { 0, "TEXCOORD", 0, 0, 4, 1 };
+      HRESULT hr = m_device->CreateGeometryShaderWithStreamOutput(v->GetBufferPointer(), v->GetBufferSize(), &slot1, 1,
+        nullptr, 0, none, nullptr, gs.GetAddressOf());
+      D3D11_BUFFER_DESC soDesc = { 32, D3D11_USAGE_DEFAULT, D3D11_BIND_STREAM_OUTPUT, 0, 0, 0 };
+      D3D11_BUFFER_DESC stagingDesc = { 32, D3D11_USAGE_STAGING, 0, D3D11_CPU_ACCESS_READ, 0, 0 };
+      ComPtr<ID3D11Buffer> soBuffer, staging;
+      if (SUCCEEDED(hr)) hr = m_device->CreateBuffer(&soDesc, nullptr, soBuffer.GetAddressOf());
+      if (SUCCEEDED(hr)) hr = m_device->CreateBuffer(&stagingDesc, nullptr, staging.GetAddressOf());
+      if (FAILED(hr)) {
+        error = "stream output without strides: " + formatHResult(hr);
+        return false;
+      }
+      m_context->ClearState();
+      m_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_POINTLIST);
+      m_context->VSSetShader(vs.Get(), nullptr, 0);
+      m_context->GSSetShader(gs.Get(), nullptr, 0);
+      ID3D11Buffer* targets[2] = { nullptr, soBuffer.Get() };
+      const UINT offsets[2] = {};
+      m_context->SOSetTargets(2, targets, offsets);
+      m_context->Draw(2, 0);
+      m_context->ClearState();
+      m_context->CopyResource(staging.Get(), soBuffer.Get());
+      D3D11_MAPPED_SUBRESOURCE mapped = {};
+      if (FAILED(hr = m_context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped))) {
+        error = "Map(stream output) failed: " + formatHResult(hr);
+        return false;
+      }
+      float values[8];
+      std::memcpy(values, mapped.pData, sizeof(values));
+      m_context->Unmap(staging.Get(), 0);
+      if (values[0] != 1.0f || values[3] != 4.0f || values[4] != 11.0f || values[7] != 14.0f) {
+        error = formatString("stream output without strides wrote %g %g %g %g | %g %g %g %g", values[0], values[1],
+          values[2], values[3], values[4], values[5], values[6], values[7]);
+        return false;
+      }
+      return true;
+    }
+
+    // Views of the planes of a video texture: the plane slice their format
+    // names, as the native runtime checks it, and draws into the chroma
+    // plane, whose pipelines render in its format.
+    bool testVideoPlaneViews(std::string& error) {
+      ComPtr<ID3D11Device3> device3;
+      UINT support = 0;
+      const UINT needed = D3D11_FORMAT_SUPPORT_TEXTURE2D | D3D11_FORMAT_SUPPORT_RENDER_TARGET | D3D11_FORMAT_SUPPORT_SHADER_LOAD;
+      if (FAILED(m_device.As(&device3)) || FAILED(m_device->CheckFormatSupport(DXGI_FORMAT_NV12, &support))
+       || (support & needed) != needed) {
+        error = "SKIP: no NV12 render targets";
+        return false;
+      }
+      const UINT size = 16;
+      std::vector<uint8_t> data(size * size * 3 / 2, 0x10);
+      const D3D11_SUBRESOURCE_DATA init = { data.data(), size, 0 };
+      D3D11_TEXTURE2D_DESC desc = { size, size, 1, 1, DXGI_FORMAT_NV12, { 1, 0 }, D3D11_USAGE_DEFAULT,
+        D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET, 0, 0 };
+      ComPtr<ID3D11Texture2D> texture, staging;
+      HRESULT hr = m_device->CreateTexture2D(&desc, &init, texture.GetAddressOf());
+      desc.Usage = D3D11_USAGE_STAGING;
+      desc.BindFlags = 0;
+      desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+      if (SUCCEEDED(hr)) hr = m_device->CreateTexture2D(&desc, nullptr, staging.GetAddressOf());
+      if (FAILED(hr)) {
+        error = "NV12 textures: " + formatHResult(hr);
+        return false;
+      }
+
+      std::string observed;
+      ComPtr<ID3D11RenderTargetView1> chroma;
+      auto srv = [&](const char* name, DXGI_FORMAT format, UINT plane) {
+        D3D11_SHADER_RESOURCE_VIEW_DESC1 viewDesc = {};
+        viewDesc.Format = format;
+        viewDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+        viewDesc.Texture2D = { 0, 1, plane };
+        ComPtr<ID3D11ShaderResourceView1> view;
+        const HRESULT result = device3->CreateShaderResourceView1(texture.Get(), &viewDesc, view.GetAddressOf());
+        D3D11_SHADER_RESOURCE_VIEW_DESC1 got = {};
+        if (view)
+          view->GetDesc1(&got);
+        observed += formatString("%s=%s/%u ", name, resultName(result).c_str(), got.Texture2D.PlaneSlice);
+      };
+      auto rtv = [&](const char* name, DXGI_FORMAT format, UINT plane) {
+        D3D11_RENDER_TARGET_VIEW_DESC1 viewDesc = {};
+        viewDesc.Format = format;
+        viewDesc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+        viewDesc.Texture2D = { 0, plane };
+        ComPtr<ID3D11RenderTargetView1> view;
+        const HRESULT result = device3->CreateRenderTargetView1(texture.Get(), &viewDesc, view.GetAddressOf());
+        D3D11_RENDER_TARGET_VIEW_DESC1 got = {};
+        if (view)
+          view->GetDesc1(&got);
+        observed += formatString("%s=%s/%u ", name, resultName(result).c_str(), got.Texture2D.PlaneSlice);
+        if (view && plane == 1)
+          chroma = std::move(view);
+      };
+      srv("lumaSrv", DXGI_FORMAT_R8_UNORM, 0);
+      srv("lumaSrvPlane1", DXGI_FORMAT_R8_UNORM, 1);
+      srv("chromaSrv", DXGI_FORMAT_R8G8_UNORM, 1);
+      srv("chromaSrvPlane0", DXGI_FORMAT_R8G8_UNORM, 0);
+      srv("ownFormatSrv", DXGI_FORMAT_UNKNOWN, 0);
+      rtv("lumaRtv", DXGI_FORMAT_R8_UNORM, 0);
+      rtv("chromaRtvPlane0", DXGI_FORMAT_R8G8_UNORM, 0);
+      rtv("chromaRtv", DXGI_FORMAT_R8G8_UNORM, 1);
+      // Views created without a plane slice report the one of their format.
+      ComPtr<ID3D11ShaderResourceView> plainView;
+      ComPtr<ID3D11ShaderResourceView1> plainView1;
+      D3D11_SHADER_RESOURCE_VIEW_DESC plainDesc = {};
+      plainDesc.Format = DXGI_FORMAT_R8G8_UNORM;
+      plainDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+      plainDesc.Texture2D.MipLevels = 1;
+      D3D11_SHADER_RESOURCE_VIEW_DESC1 plainGot = {};
+      if (SUCCEEDED(m_device->CreateShaderResourceView(texture.Get(), &plainDesc, plainView.GetAddressOf()))
+       && SUCCEEDED(plainView.As(&plainView1)))
+        plainView1->GetDesc1(&plainGot);
+      observed += formatString("plainChroma=%u ", plainGot.Texture2D.PlaneSlice);
+      ComPtr<ID3D11ShaderResourceView> defaultView;
+      observed += "defaultSrv=" + resultName(m_device->CreateShaderResourceView(texture.Get(), nullptr,
+        defaultView.GetAddressOf())) + " ";
+      // Depth-stencil textures are one plane in D3D11.
+      const D3D11_TEXTURE2D_DESC depthDesc = { 8, 8, 1, 1, DXGI_FORMAT_R24G8_TYPELESS, { 1, 0 }, D3D11_USAGE_DEFAULT,
+        D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_DEPTH_STENCIL, 0, 0 };
+      ComPtr<ID3D11Texture2D> depth;
+      if (SUCCEEDED(m_device->CreateTexture2D(&depthDesc, nullptr, depth.GetAddressOf()))) {
+        for (const UINT plane : { 0u, 1u }) {
+          D3D11_SHADER_RESOURCE_VIEW_DESC1 viewDesc = {};
+          viewDesc.Format = DXGI_FORMAT_X24_TYPELESS_G8_UINT;
+          viewDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+          viewDesc.Texture2D = { 0, 1, plane };
+          ComPtr<ID3D11ShaderResourceView1> view;
+          observed += formatString("stencilPlane%u=%s ", plane,
+            resultName(device3->CreateShaderResourceView1(depth.Get(), &viewDesc, view.GetAddressOf())).c_str());
+        }
+      }
+      const char* expected = "lumaSrv=ok/0 lumaSrvPlane1=inval/0 chromaSrv=ok/1 chromaSrvPlane0=inval/0 "
+        "ownFormatSrv=inval/0 lumaRtv=ok/0 chromaRtvPlane0=inval/0 chromaRtv=ok/1 plainChroma=1 defaultSrv=inval "
+        "stencilPlane0=ok stencilPlane1=inval ";
+      if (observed != expected) {
+        error = "plane views: " + observed;
+        return false;
+      }
+
+      // A draw into the chroma plane leaves the luma plane as it was.
+      static const char* kPs = R"(
+float4 main(float4 position : SV_Position) : SV_Target { return float4(0.25f, 0.75f, 0.0f, 1.0f); }
+)";
+      ComPtr<ID3D11VertexShader> vs;
+      ComPtr<ID3DBlob> vsCode;
+      ComPtr<ID3D11PixelShader> ps;
+      if (!chroma || !createVertexShader(kFullscreenTriangleVs, "main", vs, vsCode, error)
+       || !createPixelShader(kPs, "main", ps, error))
+        return false;
+      m_context->ClearState();
+      ID3D11RenderTargetView* targets[1] = { chroma.Get() };
+      m_context->OMSetRenderTargets(1, targets, nullptr);
+      setViewport(size / 2, size / 2);
+      m_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+      m_context->VSSetShader(vs.Get(), nullptr, 0);
+      m_context->PSSetShader(ps.Get(), nullptr, 0);
+      m_context->Draw(3, 0);
+      m_context->ClearState();
+      m_context->CopyResource(staging.Get(), texture.Get());
+      D3D11_MAPPED_SUBRESOURCE mapped = {};
+      if (FAILED(hr = m_context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped))) {
+        error = "Map(NV12) failed: " + formatHResult(hr);
+        return false;
+      }
+      const uint8_t* bytes = static_cast<const uint8_t*>(mapped.pData);
+      const uint8_t luma = bytes[size_t(size - 1) * mapped.RowPitch + 3];
+      const uint8_t* chromaRow = bytes + size_t(size + size / 2 - 1) * mapped.RowPitch;
+      const uint8_t u = chromaRow[2], v = chromaRow[3];
+      m_context->Unmap(staging.Get(), 0);
+      if (luma != 0x10 || std::abs(int(u) - 64) > 1 || std::abs(int(v) - 191) > 1) {
+        error = formatString("draw into the chroma plane: luma %u, chroma %u %u", luma, u, v);
         return false;
       }
       return true;

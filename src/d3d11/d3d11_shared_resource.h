@@ -5,6 +5,12 @@
 // resource owns, which the devices of this process open like the handle
 // itself. Handles that other runtimes created, legacy ones included, open
 // through D3D12.
+//
+// Limits: sharing works within the process. A legacy handle of DXUP means
+// nothing in another process (NT handles are per process), the keyed mutex
+// is a lock of this process, and resources opened from handles of other
+// processes or runtimes have no keyed mutex (D3D12 does not tell whether
+// they were created with one). Each limit is logged once when it is hit.
 
 #include <d3d11_4.h>
 
@@ -37,6 +43,9 @@ namespace dxup {
       D3D11_TEXTURE3D_DESC texture3D;
     } desc = {};
     std::shared_ptr<d3d12::D3D12SharedSync> sync;
+    // Opened from a handle of another process or runtime: the description
+    // is derived from the D3D12 resource.
+    bool foreign = false;
 
     UINT miscFlags() const {
       switch (dimension) {
@@ -95,7 +104,8 @@ namespace dxup {
 
     // Keyed mutex: released with key 0 when created. Ownership passes on
     // when the releasing device's work is submitted; the shared sync then
-    // orders the next owner's work after it.
+    // orders the next owner's work after it. Devices of this process only:
+    // another process's runtime never sees this lock.
     std::mutex              keyMutex;
     std::condition_variable keyChanged;
     bool                    keyHeld = false;
