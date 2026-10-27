@@ -538,6 +538,7 @@ namespace dxup {
       overrides.d3d9FloatEmulation = emulation == "strict" || emulation == "true" || emulation == "on" || emulation == "1" ? 1
         : emulation == "false" || emulation == "off" || emulation == "0" ? 0 : -1;
       overrides.d3d9DxupCompiler = config.getString("d3d9.shaderCompiler", "dxup") != "fxc";
+      overrides.d3d9WorkerThread = config.getBool("d3d9.workerThread", false);
       const std::string nanDepth = config.getString("d3d9.nanDepth", "auto");
       overrides.d3d9NanDepth = nanDepth == "zero" || nanDepth == "true" || nanDepth == "1" ? 1
         : nanDepth == "discard" || nanDepth == "false" || nanDepth == "0" ? 0 : -1;
@@ -556,14 +557,15 @@ namespace dxup {
       UserOverrides result = fromConfig(Config::get());
       logMessage(LogLevel::Info, "dxup.conf: settings from %s", configSource().c_str());
       logMessage(LogLevel::Info,
-        "dxup.conf: samplerAnisotropy %d, samplerLodBias %.2f, msaaSamples %d, msaaForce %d, msaaScope %s, sgssaa %s, syncInterval %d, maxFrameLatency %d, asyncShaders %d, shaderPrecompile %d, upscaler %u (sharpness %.2f, shader %016llx, auto %d), spatial upscale %d (sharpness %.2f, render scale %.2f), relaxedUavBarriers %d, recordThread %d, submitThread %d",
+        "dxup.conf: samplerAnisotropy %d, samplerLodBias %.2f, msaaSamples %d, msaaForce %d, msaaScope %s, sgssaa %s, syncInterval %d, maxFrameLatency %d, asyncShaders %d, shaderPrecompile %d, upscaler %u (sharpness %.2f, shader %016llx, auto %d), spatial upscale %d (sharpness %.2f, render scale %.2f), relaxedUavBarriers %d, recordThread %d, submitThread %d, d3d9 workerThread %d",
         result.samplerAnisotropy, result.samplerLodBias, result.msaaSamples, result.msaaForce ? 1 : 0,
         result.msaaScope == MsaaScope::All ? "all" : "geometry",
         result.sgssaa == SgssaaMode::Full ? "full" : result.sgssaa == SgssaaMode::Alpha ? "alpha" : "off",
         result.syncInterval, result.maxFrameLatency, result.asyncShaders ? 1 : 0, result.shaderPrecompile ? 1 : 0,
         result.upscaler, result.upscalerSharpness, static_cast<unsigned long long>(result.upscalerShader),
         result.upscalerAuto ? 1 : 0, result.spatialUpscale ? 1 : 0, result.spatialSharpness, result.renderScale,
-        result.relaxedUavBarriers ? 1 : 0, result.recordThread ? 1 : 0, result.submitThread ? 1 : 0);
+        result.relaxedUavBarriers ? 1 : 0, result.recordThread ? 1 : 0, result.submitThread ? 1 : 0,
+        result.d3d9WorkerThread ? 1 : 0);
 #ifdef _WIN32
       if (result.spoofVendorId || result.spoofDeviceId || !result.spoofDescription.empty()) {
         char description[128] = {};

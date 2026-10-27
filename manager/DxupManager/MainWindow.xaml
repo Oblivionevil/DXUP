@@ -276,6 +276,8 @@
                     <RowDefinition Height="Auto" />
                     <RowDefinition Height="Auto" />
                     <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
                   </Grid.RowDefinitions>
                   <TextBlock Text="{DynamicResource FloatEmulation}" Style="{StaticResource Caption}" />
                   <ComboBox x:Name="FloatBox" Grid.Column="1" HorizontalAlignment="Left" DisplayMemberPath="Text" SelectionChanged="OnSettingChanged" />
@@ -284,6 +286,11 @@
                   <ComboBox x:Name="NanDepthBox" Grid.Row="2" Grid.Column="1" HorizontalAlignment="Left" Margin="0,10,0,0" DisplayMemberPath="Text" SelectionChanged="OnSettingChanged" />
                   <TextBlock Grid.Row="3" Text="{DynamicResource ShaderCompiler}" Style="{StaticResource Caption}" Margin="0,10,12,0" />
                   <ComboBox x:Name="CompilerBox" Grid.Row="3" Grid.Column="1" HorizontalAlignment="Left" Margin="0,10,0,0" DisplayMemberPath="Text" SelectionChanged="OnSettingChanged" />
+                  <TextBlock Grid.Row="4" Text="{DynamicResource D3d9Worker}" Style="{StaticResource Caption}" Margin="0,10,12,0" />
+                  <CheckBox x:Name="D3d9WorkerBox" Grid.Row="4" Grid.Column="1" Margin="0,10,0,0" Checked="OnSettingChanged" Unchecked="OnSettingChanged">
+                    <TextBlock Text="{DynamicResource D3d9WorkerOn}" TextWrapping="Wrap" />
+                  </CheckBox>
+                  <TextBlock Grid.Row="5" Grid.Column="1" Text="{DynamicResource D3d9WorkerHint}" Foreground="{DynamicResource Muted}" FontSize="11" Margin="0,4,0,0" TextWrapping="Wrap" />
                 </Grid>
               </StackPanel>
 

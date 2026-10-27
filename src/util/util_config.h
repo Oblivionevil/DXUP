@@ -72,6 +72,10 @@ namespace dxup {
   //                                  thread of their own while DXUP's worker
   //                                  records the next (for games DXUP's
   //                                  worker thread limits; see SubmitQueue)
+  //   d3d9.workerThread = true       experimental: Direct3D 8/9 draws are
+  //                                  translated on a thread of their own,
+  //                                  the game's render thread only records
+  //                                  them (see d3d9::Worker)
   class Config {
   public:
     static const Config& get();
@@ -182,6 +186,9 @@ namespace dxup {
     // through Microsoft's compiler (fxc: 20-120 ms per large shader, cached
     // on disk). Shaders DXUP's compiler does not handle take fxc either way.
     bool     d3d9DxupCompiler = true;
+    // Direct3D 8/9 calls reach the legacy core on a thread of their own
+    // (d3d9.workerThread, see d3d9::Worker).
+    bool     d3d9WorkerThread = false;
     // Flip model applications draw into the real swap chain buffers, no
     // proxy copied at Present (dxgi.directBackBuffer).
     bool     directBackBuffer = true;

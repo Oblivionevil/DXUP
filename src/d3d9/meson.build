@@ -1,6 +1,6 @@
 # ---- Direct3D 9 objects (d3d9.dll, and d3d8.dll on top of them) ----
 d3d9_core_lib = static_library('dxup_d3d9_core',
-  ['d3d9_interface.cpp', 'd3d9_device.cpp', 'd3d9_resources.cpp'],
+  ['d3d9_interface.cpp', 'd3d9_device.cpp', 'd3d9_resources.cpp', 'd3d9_worker.cpp'],
   dependencies        : [util_dep, legacy_dep],
   include_directories : ['.', '..'],
 )

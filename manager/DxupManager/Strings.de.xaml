@@ -129,6 +129,9 @@ Läuft das Spiel noch?</sys:String>
   <sys:String x:Key="ShaderCompiler">Shader-Compiler</sys:String>
   <sys:String x:Key="OptCompilerDxup">DXUP (schnell, empfohlen)</sys:String>
   <sys:String x:Key="OptCompilerFxc">Microsoft fxc (langsam, zum Vergleichen)</sys:String>
+  <sys:String x:Key="D3d9Worker">Worker-Thread (Direct3D 8/9)</sys:String>
+  <sys:String x:Key="D3d9WorkerOn">Draws auf einem eigenen Thread übersetzen (experimentell)</sys:String>
+  <sys:String x:Key="D3d9WorkerHint">Der Render-Thread des Spiels zeichnet seine Direct3D-8- und -9-Aufrufe nur auf; DXUP übersetzt sie auf einem zweiten Thread. Hilft Spielen, deren Render-Thread die Bildrate begrenzt.</sys:String>
   <sys:String x:Key="LegacyHint">Wirkt nur bei Spielen mit Direct3D 7, 8 oder 9.</sys:String>
   <sys:String x:Key="SectionAdvanced">Erweitert</sys:String>
   <sys:String x:Key="AdvancedHint">Für Tests und Fehlersuche. Die Voreinstellungen passen für fast alle Spiele.</sys:String>

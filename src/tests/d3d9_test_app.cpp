@@ -1389,6 +1389,62 @@ VO main(float2 p : POSITION, float4 offset : TEXCOORD1, float4 c : COLOR0) {
     return true;
   }
 
+  // A dynamic buffer discarded draw by draw (sprites, particle systems):
+  // each draw shows what its lock wrote, also while draws recorded before
+  // still read the buffer (DXUP's worker thread gives discarding locks new
+  // memory). No-overwrite appends and plain locks between them; then a
+  // managed buffer read back as written.
+  bool sceneDiscardMany(IDirect3DDevice9* d) {
+    struct P { float x, y, z, rhw; DWORD color; };
+    d->Clear(0, nullptr, D3DCLEAR_TARGET, 0xff000000u, 1.0f, 0);
+    d->SetRenderState(D3DRS_LIGHTING, FALSE);
+    d->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+    d->SetFVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE);
+    IDirect3DVertexBuffer9* vb = nullptr;
+    if (FAILED(d->CreateVertexBuffer(16 * sizeof(P), D3DUSAGE_DYNAMIC | D3DUSAGE_WRITEONLY, 0, D3DPOOL_DEFAULT, &vb, nullptr)))
+      return false;
+    d->SetStreamSource(0, vb, 0, sizeof(P));
+    bool ok = true;
+    d->BeginScene();
+    // 48 cells of 8x8 pixels, four to a discard.
+    for (int cell = 0; cell < 48 && ok; cell++) {
+      const DWORD color = 0xff000000u | (DWORD(cell * 5) << 16) | (DWORD(255 - cell * 5) << 8) | DWORD((cell * 37) & 255);
+      const int slot = cell % 4;
+      const DWORD flags = cell % 7 == 6 ? 0 : slot ? D3DLOCK_NOOVERWRITE : D3DLOCK_DISCARD;
+      P* v = nullptr;
+      if (FAILED(vb->Lock(slot * 4 * sizeof(P), 4 * sizeof(P), reinterpret_cast<void**>(&v), flags))) {
+        ok = false;
+        break;
+      }
+      const float x = float(cell % 8) * 8.0f, y = float(cell / 8) * 8.0f;
+      v[0] = { x, y, 0.5f, 1, color };
+      v[1] = { x + 8, y, 0.5f, 1, color };
+      v[2] = { x, y + 8, 0.5f, 1, color };
+      v[3] = { x + 8, y + 8, 0.5f, 1, color };
+      vb->Unlock();
+      d->DrawPrimitive(D3DPT_TRIANGLESTRIP, slot * 4, 2);
+    }
+    d->EndScene();
+    d->SetStreamSource(0, nullptr, 0, 0);
+    vb->Release();
+    IDirect3DVertexBuffer9* managed = nullptr;
+    if (ok && SUCCEEDED(d->CreateVertexBuffer(256, 0, 0, D3DPOOL_MANAGED, &managed, nullptr))) {
+      uint8_t* bytes = nullptr;
+      if (SUCCEEDED(managed->Lock(0, 0, reinterpret_cast<void**>(&bytes), 0))) {
+        for (int i = 0; i < 256; i++)
+          bytes[i] = uint8_t(i * 7);
+        managed->Unlock();
+      }
+      if (SUCCEEDED(managed->Lock(64, 64, reinterpret_cast<void**>(&bytes), D3DLOCK_READONLY))) {
+        for (int i = 0; i < 64 && ok; i++)
+          ok = bytes[i] == uint8_t((i + 64) * 7);
+        managed->Unlock();
+      }
+      managed->Release();
+    }
+    return ok;
+  }
+
   bool sceneStateBlock(IDirect3DDevice9* d) {
     d->Clear(0, nullptr, D3DCLEAR_TARGET, 0xff000000u, 1.0f, 0);
     d->SetRenderState(D3DRS_LIGHTING, FALSE);
@@ -2683,8 +2739,10 @@ float4 main(float2 t : TEXCOORD0) : COLOR {
       double limitMb;
       const char* name;
     } passes[] = {
-      { D3DFMT_DXT5, 36, 48, smallSpace ? 160.0 : 330.0, "DXT5" },
-      { D3DFMT_A8R8G8B8, 24, 128, smallSpace ? 225.0 : 450.0, "A8R8G8B8" },
+      // 64-bit: DXUP's upload memory as well (the run before this one
+      // varies it by some 40 MB).
+      { D3DFMT_DXT5, 36, 48, smallSpace ? 160.0 : 380.0, "DXT5" },
+      { D3DFMT_A8R8G8B8, 24, 128, smallSpace ? 225.0 : 520.0, "A8R8G8B8" },
     };
     // Kept to the end: memory one pass gave back must not lower the next.
     std::vector<IDirect3DTexture9*> textures;
@@ -3458,6 +3516,8 @@ float4 main(float2 t : TEXCOORD0) : COLOR { float v = tex2D(depth, t).r; return 
     { "instancing_mt", sceneInstancing, 2, D3DCREATE_MULTITHREADED },
     { "textured_mt", sceneTextured, 2, D3DCREATE_MULTITHREADED },
     { "dynamic_redraw_mt", sceneDynamicRedraw, 2, D3DCREATE_MULTITHREADED },
+    { "discard_many", sceneDiscardMany },
+    { "discard_many_mt", sceneDiscardMany, 2, D3DCREATE_MULTITHREADED },
     { "state_block_contents_mt", sceneStateBlockContents, 2, D3DCREATE_MULTITHREADED },
   };
 
@@ -4401,7 +4461,7 @@ VO main(float3 p : POSITION, float4 c : COLOR0) { VO o; o.p = float4(p.xy, 0.5, 
   }
 
   // Runs this program with the arguments; its exit code (-1: not started).
-  int runSelf(const char* arguments) {
+  int runSelf(const char* arguments, DWORD timeout = 60000) {
     wchar_t exe[MAX_PATH];
     GetModuleFileNameW(nullptr, exe, MAX_PATH);
     std::wstring command = L"\"" + std::wstring(exe) + L"\" ";
@@ -4411,7 +4471,7 @@ VO main(float3 p : POSITION, float4 c : COLOR0) { VO o; o.p = float4(p.xy, 0.5, 
     PROCESS_INFORMATION pi = {};
     if (!CreateProcessW(nullptr, &command[0], nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi))
       return -1;
-    WaitForSingleObject(pi.hProcess, 60000);
+    WaitForSingleObject(pi.hProcess, timeout);
     DWORD code = DWORD(-1);
     GetExitCodeProcess(pi.hProcess, &code);
     CloseHandle(pi.hThread);
@@ -4429,7 +4489,7 @@ int main(int argc, char** argv) {
   const char* benchShadersPath = nullptr;
   size_t benchShadersLimit = 0;
   bool childForcedMsaa = false, identifier = false, childDpi = false, childFloatStrict = false, childDropped = false;
-  bool childSelfTest = false, dxupOnly = false;
+  bool childSelfTest = false, dxupOnly = false, childWorker = false;
   unsigned variantNonce = 0;
   for (int i = 1; i < argc; i++) {
     if (std::strcmp(argv[i], "--dump") == 0) dumpImages = true;
@@ -4442,6 +4502,7 @@ int main(int argc, char** argv) {
     else if (std::strcmp(argv[i], "--dropped-child") == 0) childDropped = true;
     else if (std::strcmp(argv[i], "--selftest-child") == 0) childSelfTest = true;
     else if (std::strcmp(argv[i], "--dxup-only") == 0) dxupOnly = true;
+    else if (std::strcmp(argv[i], "--worker-child") == 0) childWorker = true;
     else if (std::strcmp(argv[i], "--variant-child") == 0 && i + 1 < argc) variantNonce = unsigned(std::strtoul(argv[++i], nullptr, 10));
     else if (std::strcmp(argv[i], "--bench") == 0 && i + 2 < argc) { benchFrames = std::atoi(argv[i + 1]); benchDraws = std::atoi(argv[i + 2]); i += 2; }
     else if (std::strcmp(argv[i], "--bench-shaders") == 0 && i + 1 < argc) {
@@ -4520,6 +4581,33 @@ int main(int argc, char** argv) {
 
   if (variantNonce)
     return variantChild(dxup, variantNonce) == 0 ? 0 : 1;
+
+  // Every scene with d3d9.workerThread = true (dxup.conf beside the DLLs):
+  // the number of scenes not as Windows draws them.
+  if (childWorker) {
+    int failing = 0;
+    for (const Scene& scene : kScenes) {
+      std::vector<DWORD> reference, result;
+      std::string error;
+      if (!run(windows, scene, reference, error) || !run(dxup, scene, result, error)) {
+        std::printf("FAIL %-20s %s\n", scene.name, error.c_str());
+        failing++;
+        continue;
+      }
+      int differing = 0;
+      for (size_t i = 0; i < reference.size(); i++) {
+        int worst = 0;
+        for (int c = 0; c < 32; c += 8)
+          worst = (std::max)(worst, std::abs(int((reference[i] >> c) & 255) - int((result[i] >> c) & 255)));
+        differing += worst > scene.tolerance;
+      }
+      if (differing > int(reference.size() / 200)) {
+        std::printf("FAIL %-20s %d pixels differ with the worker thread\n", scene.name, differing);
+        failing++;
+      }
+    }
+    return (std::min)(failing, 254);
+  }
 
   // The first adapter as each runtime describes it (dxgi.spoofVendor).
   if (identifier) {
@@ -4674,6 +4762,22 @@ int main(int argc, char** argv) {
     const bool ok = code == 0;
     std::printf("%s %-20s mul, mad, dp3 with d3d9.floatEmulation = strict (child exit %d)\n", ok ? "ok  " : "FAIL", "float_strict",
                 code);
+    ok ? passed++ : failed++;
+  }
+  // The scenes again with the calls made on DXUP's worker thread
+  // (d3d9.workerThread, a child with dxup.conf).
+  if (!filter || std::strstr("worker_thread", filter)) {
+    const std::wstring conf = dir + L"dxup.conf";
+    int code = -1;
+    if (FILE* f = _wfopen(conf.c_str(), L"w")) {
+      std::fputs("d3d9.workerThread = true\n", f);
+      std::fclose(f);
+      code = runSelf("--worker-child", 600000);
+      DeleteFileW(conf.c_str());
+    }
+    const bool ok = code == 0;
+    std::printf("%s %-20s every scene with d3d9.workerThread (child exit %d: scenes differing)\n", ok ? "ok  " : "FAIL",
+                "worker_thread", code);
     ok ? passed++ : failed++;
   }
   // What leaves objects out is logged with saved frames on: a draw DXUP

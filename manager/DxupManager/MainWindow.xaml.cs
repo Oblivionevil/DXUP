@@ -310,6 +310,7 @@ namespace Dxup.Manager
             Select(FloatBox, settings.FloatEmulation);
             Select(NanDepthBox, settings.NanDepth);
             Select(CompilerBox, settings.FxcCompiler);
+            D3d9WorkerBox.IsChecked = settings.D3d9WorkerThread;
             LegacySection.Visibility = item.UsesLegacy ? Visibility.Visible : Visibility.Collapsed;
             SubmitThreadBox.IsChecked = settings.SubmitThread;
             RecordThreadBox.IsChecked = settings.RecordThread;
@@ -627,6 +628,7 @@ namespace Dxup.Manager
             settings.FloatEmulation = Value<string>(FloatBox);
             settings.NanDepth = Value<string>(NanDepthBox);
             settings.FxcCompiler = Value<bool>(CompilerBox);
+            settings.D3d9WorkerThread = D3d9WorkerBox.IsChecked == true;
             settings.SubmitThread = SubmitThreadBox.IsChecked == true;
             settings.RecordThread = RecordThreadBox.IsChecked == true;
             settings.DirectBackBuffer = DirectBackBufferBox.IsChecked == true;

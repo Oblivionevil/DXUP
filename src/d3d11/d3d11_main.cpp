@@ -791,9 +791,9 @@ HRESULT WINAPI DXUPCreateShaderResourceView(IUnknown* pDevice, ID3D11Resource* p
 }
 
 // Bytes into a dynamic buffer of DXUP's immediate context where writes after
-// Map(WRITE_NO_OVERWRITE) go, written by its worker thread: DXUP's Direct3D 9
-// layer uploads constants and vertices without writing write-combined memory
-// on the game's thread. With no buffer: whether the context is DXUP's.
+// Map(WRITE_NO_OVERWRITE) go, written at once without a command: DXUP's
+// Direct3D 9 layer uploads constants and vertices without a Map and Unmap
+// each. With no buffer: whether the context is DXUP's.
 HRESULT WINAPI DXUPWriteBuffer(ID3D11DeviceContext* pContext, ID3D11Buffer* pBuffer, UINT Offset, const void* pData,
     UINT Size) {
   if (!pContext)

@@ -896,6 +896,22 @@ namespace dxup::legacy {
 
   Buffer::~Buffer() = default;
 
+  std::vector<uint8_t> Buffer::takeSpare() {
+    std::lock_guard<std::mutex> lock(m_spareMutex);
+    if (m_spares.empty())
+      return {};
+    std::vector<uint8_t> spare = std::move(m_spares.back());
+    m_spares.pop_back();
+    return spare;
+  }
+
+  void Buffer::replaceData(std::vector<uint8_t>&& data) {
+    m_data.swap(data);
+    invalidate(0, 0);
+    std::lock_guard<std::mutex> lock(m_spareMutex);
+    m_spares.push_back(std::move(data));
+  }
+
   bool Buffer::indexRange(uint32_t start, uint32_t count, bool index32, uint32_t& lo, uint32_t& hi) {
     const uint32_t size = index32 ? 4 : 2;
     if (!count || (uint64_t(start) + count) * size > m_size)
@@ -2092,9 +2108,8 @@ namespace dxup::legacy {
       GetProcAddress(m_d3d11Module, "DXUPCreateShaderResourceView"));
     m_createSampler = reinterpret_cast<decltype(m_createSampler)>(
       GetProcAddress(m_d3d11Module, "DXUPCreateSamplerState"));
-    // Writes to write-combined memory on the game's thread make its next
-    // locked instruction (a reference count, a queue) wait until they left
-    // the CPU: DXUP's worker thread writes constants and vertices instead.
+    // Constants and streamed vertices go straight into the memory DXUP's
+    // D3D11 maps the buffers to, without a Map, an Unmap or a command each.
     m_writeBuffer = reinterpret_cast<decltype(m_writeBuffer)>(GetProcAddress(m_d3d11Module, "DXUPWriteBuffer"));
     if (m_writeBuffer && FAILED(m_writeBuffer(m_context.get(), nullptr, 0, nullptr, 0)))
       m_writeBuffer = nullptr;

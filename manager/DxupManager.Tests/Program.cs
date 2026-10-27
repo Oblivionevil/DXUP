@@ -82,6 +82,7 @@ namespace Dxup.Tests
             game.Settings.FloatEmulation = "strict";
             game.Settings.NanDepth = "zero";
             game.Settings.FxcCompiler = true;
+            game.Settings.D3d9WorkerThread = true;
             game.Settings.SubmitThread = true;
             game.Settings.RecordThread = true;
             game.Settings.PixelOutputMasks = false;
@@ -105,7 +106,7 @@ namespace Dxup.Tests
             var more = back.Settings;
             Check(more.SpatialSharpness == 0.5f && more.CustomVendorId == "10de" && more.CustomDeviceId == "2684"
                && more.CustomDeviceDesc == "NVIDIA GeForce RTX 4090" && !more.DirectBackBuffer && more.FloatEmulation == "strict"
-               && more.NanDepth == "zero" && more.FxcCompiler && more.SubmitThread && more.RecordThread && !more.PixelOutputMasks
+               && more.NanDepth == "zero" && more.FxcCompiler && more.D3d9WorkerThread && more.SubmitThread && more.RecordThread && !more.PixelOutputMasks
                && !more.BarrierHoisting && more.RelaxedUavBarriers == false && more.LazyTargets == true,
                 "games.cfg keeps the advanced and Direct3D 7-9 settings");
             Check(back.Extra.Count == 1 && back.Extra[0].Key == "d3d11.future", "games.cfg keeps unknown settings");
@@ -118,6 +119,7 @@ namespace Dxup.Tests
                && text.Contains("dxgi.customVendorId = 10de") && text.Contains("dxgi.customDeviceDesc = NVIDIA GeForce RTX 4090")
                && text.Contains("dxgi.directBackBuffer = false") && text.Contains("d3d9.floatEmulation = strict")
                && text.Contains("d3d9.nanDepth = zero") && text.Contains("d3d9.shaderCompiler = fxc")
+               && text.Contains("d3d9.workerThread = true")
                && text.Contains("d3d12.submitThread = true") && text.Contains("d3d12.recordThread = true")
                && text.Contains("d3d12.pixelOutputMasks = false") && text.Contains("d3d12.barrierHoisting = false")
                && text.Contains("d3d11.relaxedUavBarriers = false") && text.Contains("d3d12.lazyTargets = true"),

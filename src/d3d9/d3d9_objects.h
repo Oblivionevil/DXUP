@@ -14,6 +14,7 @@
 #include <d3d9.h>
 
 #include "../legacy/legacy_device.h"
+#include "d3d9_worker.h"
 
 #include <array>
 #include <atomic>
@@ -349,6 +350,7 @@ namespace dxup::d3d9 {
   class BufferCommon : public Resource<Base> {
   public:
     BufferCommon(Device* device, std::unique_ptr<legacy::Buffer> buffer, const Desc& desc);
+    ~BufferCommon() override;
     ULONG STDMETHODCALLTYPE AddRef() override { return this->addRefPublic(); }
     ULONG STDMETHODCALLTYPE Release() override { return this->releasePublic(); }
     HRESULT STDMETHODCALLTYPE Lock(UINT offset, UINT size, void** data, DWORD flags) override;
@@ -356,8 +358,15 @@ namespace dxup::d3d9 {
     HRESULT STDMETHODCALLTYPE GetDesc(Desc* desc) override { if (!desc) return D3DERR_INVALIDCALL; *desc = m_desc; return D3D_OK; }
     legacy::Buffer* buffer() const { return static_cast<legacy::Buffer*>(this->boundCore); }
   protected:
+    // The lock as the core makes it (with the worker: once it made what
+    // was recorded before).
+    HRESULT lockNow(UINT offset, UINT size, void** data, DWORD flags);
     std::unique_ptr<legacy::Buffer> m_buffer;   // boundCore
     Desc m_desc;
+    // With the worker thread: the memory locks give (the worker's until a
+    // discarding lock gives new memory), and memory made for such locks.
+    uint8_t* m_appData = nullptr;
+    size_t   m_extraMemory = 0;
   };
 
   class VertexBuffer final : public BufferCommon<IDirect3DVertexBuffer9, D3DVERTEXBUFFER_DESC> {
@@ -397,13 +406,14 @@ namespace dxup::d3d9 {
   class VertexDeclaration final : public DeviceChild<IDirect3DVertexDeclaration9> {
   public:
     VertexDeclaration(Device* device, const D3DVERTEXELEMENT9* elements, uint32_t fvf = 0, bool keptByDevice = false);
+    ~VertexDeclaration() override;
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** object) override;
     HRESULT STDMETHODCALLTYPE GetDeclaration(D3DVERTEXELEMENT9* elements, UINT* count) override;
-    legacy::VertexDecl* decl() { return &m_decl; }
+    legacy::VertexDecl* decl() { return m_decl.get(); }
     uint32_t fvf() const { return m_fvf; }
   private:
     std::vector<D3DVERTEXELEMENT9> m_elements;   // with the end element
-    legacy::VertexDecl m_decl;
+    std::unique_ptr<legacy::VertexDecl> m_decl;
     uint32_t m_fvf;
   };
 
@@ -411,6 +421,7 @@ namespace dxup::d3d9 {
   class ShaderObject final : public DeviceChild<Base> {
   public:
     ShaderObject(Device* device, std::shared_ptr<legacy::Shader> shader) : DeviceChild<Base>(device), m_shader(std::move(shader)) {}
+    ~ShaderObject() override;
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** object) override;
     HRESULT STDMETHODCALLTYPE GetFunction(void* data, UINT* size) override;
     legacy::Shader* shader() const { return m_shader.get(); }
@@ -451,13 +462,26 @@ namespace dxup::d3d9 {
     HRESULT STDMETHODCALLTYPE Issue(DWORD flags) override;
     HRESULT STDMETHODCALLTYPE GetData(void* data, DWORD size, DWORD flags) override;
   private:
+    // With the worker thread: what its polls found, for the application.
+    struct Results {
+      std::atomic<uint32_t> done{0};       // the issue (m_issues) whose result is here
+      std::atomic<bool>     polling{false};
+      std::atomic<bool>     failed{false}; // the last poll failed
+      uint64_t value = 0;                  // samples, the time, the timestamp frequency
+      BOOL     disjoint = FALSE;
+      bool     noted = false;              // the worker's: this issue's result counted for glitch reports
+    };
+    static HRESULT poll(legacy::Device& core, ID3D11Query* query, D3DQUERYTYPE type, UINT flags, Results& results,
+                        const void* traced);
+    HRESULT resultOf(const Results& results, void* data, DWORD size) const;
     D3DQUERYTYPE m_type;
     bool m_valid = false;
     bool m_issued = false;
     bool m_building = false;      // begun, not yet ended
     bool m_resultNoted = false;   // this issue's result counted for glitch reports
+    uint32_t m_issues = 0;        // ends issued
+    std::unique_ptr<Results> m_results;   // with the worker
     legacy::Ref<ID3D11Query> m_query;
-    legacy::Ref<ID3D11Query> m_disjoint;
   };
 
   // Everything a state block can hold, and which parts it does.
@@ -583,6 +607,67 @@ namespace dxup::d3d9 {
     HRESULT init(D3DPRESENT_PARAMETERS* params, D3DDISPLAYMODEEX* fullscreenMode);
 
     legacy::Device* core() const { return m_core.get(); }
+
+    // ---- The worker thread (d3d9.workerThread, see d3d9_worker.h) ----
+    Worker* worker() const { return m_worker.get(); }
+    // The worker while it records calls (null: they are made at once).
+    Worker* recorder() const { return m_recorder; }
+    // fn(core), recorded for the worker or made now.
+    template<typename Fn>
+    __forceinline void run(Fn&& fn) {
+      if (Worker* worker = m_recorder)
+        worker->emit(std::forward<Fn>(fn));
+      else
+        fn(*m_core);
+    }
+    // fn(core, data): data a copy of bytes from source when recorded.
+    template<typename Fn>
+    void runData(const void* source, size_t bytes, Fn&& fn) {
+      if (Worker* worker = m_recorder)
+        worker->emitData(source, bytes, std::forward<Fn>(fn));
+      else
+        fn(*m_core, static_cast<const uint8_t*>(source));
+    }
+    // The core to the caller alone, for calls that read what it holds, wait
+    // for it or lock memory it reads: the worker makes what was recorded
+    // first, and calls are made at once until the scope ends. Locks the
+    // device when multithreaded. why: for the statistics of waits.
+    class Direct {
+    public:
+      Direct(Device* device, const char* why);
+      ~Direct();
+      Direct(const Direct&) = delete;
+      Direct& operator=(const Direct&) = delete;
+    private:
+      Device* m_device;
+      Worker* m_recorder;
+      bool    m_locked;
+    };
+    // Legacy objects go once the worker made the calls recorded before them
+    // (without it: now).
+    template<typename T>
+    void retire(T* object) {
+      if (!object)
+        return;
+      if (m_worker)
+        m_worker->retire([](void* p) { delete static_cast<T*>(p); }, object);
+      else
+        delete object;
+    }
+    void retireCom(IUnknown* object) {
+      if (!object)
+        return;
+      if (m_worker)
+        m_worker->retire([](void* p) { static_cast<IUnknown*>(p)->Release(); }, object);
+      else
+        object->Release();
+    }
+    // A legacy texture deleted through retire.
+    std::shared_ptr<legacy::Texture> makeTexture(const legacy::TextureDesc& desc);
+    // After a Present was recorded (the worker: the application stays a
+    // frame ahead at most).
+    void endFrame();
+
     std::recursive_mutex& mutex() { return m_mutex; }
     bool multithreaded() const { return (m_behavior & D3DCREATE_MULTITHREADED) != 0; }
     bool ex() const { return m_ex; }
@@ -773,6 +858,10 @@ namespace dxup::d3d9 {
     void restoreWindow();
     void markLight(DWORD index);
     legacy::PrimitiveType primitive(D3DPRIMITIVETYPE type) const { return legacy::PrimitiveType(type); }
+    // StretchRect's work on the core (validated by the caller).
+    void stretch(legacy::Device& core, legacy::Texture* s, uint32_t srcSub, legacy::Texture* d, uint32_t dstSub,
+                 const RECT& sr, const RECT& dr, bool linear);
+    void noteDirect(const char* why);
 
     Interface*                      m_parent;
     UINT                            m_adapter;
@@ -782,6 +871,12 @@ namespace dxup::d3d9 {
     bool                            m_ex;
     std::recursive_mutex            m_mutex;
     std::unique_ptr<legacy::Device> m_core;
+    std::unique_ptr<Worker>         m_worker;
+    Worker*                         m_recorder = nullptr;   // m_worker but in Direct scopes
+    // Waits for the worker (Direct) by cause, logged now and then.
+    std::vector<std::pair<const char*, uint32_t>> m_directWaits;
+    uint32_t                        m_framesSinceWaits = 0;
+    uint32_t                        m_waitReports = 0;
     // StretchRect's resolve target for multisampled sources it cannot
     // resolve into the destination, kept for the next of that size.
     std::shared_ptr<legacy::Texture> m_resolveTarget;

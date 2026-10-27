@@ -236,8 +236,7 @@ namespace dxup::d3d9 {
     const HRESULT hr = [&]() -> HRESULT {
       if (!locked)
         return D3DERR_INVALIDCALL;
-      std::unique_lock<std::recursive_mutex> guard(m_device->mutex(), std::defer_lock);
-      if (m_device->multithreaded()) guard.lock();
+      Device::Direct direct(m_device, "LockRect");
       if (m_locked)
         return D3DERR_INVALIDCALL;
       legacy::Rect r = {};
@@ -267,7 +266,9 @@ namespace dxup::d3d9 {
     if (!m_locked)
       return D3DERR_INVALIDCALL;
     m_locked = false;
-    m_texture->unlock(m_subresource);
+    legacy::Texture* texture = m_texture.get();
+    const uint32_t subresource = m_subresource;
+    m_device->run([texture, subresource](legacy::Device&) { texture->unlock(subresource); });
     return D3D_OK;
   }
 
@@ -386,8 +387,7 @@ namespace dxup::d3d9 {
   HRESULT Volume::LockBox(D3DLOCKED_BOX* locked, const D3DBOX* box, DWORD flags) {
     if (!locked)
       return D3DERR_INVALIDCALL;
-    std::unique_lock<std::recursive_mutex> guard(m_device->mutex(), std::defer_lock);
-    if (m_device->multithreaded()) guard.lock();
+    Device::Direct direct(m_device, "LockBox");
     legacy::Box b = {};
     if (box)
       b = { box->Left, box->Top, box->Front, box->Right, box->Bottom, box->Back };
@@ -405,7 +405,9 @@ namespace dxup::d3d9 {
   HRESULT Volume::UnlockBox() {
     std::unique_lock<std::recursive_mutex> guard(m_device->mutex(), std::defer_lock);
     if (m_device->multithreaded()) guard.lock();
-    m_texture->unlock(m_level);
+    legacy::Texture* texture = m_texture.get();
+    const uint32_t level = m_level;
+    m_device->run([texture, level](legacy::Device&) { texture->unlock(level); });
     return D3D_OK;
   }
 
@@ -421,8 +423,12 @@ namespace dxup::d3d9 {
 
   template<typename Base>
   void TextureCommon<Base>::GenerateMipSubLevels() {
-    if (m_usage & D3DUSAGE_AUTOGENMIPMAP)
-      m_texture->markGpuWritten();
+    if (!(m_usage & D3DUSAGE_AUTOGENMIPMAP))
+      return;
+    std::unique_lock<std::recursive_mutex> guard(this->m_device->mutex(), std::defer_lock);
+    if (this->m_device->multithreaded()) guard.lock();
+    legacy::Texture* texture = m_texture.get();
+    this->m_device->run([texture](legacy::Device&) { texture->markGpuWritten(); });
   }
 
   template class TextureCommon<IDirect3DTexture9>;
@@ -651,6 +657,12 @@ namespace dxup::d3d9 {
     this->boundCore = m_buffer.get();
     if constexpr (std::is_same_v<Desc, D3DINDEXBUFFER_DESC>)
       this->boundFlags = desc.Format == D3DFMT_INDEX32 ? 1u : 0u;
+    m_appData = m_buffer->data();
+  }
+
+  template<typename Base, typename Desc>
+  BufferCommon<Base, Desc>::~BufferCommon() {
+    this->m_device->retire(m_buffer.release());
   }
 
   template<typename Base, typename Desc>
@@ -667,6 +679,47 @@ namespace dxup::d3d9 {
     }
     if (!size || uint64_t(offset) + size > total)
       size = total - offset;
+    Worker* worker = this->m_device->recorder();
+    if (!worker)
+      return lockNow(offset, size, data, flags);
+    // With the worker: locks that only write go on at once. No-overwrite
+    // locks write what draws recorded before do not read (the game's
+    // promise); discarding ones get new memory while those draws read the
+    // old. The worker gives memory back as a spare.
+    legacy::Buffer* buffer = m_buffer.get();
+    if ((flags & (D3DLOCK_DISCARD | D3DLOCK_NOOVERWRITE)) && !(flags & D3DLOCK_READONLY) && !buffer->dropsCopy()) {
+      if (!(flags & D3DLOCK_DISCARD)) {
+        worker->emit([buffer, offset, size](legacy::Device&) { buffer->invalidate(offset, size); });
+        *data = m_appData + offset;
+        return D3D_OK;
+      }
+      std::vector<uint8_t> memory = buffer->takeSpare();
+      // At most 16 MB (64 MB in a 64-bit process) made per buffer, and
+      // two buffers' worth; more locks wait for the worker.
+      const size_t budget = (std::max)(size_t(total) * 2, sizeof(void*) == 4 ? size_t(16u << 20) : size_t(64u << 20));
+      if (memory.empty() && m_extraMemory + total <= budget) {
+        try {
+          memory.resize(total);
+          m_extraMemory += total;
+        } catch (const std::bad_alloc&) {
+          memory = std::vector<uint8_t>();
+        }
+      }
+      if (!memory.empty()) {
+        m_appData = memory.data();
+        worker->emit([buffer, memory = std::move(memory)](legacy::Device&) mutable { buffer->replaceData(std::move(memory)); });
+        *data = m_appData + offset;
+        return D3D_OK;
+      }
+    }
+    // Reading, overwriting what draws may read, or a copy that went: as
+    // Direct3D 9's lock waits for the GPU, this one waits for the worker.
+    Device::Direct direct(this->m_device, "Lock buffer");
+    return lockNow(offset, size, data, flags);
+  }
+
+  template<typename Base, typename Desc>
+  HRESULT BufferCommon<Base, Desc>::lockNow(UINT offset, UINT size, void** data, DWORD flags) {
     // The copy first: one that cannot come back from the GPU fails the
     // lock with the buffer as it was.
     uint8_t* copy = m_buffer->data();
@@ -674,6 +727,7 @@ namespace dxup::d3d9 {
       *data = nullptr;
       return D3DERR_OUTOFVIDEOMEMORY;
     }
+    m_appData = copy;
     if (flags & D3DLOCK_DISCARD)
       m_buffer->invalidate(0, 0);
     else if (!(flags & D3DLOCK_READONLY))
@@ -763,8 +817,14 @@ namespace dxup::d3d9 {
 
   VertexDeclaration::VertexDeclaration(Device* device, const D3DVERTEXELEMENT9* elements, uint32_t fvf, bool keptByDevice)
   : DeviceChild(device, keptByDevice), m_elements(elements, elements + elementCount(elements)),
-    m_decl(reinterpret_cast<const legacy::VertexElement*>(elements), elementCount(elements), fvf), m_fvf(fvf) {
+    m_decl(std::make_unique<legacy::VertexDecl>(reinterpret_cast<const legacy::VertexElement*>(elements),
+                                                elementCount(elements), fvf)),
+    m_fvf(fvf) {
     m_elements.push_back(D3DDECL_END());
+  }
+
+  VertexDeclaration::~VertexDeclaration() {
+    m_device->retire(m_decl.release());
   }
 
   HRESULT VertexDeclaration::QueryInterface(REFIID riid, void** object) {
@@ -799,6 +859,12 @@ namespace dxup::d3d9 {
       return S_OK;
     }
     return E_NOINTERFACE;
+  }
+
+  template<typename Base>
+  ShaderObject<Base>::~ShaderObject() {
+    if (this->m_device->worker())
+      this->m_device->retire(new std::shared_ptr<legacy::Shader>(std::move(m_shader)));
   }
 
   template<typename Base>
@@ -839,9 +905,14 @@ namespace dxup::d3d9 {
       default:                             return;
     }
     m_valid = SUCCEEDED(d3d11->CreateQuery(&desc, m_query.put()));
+    if (m_valid && device->worker())
+      m_results = std::make_unique<Results>();
   }
 
-  Query::~Query() = default;
+  Query::~Query() {
+    m_device->retire(m_results.release());
+    m_device->retireCom(m_query.detach());
+  }
 
   HRESULT Query::QueryInterface(REFIID riid, void** object) {
     if (!object)
@@ -872,29 +943,110 @@ namespace dxup::d3d9 {
       return D3D_OK;
     std::unique_lock<std::recursive_mutex> guard(m_device->mutex(), std::defer_lock);
     if (m_device->multithreaded()) guard.lock();
-    ID3D11DeviceContext* context = m_device->core()->context();
     const bool beginEnd = m_type == D3DQUERYTYPE_OCCLUSION || m_type == D3DQUERYTYPE_TIMESTAMPDISJOINT
       || m_type == D3DQUERYTYPE_TIMESTAMPFREQ;
-    if (flags & D3DISSUE_BEGIN) {
-      if (beginEnd) {
-        context->Begin(m_query.get());
-        m_building = true;
-      }
-    }
-    if (m_device->core()->tracing9()) {
-      logMessage(LogLevel::Warn, "trace9   query %p type %u issue%s%s", static_cast<void*>(this), unsigned(m_type),
-        (flags & D3DISSUE_BEGIN) ? " begin" : "", (flags & D3DISSUE_END) ? " end" : "");
-      if (m_type == D3DQUERYTYPE_OCCLUSION && (flags & D3DISSUE_BEGIN))
-        m_device->core()->traceDepth9("at the first occlusion query");
-    }
-    if (flags & D3DISSUE_END) {
-      // An end without a begin: an empty query (occlusion: nothing drawn).
-      if (beginEnd && !m_building && (m_type == D3DQUERYTYPE_OCCLUSION || !m_issued))
-        context->Begin(m_query.get());
-      context->End(m_query.get());
+    const bool begin = (flags & D3DISSUE_BEGIN) && beginEnd;
+    if (begin)
+      m_building = true;
+    const bool end = (flags & D3DISSUE_END) != 0;
+    // An end without a begin: an empty query (occlusion: nothing drawn).
+    const bool emptyBegin = end && beginEnd && !m_building && (m_type == D3DQUERYTYPE_OCCLUSION || !m_issued);
+    if (end) {
       m_issued = true;
       m_building = false;
       m_resultNoted = false;
+      m_issues++;
+    }
+    ID3D11Query* query = m_query.get();
+    Results* results = m_results.get();
+    const void* self = this;
+    m_device->run([query, results, self, type = m_type, flags, begin, end, emptyBegin](legacy::Device& core) {
+      ID3D11DeviceContext* context = core.context();
+      if (begin)
+        context->Begin(query);
+      if (core.tracing9()) {
+        logMessage(LogLevel::Warn, "trace9   query %p type %u issue%s%s", self, unsigned(type),
+          (flags & D3DISSUE_BEGIN) ? " begin" : "", (flags & D3DISSUE_END) ? " end" : "");
+        if (type == D3DQUERYTYPE_OCCLUSION && (flags & D3DISSUE_BEGIN))
+          core.traceDepth9("at the first occlusion query");
+      }
+      if (end) {
+        if (emptyBegin)
+          context->Begin(query);
+        context->End(query);
+        if (results)
+          results->noted = false;
+      }
+    });
+    return D3D_OK;
+  }
+
+  // On the core: the D3D11 query's result into results, S_FALSE while
+  // there is none (results->noted: occlusion results counted once).
+  HRESULT Query::poll(legacy::Device& core, ID3D11Query* query, D3DQUERYTYPE type, UINT flags, Results& results,
+                      const void* traced) {
+    ID3D11DeviceContext* context = core.context();
+    HRESULT hr = S_FALSE;
+    switch (type) {
+      case D3DQUERYTYPE_EVENT: {
+        BOOL done = FALSE;
+        hr = context->GetData(query, &done, sizeof(done), flags);
+        results.value = 1;
+        break;
+      }
+      case D3DQUERYTYPE_OCCLUSION: {
+        UINT64 samples = 0;
+        hr = context->GetData(query, &samples, sizeof(samples), flags);
+        results.value = samples;
+        if (hr == S_OK && !results.noted) {
+          results.noted = true;
+          core.noteOcclusionResult(samples);
+        }
+        if (core.tracing9())
+          logMessage(LogLevel::Warn, "trace9   query %p getdata %s %llu", traced, hr == S_OK ? "done" : "pending",
+            static_cast<unsigned long long>(samples));
+        break;
+      }
+      case D3DQUERYTYPE_TIMESTAMP: {
+        UINT64 time = 0;
+        hr = context->GetData(query, &time, sizeof(time), flags);
+        results.value = time;
+        break;
+      }
+      case D3DQUERYTYPE_TIMESTAMPDISJOINT:
+      case D3DQUERYTYPE_TIMESTAMPFREQ: {
+        D3D11_QUERY_DATA_TIMESTAMP_DISJOINT disjoint = {};
+        hr = context->GetData(query, &disjoint, sizeof(disjoint), flags);
+        results.value = disjoint.Frequency;
+        results.disjoint = disjoint.Disjoint;
+        break;
+      }
+      default:
+        break;
+    }
+    return hr;
+  }
+
+  // A result the application asked for, into its memory.
+  HRESULT Query::resultOf(const Results& results, void* data, DWORD size) const {
+    if (!data)
+      return D3D_OK;
+    switch (m_type) {
+      case D3DQUERYTYPE_EVENT:
+        if (size >= sizeof(BOOL)) *static_cast<BOOL*>(data) = TRUE;
+        break;
+      case D3DQUERYTYPE_OCCLUSION:
+        if (size >= sizeof(DWORD)) *static_cast<DWORD*>(data) = DWORD((std::min)(results.value, UINT64(0xffffffffu)));
+        break;
+      case D3DQUERYTYPE_TIMESTAMP:
+      case D3DQUERYTYPE_TIMESTAMPFREQ:
+        if (size >= sizeof(UINT64)) *static_cast<UINT64*>(data) = results.value;
+        break;
+      case D3DQUERYTYPE_TIMESTAMPDISJOINT:
+        if (size >= sizeof(BOOL)) *static_cast<BOOL*>(data) = results.disjoint;
+        break;
+      default:
+        break;
     }
     return D3D_OK;
   }
@@ -920,6 +1072,35 @@ namespace dxup::d3d9 {
       if (m_type == D3DQUERYTYPE_EVENT && data && size >= sizeof(BOOL))
         *static_cast<BOOL*>(data) = TRUE;
       return D3D_OK;
+    }
+    if (Results* results = m_results.get()) {
+      // With the worker: its last poll's result, else a poll is recorded
+      // (one at a time) and sent to the worker at once.
+      if (results->done.load(std::memory_order_acquire) == m_issues)
+        return resultOf(*results, data, size);
+      if (results->failed.load(std::memory_order_acquire))
+        return FAILED(m_device->core()->d3d11()->GetDeviceRemovedReason()) ? D3DERR_DEVICELOST : D3DERR_INVALIDCALL;
+      if (!results->polling.exchange(true, std::memory_order_acq_rel)) {
+        ID3D11Query* query = m_query.get();
+        const UINT getFlags = (flags & D3DGETDATA_FLUSH) ? 0 : D3D11_ASYNC_GETDATA_DONOTFLUSH;
+        m_device->run([query, results, type = m_type, getFlags, issue = m_issues, self = static_cast<const void*>(this)](legacy::Device& core) {
+          const HRESULT hr = poll(core, query, type, getFlags, *results, self);
+          results->failed.store(FAILED(hr), std::memory_order_release);
+          if (hr == S_OK)
+            results->done.store(issue, std::memory_order_release);
+          results->polling.store(false, std::memory_order_release);
+        });
+        if (Worker* worker = m_device->recorder()) {
+          worker->submit();
+        } else {
+          // Made at once (the caller has the core to itself).
+          if (results->done.load(std::memory_order_acquire) == m_issues)
+            return resultOf(*results, data, size);
+          if (results->failed.load(std::memory_order_acquire))
+            return FAILED(m_device->core()->d3d11()->GetDeviceRemovedReason()) ? D3DERR_DEVICELOST : D3DERR_INVALIDCALL;
+        }
+      }
+      return S_FALSE;
     }
     ID3D11DeviceContext* context = m_device->core()->context();
     const UINT getFlags = (flags & D3DGETDATA_FLUSH) ? 0 : D3D11_ASYNC_GETDATA_DONOTFLUSH;

@@ -45,6 +45,8 @@ namespace dxup::legacy {
     T* get() const { return m_ptr; }
     T* operator->() const { return m_ptr; }
     T** put() { reset(); return &m_ptr; }
+    // The reference goes to the caller.
+    T* detach() { T* ptr = m_ptr; m_ptr = nullptr; return ptr; }
     explicit operator bool() const { return m_ptr != nullptr; }
   private:
     T* m_ptr = nullptr;
@@ -205,6 +207,8 @@ namespace dxup::legacy {
     // (TextureDesc::dropCopies).
     Buffer(Device* device, uint32_t size, bool index, bool dynamic = false, bool dropCopy = false);
     bool dynamic() const { return m_dynamic; }
+    // Its copy goes once uploaded (see dropCopy).
+    bool dropsCopy() const { return m_dropCopy; }
     // A draw streamed the buffer: buffers drawn often between writes go
     // back to GPU memory (unless created dynamic).
     void noteStreamedDraw() {
@@ -238,6 +242,14 @@ namespace dxup::legacy {
     struct RingCopy { uint64_t begin = 0; uint32_t size = 0, offset = 0, version = 0, generation = 0; };
     RingCopy& ringCopy() { return m_ringCopy; }
     uint32_t version() const { return m_version; }
+    // Discarding locks with the D3D9 worker thread (d3d9.workerThread): the
+    // application writes new memory while draws recorded before read the
+    // old. A spare is memory of the buffer's size the worker gave back
+    // (empty when there is none; any thread).
+    std::vector<uint8_t> takeSpare();
+    // On the worker: data becomes the buffer's memory, all of it written;
+    // the old memory a spare.
+    void replaceData(std::vector<uint8_t>&& data);
   private:
     // What draws read, together at the start: a bound buffer's first touch
     // in a draw is a cache miss, the rest should not be.
@@ -266,6 +278,8 @@ namespace dxup::legacy {
     void noteClean() { m_uploaded = m_clean.size() == 1 && m_clean[0].first == 0 && m_clean[0].second >= m_size; }
     std::vector<std::pair<uint32_t, uint32_t>> m_clean;  // sorted, disjoint [begin, end)
     std::vector<std::pair<uint32_t, uint32_t>> m_scratch;
+    std::mutex m_spareMutex;
+    std::vector<std::vector<uint8_t>> m_spares;
   };
 
   // A vertex declaration (Direct3D 9) or flexible vertex format.
@@ -376,7 +390,8 @@ namespace dxup::legacy {
     // A frame's draws go into the log (dxup_trace9_go.txt).
     bool tracing() const { return m_trace9; }
     // Bytes into a dynamic buffer (whole 64-byte lines), new memory first
-    // for WRITE_DISCARD: written by DXUP's worker thread where it has one.
+    // for WRITE_DISCARD: on DXUP's D3D11 written at once into the memory the
+    // buffer maps, without a Map or a command.
     bool writeBuffer(ID3D11Buffer* buffer, uint32_t offset, const void* data, uint32_t size, bool discard);
     // Whether textures of a format can be created directly (else converted).
     bool supports(DXGI_FORMAT format, UINT usage) const;
@@ -583,9 +598,9 @@ namespace dxup::legacy {
     HRESULT (WINAPI* m_createMappedView)(IUnknown*, ID3D11Resource*, const D3D11_SHADER_RESOURCE_VIEW_DESC*, UINT,
                                          ID3D11ShaderResourceView**) = nullptr;   // DXUP's d3d11.dll only
     HRESULT (WINAPI* m_createSampler)(IUnknown*, const D3D11_SAMPLER_DESC*, ID3D11SamplerState**) = nullptr;
-    // DXUP's D3D11 (DXUPWriteBuffer): its worker thread writes dynamic buffers.
+    // DXUP's D3D11 (DXUPWriteBuffer): dynamic buffers written into their mapped memory.
     HRESULT (WINAPI* m_writeBuffer)(ID3D11DeviceContext*, ID3D11Buffer*, UINT, const void*, UINT) = nullptr;
-    // DXUPWriteBufferWith: the worker thread keeps a copy of each stage's
+    // DXUPWriteBufferWith: DXUP's D3D11 worker thread keeps a copy of each stage's
     // float constants (WorkerConstants, its own after creation) and writes
     // the windows from it; uploads pass the constants changed since the last.
     using WriteWith = void (*)(void* user, uint8_t* target, size_t size, const void* data, size_t dataSize);

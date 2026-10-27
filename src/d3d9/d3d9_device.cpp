@@ -3,6 +3,7 @@
 #include "d3d9_objects.h"
 
 #include "../legacy/legacy_formats.h"
+#include "../util/util_config.h"
 #include "../util/util_types.h"
 
 #include <algorithm>
@@ -134,7 +135,7 @@ namespace dxup::d3d9 {
     desc.samples = samplesOf(m_params.MultiSampleType, m_params.MultiSampleQuality);
     desc.backBuffer = true;
     for (UINT i = 0; i < m_params.BackBufferCount; i++) {
-      auto texture = std::make_shared<legacy::Texture>(m_device->core(), desc);
+      auto texture = m_device->makeTexture(desc);
       if (!texture->valid()) {
         destroyBuffers();
         return;
@@ -145,7 +146,7 @@ namespace dxup::d3d9 {
     }
     if (desc.samples > 1) {
       desc.samples = 1;
-      m_resolved = std::make_shared<legacy::Texture>(m_device->core(), desc);
+      m_resolved = m_device->makeTexture(desc);
     }
   }
 
@@ -205,28 +206,32 @@ namespace dxup::d3d9 {
     DeviceLock lock(m_device);
     // What the frame drew with and no longer binds goes.
     m_device->releaseHeld(false);
-    legacy::Device* core = m_device->core();
     legacy::Texture* source = m_backBuffers[0]->texture();
-    if (m_resolved && m_resolved->valid()) {
-      core->context()->ResolveSubresource(m_resolved->resource(), 0, source->resource(), 0, source->dxgiFormat());
-      source = m_resolved.get();
-    }
-    legacy::Rect rect = {};
-    if (sourceRect)
-      rect = toRect(*sourceRect);
+    legacy::Texture* resolved = m_resolved && m_resolved->valid() ? m_resolved.get() : nullptr;
+    const bool withRect = sourceRect != nullptr;
+    const legacy::Rect rect = sourceRect ? toRect(*sourceRect) : legacy::Rect{};
     HWND target = window ? window : (m_params.hDeviceWindow ? m_params.hDeviceWindow : nullptr);
     UINT interval = syncInterval(m_params.PresentationInterval);
     if (flags & D3DPRESENT_FORCEIMMEDIATE)
       interval = 0;
-    const HRESULT hr = core->present(source, sourceRect ? &rect : nullptr, target, interval, &m_gamma.red[0]);
+    m_device->runData(&m_gamma, sizeof(m_gamma),
+      [source, resolved, withRect, rect, target, interval](legacy::Device& core, const uint8_t* gamma) {
+        legacy::Texture* shown = source;
+        if (resolved) {
+          core.context()->ResolveSubresource(resolved->resource(), 0, source->resource(), 0, source->dxgiFormat());
+          shown = resolved;
+        }
+        const HRESULT hr = core.present(shown, withRect ? &rect : nullptr, target, interval,
+                                        reinterpret_cast<const uint16_t*>(gamma));
+        if (FAILED(hr))
+          logMessage(LogLevel::Warn, "D3D9 Present failed: 0x%08lx", hr);
+      });
     m_presentCount++;
-    if (FAILED(hr)) {
-      logMessage(LogLevel::Warn, "D3D9 Present failed: 0x%08lx", hr);
-      // A removed device: Direct3D 9Ex games make a new one (Direct3D 9
-      // has no way back from it but Reset, which cannot bring it back).
-      if (m_device->removed())
-        return m_device->ex() ? D3DERR_DEVICEREMOVED : D3D_OK;
-    }
+    m_device->endFrame();
+    // A removed device: Direct3D 9Ex games make a new one (Direct3D 9 has
+    // no way back from it but Reset, which cannot bring it back).
+    if (m_device->removed())
+      return m_device->ex() ? D3DERR_DEVICEREMOVED : D3D_OK;
     return D3D_OK;
   }
 
@@ -351,6 +356,9 @@ namespace dxup::d3d9 {
   }
 
   Device::~Device() {
+    // What is recorded is made first; from here on the core is called directly.
+    m_recorder = nullptr;
+    m_worker.reset();
     releaseHeld(true);
     for (auto& entry : m_fvfDeclarations)
       entry.second->releasePrivate();
@@ -407,7 +415,72 @@ namespace dxup::d3d9 {
     logMessage(LogLevel::Info, "D3D9 device: %ux%u format %u, %u back buffers, %s, multisample %u, interval 0x%x",
       params->BackBufferWidth, params->BackBufferHeight, params->BackBufferFormat, params->BackBufferCount,
       params->Windowed ? "windowed" : "fullscreen", params->MultiSampleType, params->PresentationInterval);
+    if (UserOverrides::get().d3d9WorkerThread) {
+      m_worker = std::make_unique<Worker>(m_core.get());
+      m_recorder = m_worker.get();
+      logMessage(LogLevel::Info, "D3D9: calls on the core made by a worker thread (d3d9.workerThread)");
+    }
     return D3D_OK;
+  }
+
+  std::shared_ptr<legacy::Texture> Device::makeTexture(const legacy::TextureDesc& desc) {
+    return std::shared_ptr<legacy::Texture>(new legacy::Texture(m_core.get(), desc),
+                                            [this](legacy::Texture* texture) { retire(texture); });
+  }
+
+  Device::Direct::Direct(Device* device, const char* why)
+  : m_device(device), m_recorder(nullptr), m_locked(device->multithreaded()) {
+    if (m_locked)
+      device->m_mutex.lock();
+    m_recorder = device->m_recorder;
+    if (m_recorder) {
+      // Calls recorded during the wait (window procedures it gives sent
+      // messages) are made too.
+      do
+        m_recorder->synchronize();
+      while (!m_recorder->recordedNothing());
+      device->m_recorder = nullptr;
+      device->noteDirect(why);
+    }
+  }
+
+  Device::Direct::~Direct() {
+    if (m_recorder)
+      m_device->m_recorder = m_recorder;
+    if (m_locked)
+      m_device->m_mutex.unlock();
+  }
+
+  void Device::noteDirect(const char* why) {
+    for (auto& entry : m_directWaits) {
+      if (entry.first == why) {
+        entry.second++;
+        return;
+      }
+    }
+    m_directWaits.emplace_back(why, 1u);
+  }
+
+  void Device::endFrame() {
+    Worker* worker = m_recorder;
+    if (!worker)
+      return;
+    worker->endFrame();
+    // What made the application's thread wait for the worker (it gives up
+    // the worker's gain): logged per frame now and then.
+    if (++m_framesSinceWaits < 2000 || m_waitReports >= 4)
+      return;
+    m_waitReports++;
+    std::sort(m_directWaits.begin(), m_directWaits.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+    std::string text;
+    for (const auto& entry : m_directWaits) {
+      char part[96];
+      snprintf(part, sizeof(part), "%s%s %.2f", text.empty() ? "" : ", ", entry.first, double(entry.second) / m_framesSinceWaits);
+      text += part;
+    }
+    logMessage(LogLevel::Info, "D3D9 worker: waits per frame: %s", text.empty() ? "none" : text.c_str());
+    m_directWaits.clear();
+    m_framesSinceWaits = 0;
   }
 
   void Device::applyFullscreen(const D3DPRESENT_PARAMETERS& params) {
@@ -506,7 +579,7 @@ namespace dxup::d3d9 {
       desc.height = actual.BackBufferHeight;
       desc.format = legacy::Format(p.AutoDepthStencilFormat);
       desc.samples = samplesOf(p.MultiSampleType, p.MultiSampleQuality);
-      auto texture = std::make_shared<legacy::Texture>(m_core.get(), desc);
+      auto texture = makeTexture(desc);
       if (!texture->valid())
         return D3DERR_NOTAVAILABLE;
       // Counted on the device (as the back buffers): the device lives as
@@ -732,6 +805,7 @@ namespace dxup::d3d9 {
       logFailedCall(D3DERR_INVALIDCALL, "Reset while the application holds a back buffer or the automatic depth buffer");
       return D3DERR_INVALIDCALL;
     }
+    Direct direct(this, "Reset");
     if (m_recording) {
       m_recording->Release();
       m_recording = nullptr;
@@ -810,7 +884,7 @@ namespace dxup::d3d9 {
       desc.srgb = true;
       desc.autoMips = (usage & D3DUSAGE_AUTOGENMIPMAP) != 0;
       desc.dropCopies = sizeof(void*) == 4 && pool == D3DPOOL_MANAGED && !(usage & D3DUSAGE_DYNAMIC);
-      auto shared_ = std::make_shared<legacy::Texture>(m_core.get(), desc);
+      auto shared_ = makeTexture(desc);
       if (!shared_->valid())
         return D3DERR_INVALIDCALL;
       auto* object = new Texture2D(this, std::move(shared_), pool, usage);
@@ -841,7 +915,7 @@ namespace dxup::d3d9 {
       desc.levels = levels;
       desc.format = legacy::Format(format);
       desc.systemMemory = pool == D3DPOOL_SYSTEMMEM || pool == D3DPOOL_SCRATCH;
-      auto shared_ = std::make_shared<legacy::Texture>(m_core.get(), desc);
+      auto shared_ = makeTexture(desc);
       if (!shared_->valid())
         return D3DERR_INVALIDCALL;
       auto* object = new VolumeTexture(this, std::move(shared_), pool, usage);
@@ -876,7 +950,7 @@ namespace dxup::d3d9 {
       desc.srgb = true;
       desc.autoMips = (usage & D3DUSAGE_AUTOGENMIPMAP) != 0;
       desc.dropCopies = sizeof(void*) == 4 && pool == D3DPOOL_MANAGED && !(usage & D3DUSAGE_DYNAMIC);
-      auto shared_ = std::make_shared<legacy::Texture>(m_core.get(), desc);
+      auto shared_ = makeTexture(desc);
       if (!shared_->valid())
         return D3DERR_INVALIDCALL;
       auto* object = new CubeTexture(this, std::move(shared_), pool, usage);
@@ -949,7 +1023,7 @@ namespace dxup::d3d9 {
       desc.systemMemory = pool == D3DPOOL_SYSTEMMEM || pool == D3DPOOL_SCRATCH;
       desc.srgb = desc.renderTarget;
       desc.samples = samplesOf(multisample, quality);
-      auto texture = std::make_shared<legacy::Texture>(m_core.get(), desc);
+      auto texture = makeTexture(desc);
       if (!texture->valid())
         return D3DERR_INVALIDCALL;
       auto* object = new Surface(this, pool, std::move(texture), 0, nullptr, nullptr, usage, multisample, quality);
@@ -1043,7 +1117,7 @@ namespace dxup::d3d9 {
   HRESULT Device::UpdateTexture(IDirect3DBaseTexture9* source, IDirect3DBaseTexture9* destination) {
     if (!source || !destination || source->GetType() != destination->GetType())
       return D3DERR_INVALIDCALL;
-    DeviceLock lock(this);
+    Direct direct(this, "UpdateTexture");
     BaseTexture* src = baseTextureOf(source);
     BaseTexture* dst = baseTextureOf(destination);
     if (!src || !dst)
@@ -1111,29 +1185,42 @@ namespace dxup::d3d9 {
     legacy::Texture* d = dst->texture();
     const RECT sr = sourceRect ? *sourceRect : RECT{ 0, 0, LONG(src->width()), LONG(src->height()) };
     const RECT dr = destRect ? *destRect : RECT{ 0, 0, LONG(dst->width()), LONG(dst->height()) };
-    const bool sameSize = sr.right - sr.left == dr.right - dr.left && sr.bottom - sr.top == dr.bottom - dr.top;
-    const bool wholeSource = sr.left == 0 && sr.top == 0 && UINT(sr.right) == src->width() && UINT(sr.bottom) == src->height();
-    const bool wholeDest = dr.left == 0 && dr.top == 0 && UINT(dr.right) == dst->width() && UINT(dr.bottom) == dst->height();
-    ID3D11DeviceContext* context = m_core->context();
-    const bool depth = legacy::formatInfo(legacy::Format(src->format())).depth;
     if (s->nullTarget() || d->nullTarget())
       return D3D_OK;
+    // Depth: copied whole, as Direct3D 9 allows.
+    if (legacy::formatInfo(legacy::Format(src->format())).depth
+     && (sr.right - sr.left != dr.right - dr.left || sr.bottom - sr.top != dr.bottom - dr.top
+      || sr.left || sr.top || UINT(sr.right) != src->width() || UINT(sr.bottom) != src->height()
+      || dr.left || dr.top || UINT(dr.right) != dst->width() || UINT(dr.bottom) != dst->height()
+      || src->format() != dst->format() || !s->d3dResource() || !d->d3dResource()))
+      return D3DERR_INVALIDCALL;
+    // Video surfaces stretch filtered whatever the filter (Windows' Direct3D
+    // 9 converts them through the video processor).
+    const bool linear = filter != D3DTEXF_POINT || src->format() == D3DFMT_YUY2 || src->format() == D3DFMT_UYVY;
+    const uint32_t srcSub = src->subresource(), dstSub = dst->subresource();
+    run([this, s, srcSub, d, dstSub, sr, dr, linear](legacy::Device& core) { stretch(core, s, srcSub, d, dstSub, sr, dr, linear); });
+    return D3D_OK;
+  }
+
+  void Device::stretch(legacy::Device& core, legacy::Texture* s, uint32_t srcSub, legacy::Texture* d, uint32_t dstSub,
+                       const RECT& sr, const RECT& dr, bool linear) {
+    const bool sameSize = sr.right - sr.left == dr.right - dr.left && sr.bottom - sr.top == dr.bottom - dr.top;
+    const bool wholeSource = sr.left == 0 && sr.top == 0 && UINT(sr.right) == s->width(srcSub) && UINT(sr.bottom) == s->height(srcSub);
+    const bool wholeDest = dr.left == 0 && dr.top == 0 && UINT(dr.right) == d->width(dstSub) && UINT(dr.bottom) == d->height(dstSub);
+    ID3D11DeviceContext* context = core.context();
     s->flush();
     d->flush();
-    if (depth) {
-      // Depth: copied whole, as Direct3D 9 allows.
-      if (!sameSize || !wholeSource || !wholeDest || src->format() != dst->format() || !s->d3dResource() || !d->d3dResource())
-        return D3DERR_INVALIDCALL;
+    if (legacy::formatInfo(s->desc().format).depth) {
       if (s->desc().samples == d->desc().samples)
-        context->CopySubresourceRegion(d->d3dResource(), dst->subresource(), 0, 0, 0, s->d3dResource(), src->subresource(), nullptr);
-      return D3D_OK;
+        context->CopySubresourceRegion(d->d3dResource(), dstSub, 0, 0, 0, s->d3dResource(), srcSub, nullptr);
+      return;
     }
     if (s->desc().samples > 1) {
       // Multisampled: resolved, straight into the destination when it fits.
       if (sameSize && wholeSource && wholeDest && s->dxgiFormat() == d->dxgiFormat() && d->desc().samples == 1) {
-        context->ResolveSubresource(d->resource(), dst->subresource(), s->resource(), src->subresource(), s->dxgiFormat());
+        context->ResolveSubresource(d->resource(), dstSub, s->resource(), srcSub, s->dxgiFormat());
         d->markGpuWritten();
-        return D3D_OK;
+        return;
       }
       legacy::TextureDesc desc = s->desc();
       desc.samples = 1;
@@ -1141,32 +1228,29 @@ namespace dxup::d3d9 {
       if (!kept || kept->width != desc.width || kept->height != desc.height || kept->format != desc.format
        || kept->levels != desc.levels || kept->cube != desc.cube || kept->srgb != desc.srgb
        || kept->renderTarget != desc.renderTarget) {
-        m_resolveTarget = std::make_shared<legacy::Texture>(m_core.get(), desc);
+        m_resolveTarget = makeTexture(desc);
         if (!m_resolveTarget->valid()) {
           m_resolveTarget.reset();
-          return D3DERR_INVALIDCALL;
+          logFailedCall(D3DERR_INVALIDCALL, "StretchRect: no resolve target %ux%u, format %s", desc.width, desc.height,
+                        formatName(D3DFORMAT(desc.format)).c_str());
+          return;
         }
       }
       legacy::Texture* resolved = m_resolveTarget.get();
-      context->ResolveSubresource(resolved->resource(), 0, s->resource(), src->subresource(), s->dxgiFormat());
+      context->ResolveSubresource(resolved->resource(), 0, s->resource(), srcSub, s->dxgiFormat());
       const legacy::Rect a = toRect(sr), b = toRect(dr);
-      m_core->blit(d, dst->subresource(), &b, resolved, 0, &a, filter != D3DTEXF_POINT, false, 0);
-      return D3D_OK;
+      core.blit(d, dstSub, &b, resolved, 0, &a, linear, false, 0);
+      return;
     }
     if (sameSize && s->dxgiFormat() == d->dxgiFormat() && s->desc().samples == d->desc().samples && s->d3dResource()
      && d->d3dResource() && !s->desc().systemMemory && !d->desc().systemMemory) {
       D3D11_BOX box = { UINT(sr.left), UINT(sr.top), 0, UINT(sr.right), UINT(sr.bottom), 1 };
-      context->CopySubresourceRegion(d->d3dResource(), dst->subresource(), UINT(dr.left), UINT(dr.top), 0, s->d3dResource(),
-                                     src->subresource(), &box);
+      context->CopySubresourceRegion(d->d3dResource(), dstSub, UINT(dr.left), UINT(dr.top), 0, s->d3dResource(), srcSub, &box);
       d->markGpuWritten();
-      return D3D_OK;
+      return;
     }
-    // Video surfaces stretch filtered whatever the filter (Windows' Direct3D
-    // 9 converts them through the video processor).
-    const bool video = src->format() == D3DFMT_YUY2 || src->format() == D3DFMT_UYVY;
     const legacy::Rect a = toRect(sr), b = toRect(dr);
-    m_core->blit(d, dst->subresource(), &b, s, src->subresource(), &a, filter != D3DTEXF_POINT || video, false, 0);
-    return D3D_OK;
+    core.blit(d, dstSub, &b, s, srcSub, &a, linear, false, 0);
   }
 
   HRESULT Device::ColorFill(IDirect3DSurface9* surface, const RECT* rect, D3DCOLOR color) {
@@ -1174,10 +1258,11 @@ namespace dxup::d3d9 {
       return D3DERR_INVALIDCALL;
     DeviceLock lock(this);
     Surface* s = asSurface(surface);
-    legacy::Rect r = {};
-    if (rect)
-      r = toRect(*rect);
-    m_core->fillArgb(s->texture(), s->subresource(), rect ? &r : nullptr, color);
+    const legacy::Rect r = rect ? toRect(*rect) : legacy::Rect{};
+    const bool whole = !rect;
+    legacy::Texture* texture = s->texture();
+    const uint32_t subresource = s->subresource();
+    run([texture, subresource, r, whole, color](legacy::Device& core) { core.fillArgb(texture, subresource, whole ? nullptr : &r, color); });
     return D3D_OK;
   }
 
@@ -1191,13 +1276,17 @@ namespace dxup::d3d9 {
     if (s && !(s->usage() & D3DUSAGE_RENDERTARGET))
       return D3DERR_INVALIDCALL;
     m_renderTargets[index].set(s);
-    m_core->setRenderTarget(index, s ? s->texture() : nullptr, s ? s->subresource() : 0);
+    legacy::Texture* texture = s ? s->texture() : nullptr;
+    const uint32_t subresource = s ? s->subresource() : 0;
     // Direct3D 9 sets viewport and scissor to the first target, also when it
     // is bound already (UE3 games set their scene target again after a
     // smaller viewport: The Vanishing of Ethan Carter drew its world into a
     // 512x512 corner). Direct3D 7 keeps its viewport.
-    if (index == 0)
-      m_core->resetViewport();
+    run([index, texture, subresource](legacy::Device& core) {
+      core.setRenderTarget(index, texture, subresource);
+      if (index == 0)
+        core.resetViewport();
+    });
     return D3D_OK;
   }
 
@@ -1218,7 +1307,8 @@ namespace dxup::d3d9 {
     DeviceLock lock(this);
     Surface* s = asSurface(surface);
     m_depthStencil.set(s);
-    m_core->setDepthStencil(s ? s->texture() : nullptr);
+    legacy::Texture* texture = s ? s->texture() : nullptr;
+    run([texture](legacy::Device& core) { core.setDepthStencil(texture); });
     return D3D_OK;
   }
 
@@ -1254,9 +1344,19 @@ namespace dxup::d3d9 {
     DeviceLock lock(this);
     if (count && !rects)
       count = 0;
+    auto fill = [&](legacy::Rect* list) {
+      for (DWORD i = 0; i < count; i++)
+        list[i] = { rects[i].x1, rects[i].y1, rects[i].x2, rects[i].y2 };
+    };
+    if (Worker* worker = m_recorder) {
+      worker->emitFilled(size_t(count) * sizeof(legacy::Rect), [&](uint8_t* to) { fill(reinterpret_cast<legacy::Rect*>(to)); },
+        [count, flags, color, z, stencil](legacy::Device& core, const uint8_t* data) {
+          core.clear(count, reinterpret_cast<const legacy::Rect*>(data), flags, color, z, stencil);
+        });
+      return D3D_OK;
+    }
     std::vector<legacy::Rect> list(count);
-    for (DWORD i = 0; i < count; i++)
-      list[i] = { rects[i].x1, rects[i].y1, rects[i].x2, rects[i].y2 };
+    fill(list.data());
     m_core->clear(count, list.data(), flags, color, z, stencil);
     return D3D_OK;
   }
@@ -1271,13 +1371,16 @@ namespace dxup::d3d9 {
       rec->transforms[uint32_t(state)] = *matrix;
       return D3D_OK;
     }
-    m_core->setTransform(uint32_t(state), &matrix->_11);
+    runData(matrix, sizeof(D3DMATRIX), [state = uint32_t(state)](legacy::Device& core, const uint8_t* data) {
+      core.setTransform(state, reinterpret_cast<const float*>(data));
+    });
     return D3D_OK;
   }
 
   HRESULT Device::GetTransform(D3DTRANSFORMSTATETYPE state, D3DMATRIX* matrix) {
     if (!matrix)
       return D3DERR_INVALIDCALL;
+    Direct direct(this, "GetTransform");
     m_core->getTransform(uint32_t(state), &matrix->_11);
     return D3D_OK;
   }
@@ -1304,13 +1407,15 @@ namespace dxup::d3d9 {
       rec->viewportSet = true;
       return D3D_OK;
     }
-    m_core->setViewport({ viewport->X, viewport->Y, viewport->Width, viewport->Height, viewport->MinZ, viewport->MaxZ });
+    const legacy::Viewport v = { viewport->X, viewport->Y, viewport->Width, viewport->Height, viewport->MinZ, viewport->MaxZ };
+    run([v](legacy::Device& core) { core.setViewport(v); });
     return D3D_OK;
   }
 
   HRESULT Device::GetViewport(D3DVIEWPORT9* viewport) {
     if (!viewport)
       return D3DERR_INVALIDCALL;
+    Direct direct(this, "GetViewport");
     const legacy::Viewport& v = m_core->viewport();
     *viewport = { v.x, v.y, v.width, v.height, v.minZ, v.maxZ };
     return D3D_OK;
@@ -1328,13 +1433,14 @@ namespace dxup::d3d9 {
     static_assert(sizeof(legacy::Material) == sizeof(D3DMATERIAL9), "material layouts");
     legacy::Material m;
     std::memcpy(&m, material, sizeof(m));
-    m_core->setMaterial(m);
+    run([m](legacy::Device& core) { core.setMaterial(m); });
     return D3D_OK;
   }
 
   HRESULT Device::GetMaterial(D3DMATERIAL9* material) {
     if (!material)
       return D3DERR_INVALIDCALL;
+    Direct direct(this, "GetMaterial");
     std::memcpy(material, &m_core->material(), sizeof(*material));
     return D3D_OK;
   }
@@ -1350,8 +1456,9 @@ namespace dxup::d3d9 {
     static_assert(sizeof(legacy::Light) == sizeof(D3DLIGHT9), "light layouts");
     legacy::Light l;
     std::memcpy(&l, light, sizeof(l));
-    if (!m_core->setLight(index, l))
+    if (index >= legacy::Device::kMaxLights)
       return E_OUTOFMEMORY;
+    run([index, l](legacy::Device& core) { core.setLight(index, l); });
     markLight(index);
     return D3D_OK;
   }
@@ -1367,7 +1474,7 @@ namespace dxup::d3d9 {
   HRESULT Device::GetLight(DWORD index, D3DLIGHT9* light) {
     if (!light)
       return D3DERR_INVALIDCALL;
-    DeviceLock lock(this);
+    Direct direct(this, "GetLight");
     legacy::Light l;
     if (!lightExists(index) || !m_core->getLight(index, &l))
       return D3DERR_INVALIDCALL;
@@ -1381,8 +1488,9 @@ namespace dxup::d3d9 {
       rec->lightEnables[index] = enable;
       return D3D_OK;
     }
-    if (!m_core->lightEnable(index, enable != FALSE))
+    if (index >= legacy::Device::kMaxLights)
       return E_OUTOFMEMORY;
+    run([index, enable](legacy::Device& core) { core.lightEnable(index, enable != FALSE); });
     markLight(index);
     return D3D_OK;
   }
@@ -1390,7 +1498,7 @@ namespace dxup::d3d9 {
   HRESULT Device::GetLightEnable(DWORD index, BOOL* enable) {
     if (!enable)
       return D3DERR_INVALIDCALL;
-    DeviceLock lock(this);
+    Direct direct(this, "GetLightEnable");
     if (!lightExists(index))
       return D3DERR_INVALIDCALL;
     *enable = m_core->lightEnabled(index) ? 128 : 0;
@@ -1407,7 +1515,8 @@ namespace dxup::d3d9 {
       return D3D_OK;
     }
     m_clipPlanes[index] = { plane[0], plane[1], plane[2], plane[3] };
-    m_core->setClipPlane(index, plane);
+    const std::array<float, 4> p = m_clipPlanes[index];
+    run([index, p](legacy::Device& core) { core.setClipPlane(index, p.data()); });
     return D3D_OK;
   }
 
@@ -1424,7 +1533,10 @@ namespace dxup::d3d9 {
     // The usual call (thousands a frame) written out: a lambda's captures
     // went through the stack even inlined.
     if (!multithreaded() && !m_recording) {
-      m_core->setRenderState(uint32_t(state), value);
+      if (Worker* worker = m_recorder)
+        worker->emit([s = uint32_t(state), value](legacy::Device& core) { core.setRenderState(s, value); });
+      else
+        m_core->setRenderState(uint32_t(state), value);
       return D3D_OK;
     }
     auto body = [&]() -> HRESULT {
@@ -1433,7 +1545,7 @@ namespace dxup::d3d9 {
         rec->renderStatesSet.set(state);
         return D3D_OK;
       }
-      m_core->setRenderState(uint32_t(state), value);
+      run([s = uint32_t(state), value](legacy::Device& core) { core.setRenderState(s, value); });
       return D3D_OK;
     };
     return withLock(this, body);
@@ -1442,6 +1554,7 @@ namespace dxup::d3d9 {
   HRESULT Device::GetRenderState(D3DRENDERSTATETYPE state, DWORD* value) {
     if (!value)
       return D3DERR_INVALIDCALL;
+    Direct direct(this, "GetRenderState");
     *value = m_core->renderState(uint32_t(state));
     return D3D_OK;
   }
@@ -1462,7 +1575,11 @@ namespace dxup::d3d9 {
       if (next) hold(next);
       m_textures[index] = texture;
       m_textureObjects[index] = next;
-      m_core->setTexture(uint32_t(index), next ? static_cast<legacy::Texture*>(next->boundCore) : nullptr);
+      legacy::Texture* core = next ? static_cast<legacy::Texture*>(next->boundCore) : nullptr;
+      if (Worker* worker = m_recorder)
+        worker->emit([index, core](legacy::Device& c) { c.setTexture(uint32_t(index), core); });
+      else
+        m_core->setTexture(uint32_t(index), core);
       return D3D_OK;
     };
     return multithreaded() ? withLock(this, body) : body();
@@ -1488,7 +1605,10 @@ namespace dxup::d3d9 {
         rec->stageStatesSet[stage].set(type);
         return D3D_OK;
       }
-      m_core->setTextureStageState(stage, uint32_t(type), value);
+      if (Worker* worker = m_recorder)
+        worker->emit([stage, t = uint32_t(type), value](legacy::Device& core) { core.setTextureStageState(stage, t, value); });
+      else
+        m_core->setTextureStageState(stage, uint32_t(type), value);
       return D3D_OK;
     };
     return multithreaded() ? withLock(this, body) : body();
@@ -1497,6 +1617,7 @@ namespace dxup::d3d9 {
   HRESULT Device::GetTextureStageState(DWORD stage, D3DTEXTURESTAGESTATETYPE type, DWORD* value) {
     if (!value || stage >= 8)
       return D3DERR_INVALIDCALL;
+    Direct direct(this, "GetTextureStageState");
     *value = m_core->textureStageState(stage, uint32_t(type));
     return D3D_OK;
   }
@@ -1508,7 +1629,10 @@ namespace dxup::d3d9 {
     if (index < 0)
       return sampler == D3DDMAPSAMPLER ? D3D_OK : D3DERR_INVALIDCALL;
     if (!multithreaded() && !m_recording) {
-      m_core->setSamplerState(uint32_t(index), uint32_t(type), value);
+      if (Worker* worker = m_recorder)
+        worker->emit([i = uint32_t(index), t = uint32_t(type), value](legacy::Device& core) { core.setSamplerState(i, t, value); });
+      else
+        m_core->setSamplerState(uint32_t(index), uint32_t(type), value);
       return D3D_OK;
     }
     auto body = [&]() -> HRESULT {
@@ -1517,7 +1641,7 @@ namespace dxup::d3d9 {
         rec->samplerStatesSet[index].set(type);
         return D3D_OK;
       }
-      m_core->setSamplerState(uint32_t(index), uint32_t(type), value);
+      run([i = uint32_t(index), t = uint32_t(type), value](legacy::Device& core) { core.setSamplerState(i, t, value); });
       return D3D_OK;
     };
     return withLock(this, body);
@@ -1527,6 +1651,7 @@ namespace dxup::d3d9 {
     if (!value)
       return D3DERR_INVALIDCALL;
     const int index = samplerIndex(sampler);
+    Direct direct(this, "GetSamplerState");
     *value = index >= 0 ? m_core->samplerState(uint32_t(index), uint32_t(type)) : 0;
     return D3D_OK;
   }
@@ -1570,13 +1695,15 @@ namespace dxup::d3d9 {
       rec->scissorSet = true;
       return D3D_OK;
     }
-    m_core->setScissor(toRect(*rect));
+    const legacy::Rect r = toRect(*rect);
+    run([r](legacy::Device& core) { core.setScissor(r); });
     return D3D_OK;
   }
 
   HRESULT Device::GetScissorRect(RECT* rect) {
     if (!rect)
       return D3DERR_INVALIDCALL;
+    Direct direct(this, "GetScissorRect");
     const legacy::Rect& r = m_core->scissor();
     *rect = { r.left, r.top, r.right, r.bottom };
     return D3D_OK;
@@ -1627,6 +1754,7 @@ namespace dxup::d3d9 {
   }
 
   void Device::captureState(StateSet& s) {
+    Direct direct(this, "state block Capture");
     for (uint32_t state = 0; state < 256; state++)
       if (s.renderStatesSet.test(state))
         s.renderStates[state] = m_core->renderState(state);
@@ -1696,15 +1824,17 @@ namespace dxup::d3d9 {
     m_recording = nullptr;
     for (uint32_t state = 0; state < 256; state++)
       if (s.renderStatesSet.test(state))
-        m_core->setRenderState(state, s.renderStates[state]);
+        run([state, value = s.renderStates[state]](legacy::Device& core) { core.setRenderState(state, value); });
     for (uint32_t stage = 0; stage < 8; stage++)
       for (uint32_t type = 0; type < 33; type++)
         if (s.stageStatesSet[stage].test(type))
-          m_core->setTextureStageState(stage, type, s.stageStates[stage][type]);
+          run([stage, type, value = s.stageStates[stage][type]](legacy::Device& core) { core.setTextureStageState(stage, type, value); });
     for (uint32_t sampler = 0; sampler < legacy::kSamplerCount; sampler++)
       for (uint32_t type = 0; type < 14; type++)
         if (s.samplerStatesSet[sampler].test(type))
-          m_core->setSamplerState(sampler, type, s.samplerStates[sampler][type]);
+          run([sampler, type, value = s.samplerStates[sampler][type]](legacy::Device& core) {
+            core.setSamplerState(sampler, type, value);
+          });
     for (uint32_t i = 0; i < legacy::kSamplerCount; i++)
       if (s.texturesSet.test(i))
         SetTexture(i < 16 ? i : D3DVERTEXTEXTURESAMPLER0 + (i - 16), s.textures[i]);
@@ -1729,15 +1859,22 @@ namespace dxup::d3d9 {
     if (s.pixelShaderSet)
       SetPixelShader(s.pixelShader);
     for (uint32_t i = 0; i < 256; i++) {
-      if (s.vsFloatsSet.test(i)) m_core->setShaderConstantF(false, i, s.vsFloats[i].data(), 1);
-      if (s.psFloatsSet.test(i)) m_core->setShaderConstantF(true, i, s.psFloats[i].data(), 1);
+      for (const bool pixel : { false, true }) {
+        if ((pixel ? s.psFloatsSet : s.vsFloatsSet).test(i))
+          run([pixel, i, v = (pixel ? s.psFloats : s.vsFloats)[i]](legacy::Device& core) { core.setShaderConstantF(pixel, i, v.data(), 1); });
+      }
     }
     for (uint32_t i = 0; i < 16; i++) {
-      if (s.vsIntsSet.test(i)) m_core->setShaderConstantI(false, i, s.vsInts[i].data(), 1);
-      if (s.psIntsSet.test(i)) m_core->setShaderConstantI(true, i, s.psInts[i].data(), 1);
-      const uint32_t vsBool = s.vsBools[i], psBool = s.psBools[i];
-      if (s.vsBoolsSet.test(i)) m_core->setShaderConstantB(false, i, &vsBool, 1);
-      if (s.psBoolsSet.test(i)) m_core->setShaderConstantB(true, i, &psBool, 1);
+      for (const bool pixel : { false, true }) {
+        if ((pixel ? s.psIntsSet : s.vsIntsSet).test(i))
+          run([pixel, i, v = (pixel ? s.psInts : s.vsInts)[i]](legacy::Device& core) {
+            core.setShaderConstantI(pixel, i, reinterpret_cast<const int32_t*>(v.data()), 1);
+          });
+        if ((pixel ? s.psBoolsSet : s.vsBoolsSet).test(i))
+          run([pixel, i, v = uint32_t((pixel ? s.psBools : s.vsBools)[i])](legacy::Device& core) {
+            core.setShaderConstantB(pixel, i, &v, 1);
+          });
+      }
     }
     for (const auto& entry : s.transforms)
       SetTransform(D3DTRANSFORMSTATETYPE(entry.first), &entry.second);
@@ -1781,7 +1918,8 @@ namespace dxup::d3d9 {
       if (m_declaration.set(decl) && decl)
         hold(decl);
       m_fvf = decl ? decl->fvf() : 0;
-      m_core->setVertexDeclaration(decl ? decl->decl() : nullptr);
+      legacy::VertexDecl* core = decl ? decl->decl() : nullptr;
+      run([core](legacy::Device& c) { c.setVertexDeclaration(core); });
       return D3D_OK;
     };
     return multithreaded() ? withLock(this, body) : body();
@@ -1823,7 +1961,8 @@ namespace dxup::d3d9 {
     if (m_declaration.set(decl) && decl)
       hold(decl);
     m_fvf = fvf;
-    m_core->setVertexDeclaration(decl->decl());
+    legacy::VertexDecl* core = decl->decl();
+    run([core](legacy::Device& c) { c.setVertexDeclaration(core); });
     return D3D_OK;
   }
 
@@ -1850,7 +1989,11 @@ namespace dxup::d3d9 {
         hold(vb);
       m_streams[stream].offset = offset;
       m_streams[stream].stride = stride;
-      m_core->setStreamSource(stream, vb ? vb->buffer() : nullptr, offset, stride);
+      legacy::Buffer* core = vb ? vb->buffer() : nullptr;
+      if (Worker* worker = m_recorder)
+        worker->emit([stream, core, offset, stride](legacy::Device& c) { c.setStreamSource(stream, core, offset, stride); });
+      else
+        m_core->setStreamSource(stream, core, offset, stride);
       return D3D_OK;
     };
     return multithreaded() ? withLock(this, body) : body();
@@ -1878,7 +2021,7 @@ namespace dxup::d3d9 {
         return D3D_OK;
       }
       m_streams[stream].frequency = setting;
-      m_core->setStreamFrequency(stream, setting);
+      run([stream, setting](legacy::Device& core) { core.setStreamFrequency(stream, setting); });
       return D3D_OK;
     };
     return multithreaded() ? withLock(this, body) : body();
@@ -1901,7 +2044,12 @@ namespace dxup::d3d9 {
       }
       if (m_indices.set(ib) && ib)
         hold(ib);
-      m_core->setIndices(ib ? ib->buffer() : nullptr, ib && ib->index32());
+      legacy::Buffer* core = ib ? ib->buffer() : nullptr;
+      const bool index32 = ib && ib->index32();
+      if (Worker* worker = m_recorder)
+        worker->emit([core, index32](legacy::Device& c) { c.setIndices(core, index32); });
+      else
+        m_core->setIndices(core, index32);
       return D3D_OK;
     };
     return multithreaded() ? withLock(this, body) : body();
@@ -1965,7 +2113,8 @@ namespace dxup::d3d9 {
       }
       if (m_vertexShader.set(vs) && vs)
         hold(vs);
-      m_core->setVertexShader(vs ? vs->shader() : nullptr);
+      legacy::Shader* core = vs ? vs->shader() : nullptr;
+      run([core](legacy::Device& c) { c.setVertexShader(core); });
       return D3D_OK;
     };
     return multithreaded() ? withLock(this, body) : body();
@@ -1991,7 +2140,8 @@ namespace dxup::d3d9 {
       }
       if (m_pixelShader.set(ps) && ps)
         hold(ps);
-      m_core->setPixelShader(ps ? ps->shader() : nullptr);
+      legacy::Shader* core = ps ? ps->shader() : nullptr;
+      run([core](legacy::Device& c) { c.setPixelShader(core); });
       return D3D_OK;
     };
     return multithreaded() ? withLock(this, body) : body();
@@ -2021,7 +2171,12 @@ namespace dxup::d3d9 {
     if (!data || !inRange(start, count, 256))
       return D3DERR_INVALIDCALL;
     if (!multithreaded() && !m_recording) {
-      m_core->setShaderConstantF(false, start, data, count);
+      if (Worker* worker = m_recorder)
+        worker->emitData(data, size_t(count) * 16, [start, count](legacy::Device& core, const uint8_t* values) {
+          core.setShaderConstantF(false, start, reinterpret_cast<const float*>(values), count);
+        });
+      else
+        m_core->setShaderConstantF(false, start, data, count);
       return D3D_OK;
     }
     auto body = [&]() -> HRESULT {
@@ -2029,7 +2184,9 @@ namespace dxup::d3d9 {
         recordConstants(rec->vsFloats, rec->vsFloatsSet, start, data, count);
         return D3D_OK;
       }
-      m_core->setShaderConstantF(false, start, data, count);
+      runData(data, size_t(count) * 16, [start, count](legacy::Device& core, const uint8_t* values) {
+        core.setShaderConstantF(false, start, reinterpret_cast<const float*>(values), count);
+      });
       return D3D_OK;
     };
     return withLock(this, body);
@@ -2038,6 +2195,7 @@ namespace dxup::d3d9 {
   HRESULT Device::GetVertexShaderConstantF(UINT start, float* data, UINT count) {
     if (!data || !inRange(start, count, 256))
       return D3DERR_INVALIDCALL;
+    Direct direct(this, "GetShaderConstantF");
     m_core->getShaderConstantF(false, start, data, count);
     return D3D_OK;
   }
@@ -2050,13 +2208,16 @@ namespace dxup::d3d9 {
       recordConstants(rec->vsInts, rec->vsIntsSet, start, data, count);
       return D3D_OK;
     }
-    m_core->setShaderConstantI(false, start, reinterpret_cast<const int32_t*>(data), count);
+    runData(data, size_t(count) * 16, [start, count](legacy::Device& core, const uint8_t* values) {
+      core.setShaderConstantI(false, start, reinterpret_cast<const int32_t*>(values), count);
+    });
     return D3D_OK;
   }
 
   HRESULT Device::GetVertexShaderConstantI(UINT start, int* data, UINT count) {
     if (!data || !inRange(start, count, 16))
       return D3DERR_INVALIDCALL;
+    Direct direct(this, "GetShaderConstantI");
     m_core->getShaderConstantI(false, start, reinterpret_cast<int32_t*>(data), count);
     return D3D_OK;
   }
@@ -2072,13 +2233,16 @@ namespace dxup::d3d9 {
       }
       return D3D_OK;
     }
-    m_core->setShaderConstantB(false, start, reinterpret_cast<const uint32_t*>(data), count);
+    runData(data, size_t(count) * 4, [start, count](legacy::Device& core, const uint8_t* values) {
+      core.setShaderConstantB(false, start, reinterpret_cast<const uint32_t*>(values), count);
+    });
     return D3D_OK;
   }
 
   HRESULT Device::GetVertexShaderConstantB(UINT start, BOOL* data, UINT count) {
     if (!data || !inRange(start, count, 16))
       return D3DERR_INVALIDCALL;
+    Direct direct(this, "GetShaderConstantB");
     m_core->getShaderConstantB(false, start, reinterpret_cast<uint32_t*>(data), count);
     return D3D_OK;
   }
@@ -2087,7 +2251,12 @@ namespace dxup::d3d9 {
     if (!data || !inRange(start, count, 224))
       return D3DERR_INVALIDCALL;
     if (!multithreaded() && !m_recording) {
-      m_core->setShaderConstantF(true, start, data, count);
+      if (Worker* worker = m_recorder)
+        worker->emitData(data, size_t(count) * 16, [start, count](legacy::Device& core, const uint8_t* values) {
+          core.setShaderConstantF(true, start, reinterpret_cast<const float*>(values), count);
+        });
+      else
+        m_core->setShaderConstantF(true, start, data, count);
       return D3D_OK;
     }
     auto body = [&]() -> HRESULT {
@@ -2095,7 +2264,9 @@ namespace dxup::d3d9 {
         recordConstants(rec->psFloats, rec->psFloatsSet, start, data, count);
         return D3D_OK;
       }
-      m_core->setShaderConstantF(true, start, data, count);
+      runData(data, size_t(count) * 16, [start, count](legacy::Device& core, const uint8_t* values) {
+        core.setShaderConstantF(true, start, reinterpret_cast<const float*>(values), count);
+      });
       return D3D_OK;
     };
     return withLock(this, body);
@@ -2104,6 +2275,7 @@ namespace dxup::d3d9 {
   HRESULT Device::GetPixelShaderConstantF(UINT start, float* data, UINT count) {
     if (!data || !inRange(start, count, 224))
       return D3DERR_INVALIDCALL;
+    Direct direct(this, "GetShaderConstantF");
     m_core->getShaderConstantF(true, start, data, count);
     return D3D_OK;
   }
@@ -2116,13 +2288,16 @@ namespace dxup::d3d9 {
       recordConstants(rec->psInts, rec->psIntsSet, start, data, count);
       return D3D_OK;
     }
-    m_core->setShaderConstantI(true, start, reinterpret_cast<const int32_t*>(data), count);
+    runData(data, size_t(count) * 16, [start, count](legacy::Device& core, const uint8_t* values) {
+      core.setShaderConstantI(true, start, reinterpret_cast<const int32_t*>(values), count);
+    });
     return D3D_OK;
   }
 
   HRESULT Device::GetPixelShaderConstantI(UINT start, int* data, UINT count) {
     if (!data || !inRange(start, count, 16))
       return D3DERR_INVALIDCALL;
+    Direct direct(this, "GetShaderConstantI");
     m_core->getShaderConstantI(true, start, reinterpret_cast<int32_t*>(data), count);
     return D3D_OK;
   }
@@ -2138,13 +2313,16 @@ namespace dxup::d3d9 {
       }
       return D3D_OK;
     }
-    m_core->setShaderConstantB(true, start, reinterpret_cast<const uint32_t*>(data), count);
+    runData(data, size_t(count) * 4, [start, count](legacy::Device& core, const uint8_t* values) {
+      core.setShaderConstantB(true, start, reinterpret_cast<const uint32_t*>(values), count);
+    });
     return D3D_OK;
   }
 
   HRESULT Device::GetPixelShaderConstantB(UINT start, BOOL* data, UINT count) {
     if (!data || !inRange(start, count, 16))
       return D3DERR_INVALIDCALL;
+    Direct direct(this, "GetShaderConstantB");
     m_core->getShaderConstantB(true, start, reinterpret_cast<uint32_t*>(data), count);
     return D3D_OK;
   }
@@ -2156,7 +2334,10 @@ namespace dxup::d3d9 {
       const UINT vertices = vertexCountOf(type, primitiveCount);
       if (!vertices)
         return D3D_OK;
-      m_core->drawPrimitive(primitive(type), startVertex, vertices);
+      if (Worker* worker = m_recorder)
+        worker->emit([t = primitive(type), startVertex, vertices](legacy::Device& core) { core.drawPrimitive(t, startVertex, vertices); });
+      else
+        m_core->drawPrimitive(primitive(type), startVertex, vertices);
       return D3D_OK;
     };
     return multithreaded() ? withLock(this, body) : body();
@@ -2168,7 +2349,12 @@ namespace dxup::d3d9 {
       const UINT indices = vertexCountOf(type, primitiveCount);
       if (!indices)
         return D3D_OK;
-      m_core->drawIndexedPrimitive(primitive(type), baseVertex, minIndex, numVertices, startIndex, indices);
+      if (Worker* worker = m_recorder)
+        worker->emit([t = primitive(type), baseVertex, minIndex, numVertices, startIndex, indices](legacy::Device& core) {
+          core.drawIndexedPrimitive(t, baseVertex, minIndex, numVertices, startIndex, indices);
+        });
+      else
+        m_core->drawIndexedPrimitive(primitive(type), baseVertex, minIndex, numVertices, startIndex, indices);
       return D3D_OK;
     };
     return multithreaded() ? withLock(this, body) : body();
@@ -2179,11 +2365,19 @@ namespace dxup::d3d9 {
       return D3DERR_INVALIDCALL;
     auto body = [&]() [[msvc::forceinline]] -> HRESULT {
       const UINT vertices = vertexCountOf(type, primitiveCount);
-      if (vertices)
-        m_core->drawPrimitiveUP(primitive(type), vertices, data, stride);
       // As Direct3D 9: stream 0 is unset afterwards.
       m_streams[0].buffer.reset();
       m_streams[0].offset = m_streams[0].stride = 0;
+      if (Worker* worker = m_recorder) {
+        worker->emitData(data, size_t(vertices) * stride, [t = primitive(type), vertices, stride](legacy::Device& core, const uint8_t* copy) {
+          if (vertices)
+            core.drawPrimitiveUP(t, vertices, copy, stride);
+          core.setStreamSource(0, nullptr, 0, 0);
+        });
+        return D3D_OK;
+      }
+      if (vertices)
+        m_core->drawPrimitiveUP(primitive(type), vertices, data, stride);
       m_core->setStreamSource(0, nullptr, 0, 0);
       return D3D_OK;
     };
@@ -2196,14 +2390,31 @@ namespace dxup::d3d9 {
       return D3DERR_INVALIDCALL;
     auto body = [&]() [[msvc::forceinline]] -> HRESULT {
       const UINT count = vertexCountOf(type, primitiveCount);
-      if (count)
-        m_core->drawIndexedPrimitiveUP(primitive(type), minIndex, numVertices, count, indices, indexFormat == D3DFMT_INDEX32,
-                                       vertices, stride);
+      const bool index32 = indexFormat == D3DFMT_INDEX32;
       // As Direct3D 9: stream 0 and the indices are unset afterwards.
       m_streams[0].buffer.reset();
       m_streams[0].offset = m_streams[0].stride = 0;
-      m_core->setStreamSource(0, nullptr, 0, 0);
       m_indices.reset();
+      if (Worker* worker = m_recorder) {
+        // The vertices the draw names (Direct3D 9 copies those) after the
+        // indices; the core finds vertex minIndex where it was.
+        const size_t indexBytes = (size_t(count) * (index32 ? 4 : 2) + 15) & ~size_t(15);
+        const size_t vertexBytes = size_t(numVertices) * stride;
+        worker->emitFilled(indexBytes + vertexBytes, [&](uint8_t* to) {
+          std::memcpy(to, indices, size_t(count) * (index32 ? 4 : 2));
+          std::memcpy(to + indexBytes, static_cast<const uint8_t*>(vertices) + size_t(minIndex) * stride, vertexBytes);
+        }, [t = primitive(type), minIndex, numVertices, count, index32, stride, indexBytes](legacy::Device& core, const uint8_t* copy) {
+          if (count)
+            core.drawIndexedPrimitiveUP(t, minIndex, numVertices, count, copy, index32,
+              reinterpret_cast<const uint8_t*>(uintptr_t(copy + indexBytes) - uintptr_t(minIndex) * stride), stride);
+          core.setStreamSource(0, nullptr, 0, 0);
+          core.setIndices(nullptr, false);
+        });
+        return D3D_OK;
+      }
+      if (count)
+        m_core->drawIndexedPrimitiveUP(primitive(type), minIndex, numVertices, count, indices, index32, vertices, stride);
+      m_core->setStreamSource(0, nullptr, 0, 0);
       m_core->setIndices(nullptr, false);
       return D3D_OK;
     };
@@ -2216,7 +2427,7 @@ namespace dxup::d3d9 {
                                   IDirect3DVertexDeclaration9*, DWORD flags) {
     if (!destination)
       return D3DERR_INVALIDCALL;
-    DeviceLock lock(this);
+    Direct direct(this, "ProcessVertices");
     auto* dst = static_cast<VertexBuffer*>(destination);
     D3DVERTEXBUFFER_DESC desc = {};
     dst->GetDesc(&desc);
