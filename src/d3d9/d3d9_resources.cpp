@@ -647,7 +647,11 @@ namespace dxup::d3d9 {
 
   template<typename Base, typename Desc>
   BufferCommon<Base, Desc>::BufferCommon(Device* device, std::unique_ptr<legacy::Buffer> buffer, const Desc& desc)
-  : Resource<Base>(device, desc.Pool), m_buffer(std::move(buffer)), m_desc(desc) {}
+  : Resource<Base>(device, desc.Pool), m_buffer(std::move(buffer)), m_desc(desc) {
+    this->boundCore = m_buffer.get();
+    if constexpr (std::is_same_v<Desc, D3DINDEXBUFFER_DESC>)
+      this->boundFlags = desc.Format == D3DFMT_INDEX32 ? 1u : 0u;
+  }
 
   template<typename Base, typename Desc>
   HRESULT BufferCommon<Base, Desc>::Lock(UINT offset, UINT size, void** data, DWORD flags) {

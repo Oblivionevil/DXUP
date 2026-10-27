@@ -239,29 +239,31 @@ namespace dxup::legacy {
     RingCopy& ringCopy() { return m_ringCopy; }
     uint32_t version() const { return m_version; }
   private:
+    // What draws read, together at the start: a bound buffer's first touch
+    // in a draw is a cache miss, the rest should not be.
+    Ref<ID3D11Buffer>  m_buffer;
+    uint32_t           m_size = 0;
+    uint32_t           m_version = 0;   // counts writes
+    bool               m_dynamic = false;
+    bool               m_uploaded = false;    // m_clean is all of it (kept here: draws ask, the vector is a cache miss)
+    bool               m_dropped = false;    // m_data released after the upload
+    bool               m_declaredDynamic = false;
+    uint32_t           m_drawsSinceWrite = 0;
+    std::vector<uint8_t> m_data;
     RingCopy           m_ringCopy;
+    Device*            m_device;
+    bool               m_dropCopy = false;
+    bool               m_keptCopy = false;   // asked for again after a drop: stays
+    bool               m_settled = false;     // static for good
+    uint32_t           m_writes = 0;
     struct IndexRange { uint32_t lo, hi; };
     std::unordered_map<uint64_t, IndexRange> m_indexRanges;   // of m_indexRangesVersion
     struct RecentRange { uint64_t key; uint32_t version, lo, hi; };
     RecentRange        m_recentRanges[8] = {};   // before the map (key 0 is never asked)
     uint32_t           m_indexRangesVersion = 0;
-    uint32_t           m_version = 0;   // counts writes
-    Device*            m_device;
     bool restoreCopy();
     // After m_clean changed.
     void noteClean() { m_uploaded = m_clean.size() == 1 && m_clean[0].first == 0 && m_clean[0].second >= m_size; }
-    std::vector<uint8_t> m_data;
-    uint32_t           m_size = 0;
-    bool               m_dropCopy = false;
-    bool               m_dropped = false;    // m_data released after the upload
-    bool               m_keptCopy = false;   // asked for again after a drop: stays
-    Ref<ID3D11Buffer>  m_buffer;
-    bool               m_dynamic = false;
-    bool               m_uploaded = false;    // m_clean is all of it (kept here: draws ask, the vector is a cache miss)
-    bool               m_declaredDynamic = false;
-    bool               m_settled = false;     // static for good
-    uint32_t           m_writes = 0;
-    uint32_t           m_drawsSinceWrite = 0;
     std::vector<std::pair<uint32_t, uint32_t>> m_clean;  // sorted, disjoint [begin, end)
     std::vector<std::pair<uint32_t, uint32_t>> m_scratch;
   };

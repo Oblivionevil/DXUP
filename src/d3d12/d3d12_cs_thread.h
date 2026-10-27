@@ -510,13 +510,15 @@ namespace dxup {
       ~QueryRelease() { query->queuedOps.fetch_sub(1, std::memory_order_release); }
     };
     void discardRecording();
-    // Deferred contexts: the command list keeps these objects alive.
+    // Deferred contexts: the command list keeps these objects alive. Only
+    // the check inline: the immediate context binds objects thousands of
+    // times a frame (with keepObject inlined, keep was a call each time).
     template<typename... Objects>
-    void keep(const Objects*... objects) {
+    __forceinline void keep(const Objects*... objects) {
       if (m_recording)
         (keepObject(objects), ...);
     }
-    void keepObject(const BackendRetirable* object);
+    __declspec(noinline) void keepObject(const BackendRetirable* object);
     void keepTiled(const TiledResourceRef& ref) { keep(ref.buffer, ref.image); }
     void* mapDirect(IBackendBuffer* buffer, MapMode mode);
     void unmapDirect(IBackendBuffer* buffer);

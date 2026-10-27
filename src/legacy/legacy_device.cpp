@@ -885,8 +885,8 @@ namespace dxup::legacy {
   // ============================================================
 
   Buffer::Buffer(Device* device, uint32_t size, bool index, bool dynamic, bool dropCopy)
-  : m_device(device), m_data(size), m_size(size), m_dropCopy(dropCopy && !dynamic && !index && size >= (64u << 10)),
-    m_dynamic(dynamic), m_declaredDynamic(dynamic) {
+  : m_size(size), m_dynamic(dynamic), m_declaredDynamic(dynamic), m_data(size), m_device(device),
+    m_dropCopy(dropCopy && !dynamic && !index && size >= (64u << 10)) {
     D3D11_BUFFER_DESC bd = {};
     bd.ByteWidth = (size + 15) & ~15u;
     bd.Usage = D3D11_USAGE_DEFAULT;

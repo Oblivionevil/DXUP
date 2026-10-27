@@ -1146,20 +1146,22 @@ namespace dxup {
                                           size_t padded) {
     // The memory the application would write now (a later WRITE_DISCARD
     // gives the buffer other memory; the worker hands this back only after
-    // the commands queued before, this write among them).
+    // the commands queued before).
     auto* d3d12Buffer = static_cast<d3d12::D3D12BackendBuffer*>(buffer);
     uint8_t* mapped = d3d12Buffer && !m_recording ? d3d12Buffer->getAppMappedData() : nullptr;
     if (!mapped || !data || !size) {
       IBackendContext::writeMappedBuffer(buffer, offset, data, size, padded);
       return;
     }
+    // Written now, where an application writes after Map(NO_OVERWRITE)
+    // (mapDirect returns this memory: the commands queued before use other
+    // parts of it, or other memory after a discard): no command, no second
+    // copy on the worker. DXUP's Direct3D 9 layer writes its constants and
+    // streamed vertices this way, hundreds of times a frame.
     uint8_t* target = mapped + offset;
-    const size_t zeros = padded > size ? padded - size : 0;
-    emitArray(static_cast<const uint8_t*>(data), size, [target, zeros](CsWorkerState&, const uint8_t* copy, size_t n) {
-      std::memcpy(target, copy, n);
-      if (zeros)
-        std::memset(target + n, 0, zeros);
-    });
+    std::memcpy(target, data, size);
+    if (padded > size)
+      std::memset(target + size, 0, padded - size);
   }
 
   void CsThreadContext::writeMappedBufferWith(IBackendBuffer* buffer, uint64_t offset, size_t size, WriteFn fn,

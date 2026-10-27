@@ -52,9 +52,12 @@ namespace dxup::d3d9 {
     // Device::hold, on the device's thread only: the frame its held set
     // last saw the object bound (0: not in the set).
     uint32_t heldEpoch = 0;
-    // What a binding of it gives the core (textures: their legacy::Texture),
-    // next to heldEpoch: SetTexture reads one cache line of the object.
+    // What a binding of it gives the core (textures: their legacy::Texture,
+    // buffers their legacy::Buffer) and its flags (index buffers: 1 for
+    // 32-bit indices), next to heldEpoch: binding reads one cache line of
+    // the object.
     void* boundCore = nullptr;
+    uint32_t boundFlags = 0;
   protected:
     static constexpr uint64_t kPrivateOne = uint64_t(1) << 32;
     ULONG addRefPublic() {
@@ -351,9 +354,9 @@ namespace dxup::d3d9 {
     HRESULT STDMETHODCALLTYPE Lock(UINT offset, UINT size, void** data, DWORD flags) override;
     HRESULT STDMETHODCALLTYPE Unlock() override { return D3D_OK; }
     HRESULT STDMETHODCALLTYPE GetDesc(Desc* desc) override { if (!desc) return D3DERR_INVALIDCALL; *desc = m_desc; return D3D_OK; }
-    legacy::Buffer* buffer() const { return m_buffer.get(); }
+    legacy::Buffer* buffer() const { return static_cast<legacy::Buffer*>(this->boundCore); }
   protected:
-    std::unique_ptr<legacy::Buffer> m_buffer;
+    std::unique_ptr<legacy::Buffer> m_buffer;   // boundCore
     Desc m_desc;
   };
 
@@ -369,7 +372,7 @@ namespace dxup::d3d9 {
     using BufferCommon::BufferCommon;
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** object) override;
     D3DRESOURCETYPE STDMETHODCALLTYPE GetType() override { return D3DRTYPE_INDEXBUFFER; }
-    bool index32() const { return m_desc.Format == D3DFMT_INDEX32; }
+    bool index32() const { return boundFlags != 0; }
   };
 
   // ---- Device children that are not resources ----
