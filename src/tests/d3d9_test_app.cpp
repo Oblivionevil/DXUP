@@ -4460,6 +4460,18 @@ VO main(float3 p : POSITION, float4 c : COLOR0) { VO o; o.p = float4(p.xy, 0.5, 
     return !afterReset ? 1 : !afterRelease ? 2 : 0;
   }
 
+  // Scenes whose picture is NVIDIA's Direct3D 9 driver's where drivers
+  // differ (DXUP keeps it on every GPU): on other GPUs Windows' runtime is
+  // not the reference for them, a difference is reported and skipped.
+  bool nvidiaModelled(const char* scene) {
+    static const char* const kScenes[] = { "srgb_targets", "fog", "yuv_surfaces", "yuv_stretch", "ps1_projected",
+                                           "sampler_filters", "ffp_no_texture" };
+    for (const char* name : kScenes)
+      if (std::strcmp(scene, name) == 0)
+        return true;
+    return false;
+  }
+
   // Runs this program with the arguments; its exit code (-1: not started).
   int runSelf(const char* arguments, DWORD timeout = 60000) {
     wchar_t exe[MAX_PATH];
@@ -4582,6 +4594,16 @@ int main(int argc, char** argv) {
   if (variantNonce)
     return variantChild(dxup, variantNonce) == 0 ? 0 : 1;
 
+  // The GPU of Windows' runtime: the reference of nvidiaModelled scenes on
+  // NVIDIA's only.
+  bool windowsIsNvidia = true;
+  if (IDirect3D9* d3d = windows.create(D3D_SDK_VERSION)) {
+    D3DADAPTER_IDENTIFIER9 id = {};
+    if (SUCCEEDED(d3d->GetAdapterIdentifier(0, 0, &id)))
+      windowsIsNvidia = id.VendorId == 0x10DE;
+    d3d->Release();
+  }
+
   // Every scene with d3d9.workerThread = true (dxup.conf beside the DLLs):
   // the number of scenes not as Windows draws them.
   if (childWorker) {
@@ -4601,7 +4623,7 @@ int main(int argc, char** argv) {
           worst = (std::max)(worst, std::abs(int((reference[i] >> c) & 255) - int((result[i] >> c) & 255)));
         differing += worst > scene.tolerance;
       }
-      if (differing > int(reference.size() / 200)) {
+      if (differing > int(reference.size() / 200) && (windowsIsNvidia || !nvidiaModelled(scene.name))) {
         std::printf("FAIL %-20s %d pixels differ with the worker thread\n", scene.name, differing);
         failing++;
       }
@@ -4633,7 +4655,7 @@ int main(int argc, char** argv) {
     return 0;
   }
 
-  int passed = 0, failed = 0;
+  int passed = 0, failed = 0, skipped = 0;
   for (const Scene& scene : kScenes) {
     if (filter && !std::strstr(scene.name, filter))
       continue;
@@ -4677,8 +4699,9 @@ int main(int argc, char** argv) {
     }
     // A few edge pixels may differ by rasterization; most must match.
     const bool ok = differing <= int(reference.size() / 200);
-    std::printf("%s %-20s max difference %3d, %4d pixels beyond %d", ok ? "ok  " : "FAIL", scene.name, worst, differing,
-                scene.tolerance);
+    const bool skip = !ok && !windowsIsNvidia && nvidiaModelled(scene.name);
+    std::printf("%s %-20s max difference %3d, %4d pixels beyond %d", ok ? "ok  " : skip ? "skip" : "FAIL", scene.name, worst,
+                differing, scene.tolerance);
     if (worst)
       std::printf("  (worst at %d,%d: Windows %08lx, DXUP %08lx)", worstIndex % kWidth, worstIndex / kWidth,
                   reference[worstIndex], result[worstIndex]);
@@ -4688,12 +4711,14 @@ int main(int argc, char** argv) {
       GlobalMemoryStatusEx(&status);
       std::printf("  [%llu MB address space]", (status.ullTotalVirtual - status.ullAvailVirtual) >> 20);
     }
+    if (skip)
+      std::printf("  (DXUP draws it as NVIDIA's Direct3D 9; this GPU's driver differs)");
     std::printf("\n");
     if (!ok || dumpImages) {
       writeImage((std::string(scene.name) + "_windows.ppm").c_str(), reference);
       writeImage((std::string(scene.name) + "_dxup.ppm").c_str(), result);
     }
-    ok ? passed++ : failed++;
+    ok ? passed++ : skip ? skipped++ : failed++;
   }
   // Forced multisampling (dxup.conf next to DXUP's DLLs, in a child).
   if (!filter || std::strstr("forced_msaa", filter)) {
@@ -4867,6 +4892,9 @@ int main(int argc, char** argv) {
       dxupOnly ? "not run" : text[native]);
     ok ? passed++ : failed++;
   }
-  std::printf("%d passed, %d failed\n", passed, failed);
+  if (skipped)
+    std::printf("%d passed, %d failed, %d skipped\n", passed, failed, skipped);
+  else
+    std::printf("%d passed, %d failed\n", passed, failed);
   return failed ? 1 : 0;
 }

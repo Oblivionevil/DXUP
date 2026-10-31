@@ -2246,6 +2246,16 @@ static int compileRecords(const char* path) {
   return 0;
 }
 
+// Cases whose results are NVIDIA's Direct3D 9 driver's where drivers differ
+// (DXUP keeps them on every GPU): on other GPUs a difference is skipped.
+static bool nvidiaModelled(const char* name) {
+  static const char* const kCases[] = { "ps1_3_m3x3spec", "ps1_3_m3x3vspec", "ps1_3_bem" };
+  for (const char* c : kCases)
+    if (std::strcmp(name, c) == 0)
+      return true;
+  return false;
+}
+
 int main(int argc, char** argv) {
   // Each line as it is printed: a run that ends early shows where.
   std::setvbuf(stdout, nullptr, _IONBF, 0);
@@ -2289,8 +2299,14 @@ int main(int argc, char** argv) {
   D3D11Runner d3d11;
   if (!d3d9.init(window, k, dxupReference)) { std::printf("FAIL: Direct3D 9 setup\n"); return 1; }
   if (!d3d11.init(k)) { std::printf("FAIL: Direct3D 11 setup\n"); return 1; }
+  bool referenceIsNvidia = true;
+  if (!dxupReference && d3d9.d3d) {
+    D3DADAPTER_IDENTIFIER9 id = {};
+    if (SUCCEEDED(d3d9.d3d->GetAdapterIdentifier(0, 0, &id)))
+      referenceIsNvidia = id.VendorId == 0x10DE;
+  }
 
-  int passed = 0, failed = 0;
+  int passed = 0, failed = 0, skipped = 0;
   for (const Case& c : kCases) {
     if (filter && !std::strstr(c.name, filter))
       continue;
@@ -2377,8 +2393,9 @@ int main(int argc, char** argv) {
       if (d > worst) { worst = d; worstIndex = int(i); }
     }
     const bool ok = worst <= 2e-3f;
+    const bool skip = !ok && !referenceIsNvidia && nvidiaModelled(c.name);
     const int px = worstIndex / 4;
-    std::printf("%s %-22s max error %.2e", ok ? "ok  " : "FAIL", c.name, worst);
+    std::printf("%s %-22s max error %.2e", ok ? "ok  " : skip ? "skip" : "FAIL", c.name, worst);
     if (!ok)
       std::printf(" at (%d, %d).%c: Direct3D 9 %.6g, DXUP %.6g", px % kSize, px / kSize, "xyzw"[worstIndex % 4],
         reference[worstIndex], result[worstIndex]);
@@ -2389,18 +2406,21 @@ int main(int argc, char** argv) {
       if (i >= 4 && reference[i] != reference[i - 4]) distinct++;
     }
     std::printf("  mean |x| %.3f, %zu changes", magnitude / reference.size(), distinct);
-    std::printf("  [vs %u.%u %u slots, ps %u.%u %u slots]\n", vsInfo.major, vsInfo.minor, vsInfo.varyingCount,
-      psInfo.major, psInfo.minor, psInfo.varyingCount);
-    if (!ok || dumpAll) {
+    std::printf("  [vs %u.%u %u slots, ps %u.%u %u slots]%s\n", vsInfo.major, vsInfo.minor, vsInfo.varyingCount,
+      psInfo.major, psInfo.minor, psInfo.varyingCount, skip ? " (as NVIDIA's Direct3D 9; this GPU's driver differs)" : "");
+    if ((!ok && !skip) || dumpAll) {
       dump("vertex", vsHlsl);
       dump("pixel", psHlsl);
     }
-    ok ? passed++ : failed++;
+    ok ? passed++ : skip ? skipped++ : failed++;
   }
   if (compileBench)
     for (int level = 0; level < 3; level++)
       std::printf("compile %s: %.2f ms, %zu bytes\n", level == 0 ? "O3  " : level == 1 ? "O1  " : "skip", times.ms[level], times.bytes[level]);
-  std::printf("%d passed, %d failed\n", passed, failed);
+  if (skipped)
+    std::printf("%d passed, %d failed, %d skipped\n", passed, failed, skipped);
+  else
+    std::printf("%d passed, %d failed\n", passed, failed);
   DestroyWindow(window);
   return failed ? 1 : 0;
 }
