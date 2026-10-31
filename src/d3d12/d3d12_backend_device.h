@@ -1620,6 +1620,9 @@ namespace dxup::d3d12 {
     // compiles (mostly on a compiler thread).
     std::unordered_set<uint64_t> m_psoDiskFiles;
     std::mutex m_psoDiskBlobMutex;
+    // A software adapter (WARP) keeps no blobs: they would replace those of
+    // the GPU that games of this folder use (dropPsoBlobsOfOtherDrivers).
+    bool m_psoBlobsOff = false;
 
     std::shared_ptr<BackendRetireQueue> m_retireQueue;
     std::deque<DeferredPsoDiskWrite> m_deferredPsoDiskWrites;
@@ -1638,6 +1641,11 @@ namespace dxup::d3d12 {
     bool m_stopPsoDiskWriter = false;
     void initPsoDiskCache();
     void loadPsoDiskCache();
+    // Pipeline blobs are the driver's: those of another GPU or driver
+    // version go (each would first fail a creation). driver.txt in the
+    // cache names the adapter and driver the blobs came from; software
+    // adapters keep none (m_psoBlobsOff).
+    void dropPsoBlobsOfOtherDrivers();
     std::wstring psoDiskPath(uint64_t keyHash) const;
     std::vector<uint8_t> takePsoDiskBlob(uint64_t keyHash);
     void deferPsoBlobWrite(uint64_t keyHash, ID3D12PipelineState* pso);

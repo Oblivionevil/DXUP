@@ -397,6 +397,17 @@ static bool readReference(const std::wstring& path, std::vector<DWORD>& pixels) 
   return ok;
 }
 
+// Windows' runtime on a driver that crashes in a scene (AMD's Direct3D 9
+// driver, amdxn32.dll, in shaders on an RX 9070 XT): -1, the scene is
+// skipped and Windows' runtime not used again.
+static int runGuarded(Runtime& runtime, const Scene* scene, std::vector<DWORD>& pixels, std::string& error) {
+  __try {
+    return run(runtime, scene, pixels, error) ? 1 : 0;
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    return -1;
+  }
+}
+
 static std::wstring widen(const char* text) {
   std::wstring w;
   for (const char* c = text; *c; c++) w += wchar_t(*c);
@@ -428,7 +439,8 @@ int main(int argc, char** argv) {
     std::printf("FAIL: d3d8.dll (Windows %s, DXUP %s)\n", windows.create ? "ok" : "missing", dxup.create ? "ok" : "missing");
     return 1;
   }
-  int passed = 0, failed = 0;
+  int passed = 0, failed = 0, skipped = 0;
+  bool windowsCrashed = false;
   for (Runtime* r : { &windows, &dxup }) {
     if (!r->create)
       continue;
@@ -449,10 +461,23 @@ int main(int argc, char** argv) {
         failed++;
         continue;
       }
-    } else if (!run(windows, &scene, reference, error)) {
-      std::printf("FAIL %-18s Windows: %s\n", scene.name, error.c_str());
-      failed++;
-      continue;
+    } else {
+      const int ran = windowsCrashed ? -1 : runGuarded(windows, &scene, reference, error);
+      if (ran < 0) {
+        // DXUP still has to draw it.
+        std::vector<DWORD> unused;
+        const bool drawn = run(dxup, &scene, unused, error);
+        std::printf("%s %-18s %s; DXUP %s\n", drawn ? "skip" : "FAIL", scene.name,
+                    windowsCrashed ? "not compared" : "Windows' driver crashed", drawn ? "drew it" : error.c_str());
+        windowsCrashed = true;
+        drawn ? skipped++ : failed++;
+        continue;
+      }
+      if (!ran) {
+        std::printf("FAIL %-18s Windows: %s\n", scene.name, error.c_str());
+        failed++;
+        continue;
+      }
     }
     if (!saveDir.empty() && !writeReference(saveDir + widen(scene.name) + L".ref", reference))
       std::printf("     %-18s reference not saved\n", scene.name);
@@ -478,6 +503,9 @@ int main(int argc, char** argv) {
     std::printf("\n");
     ok ? passed++ : failed++;
   }
-  std::printf("%d passed, %d failed\n", passed, failed);
+  if (skipped)
+    std::printf("%d passed, %d failed, %d skipped\n", passed, failed, skipped);
+  else
+    std::printf("%d passed, %d failed\n", passed, failed);
   return failed ? 1 : 0;
 }

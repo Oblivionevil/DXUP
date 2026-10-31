@@ -687,7 +687,6 @@ namespace dxup::d3d12 {
     // The root bindings of one bind point were reset.
     void invalidateRootCache(bool compute);
     // AMD: the root signature is set again on every graphics/compute switch.
-    bool m_resetRootOnModeSwitch = false;
 
     // Staged WriteDiscard: maps to a staging buffer, copies on unmap.
     // Prevents CPU writing to a buffer the GPU might still be reading.

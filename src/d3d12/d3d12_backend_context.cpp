@@ -937,7 +937,6 @@ namespace dxup::d3d12 {
       m_dredMarkers = dredEnabled();
       if (m_dredMarkers)
         initDispatchBreadcrumbs();
-      m_resetRootOnModeSwitch = device->getVendorId() == 0x1002;
       m_currentRootSignature = device->getGraphicsRootSignature();
       m_computeRootSignature = device->getComputeRootSignature();
       m_cmdList->SetGraphicsRootSignature(m_currentRootSignature);
@@ -3193,10 +3192,9 @@ namespace dxup::d3d12 {
       applyNullVertexSlot(gfxPipeline->getNullVertexSlot());
 
     // D3D12 keeps graphics and compute root signatures and their arguments
-    // apart, so dispatches leave the graphics bindings alone. AMD drivers
-    // needed the graphics root signature set again after compute to restore
-    // the graphics root bindings.
-    if (newRootSig != m_currentRootSignature || (wasCompute && m_resetRootOnModeSwitch)) {
+    // apart, so dispatches leave the graphics bindings alone (also on AMD:
+    // graphics_after_dispatch on an RX 9070 XT).
+    if (newRootSig != m_currentRootSignature) {
       m_currentRootSignature = newRootSig;
       m_cmdList->SetGraphicsRootSignature(m_currentRootSignature);
       invalidateRootCache(false);
@@ -3245,8 +3243,8 @@ namespace dxup::d3d12 {
       m_perfIntervalPsoSkips++;
     }
 
-    // As for graphics: the compute bindings survive draws (AMD: set again).
-    if (newRootSig != m_computeRootSignature || (wasGraphics && m_resetRootOnModeSwitch)) {
+    // As for graphics: the compute bindings survive draws.
+    if (newRootSig != m_computeRootSignature) {
       m_computeRootSignature = newRootSig;
       m_cmdList->SetComputeRootSignature(m_computeRootSignature);
       invalidateRootCache(true);

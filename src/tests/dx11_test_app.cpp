@@ -560,6 +560,7 @@ void main(uint2 id : SV_DispatchThreadID) {
         {"dynamic_shader_resource_buffer", &Dx11TestApp::testDynamicShaderResourceBuffer},
         {"sampler_state_identity", &Dx11TestApp::testSamplerStateIdentity},
         {"uav_dispatch_ordering", &Dx11TestApp::testUavDispatchOrdering},
+        {"graphics_after_dispatch", &Dx11TestApp::testGraphicsAfterDispatch},
         {"constant_buffer_slots", &Dx11TestApp::testConstantBufferSlots},
       };
 
@@ -15903,6 +15904,130 @@ float4 main(float4 position : SV_Position) : SV_Target {
 
     // Each dispatch sees the unordered access writes of the one before, as
     // D3D11 guarantees: a slow writer followed by an immediate reader.
+    // Draws between dispatches that bind their own buffers, views and UAVs
+    // in the same slots, the graphics bindings set once: each draw sees
+    // them (D3D12 keeps graphics and compute root arguments apart; DXUP
+    // set the graphics root signature again after compute on AMD).
+    bool testGraphicsAfterDispatch(std::string& error) {
+      static const char* kVs = R"(
+float4 main(uint id : SV_VertexID) : SV_Position {
+  return float4(id == 2 ? 3.0 : -1.0, id == 1 ? 3.0 : -1.0, 0.0, 1.0);
+}
+)";
+      static const char* kPs = R"(
+cbuffer c0 : register(b0) { float4 color; };
+Texture2D<float4> tex : register(t0);
+float4 main() : SV_Target { return color + tex.Load(int3(0, 0, 0)); }
+)";
+      static const char* kCs = R"(
+cbuffer c0 : register(b0) { uint4 value; };
+Texture2D<float4> tex : register(t0);
+RWStructuredBuffer<uint> data : register(u0);
+[numthreads(1, 1, 1)]
+void main() { data[0] = value.x + (uint)tex.Load(int3(0, 0, 0)).x; }
+)";
+      ComPtr<ID3D11VertexShader> vs;
+      ComPtr<ID3DBlob> vsBytecode;
+      ComPtr<ID3D11PixelShader> ps;
+      ComPtr<ID3D11ComputeShader> cs;
+      if (!createVertexShader(kVs, "main", vs, vsBytecode, error) || !createPixelShader(kPs, "main", ps, error)
+       || !createComputeShader(kCs, "main", cs, error))
+        return false;
+      auto texture = [&](const float value[4], ComPtr<ID3D11ShaderResourceView>& view) {
+        D3D11_TEXTURE2D_DESC desc = { 1, 1, 1, 1, DXGI_FORMAT_R32G32B32A32_FLOAT, { 1, 0 }, D3D11_USAGE_DEFAULT,
+          D3D11_BIND_SHADER_RESOURCE, 0, 0 };
+        D3D11_SUBRESOURCE_DATA init = { value, 16, 16 };
+        ComPtr<ID3D11Texture2D> t;
+        return SUCCEEDED(m_device->CreateTexture2D(&desc, &init, t.GetAddressOf()))
+          && SUCCEEDED(m_device->CreateShaderResourceView(t.Get(), nullptr, view.GetAddressOf()));
+      };
+      const float gfxTexel[4] = { 0.25f, 0.5f, 0.0f, 0.0f }, csTexel[4] = { 100.0f, 0.0f, 0.0f, 0.0f };
+      const float gfxColor[4] = { 0.0f, 0.25f, 1.0f, 0.5f };
+      const uint32_t csValue[4] = { 7, 0, 0, 0 };
+      D3D11_BUFFER_DESC cbDesc = { 16, D3D11_USAGE_DEFAULT, D3D11_BIND_CONSTANT_BUFFER, 0, 0, 0 };
+      D3D11_BUFFER_DESC uavDesc = { 16, D3D11_USAGE_DEFAULT, D3D11_BIND_UNORDERED_ACCESS, 0,
+        D3D11_RESOURCE_MISC_BUFFER_STRUCTURED, 4 };
+      ComPtr<ID3D11ShaderResourceView> gfxView, csView;
+      ComPtr<ID3D11Buffer> gfxCb, csCb, uavBuffer;
+      ComPtr<ID3D11UnorderedAccessView> uav;
+      if (!texture(gfxTexel, gfxView) || !texture(csTexel, csView) || !createBuffer(cbDesc, gfxColor, 0, gfxCb, error)
+       || !createBuffer(cbDesc, csValue, 0, csCb, error) || !createBuffer(uavDesc, nullptr, 0, uavBuffer, error)
+       || FAILED(m_device->CreateUnorderedAccessView(uavBuffer.Get(), nullptr, uav.GetAddressOf()))) {
+        if (error.empty())
+          error = "resource setup failed";
+        return false;
+      }
+      D3D11_TEXTURE2D_DESC targetDesc = { 1, 1, 1, 1, DXGI_FORMAT_R32G32B32A32_FLOAT, { 1, 0 }, D3D11_USAGE_DEFAULT,
+        D3D11_BIND_RENDER_TARGET, 0, 0 };
+      ComPtr<ID3D11Texture2D> target, staging;
+      ComPtr<ID3D11RenderTargetView> rtv;
+      D3D11_BLEND_DESC blendDesc = {};
+      blendDesc.RenderTarget[0].BlendEnable = TRUE;
+      blendDesc.RenderTarget[0].SrcBlend = blendDesc.RenderTarget[0].DestBlend = D3D11_BLEND_ONE;
+      blendDesc.RenderTarget[0].SrcBlendAlpha = blendDesc.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ONE;
+      blendDesc.RenderTarget[0].BlendOp = blendDesc.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+      blendDesc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+      ComPtr<ID3D11BlendState> additive;
+      HRESULT hr = m_device->CreateTexture2D(&targetDesc, nullptr, target.GetAddressOf());
+      if (SUCCEEDED(hr))
+        hr = m_device->CreateRenderTargetView(target.Get(), nullptr, rtv.GetAddressOf());
+      if (SUCCEEDED(hr))
+        hr = m_device->CreateBlendState(&blendDesc, additive.GetAddressOf());
+      targetDesc.Usage = D3D11_USAGE_STAGING;
+      targetDesc.BindFlags = 0;
+      targetDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+      if (SUCCEEDED(hr))
+        hr = m_device->CreateTexture2D(&targetDesc, nullptr, staging.GetAddressOf());
+      if (FAILED(hr)) {
+        error = "target setup failed: " + formatHResult(hr);
+        return false;
+      }
+
+      m_context->ClearState();
+      const float zero[4] = {};
+      m_context->ClearRenderTargetView(rtv.Get(), zero);
+      ID3D11RenderTargetView* view = rtv.Get();
+      m_context->OMSetRenderTargets(1, &view, nullptr);
+      m_context->OMSetBlendState(additive.Get(), nullptr, 0xffffffffu);
+      setViewport(1, 1);
+      m_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+      m_context->VSSetShader(vs.Get(), nullptr, 0);
+      m_context->PSSetShader(ps.Get(), nullptr, 0);
+      m_context->PSSetConstantBuffers(0, 1, gfxCb.GetAddressOf());
+      m_context->PSSetShaderResources(0, 1, gfxView.GetAddressOf());
+      m_context->CSSetShader(cs.Get(), nullptr, 0);
+      m_context->CSSetConstantBuffers(0, 1, csCb.GetAddressOf());
+      m_context->CSSetShaderResources(0, 1, csView.GetAddressOf());
+      m_context->CSSetUnorderedAccessViews(0, 1, uav.GetAddressOf(), nullptr);
+      constexpr int kDraws = 8;
+      for (int i = 0; i < kDraws; i++) {
+        m_context->Draw(3, 0);
+        m_context->Dispatch(1, 1, 1);
+      }
+      m_context->ClearState();
+      m_context->CopyResource(staging.Get(), target.Get());
+      D3D11_MAPPED_SUBRESOURCE mapped = {};
+      if (FAILED(hr = m_context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped))) {
+        error = "Map failed: " + formatHResult(hr);
+        return false;
+      }
+      float result[4];
+      std::memcpy(result, mapped.pData, sizeof(result));
+      m_context->Unmap(staging.Get(), 0);
+      for (int c = 0; c < 4; c++) {
+        const float expected = kDraws * (gfxColor[c] + gfxTexel[c]);
+        if (std::fabs(result[c] - expected) > 1e-4f) {
+          char text[160];
+          snprintf(text, sizeof(text), "after %d draws between dispatches: %g %g %g %g, expected %g %g %g %g", kDraws, result[0],
+                   result[1], result[2], result[3], kDraws * (gfxColor[0] + gfxTexel[0]), kDraws * (gfxColor[1] + gfxTexel[1]),
+                   kDraws * (gfxColor[2] + gfxTexel[2]), kDraws * (gfxColor[3] + gfxTexel[3]));
+          error = text;
+          return false;
+        }
+      }
+      return true;
+    }
+
     bool testUavDispatchOrdering(std::string& error) {
       static const char* kWriterCs = R"(
 RWStructuredBuffer<uint> data : register(u0);

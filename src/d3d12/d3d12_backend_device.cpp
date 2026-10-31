@@ -5435,7 +5435,9 @@ namespace dxup::d3d12 {
     }
 
     m_deferredPsoDiskWriteKeys.reserve(256);
-    loadPsoDiskCache();
+    dropPsoBlobsOfOtherDrivers();
+    if (!m_psoBlobsOff)
+      loadPsoDiskCache();
     loadPipelineStateCache();
 
     try {
@@ -5563,6 +5565,47 @@ namespace dxup::d3d12 {
 #endif
   }
 
+  void D3D12BackendDevice::dropPsoBlobsOfOtherDrivers() {
+    DXGI_ADAPTER_DESC1 desc = {};
+    LARGE_INTEGER driver = {};
+    if (!m_adapter || FAILED(m_adapter->GetDesc1(&desc))
+     || FAILED(m_adapter->CheckInterfaceSupport(__uuidof(IDXGIDevice), &driver)))
+      return;
+    if (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) {
+      m_psoBlobsOff = true;
+      return;
+    }
+    char id[96];
+    snprintf(id, sizeof(id), "%04x %04x %08x %02x %llu", desc.VendorId, desc.DeviceId, desc.SubSysId, desc.Revision,
+             static_cast<unsigned long long>(driver.QuadPart));
+    const std::wstring path = m_psoDiskCacheDir + L"\\driver.txt";
+    std::string previous;
+    {
+      std::ifstream f(path, std::ios::binary);
+      if (f)
+        previous.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+    }
+    if (previous == id)
+      return;
+    // Without the file: blobs of an earlier DXUP, from this driver mostly.
+    if (!previous.empty()) {
+      uint32_t removed = 0;
+      WIN32_FIND_DATAW fd = {};
+      HANDLE find = FindFirstFileW((m_psoDiskCacheDir + L"\\*.pso").c_str(), &fd);
+      if (find != INVALID_HANDLE_VALUE) {
+        do {
+          if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && DeleteFileW((m_psoDiskCacheDir + L"\\" + fd.cFileName).c_str()))
+            removed++;
+        } while (FindNextFileW(find, &fd));
+        FindClose(find);
+      }
+      logMessage(LogLevel::Info, "PSO disk cache: another GPU or driver (%s), its %u pipeline blobs removed", id, removed);
+    }
+    std::ofstream f(path, std::ios::binary | std::ios::trunc);
+    if (f)
+      f.write(id, std::streamsize(std::strlen(id)));
+  }
+
   void D3D12BackendDevice::loadPsoDiskCache() {
 #ifdef _WIN32
     if (m_psoDiskCacheDir.empty()) return;
@@ -5603,7 +5646,7 @@ namespace dxup::d3d12 {
 
   void D3D12BackendDevice::savePsoBlobToDisk(uint64_t keyHash, ID3D12PipelineState* pso) {
 #ifdef _WIN32
-    if (m_psoDiskCacheDir.empty() || !pso) return;
+    if (m_psoDiskCacheDir.empty() || !pso || m_psoBlobsOff) return;
 
     ID3DBlob* rawBlob = nullptr;
     HRESULT hr = pso->GetCachedBlob(&rawBlob);
