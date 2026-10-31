@@ -83,11 +83,18 @@ namespace dxup::d3d12 {
   constexpr uint32_t kGraphicsRootCbvBase = 20;
   constexpr uint32_t kComputeRootCbvBase = 4;
   constexpr uint32_t kGraphicsRootCbvCount = 14;
+  // The first root CBV of each graphics stage (draws look it up per slot).
+  constexpr uint32_t kGraphicsRootCbvStageBase[5] = {
+    kGraphicsRootCbvBase,
+    kGraphicsRootCbvBase + kRootCbvSlots[0],
+    kGraphicsRootCbvBase + kRootCbvSlots[0] + kRootCbvSlots[1],
+    kGraphicsRootCbvBase + kRootCbvSlots[0] + kRootCbvSlots[1] + kRootCbvSlots[2],
+    kGraphicsRootCbvBase + kRootCbvSlots[0] + kRootCbvSlots[1] + kRootCbvSlots[2] + kRootCbvSlots[3],
+  };
+  static_assert(kGraphicsRootCbvStageBase[4] + kRootCbvSlots[4] == kGraphicsRootCbvBase + kGraphicsRootCbvCount,
+                "graphics root CBVs");
   inline uint32_t graphicsRootCbvIndex(uint32_t stage, uint32_t slot) {
-    uint32_t index = kGraphicsRootCbvBase;
-    for (uint32_t i = 0; i < stage; i++)
-      index += kRootCbvSlots[i];
-    return index + slot;
+    return kGraphicsRootCbvStageBase[stage] + slot;
   }
   // Changes whenever the layout changes; part of the PSO disk cache key.
   constexpr uint64_t kRootSignatureLayoutVersion = 0x52434256u;
@@ -1133,9 +1140,8 @@ namespace dxup::d3d12 {
     ID3D12RootSignature* getCommonRootSignature() const { return m_graphicsRootSignature.Get(); }
     ID3D12RootSignature* getGraphicsRootSignature() const { return m_graphicsRootSignature.Get(); }
     // 64 KB of zeros: unbound constant buffers read 0 in D3D11.
-    D3D12_GPU_VIRTUAL_ADDRESS getZeroConstantBufferAddress() const {
-      return m_zeroConstantBuffer ? m_zeroConstantBuffer->GetGPUVirtualAddress() : 0;
-    }
+    // (Kept: draws ask for it, a call into D3D12 each time.)
+    D3D12_GPU_VIRTUAL_ADDRESS getZeroConstantBufferAddress() const { return m_zeroConstantBufferAddress; }
     // Null views of each resource dimension a shader declares (index as in
     // ShaderResourceLimits::dimensions): unbound slots read 0 in D3D11, and
     // D3D12 needs the null view to match the declaration. The default
@@ -1176,6 +1182,7 @@ namespace dxup::d3d12 {
 
     ComPtr<ID3D12RootSignature>  m_graphicsRootSignature;
     ComPtr<ID3D12Resource>       m_zeroConstantBuffer;
+    D3D12_GPU_VIRTUAL_ADDRESS    m_zeroConstantBufferAddress = 0;
     ComPtr<ID3D12RootSignature>  m_computeRootSignature;
     D3D12DescriptorHeapManager   m_descriptorHeapManager;
     bool                         m_debugLayerEnabled = false;

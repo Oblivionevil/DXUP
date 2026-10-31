@@ -4425,7 +4425,12 @@ float4 main(float4 position : SV_Position) : SV_Target {
       std::array<double, 5> samplesMs = {}, issueMs = {};
       LARGE_INTEGER frequency = {};
       QueryPerformanceFrequency(&frequency);
+      // DXUP_BENCH_REPEAT=N: each sample N times over (see bound_draw_throughput).
+      const char* repeatText = std::getenv("DXUP_BENCH_REPEAT");
+      const unsigned repeat = repeatText ? (std::max)(1u, unsigned(std::strtoul(repeatText, nullptr, 10))) : 1u;
       for (size_t i = 0; i < samplesMs.size(); i++) {
+        for (unsigned r = 1; r < repeat; r++)
+          runDraws(kDrawCount);
         LARGE_INTEGER start = {}, end = {};
         QueryPerformanceCounter(&start);
         runDraws(kDrawCount);
@@ -4508,7 +4513,13 @@ float4 main(float4 position : SV_Position) : SV_Target {
       std::array<double, 5> samplesMs = {};
       LARGE_INTEGER frequency = {};
       QueryPerformanceFrequency(&frequency);
+      // DXUP_BENCH_REPEAT=N: each sample N times over (long enough for a
+      // CPU profile), timed once.
+      const char* repeatText = std::getenv("DXUP_BENCH_REPEAT");
+      const unsigned repeat = repeatText ? (std::max)(1u, unsigned(std::strtoul(repeatText, nullptr, 10))) : 1u;
       for (auto& sample : samplesMs) {
+        for (unsigned r = 1; r < repeat; r++)
+          runDraws(kDrawCount);
         LARGE_INTEGER start = {}, end = {};
         QueryPerformanceCounter(&start);
         runDraws(kDrawCount);

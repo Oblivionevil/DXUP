@@ -1445,14 +1445,19 @@ namespace dxup::d3d12 {
         }
       }
 
+      // As many as the shader declares (clampDescriptorCountToShader), else
+      // up to the last bound.
       uint32_t descriptorCount = 0;
-      for (uint32_t slot = rootSlots; slot < kMaxConstantBuffers; slot++) {
-        const auto& binding = m_cbvBindings[stageIdx][slot];
-        if (binding.bound || binding.gpuAddress || binding.sizeInBytes)
-          descriptorCount = slot + 1;
+      if (stageLimits && stageLimits->known) {
+        descriptorCount = stageLimits->cbvCount;
+      } else {
+        for (uint32_t slot = rootSlots; slot < kMaxConstantBuffers; slot++) {
+          const auto& binding = m_cbvBindings[stageIdx][slot];
+          if (binding.bound || binding.gpuAddress || binding.sizeInBytes)
+            descriptorCount = slot + 1;
+        }
       }
-      descriptorCount = (std::min)(clampDescriptorCountToShader(stageIdx, descriptorCount, &ShaderResourceLimits::cbvCount),
-                                   uint32_t(kMaxConstantBuffers));
+      descriptorCount = (std::min)(descriptorCount, uint32_t(kMaxConstantBuffers));
       if (icbSlot != UINT32_MAX && icbSlot < kMaxConstantBuffers)
         descriptorCount = (std::max)(descriptorCount, icbSlot + 1);
       // The table covers the slots after the root descriptors.
@@ -1624,20 +1629,25 @@ namespace dxup::d3d12 {
       std::array<uint64_t, kMaxShaderResources> srcVersions;
       uint32_t descriptorCount = 0;
 
-      const uint32_t bindingEnd = m_srvBindingEnd[stageIdx];
-      for (uint32_t slot = 0; slot < bindingEnd; slot++) {
-        const auto& binding = m_srvBindings[stageIdx][slot];
-        if (binding.handle.ptr || binding.nullHandle.ptr)
-          descriptorCount = slot + 1;
+      // As many as the shader declares (clampDescriptorCountToShader), else
+      // up to the last bound.
+      const ShaderResourceLimits* limits = activeResourceLimits(stageIdx);
+      if (limits && limits->known) {
+        descriptorCount = limits->srvCount;
+      } else {
+        const uint32_t bindingEnd = m_srvBindingEnd[stageIdx];
+        for (uint32_t slot = 0; slot < bindingEnd; slot++) {
+          const auto& binding = m_srvBindings[stageIdx][slot];
+          if (binding.handle.ptr || binding.nullHandle.ptr)
+            descriptorCount = slot + 1;
+        }
       }
-      descriptorCount = (std::min)(clampDescriptorCountToShader(stageIdx, descriptorCount, &ShaderResourceLimits::srvCount),
-                                   uint32_t(kMaxShaderResources));
+      descriptorCount = (std::min)(descriptorCount, uint32_t(kMaxShaderResources));
       if (!descriptorCount)
         return;
 
       // Unbound registers get a null view of the dimension the shader
       // declares for them.
-      const ShaderResourceLimits* limits = activeResourceLimits(stageIdx);
       const uint8_t* dimensions = limits && limits->known ? limits->dimensions : nullptr;
       uint64_t fingerprint = descriptorTableFingerprintSeed(descriptorCount);
       for (uint32_t slot = 0; slot < descriptorCount; slot++) {
@@ -4257,6 +4267,12 @@ namespace dxup::d3d12 {
     constexpr uint32_t computeStage = static_cast<uint32_t>(ShaderStage::Compute);
     const uint32_t firstStage = compute ? computeStage : 0u;
     const uint32_t lastStage = compute ? computeStage + 1 : computeStage;
+    // No UAV bound (most draws): nothing to order.
+    bool anyBound = false;
+    for (uint32_t stage = firstStage; stage < lastStage && !anyBound; stage++)
+      anyBound = m_uavBindingEnd[stage] != 0;
+    if (!anyBound)
+      return;
     // A shader cannot write a UAV it does not declare: UAVs left bound need
     // no barrier for draws and dispatches that do not use them. Graphics
     // UAVs are shared by the stages (bound with the pixel stage's).

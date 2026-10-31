@@ -2375,6 +2375,7 @@ namespace dxup::d3d12 {
           std::memset(mapped, 0, 65536);
           m_zeroConstantBuffer->Unmap(0, nullptr);
         }
+        m_zeroConstantBufferAddress = m_zeroConstantBuffer->GetGPUVirtualAddress();
       }
     }
 
