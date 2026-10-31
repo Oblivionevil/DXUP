@@ -30,6 +30,8 @@
   <sys:String x:Key="Sgssaa">Supersampling (SGSSAA)</sys:String>
   <sys:String x:Key="VSync">VSync</sys:String>
   <sys:String x:Key="Frames">Pre-rendered frames</sys:String>
+  <sys:String x:Key="LowLatency">Low input latency</sys:String>
+  <sys:String x:Key="LowLatencyHint">One pre-rendered frame; when the graphics card limits the frame rate, DXUP holds the next frame back until the card needs it. The game reads its input later, the frame rate stays about the same.</sys:String>
   <sys:String x:Key="SectionShaders">Shaders</sys:String>
   <sys:String x:Key="Precompile">Precompile</sys:String>
   <sys:String x:Key="PrecompileOn">Compile pipelines of earlier runs while loading (recommended)</sys:String>

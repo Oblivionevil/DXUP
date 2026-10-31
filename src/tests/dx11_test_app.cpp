@@ -498,6 +498,7 @@ void main(uint2 id : SV_DispatchThreadID) {
         {"relaxed_uav_barriers", &Dx11TestApp::testRelaxedUavBarriers},
         {"record_thread", &Dx11TestApp::testRecordThread},
         {"submit_thread", &Dx11TestApp::testSubmitThread},
+        {"low_latency_gpu_pacing", &Dx11TestApp::testLowLatencyGpuPacing},
         {"native_fallback", &Dx11TestApp::testNativeFallback},
         {"fullscreen_swap_chain", &Dx11TestApp::testFullscreenSwapChain},
         {"window_ghosting", &Dx11TestApp::testWindowGhosting},
@@ -10184,6 +10185,52 @@ float4 main(float4 position : SV_Position, float4 t0 : TEXCOORD0, float4 t : TEX
     // presents work (see runSubmitThreadChild).
     bool testSubmitThread(std::string& error) {
       return runChildWithConfig("d3d12.submitThread = true\n", "--submit-thread-child", error);
+    }
+
+    // dxgi.lowLatency: a GPU-bound game's next frame is held back, so the
+    // input it reads at its start waits less for the GPU: from a frame's
+    // start to the end of its GPU work takes less than with one
+    // pre-rendered frame alone (dxgi.maxFrameLatency = 1), at about the same
+    // frame rate (see runLowLatencyChild).
+    bool testLowLatencyGpuPacing(std::string& error) {
+      if (!runsOnDxup()) {
+        error = "SKIP: needs DXUP";
+        return false;
+      }
+      char path[MAX_PATH] = {};
+      GetModuleFileNameA(nullptr, path, MAX_PATH);
+      std::string dir = path;
+      dir.resize(dir.find_last_of('\\') + 1);
+      auto result = [&](const char* tag, double& latency, double& frame) {
+        const std::string file = dir + "low_latency_" + tag + ".txt";
+        FILE* in = nullptr;
+        const bool read = !fopen_s(&in, file.c_str(), "r") && in && std::fscanf(in, "%lf %lf", &latency, &frame) == 2;
+        if (in)
+          std::fclose(in);
+        DeleteFileA(file.c_str());
+        return read;
+      };
+      double baseLatency = 0.0, baseFrame = 0.0, pacedLatency = 0.0, pacedFrame = 0.0;
+      if (!runChildWithConfig("dxgi.maxFrameLatency = 1\n", "--low-latency-child base", error)
+       || !result("base", baseLatency, baseFrame)
+       || !runChildWithConfig("dxgi.lowLatency = true\n", "--low-latency-child paced", error)
+       || !result("paced", pacedLatency, pacedFrame)) {
+        if (error.empty())
+          error = "no result from the child";
+        return false;
+      }
+      std::printf("  low latency: frame start to GPU done %.2f ms (one pre-rendered frame: %.2f ms), %.2f ms a frame (%.2f ms)\n",
+        pacedLatency, baseLatency, pacedFrame, baseFrame);
+      if (pacedLatency > baseLatency - 0.25 * baseFrame) {
+        error = formatString("frame start to GPU done %.2f ms, with one pre-rendered frame alone %.2f ms", pacedLatency,
+          baseLatency);
+        return false;
+      }
+      if (pacedFrame > baseFrame * 1.08) {
+        error = formatString("%.2f ms a frame, with one pre-rendered frame alone %.2f ms", pacedFrame, baseFrame);
+        return false;
+      }
+      return true;
     }
 
     // A pixel shader that writes an unordered access view runs once per
@@ -25234,6 +25281,212 @@ float4 main() : SV_Target { return color; }
   }
 
   // See testSubmitThread. Returns 0 or the failed check.
+  // See testLowLatencyGpuPacing. A GPU-bound loop: one full-window draw a
+  // frame whose loop is sized (by timestamps around it) to about 8 ms of GPU
+  // time, below a 240 Hz limit a driver may force, a D3D11 fence signaled
+  // after each frame and
+  // a thread noting when each signal completes. Writes "<latency> <frame>"
+  // (medians in ms) to low_latency_<tag>.txt: from the start of a frame,
+  // where a game reads its input, to the end of its GPU work, and from one
+  // frame's end to the next.
+  int runLowLatencyChild(const char* tag) {
+    static const char* kHeavyPs = R"(
+cbuffer Work : register(b0) { uint iterations; uint3 unused; };
+float4 main(float4 p : SV_Position) : SV_Target {
+  float v = p.x * 0.001f + p.y * 0.002f;
+  [loop] for (uint i = 0; i < iterations; i++)
+    v = frac(v * 1.6180339f + 0.31f);
+  return float4(v, v, v, 1.0f);
+}
+)";
+    WNDCLASSA windowClass = {};
+    windowClass.lpfnWndProc = DefWindowProcA;
+    windowClass.hInstance = GetModuleHandleA(nullptr);
+    windowClass.lpszClassName = "Dx11TestLowLatency";
+    RegisterClassA(&windowClass);
+    HWND window = CreateWindowExA(0, windowClass.lpszClassName, "low latency", WS_OVERLAPPEDWINDOW,
+      CW_USEDEFAULT, CW_USEDEFAULT, 1280, 720, nullptr, nullptr, windowClass.hInstance, nullptr);
+    if (!window)
+      return 2;
+    int result = 0;
+    {
+      ComPtr<ID3D11Device> device;
+      ComPtr<ID3D11DeviceContext> context;
+      D3D_FEATURE_LEVEL level = D3D_FEATURE_LEVEL_11_0;
+      ComPtr<ID3D11Device5> device5;
+      ComPtr<ID3D11DeviceContext4> context4;
+      ComPtr<IDXGIDevice> dxgiDevice;
+      ComPtr<IDXGIAdapter> adapter;
+      ComPtr<IDXGIFactory2> factory;
+      if (FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, &level, 1, D3D11_SDK_VERSION,
+            device.GetAddressOf(), nullptr, context.GetAddressOf()))
+       || FAILED(device.As(&device5)) || FAILED(context.As(&context4))
+       || FAILED(device.As(&dxgiDevice)) || FAILED(dxgiDevice->GetAdapter(adapter.GetAddressOf()))
+       || FAILED(adapter->GetParent(IID_PPV_ARGS(factory.GetAddressOf())))) {
+        DestroyWindow(window);
+        return 3;
+      }
+      ShaderCompiler compiler;
+      ComPtr<ID3DBlob> vsBlob, psBlob;
+      ComPtr<ID3D11VertexShader> vs;
+      ComPtr<ID3D11PixelShader> ps;
+      ComPtr<ID3D11Fence> fence;
+      std::string compileError;
+      if (!compiler.compile(kFullscreenTriangleVs, "main", "vs_5_0", vsBlob, compileError)
+       || !compiler.compile(kHeavyPs, "main", "ps_5_0", psBlob, compileError)
+       || FAILED(device->CreateVertexShader(vsBlob->GetBufferPointer(), vsBlob->GetBufferSize(), nullptr, vs.GetAddressOf()))
+       || FAILED(device->CreatePixelShader(psBlob->GetBufferPointer(), psBlob->GetBufferSize(), nullptr, ps.GetAddressOf()))
+       || FAILED(device5->CreateFence(0, D3D11_FENCE_FLAG_NONE, IID_PPV_ARGS(fence.GetAddressOf())))) {
+        DestroyWindow(window);
+        return 4;
+      }
+      D3D11_BUFFER_DESC cbDesc = { 16, D3D11_USAGE_DEFAULT, D3D11_BIND_CONSTANT_BUFFER, 0, 0, 0 };
+      ComPtr<ID3D11Buffer> cb;
+      DXGI_SWAP_CHAIN_DESC1 desc = {};
+      desc.Width = 1280;
+      desc.Height = 720;
+      desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+      desc.SampleDesc.Count = 1;
+      desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+      desc.BufferCount = 2;
+      desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+      ComPtr<IDXGISwapChain1> swapChain;
+      if (FAILED(device->CreateBuffer(&cbDesc, nullptr, cb.GetAddressOf()))
+       || FAILED(factory->CreateSwapChainForHwnd(device.Get(), window, &desc, nullptr, nullptr, swapChain.GetAddressOf()))) {
+        DestroyWindow(window);
+        return 5;
+      }
+
+      // Fence value v completes with frame v - 1; the thread notes when.
+      constexpr uint32_t kFrames = 480;
+      std::vector<std::atomic<int64_t>> done(kFrames + 1);
+      std::vector<int64_t> start(kFrames, 0);
+      std::atomic<uint64_t> signaled{0};
+      std::thread waiter([&] {
+        HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        for (uint64_t value = 1; value <= kFrames; value++) {
+          while (signaled.load(std::memory_order_acquire) < value)
+            Sleep(0);
+          if (SUCCEEDED(fence->SetEventOnCompletion(value, event)))
+            WaitForSingleObject(event, 5000);
+          LARGE_INTEGER now;
+          QueryPerformanceCounter(&now);
+          done[value].store(now.QuadPart, std::memory_order_release);
+        }
+        CloseHandle(event);
+      });
+      LARGE_INTEGER frequency;
+      QueryPerformanceFrequency(&frequency);
+      const double msPerTick = 1000.0 / double(frequency.QuadPart);
+      auto frameMs = [&](uint32_t first, uint32_t last) {
+        // Waits until frame `last` is done; the median time between frames.
+        while (!done[last + 1].load(std::memory_order_acquire))
+          Sleep(1);
+        std::vector<double> deltas;
+        for (uint32_t f = first + 1; f <= last; f++)
+          deltas.push_back(double(done[f + 1].load() - done[f].load()) * msPerTick);
+        std::sort(deltas.begin(), deltas.end());
+        return deltas[deltas.size() / 2];
+      };
+
+      // The draw's GPU time, from timestamps around it in frames 10-19,
+      // 50-59 and 90-99; sized after each of those to about 8 ms.
+      D3D11_QUERY_DESC disjointDesc = { D3D11_QUERY_TIMESTAMP_DISJOINT, 0 };
+      D3D11_QUERY_DESC timestampDesc = { D3D11_QUERY_TIMESTAMP, 0 };
+      ComPtr<ID3D11Query> disjoint, before, after;
+      if (FAILED(device->CreateQuery(&disjointDesc, disjoint.GetAddressOf()))
+       || FAILED(device->CreateQuery(&timestampDesc, before.GetAddressOf()))
+       || FAILED(device->CreateQuery(&timestampDesc, after.GetAddressOf()))) {
+        DestroyWindow(window);
+        return 8;
+      }
+      std::vector<double> drawMs;
+      uint32_t iterations = 256;
+      for (uint32_t frame = 0; frame < kFrames; frame++) {
+        const bool timed = frame < 100 && frame % 40 >= 10 && frame % 40 < 20;
+        if (frame < 101 && frame % 40 == 20 && !drawMs.empty()) {
+          std::sort(drawMs.begin(), drawMs.end());
+          const double ms = drawMs[drawMs.size() / 2];
+          drawMs.clear();
+          const double scale = (std::min)(64.0, (std::max)(1.0 / 64.0, 8.0 / (std::max)(ms, 0.01)));
+          iterations = uint32_t((std::min)(double(1u << 24), (std::max)(16.0, iterations * scale)));
+        }
+        LARGE_INTEGER now;
+        QueryPerformanceCounter(&now);
+        start[frame] = now.QuadPart;
+        const uint32_t work[4] = { iterations, 0, 0, 0 };
+        context->UpdateSubresource(cb.Get(), 0, nullptr, work, 0, 0);
+        ComPtr<ID3D11Texture2D> back;
+        ComPtr<ID3D11RenderTargetView> rtv;
+        if (FAILED(swapChain->GetBuffer(0, IID_PPV_ARGS(back.GetAddressOf())))
+         || FAILED(device->CreateRenderTargetView(back.Get(), nullptr, rtv.GetAddressOf()))) {
+          result = 6;
+          break;
+        }
+        ID3D11RenderTargetView* target = rtv.Get();
+        ID3D11Buffer* buffer = cb.Get();
+        D3D11_VIEWPORT viewport = { 0.0f, 0.0f, 1280.0f, 720.0f, 0.0f, 1.0f };
+        context->OMSetRenderTargets(1, &target, nullptr);
+        context->RSSetViewports(1, &viewport);
+        context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        context->VSSetShader(vs.Get(), nullptr, 0);
+        context->PSSetShader(ps.Get(), nullptr, 0);
+        context->PSSetConstantBuffers(0, 1, &buffer);
+        if (timed) {
+          context->Begin(disjoint.Get());
+          context->End(before.Get());
+        }
+        context->Draw(3, 0);
+        if (timed) {
+          context->End(after.Get());
+          context->End(disjoint.Get());
+          D3D11_QUERY_DATA_TIMESTAMP_DISJOINT disjointData = {};
+          UINT64 t0 = 0, t1 = 0;
+          while (context->GetData(disjoint.Get(), &disjointData, sizeof(disjointData), 0) != S_OK) {}
+          while (context->GetData(before.Get(), &t0, sizeof(t0), 0) != S_OK) {}
+          while (context->GetData(after.Get(), &t1, sizeof(t1), 0) != S_OK) {}
+          if (!disjointData.Disjoint && t1 > t0 && disjointData.Frequency)
+            drawMs.push_back(double(t1 - t0) * 1000.0 / double(disjointData.Frequency));
+        }
+        context4->Signal(fence.Get(), frame + 1);
+        signaled.store(frame + 1, std::memory_order_release);
+        swapChain->Present(0, 0);
+        MSG msg;
+        while (PeekMessageA(&msg, nullptr, 0, 0, PM_REMOVE))
+          DispatchMessageA(&msg);
+      }
+      if (!result) {
+        // The frames after the last sizing, with the pacing settled.
+        const uint32_t first = 240;
+        const double frame = frameMs(first, kFrames - 1);
+        std::vector<double> latencies;
+        for (uint32_t f = first; f < kFrames; f++)
+          latencies.push_back(double(done[f + 1].load() - start[f]) * msPerTick);
+        std::sort(latencies.begin(), latencies.end());
+        char path[MAX_PATH] = {};
+        GetModuleFileNameA(nullptr, path, MAX_PATH);
+        std::string file = path;
+        file.resize(file.find_last_of('\\') + 1);
+        file += std::string("low_latency_") + tag + ".txt";
+        FILE* out = nullptr;
+        if (fopen_s(&out, file.c_str(), "w") || !out) {
+          result = 7;
+        } else {
+          std::fprintf(out, "%.3f %.3f\n", latencies[latencies.size() / 2], frame);
+          std::fclose(out);
+        }
+      } else {
+        // The thread waits for every value: signal the last.
+        context4->Signal(fence.Get(), kFrames);
+        context->Flush();
+        signaled.store(kFrames, std::memory_order_release);
+      }
+      waiter.join();
+    }
+    DestroyWindow(window);
+    return result;
+  }
+
   int runSubmitThreadChild() {
     WNDCLASSA windowClass = {};
     windowClass.lpfnWndProc = DefWindowProcA;
@@ -25740,6 +25993,8 @@ int main(int argc, char** argv) {
     return runRecordThreadChild();
   if (argc > 1 && std::strcmp(argv[1], "--submit-thread-child") == 0)
     return runSubmitThreadChild();
+  if (argc > 2 && std::strcmp(argv[1], "--low-latency-child") == 0)
+    return runLowLatencyChild(argv[2]);
   if (argc > 1 && std::strcmp(argv[1], "--native-fallback-child") == 0)
     return runNativeFallbackChild();
   if (argc > 1 && std::strcmp(argv[1], "--lazy-render-targets-child") == 0)

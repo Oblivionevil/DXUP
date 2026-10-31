@@ -2,6 +2,7 @@
 
 #include "../directx/directx_backend.h"
 #include "../util/util_thread.h"
+#include "d3d12_frame_pacer.h"
 
 #include <atomic>
 #include <condition_variable>
@@ -467,6 +468,20 @@ namespace dxup {
     std::atomic<uint64_t>   m_framesExecuted{0};
     uint64_t                m_presentFences[kPresentHistory] = {};
     void*                   m_frameEvent = nullptr;
+    // dxgi.lowLatency: each frame's present index (getPresentCount, stored
+    // by the worker), and on the application thread the pacing of the next
+    // frame with its statistics.
+    uint64_t                m_presentIndices[kPresentHistory] = {};
+    d3d12::LatencyPacer     m_latencyPacer;
+    bool                    m_lowLatency = false;
+    uint64_t                m_pacedFrame = 0;
+    int64_t                 m_pacingReturn = 0;
+    void*                   m_pacingTimer = nullptr;
+    double                  m_pacingSleptMs = 0.0;
+    uint32_t                m_pacingFrames = 0;
+    // Holds the next frame back as m_latencyPacer says; entry is when
+    // waitForFrameLatency began (QPC).
+    void paceFrame(uint32_t maxLatency, int64_t entry);
     void waitForChunk(uint64_t chunk);
     void waitForFrames(uint64_t frames);
     // Worker: wakes the threads whose chunk ran.

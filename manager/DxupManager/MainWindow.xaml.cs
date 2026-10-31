@@ -321,6 +321,7 @@ namespace Dxup.Manager
             Select(LazyBox, settings.LazyTargets);
             Select(VSyncBox, settings.SyncInterval);
             Select(FramesBox, settings.MaxFrameLatency);
+            LowLatencyBox.IsChecked = settings.LowLatency;
             AsyncBox.IsChecked = settings.AsyncShaders;
             PrecompileBox.IsChecked = settings.ShaderPrecompile;
             ShowLargeAddress(item);
@@ -638,6 +639,7 @@ namespace Dxup.Manager
             settings.LazyTargets = BoolValue(LazyBox);
             settings.SyncInterval = IntValue(VSyncBox);
             settings.MaxFrameLatency = IntValue(FramesBox);
+            settings.LowLatency = LowLatencyBox.IsChecked == true;
             settings.AsyncShaders = AsyncBox.IsChecked == true;
             settings.ShaderPrecompile = PrecompileBox.IsChecked == true;
             // Forcing MSAA needs a sample count.

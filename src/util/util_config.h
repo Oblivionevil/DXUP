@@ -56,6 +56,10 @@ namespace dxup {
   //                                  the back buffer that DXUP copies at
   //                                  Present (default: into the real buffer)
   //   dxgi.maxFrameLatency = 1       force the number of pre-rendered frames (1-16)
+  //   dxgi.lowLatency = true         less input lag: one pre-rendered frame,
+  //                                  and a GPU-bound game's next frame is
+  //                                  held back until shortly before the GPU
+  //                                  needs it (see LatencyPacer)
   //   dxgi.spoofVendor = nvidia      the application sees a GPU of this maker
   //                                  (nvidia, amd, intel): its name, ids and
   //                                  a driver version of that maker; DXUP
@@ -114,6 +118,7 @@ namespace dxup {
     int32_t samplerAnisotropy = -1;
     int32_t syncInterval      = -1;
     int32_t maxFrameLatency   = -1;
+    bool    lowLatency        = false;
     // 0 when unset.
     int32_t msaaSamples       = 0;
     bool    msaaForce         = false;

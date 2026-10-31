@@ -965,6 +965,8 @@ namespace dxup::d3d12 {
       const std::wstring profileOut = dxupSiblingPathW("dxup_gpu_profile_out.txt");
       if (!profileMarker.empty() && !profileOut.empty())
         m_gpuProfiler.init(d3d12Device, device->getCommandQueue(), profileMarker, profileOut);
+      if (UserOverrides::get().lowLatency)
+        m_frameTimer.init(d3d12Device, device->getCommandQueue());
 
     }
 
@@ -974,6 +976,8 @@ namespace dxup::d3d12 {
 
   D3D12BackendContext::~D3D12BackendContext() {
 #ifdef _WIN32
+    if (m_pacingTimer)
+      CloseHandle(m_pacingTimer);
     m_cmdList.stopThread();
     // Queued submissions use the lists, allocators and the fence: they run
     // first (synchronize() below stops early on a removed device).
@@ -7456,6 +7460,7 @@ namespace dxup::d3d12 {
     }
 
     steps.mark(7);
+    m_frameTimer.onSubmitted();
     // With the debug layer its findings reach the log while the game runs.
     if (!m_copyOnly && m_device->isDebugLayerEnabled() && (m_fenceValue & 31) == 0)
       m_device->drainDebugMessages();
@@ -7831,6 +7836,8 @@ namespace dxup::d3d12 {
         logMessage(LogLevel::Info, "presentImage #%llu: backBuffer=null",
           static_cast<unsigned long long>(presentIndex));
     }
+    if (!m_closedForSubmission)
+      m_frameTimer.onPresent(m_cmdList, m_presentCount);
     flush();
 
     // Full GPU sync at frame boundary to ensure all in-flight command lists
@@ -7867,6 +7874,25 @@ namespace dxup::d3d12 {
 #endif
   }
 
+  bool D3D12BackendContext::frameGpuTiming(uint64_t frame, double& busyMs, double& lateMs) const {
+#ifdef _WIN32
+    // Done when its fence is (or the fence of a later present in its slot).
+    const uint64_t fence = m_presentFenceValues[frame % kPresentFenceHistory];
+    FrameTimer::Times times, before;
+    if (!fence || !m_fence || m_fence->GetCompletedValue() < fence || !m_frameTimer.read(frame, times))
+      return false;
+    busyMs = times.busyMs;
+    lateMs = frame && m_frameTimer.read(frame - 1, before) && times.submitted > before.ended
+      ? double(times.submitted - before.ended) * 1000.0 / double(m_frameTimer.qpcFrequency()) : 0.0;
+    return true;
+#else
+    (void)frame;
+    (void)busyMs;
+    (void)lateMs;
+    return false;
+#endif
+  }
+
   uint64_t D3D12BackendContext::getLastPresentFenceValue() const {
 #ifdef _WIN32
     return m_presentCount ? m_presentFenceValues[(m_presentCount - 1) % kPresentFenceHistory] : 0;
@@ -7892,6 +7918,35 @@ namespace dxup::d3d12 {
   }
 
   void D3D12BackendContext::waitForFrameLatency(uint32_t maxLatency) {
+#ifdef _WIN32
+    LARGE_INTEGER entry, frequency;
+    QueryPerformanceCounter(&entry);
+    waitForPresentFence(maxLatency);
+    if (!m_frameTimer.enabled())
+      return;
+    // dxgi.lowLatency without the CS worker: this thread records and
+    // presents, the presents up to maxLatency before the latest are done.
+    QueryPerformanceFrequency(&frequency);
+    const double msPerTick = 1000.0 / double(frequency.QuadPart);
+    if (m_pacingReturn)
+      m_latencyPacer.noteCpuFrame(double(entry.QuadPart - m_pacingReturn) * msPerTick);
+    for (const uint64_t done = m_presentCount > maxLatency ? m_presentCount - maxLatency : 0; m_pacedFrame < done;
+         m_pacedFrame++) {
+      double busyMs = 0.0, lateMs = 0.0;
+      if (frameGpuTiming(m_pacedFrame, busyMs, lateMs))
+        m_latencyPacer.noteGpuFrame(busyMs, lateMs);
+    }
+    if (const double sleepMs = m_latencyPacer.sleepMs())
+      paceSleep(m_pacingTimer, sleepMs, [](HANDLE timer, DWORD timeout) { WaitForSingleObject(timer, timeout); });
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    m_pacingReturn = now.QuadPart;
+#else
+    (void)maxLatency;
+#endif
+  }
+
+  void D3D12BackendContext::waitForPresentFence(uint32_t maxLatency) {
 #ifdef _WIN32
     uint64_t targetFence = 0;
     {
@@ -9713,6 +9768,8 @@ namespace dxup::d3d12 {
     HRESULT cmdListResetHr = m_cmdList->Reset(m_currentAllocator.Get(), nullptr);
     if (m_gpuProfiler.capturing())
       m_gpuProfiler.onListBegin(m_cmdList.raw());
+    if (SUCCEEDED(cmdListResetHr))
+      m_frameTimer.onListBegin(m_cmdList);
     if (FAILED(cmdListResetHr)) {
       logMessage(LogLevel::Error, "Command list Reset() failed (hr=0x%08x)", cmdListResetHr);
       logDeviceRemovedReason(m_device, "CommandList::Reset");

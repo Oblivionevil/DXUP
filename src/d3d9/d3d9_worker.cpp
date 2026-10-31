@@ -2,6 +2,7 @@
 
 #include "d3d9_worker.h"
 
+#include "../util/util_config.h"
 #include "../util/util_types.h"
 
 #include <algorithm>
@@ -190,7 +191,10 @@ namespace dxup::d3d9 {
     emit([this, frame](legacy::Device&) { m_framesDone.store(frame, std::memory_order_seq_cst); });
     recordRetired();
     publish();
-    waitFor([&] { return m_framesDone.load(std::memory_order_seq_cst) + 1 >= frame; });
+    // dxgi.lowLatency holds the next frame back in the present, which runs
+    // on the worker: the application waits for it, not a frame behind.
+    static const uint64_t ahead = UserOverrides::get().lowLatency ? 0 : 1;
+    waitFor([&] { return m_framesDone.load(std::memory_order_seq_cst) + ahead >= frame; });
   }
 
   Worker::Chunk* Worker::popChunk() {

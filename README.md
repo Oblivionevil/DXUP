@@ -59,6 +59,7 @@ d3d11.sgssaa = true            # supersampling where targets are multisampled (o
 d3d11.asyncShaders = true      # compile pipelines in the background
 dxgi.syncInterval = 0          # force VSync off (0) or on (1-4)
 dxgi.maxFrameLatency = 1       # pre-rendered frames (1-16)
+dxgi.lowLatency = true         # less input lag: the next frame waits until the GPU needs it
 dxgi.renderScale = 0.75        # render at this share of the resolution, scaled up by DXUP
 dxgi.upscale = spatial         # scale a back buffer smaller than the window with DXUP's filter
 dxgi.spoofVendor = nvidia      # the game sees an NVIDIA, AMD or Intel GPU; DXUP renders on the real one

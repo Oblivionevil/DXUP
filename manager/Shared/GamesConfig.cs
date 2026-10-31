@@ -18,6 +18,7 @@ namespace Dxup.Shared
         public string Sgssaa = "off";    // off, true, alpha
         public int? SyncInterval;        // 0 = VSync off, 1-4 on
         public int? MaxFrameLatency;     // 1-16
+        public bool LowLatency;          // one pre-rendered frame, the next held back until the GPU needs it
         public bool AsyncShaders;        // pipelines compile in the background
         public bool ShaderPrecompile = true; // pipelines of earlier runs compile at load
         public string Upscaler = "off";  // off, dlss, fsr, xess: in place of the game's TAA
@@ -64,6 +65,7 @@ namespace Dxup.Shared
                     return true;
                 case "dxgi.syncinterval": SyncInterval = ParseInt(value); return true;
                 case "dxgi.maxframelatency": MaxFrameLatency = ParseInt(value); return true;
+                case "dxgi.lowlatency": LowLatency = ParseBool(value) ?? false; return true;
                 case "d3d11.asyncshaders": AsyncShaders = ParseBool(value) ?? false; return true;
                 case "d3d11.shaderprecompile": ShaderPrecompile = ParseBool(value) ?? true; return true;
                 case "d3d11.upscaler":
@@ -144,6 +146,7 @@ namespace Dxup.Shared
             if (Sgssaa != "off") yield return Entry("d3d11.sgssaa", Sgssaa);
             if (SyncInterval.HasValue) yield return Entry("dxgi.syncInterval", SyncInterval.Value.ToString(CultureInfo.InvariantCulture));
             if (MaxFrameLatency.HasValue) yield return Entry("dxgi.maxFrameLatency", MaxFrameLatency.Value.ToString(CultureInfo.InvariantCulture));
+            if (LowLatency) yield return Entry("dxgi.lowLatency", "true");
             if (AsyncShaders) yield return Entry("d3d11.asyncShaders", "true");
             if (!ShaderPrecompile) yield return Entry("d3d11.shaderPrecompile", "false");
             if (Upscaler != "off") yield return Entry("d3d11.upscaler", Upscaler);

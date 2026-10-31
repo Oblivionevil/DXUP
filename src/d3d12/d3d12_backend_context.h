@@ -1,6 +1,7 @@
 #pragma once
 
 #include "d3d12_backend_device.h"
+#include "d3d12_frame_pacer.h"
 #include "d3d12_gpu_profiler.h"
 #include "d3d12_command_recorder.h"
 #include "../upscale/upscaler.h"
@@ -289,6 +290,13 @@ namespace dxup::d3d12 {
     // thread), and a wait for a fence value any one other thread may call.
     uint64_t getLastPresentFenceValue() const;
     void waitForFenceValue(uint64_t value);
+    // Presents made so far (recording thread).
+    uint64_t getPresentCount() const { return m_presentCount; }
+    // dxgi.lowLatency, any thread once the fence of present `frame` (a
+    // getPresentCount index) completed: the GPU time of its work and how
+    // long after the end of the frame before its work was submitted (0 if
+    // before), false without.
+    bool frameGpuTiming(uint64_t frame, double& busyMs, double& lateMs) const;
 
     // FPS overlay blit — copies RGBA pixel data onto a target image (must be in COPY_DEST)
     void blitPixels(IBackendImage* dst, uint32_t dstX, uint32_t dstY,
@@ -1312,6 +1320,15 @@ namespace dxup::d3d12 {
     // Deferred context: true after closeForSubmission()
     bool m_closedForSubmission = false;
     GpuProfiler m_gpuProfiler;
+    // dxgi.lowLatency: each frame's GPU begin and end, and the pacing of
+    // waitForFrameLatency without the CS worker (application thread).
+    FrameTimer m_frameTimer;
+    LatencyPacer m_latencyPacer;
+    uint64_t m_pacedFrame = 0;
+    int64_t m_pacingReturn = 0;
+    HANDLE m_pacingTimer = nullptr;
+    // The wait of waitForFrameLatency for the GPU.
+    void waitForPresentFence(uint32_t maxLatency);
 #endif
   };
 
