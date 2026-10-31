@@ -965,7 +965,7 @@ namespace dxup::d3d12 {
       const std::wstring profileOut = dxupSiblingPathW("dxup_gpu_profile_out.txt");
       if (!profileMarker.empty() && !profileOut.empty())
         m_gpuProfiler.init(d3d12Device, device->getCommandQueue(), profileMarker, profileOut);
-      if (UserOverrides::get().lowLatency)
+      if (UserOverrides::get().lowLatency || dxupSiblingExists("dxup_latency_stats.txt"))
         m_frameTimer.init(d3d12Device, device->getCommandQueue());
 
     }
@@ -7874,7 +7874,7 @@ namespace dxup::d3d12 {
 #endif
   }
 
-  bool D3D12BackendContext::frameGpuTiming(uint64_t frame, double& busyMs, double& lateMs) const {
+  bool D3D12BackendContext::frameGpuTiming(uint64_t frame, double& busyMs, double& lateMs, int64_t* endedQpc) const {
 #ifdef _WIN32
     // Done when its fence is (or the fence of a later present in its slot).
     const uint64_t fence = m_presentFenceValues[frame % kPresentFenceHistory];
@@ -7882,6 +7882,8 @@ namespace dxup::d3d12 {
     if (!fence || !m_fence || m_fence->GetCompletedValue() < fence || !m_frameTimer.read(frame, times))
       return false;
     busyMs = times.busyMs;
+    if (endedQpc)
+      *endedQpc = times.ended;
     lateMs = frame && m_frameTimer.read(frame - 1, before) && times.submitted > before.ended
       ? double(times.submitted - before.ended) * 1000.0 / double(m_frameTimer.qpcFrequency()) : 0.0;
     return true;
@@ -7889,6 +7891,7 @@ namespace dxup::d3d12 {
     (void)frame;
     (void)busyMs;
     (void)lateMs;
+    (void)endedQpc;
     return false;
 #endif
   }

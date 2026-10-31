@@ -296,7 +296,10 @@ namespace dxup::d3d12 {
     // getPresentCount index) completed: the GPU time of its work and how
     // long after the end of the frame before its work was submitted (0 if
     // before), false without.
-    bool frameGpuTiming(uint64_t frame, double& busyMs, double& lateMs) const;
+    bool frameGpuTiming(uint64_t frame, double& busyMs, double& lateMs, int64_t* endedQpc = nullptr) const;
+    // Frame timestamps are taken (dxgi.lowLatency, or dxup_latency_stats.txt
+    // next to the DLL for the statistics alone).
+    bool frameTimingEnabled() const { return m_frameTimer.enabled(); }
 
     // FPS overlay blit — copies RGBA pixel data onto a target image (must be in COPY_DEST)
     void blitPixels(IBackendImage* dst, uint32_t dstX, uint32_t dstY,

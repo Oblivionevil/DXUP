@@ -474,6 +474,12 @@ namespace dxup {
     uint64_t                m_presentIndices[kPresentHistory] = {};
     d3d12::LatencyPacer     m_latencyPacer;
     bool                    m_lowLatency = false;
+    // dxup_latency_stats.txt (or lowLatency): how long from each frame's
+    // start (the return of the Present before) to the end of its GPU work,
+    // logged every 1000 frames.
+    bool                    m_latencyStats = false;
+    int64_t                 m_frameStarts[kPresentHistory] = {};
+    std::vector<double>     m_frameLatencies;
     uint64_t                m_pacedFrame = 0;
     int64_t                 m_pacingReturn = 0;
     void*                   m_pacingTimer = nullptr;

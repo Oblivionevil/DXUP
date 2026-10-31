@@ -229,6 +229,7 @@ namespace dxup {
       m_retireQueue->setDeferred(true);
     m_frameEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     m_lowLatency = UserOverrides::get().lowLatency;
+    m_latencyStats = static_cast<d3d12::D3D12BackendContext*>(m_real.get())->frameTimingEnabled();
     m_worker = Thread([this] { workerMain(); });
   }
 
@@ -1481,12 +1482,12 @@ namespace dxup {
 
   void CsThreadContext::waitForFrameLatency(uint32_t maxLatency) {
     LARGE_INTEGER entry = {};
-    if (m_lowLatency)
+    if (m_latencyStats)
       QueryPerformanceCounter(&entry);
     // The worker may still record the frame just presented, but not the
     // one before: the application runs at most a frame ahead of it.
     if (m_presents < 2) {
-      if (m_lowLatency)
+      if (m_latencyStats)
         paceFrame(maxLatency, entry.QuadPart);
       return;
     }
@@ -1502,7 +1503,7 @@ namespace dxup {
       HitchScope hitch("app waitForFrameLatency");
       static_cast<d3d12::D3D12BackendContext*>(m_real.get())->waitForFenceValue(m_presentFences[frame % kPresentHistory]);
     }
-    if (m_lowLatency)
+    if (m_latencyStats)
       paceFrame(maxLatency, entry.QuadPart);
   }
 
@@ -1519,26 +1520,41 @@ namespace dxup {
       m_framesExecuted.load(std::memory_order_acquire));
     for (; m_pacedFrame < done; m_pacedFrame++) {
       double busyMs = 0.0, lateMs = 0.0;
+      int64_t ended = 0;
       const uint64_t index = m_presentIndices[m_pacedFrame % kPresentHistory];
       if (m_pacedFrame + kPresentHistory > m_presents && index != UINT64_MAX
-       && real->frameGpuTiming(index, busyMs, lateMs))
+       && real->frameGpuTiming(index, busyMs, lateMs, &ended)) {
         m_latencyPacer.noteGpuFrame(busyMs, lateMs);
+        const int64_t start = m_frameStarts[m_pacedFrame % kPresentHistory];
+        if (start && ended > start)
+          m_frameLatencies.push_back(double(ended - start) * msPerTick);
+      }
     }
-    const double sleepMs = m_latencyPacer.sleepMs();
+    const double sleepMs = m_lowLatency ? m_latencyPacer.sleepMs() : 0.0;
     if (sleepMs > 0.0) {
       HitchScope hitch("app lowLatency sleep");
       d3d12::paceSleep(m_pacingTimer, sleepMs, [](HANDLE timer, DWORD timeout) { waitTakingSentMessages(timer, timeout); });
     }
     m_pacingSleptMs += sleepMs;
     if (++m_pacingFrames == 1000) {
-      logMessage(LogLevel::Info, "low latency: held back %.3f ms a frame, margin %.2f ms, %llu frames late so far",
-        m_pacingSleptMs / m_pacingFrames, m_latencyPacer.marginMs(),
-        static_cast<unsigned long long>(m_latencyPacer.lateFrames()));
+      double median = 0.0, p95 = 0.0;
+      if (!m_frameLatencies.empty()) {
+        std::sort(m_frameLatencies.begin(), m_frameLatencies.end());
+        median = m_frameLatencies[m_frameLatencies.size() / 2];
+        p95 = m_frameLatencies[m_frameLatencies.size() * 95 / 100];
+      }
+      logMessage(LogLevel::Info, "frame latency: frame start to GPU done %.2f ms (p95 %.2f) over %zu frames; "
+        "low latency %s: held back %.3f ms a frame, margin %.2f ms, %llu frames late so far",
+        median, p95, m_frameLatencies.size(), m_lowLatency ? "on" : "off", m_pacingSleptMs / m_pacingFrames,
+        m_latencyPacer.marginMs(), static_cast<unsigned long long>(m_latencyPacer.lateFrames()));
+      m_frameLatencies.clear();
       m_pacingSleptMs = 0.0;
       m_pacingFrames = 0;
     }
     QueryPerformanceCounter(&now);
     m_pacingReturn = now.QuadPart;
+    // The application starts frame m_presents now.
+    m_frameStarts[m_presents % kPresentHistory] = now.QuadPart;
   }
 
   void CsThreadContext::executeOnBackend(std::function<void(IBackendContext*)> fn) {
