@@ -1590,6 +1590,10 @@ namespace dxup::legacy {
   // The PCI vendor of the GPU DXUP renders on (DXUPGetVendorId), 0 unknown.
   std::atomic<uint32_t> g_vendorId{0};
 
+  uint32_t Device::vendorId() {
+    return g_vendorId.load(std::memory_order_relaxed);
+  }
+
   // Where Direct3D 9 drivers differ: as dxup.conf says, or as the driver of
   // the GPU's maker (UserOverrides::d3d9FloatEmulation, d3d9NanDepth).
   void driverBehavior(TranslateOptions9& options) {

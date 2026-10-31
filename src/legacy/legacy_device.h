@@ -368,6 +368,8 @@ namespace dxup::legacy {
     ~Device();
 
     ID3D11Device*        d3d11() const { return m_device.get(); }
+    // The PCI vendor of the GPU DXUP renders on (DXUPGetVendorId), 0 unknown.
+    static uint32_t vendorId();
     // On DXUP's D3D11: targets of this size are a swap chain's (dxup.conf
     // d3d11.msaaForce covers them). Before the back buffer is made.
     void noteBackBufferSize(uint32_t width, uint32_t height);

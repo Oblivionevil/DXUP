@@ -1238,7 +1238,13 @@ namespace dxup::d3d9 {
       core.blit(d, dstSub, &b, resolved, 0, &a, linear, false, 0);
       return;
     }
-    if (sameSize && s->dxgiFormat() == d->dxgiFormat() && s->desc().samples == d->desc().samples && s->d3dResource()
+    // AMD: a copy reads a render target in the copy source state, for which
+    // the driver decompresses it; a quad sampling it reads it compressed
+    // (Mirror's Edge resolves its 4K scene five times a frame: 418 -> 493
+    // fps on an RX 9070 XT, native 515).
+    const bool drawn = legacy::Device::vendorId() == 0x1002 && s->desc().renderTarget && d->desc().renderTarget
+      && srcSub == 0 && s->desc().levels == 1 && !s->desc().cube && !s->desc().volume && s->srv();
+    if (!drawn && sameSize && s->dxgiFormat() == d->dxgiFormat() && s->desc().samples == d->desc().samples && s->d3dResource()
      && d->d3dResource() && !s->desc().systemMemory && !d->desc().systemMemory) {
       D3D11_BOX box = { UINT(sr.left), UINT(sr.top), 0, UINT(sr.right), UINT(sr.bottom), 1 };
       context->CopySubresourceRegion(d->d3dResource(), dstSub, UINT(dr.left), UINT(dr.top), 0, s->d3dResource(), srcSub, &box);
@@ -1246,7 +1252,7 @@ namespace dxup::d3d9 {
       return;
     }
     const legacy::Rect a = toRect(sr), b = toRect(dr);
-    core.blit(d, dstSub, &b, s, srcSub, &a, linear, false, 0);
+    core.blit(d, dstSub, &b, s, srcSub, &a, linear && !(drawn && sameSize), false, 0);
   }
 
   HRESULT Device::ColorFill(IDirect3DSurface9* surface, const RECT* rect, D3DCOLOR color) {
