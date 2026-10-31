@@ -4,6 +4,7 @@
 
 #include "../util/util_types.h"
 
+#include <algorithm>
 #include <exception>
 
 namespace dxup::d3d9 {
@@ -39,9 +40,12 @@ namespace dxup::d3d9 {
 
   Worker::Worker(legacy::Device* core) : m_core(core) {
     m_doneEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    m_wakeEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     m_chunk = new Chunk();
+    m_queue.push_back(m_chunk);
+    m_chunksStarted = 1;
     m_begin = m_pos = m_chunk->data;
-    m_end = m_chunk->data + kChunkSize;
+    m_end = m_begin + kPublishBytes;
     m_thread = dxup::Thread([this] { workerMain(); });
   }
 
@@ -52,20 +56,23 @@ namespace dxup::d3d9 {
       return;
     }
     synchronize();
-    {
-      std::lock_guard<std::mutex> lock(m_mutex);
-      m_stopping = true;
-    }
-    m_wake.notify_one();
+    m_stopping.store(true, std::memory_order_seq_cst);
+    SetEvent(m_wakeEvent);
     m_thread.join();
     // Released while the worker made the last calls: deleted here.
     for (const auto& entry : m_retired)
       entry.first(entry.second);
     for (Chunk* chunk : m_freeChunks)
       delete chunk;
-    delete m_chunk;
+    // The one being recorded is the worker's after it made the others.
+    if (std::find(m_queue.begin(), m_queue.end(), m_chunk) == m_queue.end())
+      delete m_chunk;
+    for (Chunk* chunk : m_queue)
+      delete chunk;
     if (m_doneEvent)
       CloseHandle(m_doneEvent);
+    if (m_wakeEvent)
+      CloseHandle(m_wakeEvent);
   }
 
   uint8_t* Worker::reserve(uint32_t size) {
@@ -73,31 +80,52 @@ namespace dxup::d3d9 {
       logMessage(LogLevel::Error, "D3D9 worker: a command of %u bytes does not fit a chunk", size);
       std::terminate();
     }
-    submitChunk();
+    if (size_t(m_begin + kChunkSize - m_pos) < size)
+      nextChunk();
+    else
+      publish();
+    const size_t room = size_t(m_begin + kChunkSize - m_pos);
+    m_end = m_pos + (std::min)(room, (std::max)(size_t(size), kPublishBytes));
     return m_pos;
   }
 
-  void Worker::submitChunk() {
-    if (m_pos == m_begin)
+  void Worker::wakeWorker() {
+    if (m_workerSleeping.load(std::memory_order_seq_cst))
+      SetEvent(m_wakeEvent);
+  }
+
+  void Worker::publish() {
+    const uint32_t bytes = uint32_t(m_pos - m_begin);
+    if (m_chunk->published.load(std::memory_order_relaxed) == bytes)
       return;
-    m_chunk->used = m_pos;
+    m_chunk->published.store(bytes, std::memory_order_seq_cst);
+    wakeWorker();
+  }
+
+  void Worker::nextChunk() {
     Chunk* next = nullptr;
     {
       std::lock_guard<std::mutex> lock(m_mutex);
-      m_queue.push_back(m_chunk);
       if (!m_freeChunks.empty()) {
         next = m_freeChunks.back();
         m_freeChunks.pop_back();
       }
     }
-    m_queued.fetch_add(1, std::memory_order_release);
-    m_wake.notify_one();
-    m_submitted++;
     if (!next)
       next = new Chunk();
+    next->published.store(0, std::memory_order_relaxed);
+    next->consumed.store(0, std::memory_order_relaxed);
+    // Queued before this one is sealed: the worker finds it when done.
+    {
+      std::lock_guard<std::mutex> lock(m_mutex);
+      m_queue.push_back(next);
+    }
+    m_chunksStarted++;
+    m_chunk->published.store(uint32_t(m_pos - m_begin) | kSealed, std::memory_order_seq_cst);
+    wakeWorker();
     m_chunk = next;
     m_begin = m_pos = next->data;
-    m_end = next->data + kChunkSize;
+    m_end = m_begin + kPublishBytes;
   }
 
   void Worker::retire(void (*destroy)(void*), void* object) {
@@ -123,11 +151,6 @@ namespace dxup::d3d9 {
     });
   }
 
-  void Worker::submit() {
-    recordRetired();
-    submitChunk();
-  }
-
   template<typename Done>
   void Worker::waitFor(Done done) {
     if (done())
@@ -146,41 +169,42 @@ namespace dxup::d3d9 {
     m_waiting.store(false, std::memory_order_relaxed);
   }
 
+  bool Worker::caughtUp() const {
+    return m_chunksFinished.load(std::memory_order_seq_cst) + 1 == m_chunksStarted
+        && m_chunk->consumed.load(std::memory_order_seq_cst) == uint32_t(m_pos - m_begin);
+  }
+
   void Worker::synchronize() {
-    submit();
-    const uint64_t target = m_submitted;
-    waitFor([&] { return m_executed.load(std::memory_order_seq_cst) >= target; });
+    recordRetired();
+    publish();
+    // Calls recorded during the wait (window procedures it gives sent
+    // messages) are published and waited for too.
+    waitFor([&] {
+      publish();
+      return caughtUp();
+    });
   }
 
   void Worker::endFrame() {
     const uint64_t frame = ++m_framesRecorded;
     emit([this, frame](legacy::Device&) { m_framesDone.store(frame, std::memory_order_seq_cst); });
-    submit();
+    recordRetired();
+    publish();
     waitFor([&] { return m_framesDone.load(std::memory_order_seq_cst) + 1 >= frame; });
   }
 
-  Worker::Chunk* Worker::takeChunk() {
-    if (m_queued.load(std::memory_order_acquire) == 0) {
-      const int64_t until = microsecondsNow() + kWorkerSpinMicroseconds;
-      for (uint32_t i = 0; m_queued.load(std::memory_order_acquire) == 0; i++) {
-        YieldProcessor();
-        if ((i & 63) == 63 && microsecondsNow() >= until)
-          break;
-      }
-    }
-    std::unique_lock<std::mutex> lock(m_mutex);
-    m_wake.wait(lock, [&] { return m_stopping || !m_queue.empty(); });
+  Worker::Chunk* Worker::popChunk() {
+    std::lock_guard<std::mutex> lock(m_mutex);
     if (m_queue.empty())
       return nullptr;
     Chunk* chunk = m_queue.front();
     m_queue.pop_front();
-    m_queued.fetch_sub(1, std::memory_order_relaxed);
     return chunk;
   }
 
-  void Worker::execute(Chunk* chunk) {
+  void Worker::execute(Chunk* chunk, uint32_t from, uint32_t to) {
     static std::atomic<uint32_t> s_failures{0};
-    for (uint8_t* at = chunk->data; at < chunk->used;) {
+    for (uint8_t* at = chunk->data + from; at < chunk->data + to;) {
       auto* command = reinterpret_cast<Command*>(at);
       const uint32_t size = command->size;
       // A failing call is skipped: the application waits for the worker.
@@ -208,14 +232,52 @@ namespace dxup::d3d9 {
     delete chunk;
   }
 
+  bool Worker::waitForCommands(Chunk* chunk, uint32_t seen) {
+    const int64_t until = microsecondsNow() + kWorkerSpinMicroseconds;
+    for (uint32_t i = 0;; i++) {
+      if (chunk->published.load(std::memory_order_acquire) != seen)
+        return true;
+      if (m_stopping.load(std::memory_order_relaxed))
+        return false;
+      YieldProcessor();
+      if ((i & 63) == 63 && microsecondsNow() >= until)
+        break;
+    }
+    m_workerSleeping.store(true, std::memory_order_seq_cst);
+    while (chunk->published.load(std::memory_order_seq_cst) == seen && !m_stopping.load(std::memory_order_seq_cst))
+      WaitForSingleObject(m_wakeEvent, 100);
+    m_workerSleeping.store(false, std::memory_order_relaxed);
+    return chunk->published.load(std::memory_order_acquire) != seen || !m_stopping.load(std::memory_order_relaxed);
+  }
+
   void Worker::workerMain() {
     SetThreadDescription(GetCurrentThread(), L"dxup-d3d9");
-    while (Chunk* chunk = takeChunk()) {
-      execute(chunk);
-      freeChunk(chunk);
-      m_executed.fetch_add(1, std::memory_order_seq_cst);
-      if (m_waiting.load(std::memory_order_seq_cst))
-        SetEvent(m_doneEvent);
+    Chunk* chunk = popChunk();
+    uint32_t done = 0;
+    while (chunk) {
+      const uint32_t published = chunk->published.load(std::memory_order_acquire);
+      const uint32_t end = published & ~kSealed;
+      if (done < end) {
+        execute(chunk, done, end);
+        done = end;
+        chunk->consumed.store(done, std::memory_order_seq_cst);
+        if (m_waiting.load(std::memory_order_seq_cst))
+          SetEvent(m_doneEvent);
+        continue;
+      }
+      if (published & kSealed) {
+        // The next one was queued before this was sealed.
+        Chunk* next = popChunk();
+        freeChunk(chunk);
+        m_chunksFinished.fetch_add(1, std::memory_order_seq_cst);
+        if (m_waiting.load(std::memory_order_seq_cst))
+          SetEvent(m_doneEvent);
+        chunk = next;
+        done = 0;
+        continue;
+      }
+      if (!waitForCommands(chunk, published))
+        return;
     }
   }
 

@@ -434,11 +434,7 @@ namespace dxup::d3d9 {
       device->m_mutex.lock();
     m_recorder = device->m_recorder;
     if (m_recorder) {
-      // Calls recorded during the wait (window procedures it gives sent
-      // messages) are made too.
-      do
-        m_recorder->synchronize();
-      while (!m_recorder->recordedNothing());
+      m_recorder->synchronize();
       device->m_recorder = nullptr;
       device->noteDirect(why);
     }

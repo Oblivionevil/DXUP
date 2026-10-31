@@ -1091,7 +1091,7 @@ namespace dxup::d3d9 {
           results->polling.store(false, std::memory_order_release);
         });
         if (Worker* worker = m_device->recorder()) {
-          worker->submit();
+          worker->publish();
         } else {
           // Made at once (the caller has the core to itself).
           if (results->done.load(std::memory_order_acquire) == m_issues)

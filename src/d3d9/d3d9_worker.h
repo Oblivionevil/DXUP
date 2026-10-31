@@ -4,7 +4,9 @@
 // (dxup.conf d3d9.workerThread): the application's thread records them into
 // chunks of commands, the worker ("dxup-d3d9") makes them in order. Draws
 // are most of what the core costs a game's render thread; with the worker
-// that thread only copies their arguments.
+// that thread only copies their arguments. The worker follows the chunk
+// being recorded every few kilobytes (games that wait for the GPU each
+// frame, as Mirror's Edge does for an event query, wait for its work too).
 //
 // Calls that return what the core holds or waits for (getters, locks that
 // read, Reset) wait until the worker made everything recorded before
@@ -13,7 +15,6 @@
 #include <windows.h>
 
 #include <atomic>
-#include <condition_variable>
 #include <cstdint>
 #include <cstring>
 #include <deque>
@@ -83,24 +84,26 @@ namespace dxup::d3d9 {
 
     // An object the worker deletes once it made the calls recorded so far
     // (from any thread: applications release objects anywhere). Recorded
-    // with the next submit.
+    // at the next synchronize or frame end.
     void retire(void (*destroy)(void*), void* object);
-    // What is recorded goes to the worker.
-    void submit();
-    // Waits until the worker made all recorded calls, taking the messages
-    // sent to this thread meanwhile (the worker's Present sends some to the
-    // window, whose thread may be this one).
+    // What is recorded is the worker's to make now (it sees the rest of a
+    // chunk every kPublishBytes).
+    void publish();
+    // Waits until the worker made all recorded calls (also those recorded
+    // during the wait), taking the messages sent to this thread meanwhile:
+    // the worker's Present sends some to the window, whose thread may be
+    // this one.
     void synchronize();
     // After recording a Present: waits until the worker made the Present
     // before it (the application stays at most a frame ahead).
     void endFrame();
-    // Nothing recorded since the last submit.
-    bool recordedNothing() const { return m_pos == m_begin; }
 
   private:
     static constexpr size_t kAlign = 8;
     static constexpr size_t kChunkSize = 64u << 10;
     static constexpr size_t kMaxInlineData = 16u << 10;
+    static constexpr size_t kPublishBytes = 2048;
+    static constexpr uint32_t kSealed = 0x80000000u;   // in Chunk::published: no more commands
 
     // Makes the call and destroys the command (also when the call throws).
     struct Command {
@@ -148,19 +151,28 @@ namespace dxup::d3d9 {
       }
     };
 
+    // Chunks are queued when their recording begins; the worker makes what
+    // is published of the first, and goes on to the next once it is sealed.
     struct Chunk {
-      uint8_t* used = nullptr;   // the end of its commands
+      alignas(64) std::atomic<uint32_t> published{0};   // bytes of commands (kSealed: all of them)
+      alignas(64) std::atomic<uint32_t> consumed{0};    // bytes the worker made
       alignas(64) uint8_t data[kChunkSize];
     };
 
-    // Room for a command of size bytes: the chunk goes to the worker when
-    // full.
+    // Room for a command of size bytes: publishes what is recorded, or
+    // seals the chunk when full and records into the next.
     __declspec(noinline) uint8_t* reserve(uint32_t size);
-    void submitChunk();
+    void nextChunk();
+    void wakeWorker();
     void recordRetired();
-    Chunk* takeChunk();
-    void execute(Chunk* chunk);
+    // The worker made everything recorded.
+    bool caughtUp() const;
+    Chunk* popChunk();
+    void execute(Chunk* chunk, uint32_t from, uint32_t to);
     void freeChunk(Chunk* chunk);
+    // The worker without commands to make: spins, then sleeps until the
+    // chunk's published bytes differ from seen (false: the worker stops).
+    bool waitForCommands(Chunk* chunk, uint32_t seen);
     void workerMain();
     // Waits until done() holds (see synchronize).
     template<typename Done>
@@ -171,21 +183,21 @@ namespace dxup::d3d9 {
     Chunk*   m_chunk = nullptr;
     uint8_t* m_begin = nullptr;
     uint8_t* m_pos = nullptr;
-    uint8_t* m_end = nullptr;
-    uint64_t m_submitted = 0;
+    uint8_t* m_end = nullptr;     // where reserve publishes next (or the chunk ends)
+    uint64_t m_chunksStarted = 0;
     uint64_t m_framesRecorded = 0;
 
     std::mutex              m_mutex;
-    std::condition_variable m_wake;
-    std::deque<Chunk*>      m_queue;
-    std::atomic<uint32_t>   m_queued{0};
-    bool                    m_stopping = false;
+    std::deque<Chunk*>      m_queue;        // under m_mutex
     std::vector<Chunk*>     m_freeChunks;   // under m_mutex
 
-    std::atomic<uint64_t> m_executed{0};
+    std::atomic<uint64_t> m_chunksFinished{0};
     std::atomic<uint64_t> m_framesDone{0};
-    std::atomic<bool>     m_waiting{false};
+    std::atomic<bool>     m_waiting{false};          // the application waits for m_doneEvent
     HANDLE                m_doneEvent = nullptr;
+    std::atomic<bool>     m_workerSleeping{false};   // the worker waits for m_wakeEvent
+    HANDLE                m_wakeEvent = nullptr;
+    std::atomic<bool>     m_stopping{false};
 
     std::mutex m_retireMutex;
     std::vector<std::pair<void (*)(void*), void*>> m_retired;
