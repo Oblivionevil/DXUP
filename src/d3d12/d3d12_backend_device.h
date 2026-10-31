@@ -377,6 +377,7 @@ namespace dxup::d3d12 {
 
   private:
 #ifdef _WIN32
+    // Written by the recording thread for every new slice (replaceSlice).
     ComPtr<ID3D12Resource>    m_resource;
     // Queried once: binds read it for every draw.
     D3D12_GPU_VIRTUAL_ADDRESS m_gpuAddress = 0;
@@ -384,20 +385,25 @@ namespace dxup::d3d12 {
     D3D12_RESOURCE_STATES     m_currentState = D3D12_RESOURCE_STATE_COMMON;
     bool                      m_fixedState = false;
     uint64_t                  m_offset = 0;
-    D3D12UploadSuballocator*  m_suballocator = nullptr;
     D3D12UploadSuballocator::Slice m_slice;
+    D3D12_RESOURCE_STATES*    m_sharedState = nullptr;
+    ComPtr<ID3D12Resource>    m_soCounter;
+    std::shared_ptr<D3D12SharedSync> m_sharedSync;
+    // The application thread reads and writes the members below for every
+    // WRITE_DISCARD and constant buffer rename (CsThreadContext) while the
+    // worker writes the ones above for the slice before: on cache lines of
+    // their own, neither thread waits for the other's line.
+    uint8_t                   m_cacheLineGap[64] = {};
+    bool                      m_renamableConstantBuffer = false;
+    D3D12UploadSuballocator*  m_suballocator = nullptr;
     uint32_t                  m_sizeClass = 0;
     bool                      m_persistentlyMapped = false;
-    D3D12_RESOURCE_STATES*    m_sharedState = nullptr;
-    bool                      m_renamableConstantBuffer = false;
+    uint8_t*                  m_appMapped = nullptr;
     uint8_t*                  m_renamedData = nullptr;
     std::unique_ptr<uint8_t[]> m_renameShadow;
     std::vector<uint8_t>      m_lastUpdate;
     uint8_t*                  m_lastUpdateSlice = nullptr;
     std::atomic<bool>         m_renameBlocked{ false };
-    uint8_t*                  m_appMapped = nullptr;
-    ComPtr<ID3D12Resource>    m_soCounter;
-    std::shared_ptr<D3D12SharedSync> m_sharedSync;
 #endif
     BufferDesc                m_desc;
   };

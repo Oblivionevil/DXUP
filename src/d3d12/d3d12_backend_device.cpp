@@ -701,11 +701,11 @@ namespace dxup::d3d12 {
   , m_currentState(slice.state ? D3D12_RESOURCE_STATE_COMMON : D3D12_RESOURCE_STATE_GENERIC_READ)
   , m_fixedState(!slice.state)
   , m_offset(slice.offset)
-  , m_suballocator(allocator)
   , m_slice(slice)
+  , m_sharedState(slice.state)
+  , m_suballocator(allocator)
   , m_sizeClass(slice.sizeClass)
   , m_persistentlyMapped(allocator->isMapped())
-  , m_sharedState(slice.state)
   , m_desc(desc) {
     m_gpuAddress = slice.resource->GetGPUVirtualAddress() + slice.offset;
   }
