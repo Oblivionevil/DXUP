@@ -198,7 +198,7 @@
                 </Grid.RowDefinitions>
                 <TextBlock Text="{DynamicResource VSync}" Style="{StaticResource Caption}" />
                 <ComboBox x:Name="VSyncBox" Grid.Column="1" HorizontalAlignment="Left" DisplayMemberPath="Text" SelectionChanged="OnSettingChanged" />
-                <TextBlock Grid.Row="1" Text="{DynamicResource Frames}" Style="{StaticResource Caption}" Margin="0,10,12,0" />
+                <TextBlock Grid.Row="1" Text="{DynamicResource Frames}" Style="{StaticResource Caption}" Margin="0,19,12,0" VerticalAlignment="Top" />
                 <StackPanel Grid.Row="1" Grid.Column="1" Margin="0,10,0,0">
                   <ComboBox x:Name="FramesBox" HorizontalAlignment="Left" DisplayMemberPath="Text" SelectionChanged="OnSettingChanged" />
                   <CheckBox x:Name="LowLatencyBox" Margin="0,8,0,0" Checked="OnSettingChanged" Unchecked="OnSettingChanged">
