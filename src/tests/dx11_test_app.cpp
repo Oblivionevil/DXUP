@@ -10187,7 +10187,7 @@ float4 main(float4 position : SV_Position, float4 t0 : TEXCOORD0, float4 t : TEX
       return runChildWithConfig("d3d12.submitThread = true\n", "--submit-thread-child", error);
     }
 
-    // dxgi.lowLatency: a GPU-bound game's next frame is held back, so the
+    // dxgi.lowLatency (on by default): a GPU-bound game's next frame is held back, so the
     // input it reads at its start waits less for the GPU: from a frame's
     // start to the end of its GPU work takes less than with one
     // pre-rendered frame alone (dxgi.maxFrameLatency = 1), at about the same
@@ -10211,9 +10211,9 @@ float4 main(float4 position : SV_Position, float4 t0 : TEXCOORD0, float4 t : TEX
         return read;
       };
       double baseLatency = 0.0, baseFrame = 0.0, pacedLatency = 0.0, pacedFrame = 0.0;
-      if (!runChildWithConfig("dxgi.maxFrameLatency = 1\n", "--low-latency-child base", error)
+      if (!runChildWithConfig("dxgi.lowLatency = false\ndxgi.maxFrameLatency = 1\n", "--low-latency-child base", error)
        || !result("base", baseLatency, baseFrame)
-       || !runChildWithConfig("dxgi.lowLatency = true\n", "--low-latency-child paced", error)
+       || !runChildWithConfig("", "--low-latency-child paced", error)
        || !result("paced", pacedLatency, pacedFrame)) {
         if (error.empty())
           error = "no result from the child";

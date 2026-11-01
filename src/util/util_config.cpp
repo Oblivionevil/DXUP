@@ -499,7 +499,7 @@ namespace dxup {
     overrides.syncInterval = clampSetting(config.getInt("dxgi.syncInterval", -1), 0, 4);
     // At least one frame is always queued; DXGI allows up to 16.
     overrides.maxFrameLatency = clampSetting(config.getInt("dxgi.maxFrameLatency", -1), 1, 16);
-    overrides.lowLatency = config.getBool("dxgi.lowLatency", false);
+    overrides.lowLatency = config.getBool("dxgi.lowLatency", true);
     // Sample counts D3D11 hardware offers.
     const int32_t samples = config.getInt("d3d11.msaaSamples", 0);
     overrides.msaaSamples = (samples == 2 || samples == 4 || samples == 8 || samples == 16) ? samples : 0;
