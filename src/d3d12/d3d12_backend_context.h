@@ -55,6 +55,10 @@ namespace dxup::d3d12 {
   constexpr D3D12_RESOURCE_STATES kShaderReadState = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
     | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
   constexpr uint32_t kEarlySubmitMinDraws = 512;
+  // Draws between early submissions while the CS worker has caught up with
+  // the application (CsThreadContext::workerMain): each submission costs the
+  // worker time, which only a worker with work queued behind lacks.
+  constexpr uint32_t kEarlySubmitIntervalCaughtUp = 64;
   // Upload buffers a command list may collect before it is submitted (less
   // in a 32-bit process: their memory is address space).
   constexpr uint64_t kPendingUploadFlushThreshold = (sizeof(void*) == 4 ? 32ull : 128ull) * 1024ull * 1024ull;
@@ -292,6 +296,8 @@ namespace dxup::d3d12 {
     void waitForFenceValue(uint64_t value);
     // Presents made so far (recording thread).
     uint64_t getPresentCount() const { return m_presentCount; }
+    // The CS worker runs commands with none queued behind them (worker).
+    void setWorkerCaughtUp(bool caughtUp) { m_workerCaughtUp = caughtUp; }
     // dxgi.lowLatency, any thread once the fence of present `frame` (a
     // getPresentCount index) completed: the GPU time of its work and how
     // long after the end of the frame before its work was submitted (0 if
@@ -675,8 +681,11 @@ namespace dxup::d3d12 {
     }
     void writeDispatchBreadcrumb(bool begin);
     void logDispatchBreadcrumbs();
+    // The CS worker had nothing queued behind the commands it runs now.
+    bool m_workerCaughtUp = false;
     // Submits what is recorded when the GPU ran out of work, checked every
-    // kEarlySubmitInterval draws once kEarlySubmitMinDraws are recorded.
+    // kEarlySubmitInterval draws once kEarlySubmitMinDraws are recorded
+    // (every kEarlySubmitIntervalCaughtUp while the worker has caught up).
     // Otherwise a frame reaches the GPU only when it is presented: a CPU-
     // bound game leaves the GPU idle meanwhile, and a Map that waits for
     // work of the frame (staging uploads read back the next frame) waits
@@ -690,7 +699,12 @@ namespace dxup::d3d12 {
         flush();
         return;
       }
-      if ((m_drawOpsSinceFlush & (kEarlySubmitInterval - 1)) || m_drawOpsSinceFlush < kEarlySubmitMinDraws || m_copyOnly)
+      // Sooner while the CS worker has nothing queued behind this (the
+      // application thread is the limit): the GPU starts the frame earlier,
+      // and a game that waits for the previous frame's GPU work waits less.
+      const uint32_t interval = m_workerCaughtUp ? kEarlySubmitIntervalCaughtUp : kEarlySubmitInterval;
+      const uint32_t minDraws = m_workerCaughtUp ? kEarlySubmitIntervalCaughtUp : kEarlySubmitMinDraws;
+      if ((m_drawOpsSinceFlush & (interval - 1)) || m_drawOpsSinceFlush < minDraws || m_copyOnly)
         return;
       if (m_fence && m_fence->GetCompletedValue() >= m_lastSignaledFenceValue)
         flush();

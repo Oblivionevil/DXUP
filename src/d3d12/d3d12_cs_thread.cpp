@@ -333,6 +333,8 @@ namespace dxup {
       }
 
       try {
+        static_cast<d3d12::D3D12BackendContext*>(m_real.get())->setWorkerCaughtUp(
+          !m_queuedChunks.load(std::memory_order_relaxed));
         chunk->executeAll(m_workerState);
         // The GPU may still use what these commands referenced.
         if (!chunk->retired.empty())
