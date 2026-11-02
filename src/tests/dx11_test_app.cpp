@@ -18954,7 +18954,10 @@ float4 main(float4 position : SV_Position) : SV_Target { return float4(0.2f, 0.4
     // Small draws the way engines issue them: every draw maps its own
     // constant buffer and binds other textures, the material and samplers
     // change every few draws and the pixel shader every eight. GPU time per
-    // draw against draws that change nothing.
+    // draw against draws that change nothing. A heavy pass keeps the GPU busy
+    // while they are recorded: DXUP submits early when the GPU is idle, and the
+    // timestamps would show the CPU's recording speed. Native 4 / 18 ns, raw
+    // Direct3D 12 and DXUP 46 / 55 ns on an AMD RX 9070 XT.
     bool testDrawBindingGpuCost(std::string& error) {
       static const char* kVs = R"(
 cbuffer Frame : register(b0) { float4 frameScale; };
@@ -19055,12 +19058,24 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0, float4 color :
        || !createQueryObject(D3D11_QUERY_TIMESTAMP, begin, error)
        || !createQueryObject(D3D11_QUERY_TIMESTAMP, end, error))
         return false;
+      ComPtr<ID3D11VertexShader> heavyVs;
+      ComPtr<ID3DBlob> heavyVsBytecode;
+      ComPtr<ID3D11PixelShader> heavyPs;
+      if (!createVertexShader(kFullscreenTriangleVs, "main", heavyVs, heavyVsBytecode, error)
+       || !createPixelShader("float4 main(float4 p : SV_Position) : SV_Target { float a = p.x * 0.001f; "
+            "for (uint i = 0; i < 2000; i++) a = sin(a) + 1.5f; return float4(a, a, a, 1.0f); }", "main", heavyPs, error))
+        return false;
       constexpr UINT kDraws = 2000;
       auto run = [&](bool changing) {
         m_context->ClearState();
         ID3D11RenderTargetView* rtv = target.rtv.Get();
         m_context->OMSetRenderTargets(1, &rtv, nullptr);
         setViewport(1024, 1024);
+        m_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        m_context->VSSetShader(heavyVs.Get(), nullptr, 0);
+        m_context->PSSetShader(heavyPs.Get(), nullptr, 0);
+        m_context->Draw(3, 0);
+        m_context->Flush();
         m_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
         m_context->VSSetShader(vs.Get(), nullptr, 0);
         ID3D11Buffer* cbs[3] = { frameCb.Get(), drawCb.Get(), materialCb[0].Get() };

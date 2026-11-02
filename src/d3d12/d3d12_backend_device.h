@@ -1496,9 +1496,10 @@ namespace dxup::d3d12 {
     Rc<IBackendPipeline> compileComputePipeline(const ComputePipelineDesc& desc, const ComputePsoCacheKey& key);
     // masksLater: a pipeline whose masked outputs (d3d12.pixelOutputMasks)
     // give the driver shaders it has not compiled starts without the masks
-    // and gets them later (queueMaskedPipeline).
+    // and gets them later (queueMaskedPipeline). knownStages: bit 0 the driver
+    // had the vertex shader, bit 1 the pixel shader before this pipeline.
     Rc<IBackendPipeline> buildGraphicsPipeline(const GraphicsPipelineDesc& desc, const PsoCacheKey& key,
-                                               bool masksLater = true);
+                                               bool masksLater = true, uint32_t* knownStages = nullptr);
     void queueMaskedPipeline(const GraphicsPipelineDesc& desc, const PsoCacheKey& key,
                              const std::shared_ptr<D3D12BackendGraphicsPipeline>& pipeline);
     Rc<IBackendPipeline> buildComputePipeline(const ComputePipelineDesc& desc, const ComputePsoCacheKey& key);
@@ -1593,7 +1594,7 @@ namespace dxup::d3d12 {
     static uint64_t stageHash(const void* bytecode, size_t size);
     void noteDriverStages(const D3D12_SHADER_BYTECODE& vs, const D3D12_SHADER_BYTECODE& ps);
     bool driverHasStages(const D3D12_SHADER_BYTECODE& vs, const D3D12_SHADER_BYTECODE& ps);
-    void logSlowPipeline(const GraphicsPipelineDesc& desc, uint64_t us);
+    void logSlowPipeline(const GraphicsPipelineDesc& desc, uint64_t us, uint32_t knownStages);
     void queuePrecompile(uint32_t index);
     void storePipelineRecord(const GraphicsPipelineDesc& desc, const PsoCacheKey& key);
     void appendPipelineRecord(const std::vector<uint8_t>& record);

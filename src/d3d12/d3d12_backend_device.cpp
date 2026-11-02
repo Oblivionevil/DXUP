@@ -4344,15 +4344,16 @@ namespace dxup::d3d12 {
     const GraphicsPipelineDesc& desc = vertexStreamOut ? withoutGs : source;
     const int64_t start = hitchTraceEnabled() ? hitchTimestamp() : 0;
     Rc<IBackendPipeline> pipeline;
+    uint32_t knownStages = 0;
     try {
-      pipeline = buildGraphicsPipeline(desc, key);
+      pipeline = buildGraphicsPipeline(desc, key, true, &knownStages);
     } catch (const std::exception& e) {
       logMessage(LogLevel::Error, "createGraphicsPipeline: %s", e.what());
     }
     if (start) {
       const uint64_t us = notePsoCompile(start);
       if (us >= 4000)
-        logSlowPipeline(desc, us);
+        logSlowPipeline(desc, us, knownStages);
     }
     // The description as the application made it, which the key stands for:
     // a later run then finds the record and precompiles the same pipeline.
@@ -4372,7 +4373,7 @@ namespace dxup::d3d12 {
   }
 
   Rc<IBackendPipeline> D3D12BackendDevice::buildGraphicsPipeline(const GraphicsPipelineDesc& desc, const PsoCacheKey& cacheKey,
-                                                                 bool masksLater) {
+                                                                 bool masksLater, uint32_t* knownStages) {
     // Compiler threads count too.
     static std::atomic<int> gfxPipeCreateLogCount{0};
     if (gfxPipeCreateLogCount < 128) {
@@ -4758,6 +4759,9 @@ namespace dxup::d3d12 {
       psoDesc.VS = unmaskedVs;
       psoDesc.PS = unmaskedPs;
     }
+
+    if (knownStages)
+      *knownStages = (driverHasStages(psoDesc.VS, {}) ? 1u : 0u) | (driverHasStages({}, psoDesc.PS) ? 2u : 0u);
 
     ID3D12PipelineState* rawPso = nullptr;
     HRESULT hr = safeCreateGraphicsPSO(m_device.Get(), &psoDesc, &rawPso);
@@ -5175,29 +5179,24 @@ namespace dxup::d3d12 {
     return (!vsHash || m_warmedStages.count(vsHash)) && (!psHash || m_warmedStages.count(psHash));
   }
 
-  // What a pipeline that compiled slowly had, and which of its stages a
-  // warm-up had compiled before: tells which pipelines the warm-up misses.
-  void D3D12BackendDevice::logSlowPipeline(const GraphicsPipelineDesc& desc, uint64_t us) {
-    auto stage = [this](const void* code, size_t size) -> std::string {
+  // What a pipeline that compiled slowly had, and which of its stages the
+  // driver had compiled before: tells which pipelines the warm-up misses.
+  void D3D12BackendDevice::logSlowPipeline(const GraphicsPipelineDesc& desc, uint64_t us, uint32_t knownStages) {
+    auto stage = [](const void* code, size_t size, bool known) -> std::string {
       if (!code || !size)
         return "-";
-      const uint64_t hash = stageHash(code, size);
-      bool warmed;
-      {
-        std::lock_guard<std::mutex> lock(m_probeMutex);
-        warmed = m_warmedStages.count(hash) != 0;
-      }
       char text[40];
-      snprintf(text, sizeof(text), "%016llx%s", static_cast<unsigned long long>(hash), warmed ? " warm" : " cold");
+      snprintf(text, sizeof(text), "%016llx%s", static_cast<unsigned long long>(stageHash(code, size)), known ? " warm" : " cold");
       return text;
     };
     std::string formats;
     for (uint32_t i = 0; i < desc.numRenderTargets && i < 8; i++)
       formats += (i ? "," : "") + std::to_string(uint32_t(desc.rtvFormats[i]));
     logMessage(LogLevel::Warn, "slow pipeline %.1f ms: vs %s, ps %s, gs %s, hs %s, ds %s, inputs %u, targets [%s], depth %u, samples %u%s, so %u",
-      double(us) / 1000.0, stage(desc.vsBytecode, desc.vsBytecodeSize).c_str(), stage(desc.psBytecode, desc.psBytecodeSize).c_str(),
-      stage(desc.gsBytecode, desc.gsBytecodeSize).c_str(), stage(desc.hsBytecode, desc.hsBytecodeSize).c_str(),
-      stage(desc.dsBytecode, desc.dsBytecodeSize).c_str(), desc.inputLayout.numElements, formats.c_str(),
+      double(us) / 1000.0, stage(desc.vsBytecode, desc.vsBytecodeSize, knownStages & 1).c_str(),
+      stage(desc.psBytecode, desc.psBytecodeSize, knownStages & 2).c_str(),
+      stage(desc.gsBytecode, desc.gsBytecodeSize, false).c_str(), stage(desc.hsBytecode, desc.hsBytecodeSize, false).c_str(),
+      stage(desc.dsBytecode, desc.dsBytecodeSize, false).c_str(), desc.inputLayout.numElements, formats.c_str(),
       uint32_t(desc.dsvFormat), desc.sampleCount, desc.sampleShading ? " per sample" : "", desc.numSOEntries);
   }
 
