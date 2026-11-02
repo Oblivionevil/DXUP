@@ -514,6 +514,7 @@ void main(uint2 id : SV_DispatchThreadID) {
         {"async_shaders", &Dx11TestApp::testAsyncShaders},
         {"upscaler_replace", &Dx11TestApp::testUpscalerReplace},
         {"pipeline_precompile", &Dx11TestApp::testPipelinePrecompile},
+        {"pipeline_blobs_other_gpu", &Dx11TestApp::testPipelineBlobsOfOtherGpu},
         {"d3d10_device", &Dx11TestApp::testD3D10Device},
         {"state_creation_validation", &Dx11TestApp::testStateCreationValidation},
         {"shader_and_layout_validation", &Dx11TestApp::testShaderAndLayoutValidation},
@@ -10646,6 +10647,115 @@ float4 main(float4 position : SV_Position, float4 t0 : TEXCOORD0, float4 t : TEX
       }
       if (after != recorded) {
         error = formatString("the second process stored pipelines again (%lld -> %lld bytes)", recorded, after);
+        return false;
+      }
+      return true;
+    }
+
+    // Pipeline blobs of another GPU in dxup_pso_cache (a card swapped before
+    // driver.txt existed): no creation tries them, the next process replaces
+    // those it uses, and the first with an unchecked cache removes the rest.
+    bool testPipelineBlobsOfOtherGpu(std::string& error) {
+      if (!runsOnDxup())
+        return true;
+      char path[MAX_PATH] = {};
+      GetModuleFileNameA(nullptr, path, MAX_PATH);
+      std::string directory = path;
+      directory.resize(directory.find_last_of('\\') + 1);
+      const std::string cache = directory + "dxup_pso_cache\\";
+      auto listBlobs = [&] {
+        std::vector<std::string> names;
+        WIN32_FIND_DATAA data = {};
+        HANDLE find = FindFirstFileA((cache + "*.pso").c_str(), &data);
+        if (find != INVALID_HANDLE_VALUE) {
+          do
+            names.push_back(data.cFileName);
+          while (FindNextFileA(find, &data));
+          FindClose(find);
+        }
+        return names;
+      };
+      const std::vector<std::string> before = listBlobs();
+      const std::string argument = formatString("--precompile-child %llu", static_cast<unsigned long long>(GetTickCount64()));
+      if (!runChildProcess(argument.c_str(), error)) {
+        error = "first process: " + error;
+        return false;
+      }
+      std::vector<std::string> added;
+      for (const std::string& name : listBlobs()) {
+        if (std::find(before.begin(), before.end(), name) == before.end())
+          added.push_back(name);
+      }
+      if (added.empty()) {
+        error = "the first process stored no blobs";
+        return false;
+      }
+      // The PCI vendor in the header of the D3D12 runtime.
+      const uint32_t otherVendor = 0x1234;
+      auto blobVendor = [&](const std::string& name) -> uint32_t {
+        uint32_t vendor = 0;
+        if (FILE* file = std::fopen((cache + name).c_str(), "rb")) {
+          std::fseek(file, 36, SEEK_SET);
+          if (std::fread(&vendor, sizeof(vendor), 1, file) != 1)
+            vendor = 0;
+          std::fclose(file);
+        }
+        return vendor;
+      };
+      auto makeOtherGpus = [&](const std::string& name) {
+        if (FILE* file = std::fopen((cache + name).c_str(), "r+b")) {
+          std::fseek(file, 36, SEEK_SET);
+          std::fwrite(&otherVendor, sizeof(otherVendor), 1, file);
+          std::fclose(file);
+        }
+      };
+      for (const std::string& name : added)
+        makeOtherGpus(name);
+      if (!runChildProcess(argument.c_str(), error)) {
+        error = "second process: " + error;
+        return false;
+      }
+      std::string log;
+      if (FILE* file = _fsopen((directory + "logdxup.log").c_str(), "rb", _SH_DENYNO)) {
+        char chunk[4096];
+        size_t size = 0;
+        while ((size = std::fread(chunk, 1, sizeof(chunk), file)) != 0)
+          log.append(chunk, size);
+        std::fclose(file);
+      }
+      if (log.find("cached blob failed") != std::string::npos) {
+        error = "a pipeline creation tried a blob of another GPU";
+        return false;
+      }
+      for (const std::string& name : added) {
+        if (blobVendor(name) == otherVendor) {
+          error = "the second process did not replace " + name;
+          return false;
+        }
+      }
+      // A blob no pipeline asks for.
+      const std::string unused = "1234567812345678.pso";
+      if (!CopyFileA((cache + added[0]).c_str(), (cache + unused).c_str(), FALSE)) {
+        error = formatString("CopyFile failed: %lu", GetLastError());
+        return false;
+      }
+      makeOtherGpus(unused);
+      DeleteFileA((cache + "gpu_checked.txt").c_str());
+      if (!runChildProcess(argument.c_str(), error)) {
+        error = "third process: " + error;
+        return false;
+      }
+      if (blobVendor(unused)) {
+        DeleteFileA((cache + unused).c_str());
+        error = "the unchecked cache kept a blob of another GPU";
+        return false;
+      }
+      if (!blobVendor(added[0])) {
+        error = "the check of the cache removed a blob of this GPU";
+        return false;
+      }
+      if (GetFileAttributesA((cache + "gpu_checked.txt").c_str()) == INVALID_FILE_ATTRIBUTES) {
+        error = "the cache was not marked as checked";
         return false;
       }
       return true;

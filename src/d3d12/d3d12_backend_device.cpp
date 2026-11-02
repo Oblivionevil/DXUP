@@ -5490,6 +5490,10 @@ namespace dxup::d3d12 {
     // Listed at start, read now (on a compiler thread, mostly).
     std::vector<uint8_t> blob;
     readPsoFile(psoDiskPath(keyHash), blob);
+    if (psoBlobOfOtherGpu(blob.data(), blob.size())) {
+      DeleteFileW(psoDiskPath(keyHash).c_str());
+      blob.clear();
+    }
     return blob;
   }
 
@@ -5524,6 +5528,7 @@ namespace dxup::d3d12 {
     // more after a session with a few hundred new pipelines).
     SetThreadDescription(GetCurrentThread(), L"dxup-pso-writer");
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
+    dropPsoBlobsOfOtherGpus();
 
     for (;;) {
       DeferredPsoDiskWrite write;
@@ -5575,6 +5580,8 @@ namespace dxup::d3d12 {
       m_psoBlobsOff = true;
       return;
     }
+    m_psoBlobVendor = desc.VendorId;
+    m_psoBlobDevice = desc.DeviceId;
     char id[96];
     snprintf(id, sizeof(id), "%04x %04x %08x %02x %llu", desc.VendorId, desc.DeviceId, desc.SubSysId, desc.Revision,
              static_cast<unsigned long long>(driver.QuadPart));
@@ -5587,7 +5594,8 @@ namespace dxup::d3d12 {
     }
     if (previous == id)
       return;
-    // Without the file: blobs of an earlier DXUP, from this driver mostly.
+    // Without the file: blobs of an earlier DXUP, from this driver mostly
+    // (those of another GPU: dropPsoBlobsOfOtherGpus).
     if (!previous.empty()) {
       uint32_t removed = 0;
       WIN32_FIND_DATAW fd = {};
@@ -5604,6 +5612,52 @@ namespace dxup::d3d12 {
     std::ofstream f(path, std::ios::binary | std::ios::trunc);
     if (f)
       f.write(id, std::streamsize(std::strlen(id)));
+  }
+
+  // A blob starts with the D3D12 runtime's header, the same with NVIDIA's and
+  // AMD's drivers: a GUID, and at offset 36 the PCI ids of the adapter. With
+  // any other start the driver decides, as for other versions of itself.
+  bool D3D12BackendDevice::psoBlobOfOtherGpu(const uint8_t* blob, size_t size) const {
+    static const uint8_t kRuntimeHeader[16] = { 0xdc, 0x7a, 0xff, 0x3d, 0x1a, 0x9b, 0xf7, 0x48,
+                                                0xb0, 0xe8, 0x02, 0x81, 0x52, 0xaf, 0xd8, 0xa3 };
+    uint32_t ids[2];
+    if (!m_psoBlobVendor || size < 36 + sizeof(ids) || std::memcmp(blob, kRuntimeHeader, sizeof(kRuntimeHeader)))
+      return false;
+    std::memcpy(ids, blob + 36, sizeof(ids));
+    return ids[0] != m_psoBlobVendor || ids[1] != m_psoBlobDevice;
+  }
+
+  void D3D12BackendDevice::dropPsoBlobsOfOtherGpus() {
+    const std::wstring marker = m_psoDiskCacheDir + L"\\gpu_checked.txt";
+    if (!m_psoBlobVendor || GetFileAttributesW(marker.c_str()) != INVALID_FILE_ATTRIBUTES)
+      return;
+    uint32_t removed = 0;
+    WIN32_FIND_DATAW fd = {};
+    HANDLE find = FindFirstFileW((m_psoDiskCacheDir + L"\\*.pso").c_str(), &fd);
+    if (find != INVALID_HANDLE_VALUE) {
+      do {
+        {
+          // The device's destruction waits for this thread: the next run goes on.
+          std::lock_guard<std::mutex> lock(m_psoDiskWriteMutex);
+          if (m_stopPsoDiskWriter) {
+            FindClose(find);
+            return;
+          }
+        }
+        const std::wstring path = m_psoDiskCacheDir + L"\\" + fd.cFileName;
+        uint8_t header[44];
+        size_t size = 0;
+        if (FILE* file = _wfsopen(path.c_str(), L"rb", _SH_DENYNO)) {
+          size = fread(header, 1, sizeof(header), file);
+          fclose(file);
+        }
+        if (psoBlobOfOtherGpu(header, size) && DeleteFileW(path.c_str()))
+          removed++;
+      } while (FindNextFileW(find, &fd));
+      FindClose(find);
+    }
+    std::ofstream f(marker, std::ios::binary | std::ios::trunc);
+    logMessage(LogLevel::Info, "PSO disk cache: %u pipeline blobs of another GPU removed", removed);
   }
 
   void D3D12BackendDevice::loadPsoDiskCache() {

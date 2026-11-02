@@ -1660,6 +1660,13 @@ namespace dxup::d3d12 {
     // cache names the adapter and driver the blobs came from; software
     // adapters keep none (m_psoBlobsOff).
     void dropPsoBlobsOfOtherDrivers();
+    // Blobs from before driver.txt, which a swapped GPU left behind: whether
+    // one is another GPU's (by its header, so that no creation tries it), and
+    // all of them once per cache (gpu_checked.txt) on the writer thread.
+    bool psoBlobOfOtherGpu(const uint8_t* blob, size_t size) const;
+    void dropPsoBlobsOfOtherGpus();
+    uint32_t m_psoBlobVendor = 0;
+    uint32_t m_psoBlobDevice = 0;
     std::wstring psoDiskPath(uint64_t keyHash) const;
     std::vector<uint8_t> takePsoDiskBlob(uint64_t keyHash);
     void deferPsoBlobWrite(uint64_t keyHash, ID3D12PipelineState* pso);
