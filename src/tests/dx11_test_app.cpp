@@ -455,6 +455,7 @@ void main(uint2 id : SV_DispatchThreadID) {
         {"output_closest_mode", &Dx11TestApp::testOutputClosestMode},
         {"swap_chain_one_buffer_resize", &Dx11TestApp::testSwapChainOneBufferResize},
         {"unbound_resources_read_zero", &Dx11TestApp::testUnboundResourcesReadZero},
+        {"unbound_constant_buffers_after_clear", &Dx11TestApp::testUnboundConstantBuffersAfterClear},
         {"recreated_texture_uav", &Dx11TestApp::testRecreatedTextureUav},
         {"constant_buffer_update_sequence", &Dx11TestApp::testConstantBufferUpdateSequence},
         {"occlusion_queries_across_passes", &Dx11TestApp::testOcclusionQueriesAcrossPasses},
@@ -10683,6 +10684,108 @@ float4 main(float4 position : SV_Position, float4 t0 : TEXCOORD0, float4 t : TEX
     // (DXUP gave such registers other dispatches' or random descriptors).
     // The result buffer stays bound for unordered access while it is copied
     // from: the next dispatch writes it again before the next copy.
+    // Shaders read constant buffers the application never bound, in the first
+    // draw and dispatch of a command list after ClearState: zeros, and a hung
+    // GPU on AMD while their root arguments were left unset.
+    bool testUnboundConstantBuffersAfterClear(std::string& error) {
+      static const char* kVs = R"(
+cbuffer Offset : register(b0) { float4 offsetValue; };
+float4 main(uint id : SV_VertexID) : SV_Position {
+  float2 uv = float2((id << 1) & 2, id & 2);
+  return float4(uv * float2(2.0f, -2.0f) + float2(-1.0f, 1.0f), 0.0f, 1.0f) + offsetValue;
+}
+)";
+      static const char* kPs = R"(
+cbuffer Color : register(b0) { float4 colorValue; };
+float4 main() : SV_Target { return colorValue + float4(0.25f, 0.5f, 0.75f, 1.0f); }
+)";
+      static const char* kCs = R"(
+cbuffer Value : register(b0) { uint value; };
+RWByteAddressBuffer result : register(u0);
+[numthreads(1, 1, 1)] void main() { result.Store(0, value + 7); }
+)";
+      TextureTarget target;
+      if (!createColorTarget(16, 16, D3D11_BIND_RENDER_TARGET, target, error))
+        return false;
+      ComPtr<ID3D11VertexShader> vs;
+      ComPtr<ID3DBlob> vsBytecode;
+      ComPtr<ID3D11PixelShader> ps;
+      ComPtr<ID3D11ComputeShader> cs;
+      if (!createVertexShader(kVs, "main", vs, vsBytecode, error)
+       || !createPixelShader(kPs, "main", ps, error)
+       || !createComputeShader(kCs, "main", cs, error))
+        return false;
+      D3D11_BUFFER_DESC resultDesc = { 16, D3D11_USAGE_DEFAULT, D3D11_BIND_UNORDERED_ACCESS, 0,
+        D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS, 0 };
+      ComPtr<ID3D11Buffer> result;
+      HRESULT hr = m_device->CreateBuffer(&resultDesc, nullptr, result.GetAddressOf());
+      D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc = {};
+      uavDesc.Format = DXGI_FORMAT_R32_TYPELESS;
+      uavDesc.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
+      uavDesc.Buffer.NumElements = 4;
+      uavDesc.Buffer.Flags = D3D11_BUFFER_UAV_FLAG_RAW;
+      ComPtr<ID3D11UnorderedAccessView> uav;
+      if (SUCCEEDED(hr))
+        hr = m_device->CreateUnorderedAccessView(result.Get(), &uavDesc, uav.GetAddressOf());
+      ComPtr<ID3D11DeviceContext> deferred;
+      if (SUCCEEDED(hr))
+        hr = m_device->CreateDeferredContext(0, deferred.GetAddressOf());
+      if (FAILED(hr)) {
+        error = "resource creation failed: " + formatHResult(hr);
+        return false;
+      }
+
+      auto recordDraw = [&](ID3D11DeviceContext* context) {
+        ID3D11RenderTargetView* rtv = target.rtv.Get();
+        const D3D11_VIEWPORT viewport = { 0.0f, 0.0f, 16.0f, 16.0f, 0.0f, 1.0f };
+        context->OMSetRenderTargets(1, &rtv, nullptr);
+        context->RSSetViewports(1, &viewport);
+        context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        context->VSSetShader(vs.Get(), nullptr, 0);
+        context->PSSetShader(ps.Get(), nullptr, 0);
+        context->Draw(3, 0);
+      };
+      auto recordDispatch = [&](ID3D11DeviceContext* context) {
+        context->CSSetShader(cs.Get(), nullptr, 0);
+        context->CSSetUnorderedAccessViews(0, 1, uav.GetAddressOf(), nullptr);
+        context->Dispatch(1, 1, 1);
+      };
+      const float black[4] = {};
+      const UINT stale[4] = { 1, 1, 1, 1 };
+      for (int round = 0; round < 8; round++) {
+        const bool useDeferred = (round & 1) != 0;
+        m_context->ClearRenderTargetView(target.rtv.Get(), black);
+        m_context->ClearUnorderedAccessViewUint(uav.Get(), stale);
+        m_context->Flush();
+        m_context->ClearState();
+        if (useDeferred) {
+          recordDraw(deferred.Get());
+          recordDispatch(deferred.Get());
+          ComPtr<ID3D11CommandList> list;
+          hr = deferred->FinishCommandList(FALSE, list.GetAddressOf());
+          if (FAILED(hr)) {
+            error = "FinishCommandList failed: " + formatHResult(hr);
+            return false;
+          }
+          m_context->ExecuteCommandList(list.Get(), FALSE);
+        } else {
+          recordDraw(m_context.Get());
+          recordDispatch(m_context.Get());
+        }
+        m_context->ClearState();
+        if (!expectTexturePixel(target.texture.Get(), 8, 8, Rgba8{ 64, 128, 191, 255 }, 1, error))
+          return false;
+        std::vector<uint32_t> values;
+        if (!readBackUints(result.Get(), 1, values, error))
+          return false;
+        if (values[0] != 7) {
+          error = formatString("round %d: compute shader wrote %u, expected 7", round, values[0]);
+          return false;
+        }
+      }
+      return true;
+    }
+
     bool testUnboundResourcesReadZero(std::string& error) {
       static const char* kCs = R"(
 Texture2D<float4> first : register(t0);
