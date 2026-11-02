@@ -1339,6 +1339,7 @@ namespace dxup::d3d12 {
     GpuProfiler m_gpuProfiler;
     // dxgi.lowLatency: each frame's GPU begin and end, and the pacing of
     // waitForFrameLatency without the CS worker (application thread).
+    int64_t m_pacedGpuEnd = 0;
     FrameTimer m_frameTimer;
     LatencyPacer m_latencyPacer;
     uint64_t m_pacedFrame = 0;

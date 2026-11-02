@@ -7936,13 +7936,19 @@ namespace dxup::d3d12 {
     for (const uint64_t done = m_presentCount > maxLatency ? m_presentCount - maxLatency : 0; m_pacedFrame < done;
          m_pacedFrame++) {
       double busyMs = 0.0, lateMs = 0.0;
-      if (frameGpuTiming(m_pacedFrame, busyMs, lateMs))
+      int64_t ended = 0;
+      if (frameGpuTiming(m_pacedFrame, busyMs, lateMs, &ended)) {
         m_latencyPacer.noteGpuFrame(busyMs, lateMs);
+        m_pacedGpuEnd = ended;
+      }
     }
-    if (const double sleepMs = m_latencyPacer.sleepMs())
-      paceSleep(m_pacingTimer, sleepMs, [](HANDLE timer, DWORD timeout) { WaitForSingleObject(timer, timeout); });
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
+    const double sleepMs = m_pacedGpuEnd ? m_latencyPacer.sleepMs(double(now.QuadPart - m_pacedGpuEnd) * msPerTick) : 0.0;
+    if (sleepMs > 0.0) {
+      paceSleep(m_pacingTimer, sleepMs, [](HANDLE timer, DWORD timeout) { WaitForSingleObject(timer, timeout); });
+      QueryPerformanceCounter(&now);
+    }
     m_pacingReturn = now.QuadPart;
 #else
     (void)maxLatency;

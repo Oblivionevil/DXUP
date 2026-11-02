@@ -479,6 +479,7 @@ namespace dxup {
     // logged every 1000 frames.
     bool                    m_latencyStats = false;
     int64_t                 m_frameStarts[kPresentHistory] = {};
+    int64_t                 m_pacedGpuEnd = 0;    // the end of the latest frame's GPU work known (QPC)
     std::vector<double>     m_frameLatencies;
     uint64_t                m_pacedFrame = 0;
     int64_t                 m_pacingReturn = 0;

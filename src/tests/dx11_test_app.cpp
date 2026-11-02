@@ -25393,7 +25393,8 @@ float4 main(float4 p : SV_Position) : SV_Target {
       };
 
       // The draw's GPU time, from timestamps around it in frames 10-19,
-      // 50-59 and 90-99; sized after each of those to about 8 ms.
+      // 50-59 and 90-99; sized after each of those to about 7 ms: clear of
+      // 8.33 ms, the display's every other refresh at 240 Hz with forced VSync.
       D3D11_QUERY_DESC disjointDesc = { D3D11_QUERY_TIMESTAMP_DISJOINT, 0 };
       D3D11_QUERY_DESC timestampDesc = { D3D11_QUERY_TIMESTAMP, 0 };
       ComPtr<ID3D11Query> disjoint, before, after;
@@ -25411,7 +25412,7 @@ float4 main(float4 p : SV_Position) : SV_Target {
           std::sort(drawMs.begin(), drawMs.end());
           const double ms = drawMs[drawMs.size() / 2];
           drawMs.clear();
-          const double scale = (std::min)(64.0, (std::max)(1.0 / 64.0, 8.0 / (std::max)(ms, 0.01)));
+          const double scale = (std::min)(64.0, (std::max)(1.0 / 64.0, 7.0 / (std::max)(ms, 0.01)));
           iterations = uint32_t((std::min)(double(1u << 24), (std::max)(16.0, iterations * scale)));
         }
         LARGE_INTEGER now;

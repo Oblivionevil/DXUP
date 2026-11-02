@@ -188,26 +188,30 @@ namespace dxup::d3d12 {
 #endif
 
   // dxgi.lowLatency on the application thread: how long to hold the next
-  // frame back, so that its work reaches the GPU just before the GPU is done
-  // with the frame before (Reflex-like). Without it a GPU-bound game starts
-  // a frame as soon as the frame latency allows and its input waits a frame
-  // in the queue. A frame whose work reached the GPU only after the frame
-  // before was done (the GPU waited for it: held back too long) widens the
-  // margin; frames on time narrow it again, so it settles where the GPU just
-  // stays busy. Waits for the display (VSync) do not count.
+  // frame back, so that its first command list reaches the GPU just before
+  // the GPU is done with the frame before (Reflex-like). Without it a
+  // GPU-bound game starts a frame as soon as the frame latency allows and its
+  // input waits a frame in the queue. A frame whose first list reached the
+  // GPU only after the frame before was done (the GPU waited for it: held back
+  // too long) widens the margin; frames on time narrow it again, so it settles
+  // where the GPU just stays busy. Waits for the display (VSync) do not count.
   class LatencyPacer {
   public:
     // A frame the GPU finished: its GPU time and how long after the end of
     // the frame before its work arrived (0 if before).
     void noteGpuFrame(double busyMs, double lateMs) {
       m_gpu[m_gpuCount++ % kHistory] = busyMs;
-      // Grows at once, shrinks by a percent a frame: at most a frame's GPU
-      // time, beyond which nothing is held back anyway.
+      // Grows at once, shrinks by a quarter percent a frame (about one frame
+      // in forty late): at most a frame's GPU time, beyond which nothing is
+      // held back anyway. By little at a time: a single frame late by
+      // milliseconds (the game hitched) says nothing about the next, whose
+      // input would wait for hundreds of frames.
       if (lateMs > kLateMs) {
-        m_marginMs = (std::min)(m_marginMs + (std::max)(kMarginStepMs, lateMs), (std::max)(busyMs, kMinMarginMs));
+        const double step = (std::min)((std::max)(kMarginStepMs, lateMs), kMarginMaxStepMs);
+        m_marginMs = (std::min)(m_marginMs + step, (std::max)(busyMs, kMinMarginMs));
         m_late++;
       } else {
-        m_marginMs = (std::max)(m_marginMs - (std::max)(kMarginDecayMs, m_marginMs * 0.01), kMinMarginMs);
+        m_marginMs = (std::max)(m_marginMs - (std::max)(kMarginDecayMs, m_marginMs * kMarginDecay), kMinMarginMs);
       }
     }
 
@@ -215,15 +219,20 @@ namespace dxup::d3d12 {
     // Present to this one.
     void noteCpuFrame(double ms) { m_cpu[m_cpuCount++ % kHistory] = ms; }
 
-    // How long to hold the next frame back now (0 when not GPU-bound).
-    double sleepMs() const {
+    // How long to hold the next frame back now, sinceEndMs after the end of
+    // the GPU work of the latest frame done (0 when not GPU-bound: the
+    // application with its slow frames has no time to spare). The GPU then
+    // works on the frame after that for its usual time; the application may
+    // still be recording while the GPU begins the next one.
+    double sleepMs(double sinceEndMs) const {
       if (m_gpuCount < kHistory || m_cpuCount < kHistory)
         return 0.0;
-      // The GPU's usual frame against the application's slow ones.
       const double gpu = percentile(m_gpu, 0.5);
       const double cpu = percentile(m_cpu, 0.75);
-      const double sleep = gpu - cpu - m_marginMs;
-      return sleep > 0.05 ? (std::min)(sleep, gpu) : 0.0;
+      if (gpu - cpu - m_marginMs <= kMinSleepMs)
+        return 0.0;
+      const double sleep = gpu - m_marginMs - sinceEndMs;
+      return sleep > kMinSleepMs ? (std::min)(sleep, gpu) : 0.0;
     }
 
     double marginMs() const { return m_marginMs; }
@@ -232,8 +241,11 @@ namespace dxup::d3d12 {
   private:
     static constexpr uint32_t kHistory = 16;
     static constexpr double kLateMs = 0.05;
+    static constexpr double kMinSleepMs = 0.05;
     static constexpr double kMarginStepMs = 0.25;
-    static constexpr double kMarginDecayMs = 0.02;
+    static constexpr double kMarginMaxStepMs = 0.5;
+    static constexpr double kMarginDecay = 0.0025;
+    static constexpr double kMarginDecayMs = 0.005;
     static constexpr double kMinMarginMs = 0.3;
 
     static double percentile(const double (&values)[kHistory], double p) {

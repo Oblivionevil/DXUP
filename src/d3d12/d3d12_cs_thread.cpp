@@ -1527,12 +1527,15 @@ namespace dxup {
       if (m_pacedFrame + kPresentHistory > m_presents && index != UINT64_MAX
        && real->frameGpuTiming(index, busyMs, lateMs, &ended)) {
         m_latencyPacer.noteGpuFrame(busyMs, lateMs);
+        m_pacedGpuEnd = ended;
         const int64_t start = m_frameStarts[m_pacedFrame % kPresentHistory];
         if (start && ended > start)
           m_frameLatencies.push_back(double(ended - start) * msPerTick);
       }
     }
-    const double sleepMs = m_lowLatency ? m_latencyPacer.sleepMs() : 0.0;
+    QueryPerformanceCounter(&now);
+    const double sleepMs = m_lowLatency && m_pacedGpuEnd
+      ? m_latencyPacer.sleepMs(double(now.QuadPart - m_pacedGpuEnd) * msPerTick) : 0.0;
     if (sleepMs > 0.0) {
       HitchScope hitch("app lowLatency sleep");
       d3d12::paceSleep(m_pacingTimer, sleepMs, [](HANDLE timer, DWORD timeout) { waitTakingSentMessages(timer, timeout); });
@@ -1545,7 +1548,9 @@ namespace dxup {
         median = m_frameLatencies[m_frameLatencies.size() / 2];
         p95 = m_frameLatencies[m_frameLatencies.size() * 95 / 100];
       }
-      logMessage(LogLevel::Info, "frame latency: frame start to GPU done %.2f ms (p95 %.2f) over %zu frames; "
+      // The marker asks for them; else with the info log.
+      static const bool asked = dxupSiblingExists("dxup_latency_stats.txt");
+      logMessage(asked ? LogLevel::Warn : LogLevel::Info, "frame latency: frame start to GPU done %.2f ms (p95 %.2f) over %zu frames; "
         "low latency %s: held back %.3f ms a frame, margin %.2f ms, %llu frames late so far",
         median, p95, m_frameLatencies.size(), m_lowLatency ? "on" : "off", m_pacingSleptMs / m_pacingFrames,
         m_latencyPacer.marginMs(), static_cast<unsigned long long>(m_latencyPacer.lateFrames()));
