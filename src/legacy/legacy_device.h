@@ -539,6 +539,7 @@ namespace dxup::legacy {
     struct TransformConstants;
     struct VertexConstants;
     struct PixelConstants;
+    void selectFfpPixelVariant(const PixelConstants& constants);
     struct ShaderFixedConstants;
     struct DrawArgs;
     struct ShaderWarmup;
@@ -635,6 +636,13 @@ namespace dxup::legacy {
     std::vector<std::unique_ptr<SwapChain>> m_swapChains;
     Ref<ID3D11VertexShader>         m_ffpVs;
     Ref<ID3D11PixelShader>          m_ffpPs;
+    // The fixed-function pixel shader compiled for one setup of stages, fog
+    // and alpha test, by the setup's hash. m_ffpPs draws until it is done.
+    struct FfpPixelVariant;
+    std::unordered_map<uint64_t, std::shared_ptr<FfpPixelVariant>> m_ffpPixelVariants;
+    FfpPixelVariant*                m_ffpPixelVariant = nullptr;
+    uint64_t                        m_ffpPixelSetup = 0;
+    ID3D11PixelShader*              m_boundFfpPs = nullptr;
     Ref<ID3D11VertexShader>         m_quadVs;
     Ref<ID3D11PixelShader>          m_clearPs;
     Ref<ID3D11PixelShader>          m_blitPs;

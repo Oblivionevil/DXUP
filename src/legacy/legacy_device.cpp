@@ -9,6 +9,7 @@
 
 #include "ffp_vs.h"
 #include "ffp_ps.h"
+#include "ffp_source.h"
 #include "quad_vs.h"
 #include "clear_ps.h"
 #include "blit_ps.h"
@@ -3527,6 +3528,149 @@ namespace dxup::legacy {
     c->pixelFlags[2] = !tableMode && vertexMode && rs[RsRangeFogEnable] ? 1 : 0;
     writeBuffer(m_pixelConstants.get(), 0, c, sizeof(*c), true);
     m_pixelConstantsDirty = false;
+    selectFfpPixelVariant(*c);
+  }
+
+  struct Device::FfpPixelVariant {
+    Ref<ID3D11PixelShader> shader;
+    std::atomic<ID3D11PixelShader*> ready{ nullptr };
+  };
+
+  namespace {
+    // What the macros of ffp.hlsl take: the stages' operations and arguments,
+    // then specular, fog, range fog, fog mode, alpha test and its function.
+    constexpr uint32_t kFfpSetupWords = 8 * 8 + 6;
+    // More setups than any game has: what goes on past it is not worth
+    // compiling for.
+    constexpr size_t kMaxFfpPixelVariants = 1024;
+
+    bool ffpVariantsOff() {
+      static const bool off = dxupSiblingExists("dxup_ffp_uber.txt");
+      return off;
+    }
+
+    // For tests: every draw with its variant, not after it compiled.
+    bool ffpVariantsWait() {
+      static const bool wait = dxupSiblingExists("dxup_ffp_wait.txt");
+      return wait;
+    }
+
+    bool compileFfpPixelShader(const std::array<uint32_t, kFfpSetupWords>& setup, uint32_t stageCount, uint64_t hash, std::vector<uint8_t>& code) {
+      static const uint64_t sourceHash = [] {
+        uint64_t value = 14695981039346656037ull;
+        for (char c : g_ffp_source)
+          value = fnv64Multiply(value ^ uint8_t(c));
+        return value;
+      }();
+      const uint64_t cacheKey = fnv64Multiply(hash ^ sourceHash);
+      if (ShaderDiskCache::instance().find(cacheKey, code))
+        return true;
+      CompileFunction compileHlsl = compiler();
+      if (!compileHlsl)
+        return false;
+      std::string ops, args;
+      for (uint32_t stage = 0; stage < 8; stage++) {
+        const uint32_t* s = setup.data() + stage * 8;
+        char text[80];
+        sprintf_s(text, "%suint4(%u,%u,%u,%u)", stage ? "," : "", s[0], s[1], s[2], s[3]);
+        ops += text;
+        sprintf_s(text, "%suint4(%u,%u,%u,%u)", stage ? "," : "", s[4], s[5], s[6], s[7]);
+        args += text;
+      }
+      const uint32_t* flags = setup.data() + 64;
+      char count[12], specular[12], fog[12], rangeFog[12], fogMode[12], alphaTest[12], alphaFunction[12];
+      sprintf_s(count, "%u", stageCount);
+      sprintf_s(specular, "%u", flags[0]);
+      sprintf_s(fog, "%u", flags[1]);
+      sprintf_s(rangeFog, "%u", flags[2]);
+      sprintf_s(fogMode, "%u", flags[3]);
+      sprintf_s(alphaTest, "%u", flags[4]);
+      sprintf_s(alphaFunction, "%u", flags[5]);
+      const D3D_SHADER_MACRO macros[] = {
+        { "FFP_STAGE_COUNT", count }, { "FFP_STAGE_OPS", ops.c_str() }, { "FFP_STAGE_ARGS", args.c_str() },
+        { "FFP_SPECULAR", specular }, { "FFP_FOG", fog }, { "FFP_RANGE_FOG", rangeFog }, { "FFP_FOG_MODE", fogMode },
+        { "FFP_ALPHA_TEST", alphaTest }, { "FFP_ALPHA_FUNCTION", alphaFunction }, { nullptr, nullptr },
+      };
+      ID3DBlob* blob = nullptr;
+      ID3DBlob* errors = nullptr;
+      const HRESULT hr = compileHlsl(g_ffp_source, sizeof(g_ffp_source), "ffp", macros, nullptr, "ps_main", "ps_5_0",
+        D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &blob, &errors);
+      if (FAILED(hr)) {
+        logMessage(LogLevel::Warn, "fixed-function pixel variant failed to compile: %s",
+          errors ? static_cast<const char*>(errors->GetBufferPointer()) : "");
+        if (errors) errors->Release();
+        return false;
+      }
+      code.assign(static_cast<const uint8_t*>(blob->GetBufferPointer()),
+        static_cast<const uint8_t*>(blob->GetBufferPointer()) + blob->GetBufferSize());
+      blob->Release();
+      if (errors) errors->Release();
+      ShaderDiskCache::instance().store(cacheKey, code.data(), code.size());
+      return true;
+    }
+  }
+
+  void Device::selectFfpPixelVariant(const PixelConstants& c) {
+    if (ffpVariantsOff())
+      return;
+    // Only what the macros take: colors, factors and matrices stay constants.
+    // Fog and alpha test modes count while they are on.
+    const uint32_t stageCount = c.pixelFlags[1];
+    uint32_t flags[kFfpSetupWords - 64] = {};
+    flags[0] = c.alphaTest[3] != 0.0f;
+    flags[1] = c.pixelFlags[0];
+    if (flags[1]) {
+      flags[2] = c.pixelFlags[2];
+      flags[3] = uint32_t(c.fogTable[3]);
+    }
+    flags[4] = c.alphaTest[2] != 0.0f;
+    if (flags[4])
+      flags[5] = uint32_t(c.alphaTest[1]);
+    uint64_t hash = fnv64Multiply(14695981039346656037ull ^ stageCount);
+    for (uint32_t stage = 0; stage < stageCount; stage++) {
+      for (uint32_t i = 0; i < 4; i++)
+        hash = fnv64Multiply(hash ^ c.stageOps[stage][i]);
+      for (uint32_t i = 0; i < 4; i++)
+        hash = fnv64Multiply(hash ^ c.stageArgs[stage][i]);
+    }
+    for (uint32_t flag : flags)
+      hash = fnv64Multiply(hash ^ flag);
+    if (hash == m_ffpPixelSetup)
+      return;
+    m_ffpPixelSetup = hash;
+
+    auto found = m_ffpPixelVariants.find(hash);
+    if (found != m_ffpPixelVariants.end()) {
+      m_ffpPixelVariant = found->second.get();
+      return;
+    }
+    if (m_ffpPixelVariants.size() >= kMaxFfpPixelVariants) {
+      m_ffpPixelVariant = nullptr;
+      return;
+    }
+    auto variant = std::make_shared<FfpPixelVariant>();
+    m_ffpPixelVariants.emplace(hash, variant);
+    m_ffpPixelVariant = variant.get();
+    std::array<uint32_t, kFfpSetupWords> setup = {};
+    for (uint32_t stage = 0; stage < stageCount; stage++) {
+      std::memcpy(&setup[stage * 8], c.stageOps[stage], 16);
+      std::memcpy(&setup[stage * 8 + 4], c.stageArgs[stage], 16);
+    }
+    std::memcpy(&setup[64], flags, sizeof(flags));
+    // Its reference keeps the device for the worker.
+    ID3D11Device* device = m_device.get();
+    device->AddRef();
+    auto compile = [device, variant, setup, stageCount, hash] {
+      std::vector<uint8_t> code;
+      if (compileFfpPixelShader(setup, stageCount, hash, code)
+       && SUCCEEDED(device->CreatePixelShader(code.data(), code.size(), nullptr, variant->shader.put())))
+        variant->ready.store(variant->shader.get(), std::memory_order_release);
+      device->Release();
+    };
+    if (ffpVariantsWait())
+      compile();
+    else
+      CompilePool::instance().post(compile, true);
   }
 
   // dxup_frame_dump.txt next to the DLL (DXUP Manager's "Record a problem").
@@ -4589,7 +4733,10 @@ namespace dxup::legacy {
     const bool ffpPixel = !m_psVariant;
     if (m_dirty & DirtyShaders) {
       m_context->VSSetShader(m_vsVariant ? m_vsVariant->vs.get() : m_ffpVs.get(), nullptr, 0);
-      m_context->PSSetShader(m_psVariant ? m_psVariant->ps.get() : m_ffpPs.get(), nullptr, 0);
+      // The fixed-function one below, with its constants.
+      if (m_psVariant)
+        m_context->PSSetShader(m_psVariant->ps.get(), nullptr, 0);
+      m_boundFfpPs = nullptr;
       // A shader's window binds b0 (bindShaderConstants keeps the bound
       // one when it fits); the other buffers change with the kind of stage
       // only.
@@ -4637,6 +4784,13 @@ namespace dxup::legacy {
     if (ffpPixel) {
       if (m_pixelConstantsDirty)
         updatePixelConstants();
+      ID3D11PixelShader* ffpPs = m_ffpPixelVariant ? m_ffpPixelVariant->ready.load(std::memory_order_acquire) : nullptr;
+      if (!ffpPs)
+        ffpPs = m_ffpPs.get();
+      if (ffpPs != m_boundFfpPs) {
+        m_context->PSSetShader(ffpPs, nullptr, 0);
+        m_boundFfpPs = ffpPs;
+      }
     } else {
       if (m_shaderConstantsDirty[1])
         updateShaderConstants(true);

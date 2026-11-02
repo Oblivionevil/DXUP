@@ -1,7 +1,10 @@
 // The fixed-function pipeline of Direct3D 7 to 9 as one vertex and one pixel
-// shader, driven by constants: no shader compilation while a game runs. The
-// legacy device fills the constant buffers from the render, texture stage and
+// shader, driven by constants: nothing has to compile for a draw. The legacy
+// device fills the constant buffers from the render, texture stage and
 // transform states; branches on them are uniform across a draw.
+// The branches of the pixel shader cost two thirds of its GPU time, so each
+// setup of it also compiles in the background with the macros below given
+// (Device::selectFfpPixelVariant) and replaces it once it is done.
 
 // Matrices are given in Direct3D's row-major layout, for mul(vector, matrix).
 #pragma pack_matrix(row_major)
@@ -259,6 +262,30 @@ cbuffer FfpPixel : register(b1) {
   uint4  pixelFlags;             // fog enabled, stage count, range fog
 };
 
+#ifdef FFP_STAGE_COUNT
+static const uint4 fixedStageOps[MAX_STAGES] = { FFP_STAGE_OPS };
+static const uint4 fixedStageArgs[MAX_STAGES] = { FFP_STAGE_ARGS };
+#define STAGE_OPS(stage)    fixedStageOps[stage]
+#define STAGE_ARGS(stage)   fixedStageArgs[stage]
+#define STAGE_COUNT         FFP_STAGE_COUNT
+#define SPECULAR_ENABLED    (FFP_SPECULAR != 0)
+#define FOG_ENABLED         (FFP_FOG != 0)
+#define RANGE_FOG           (FFP_RANGE_FOG != 0)
+#define FOG_MODE            FFP_FOG_MODE
+#define ALPHA_TEST_ENABLED  (FFP_ALPHA_TEST != 0)
+#define ALPHA_FUNCTION      FFP_ALPHA_FUNCTION
+#else
+#define STAGE_OPS(stage)    stageOps[stage]
+#define STAGE_ARGS(stage)   stageArgs[stage]
+#define STAGE_COUNT         pixelFlags.y
+#define SPECULAR_ENABLED    (alphaTest.w != 0.0f)
+#define FOG_ENABLED         (pixelFlags.x != 0)
+#define RANGE_FOG           (pixelFlags.z != 0)
+#define FOG_MODE            ((uint)fogTable.w)
+#define ALPHA_TEST_ENABLED  (alphaTest.z != 0.0f)
+#define ALPHA_FUNCTION      ((uint)alphaTest.y)
+#endif
+
 float4 argument(uint arg, float4 diffuse, float4 current, float4 texel, float4 specular, float4 temp, float4 constant) {
   float4 value;
   switch (arg & 0xfu) {
@@ -306,7 +333,7 @@ float4 combine(uint op, float4 a1, float4 a2, float4 a0, float4 diffuse, float4 
 
 bool alphaPasses(float alpha) {
   const float reference = alphaTest.x;
-  switch ((uint)alphaTest.y) {
+  switch (ALPHA_FUNCTION) {
     case 1:  return false;
     case 2:  return alpha < reference;
     case 3:  return alpha == reference;
@@ -328,8 +355,8 @@ float4 ps_main(PSInput input) : SV_Target {
 
   [unroll]
   for (uint stage = 0; stage < MAX_STAGES; stage++) {
-    const uint4 ops = stageOps[stage];
-    if (stage >= pixelFlags.y || ops.x == 1)
+    const uint4 ops = STAGE_OPS(stage);
+    if (stage >= STAGE_COUNT || ops.x == 1)
       break;
     const uint textureType = ops.w & 0xfu;
     float4 tc = input.tex[stage];
@@ -366,7 +393,7 @@ float4 ps_main(PSInput input) : SV_Target {
       continue;
     }
 
-    const uint4 args = stageArgs[stage];
+    const uint4 args = STAGE_ARGS(stage);
     const float4 constant = stageConstant[stage];
     const float4 c1 = argument(args.x, diffuse, current, texel, specular, temp, constant);
     const float4 c2 = argument(args.y, diffuse, current, texel, specular, temp, constant);
@@ -392,13 +419,13 @@ float4 ps_main(PSInput input) : SV_Target {
       current = result;
   }
 
-  if (alphaTest.w != 0.0f)
+  if (SPECULAR_ENABLED)
     current.rgb = saturate(current.rgb + specular.rgb);
 
-  if (pixelFlags.x != 0) {
+  if (FOG_ENABLED) {
     float fog = input.fog.x;
-    const uint tableMode = (uint)fogTable.w;
-    const float depth = pixelFlags.z != 0 ? input.fog.z : input.fog.y;
+    const uint tableMode = FOG_MODE;
+    const float depth = RANGE_FOG ? input.fog.z : input.fog.y;
     if (tableMode == 3)
       fog = saturate((fogTable.y - depth) / fogRange(fogTable.x, fogTable.y));
     else if (tableMode == 1)
@@ -408,7 +435,7 @@ float4 ps_main(PSInput input) : SV_Target {
     current.rgb = lerp(fogColor.rgb, current.rgb, fog);
   }
 
-  if (alphaTest.z != 0.0f && !alphaPasses(current.a))
+  if (ALPHA_TEST_ENABLED && !alphaPasses(current.a))
     discard;
   return current;
 }

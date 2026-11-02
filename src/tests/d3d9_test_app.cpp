@@ -4805,6 +4805,21 @@ int main(int argc, char** argv) {
                 "worker_thread", code);
     ok ? passed++ : failed++;
   }
+  // The scenes again with the fixed-function pixel shader compiled for each
+  // setup before its draw, as a game gets it soon after the first one.
+  if (!filter || std::strstr("ffp_variants", filter)) {
+    const std::wstring marker = dir + L"dxup_ffp_wait.txt";
+    int code = -1;
+    if (FILE* f = _wfopen(marker.c_str(), L"w")) {
+      std::fclose(f);
+      code = runSelf("--worker-child", 600000);
+      DeleteFileW(marker.c_str());
+    }
+    const bool ok = code == 0;
+    std::printf("%s %-20s every scene with specialized fixed-function pixel shaders (child exit %d: scenes differing)\n", ok ? "ok  " : "FAIL",
+                "ffp_variants", code);
+    ok ? passed++ : failed++;
+  }
   // What leaves objects out is logged with saved frames on: a draw DXUP
   // could not draw and a failed call (a child with dxup_frame_dump.txt).
   if (!filter || std::strstr("dropped_report", filter)) {

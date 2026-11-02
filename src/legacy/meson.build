@@ -18,6 +18,14 @@ foreach shader : [
   )
 endforeach
 
+# The source of the fixed-function pixel shader, for the variants compiled
+# while a game runs (Device::selectFfpPixelVariant).
+legacy_shaders += custom_target('ffp_source',
+  input   : 'ffp.hlsl',
+  output  : 'ffp_source.h',
+  command : [find_program('python3', 'python'), files('embed_source.py'), '@INPUT@', '@OUTPUT@', 'g_ffp_source'],
+)
+
 legacy_lib = static_library('dxup_legacy',
   ['legacy_selftest.cpp', 'd3d9_shader.cpp', 'd3d9_dxbc.cpp', legacy_shaders],
   include_directories : ['.', '..'],
