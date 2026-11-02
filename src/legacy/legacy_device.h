@@ -540,6 +540,7 @@ namespace dxup::legacy {
     struct VertexConstants;
     struct PixelConstants;
     void selectFfpPixelVariant(const PixelConstants& constants);
+    void bindFfpPixelShader();
     struct ShaderFixedConstants;
     struct DrawArgs;
     struct ShaderWarmup;

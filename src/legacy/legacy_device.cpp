@@ -3526,15 +3526,29 @@ namespace dxup::legacy {
     c->pixelFlags[0] = rs[RsFogEnable] ? 1 : 0;
     c->pixelFlags[1] = stageCount;
     c->pixelFlags[2] = !tableMode && vertexMode && rs[RsRangeFogEnable] ? 1 : 0;
+    // The shader before the constants: binding it takes a reference, whose
+    // locked instruction would wait for the write-combined constants to reach
+    // memory (160 ns per draw).
+    selectFfpPixelVariant(*c);
+    bindFfpPixelShader();
     writeBuffer(m_pixelConstants.get(), 0, c, sizeof(*c), true);
     m_pixelConstantsDirty = false;
-    selectFfpPixelVariant(*c);
   }
 
   struct Device::FfpPixelVariant {
     Ref<ID3D11PixelShader> shader;
     std::atomic<ID3D11PixelShader*> ready{ nullptr };
   };
+
+  void Device::bindFfpPixelShader() {
+    ID3D11PixelShader* shader = m_ffpPixelVariant ? m_ffpPixelVariant->ready.load(std::memory_order_acquire) : nullptr;
+    if (!shader)
+      shader = m_ffpPs.get();
+    if (shader != m_boundFfpPs) {
+      m_context->PSSetShader(shader, nullptr, 0);
+      m_boundFfpPs = shader;
+    }
+  }
 
   namespace {
     // What the macros of ffp.hlsl take: the stages' operations and arguments,
@@ -4784,13 +4798,8 @@ namespace dxup::legacy {
     if (ffpPixel) {
       if (m_pixelConstantsDirty)
         updatePixelConstants();
-      ID3D11PixelShader* ffpPs = m_ffpPixelVariant ? m_ffpPixelVariant->ready.load(std::memory_order_acquire) : nullptr;
-      if (!ffpPs)
-        ffpPs = m_ffpPs.get();
-      if (ffpPs != m_boundFfpPs) {
-        m_context->PSSetShader(ffpPs, nullptr, 0);
-        m_boundFfpPs = ffpPs;
-      }
+      else
+        bindFfpPixelShader();
     } else {
       if (m_shaderConstantsDirty[1])
         updateShaderConstants(true);
