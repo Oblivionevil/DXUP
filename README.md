@@ -143,6 +143,13 @@ For 32-bit games, configure a second build directory from an x86 developer
 prompt (`build_rel32`). `build_package.ps1` builds the setup from
 `build_rel` and `build_rel32` (it needs the .NET SDK for the manager).
 
+`build_pgo.sh` makes a profile-guided build (`build_pgo64`, `build_pgo32`):
+an instrumented build, training with the test programs, the final link.
+Releases are built this way, with profiles from games added
+(`build_package.ps1 -Pgo`): less CPU time per draw. The script describes how to
+add a game's profile; with the test programs alone, a game's own paths can end
+up slower than in `build_rel`.
+
 Tests: `src/tests` builds `dx11_test_app`, `d3d9_test_app`,
 `d3d8_test_app` and `dx7_test_app`. Each runs its checks on Windows' own
 Direct3D and on DXUP when DXUP's DLLs lie next to it.
