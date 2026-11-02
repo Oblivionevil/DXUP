@@ -3045,6 +3045,7 @@ namespace dxup::d3d12 {
 #ifdef _WIN32
     ContextLock ctxLock(*this);
     D3D12_VIEWPORT d3d12Viewports[kMaxViewports] = {};
+    count = (std::min)(count, uint32_t(kMaxViewports));
     for (uint32_t i = 0; i < count; i++) {
       d3d12Viewports[i].TopLeftX = viewports[i].x;
       d3d12Viewports[i].TopLeftY = viewports[i].y;
@@ -3067,6 +3068,7 @@ namespace dxup::d3d12 {
 #ifdef _WIN32
     ContextLock ctxLock(*this);
     D3D12_RECT d3d12Rects[kMaxViewports];
+    count = (std::min)(count, uint32_t(kMaxViewports));
     for (uint32_t i = 0; i < count; i++) {
       d3d12Rects[i].left   = rects[i].left;
       d3d12Rects[i].top    = rects[i].top;

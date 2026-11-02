@@ -19,12 +19,21 @@ foreach shader : [
 endforeach
 
 legacy_lib = static_library('dxup_legacy',
-  ['legacy_device.cpp', 'legacy_selftest.cpp', 'd3d9_shader.cpp', 'd3d9_dxbc.cpp', legacy_shaders],
+  ['legacy_selftest.cpp', 'd3d9_shader.cpp', 'd3d9_dxbc.cpp', legacy_shaders],
   include_directories : ['.', '..'],
   dependencies        : [util_dep],
 )
 
+# Every draw runs through it: no stack cookies, as d3d12_draw_path_lib. The
+# shader translators keep the compiler's check.
+legacy_draw_path_lib = static_library('dxup_legacy_draw',
+  ['legacy_device.cpp', legacy_shaders],
+  include_directories : ['.', '..'],
+  dependencies        : [util_dep],
+  cpp_args            : meson.get_compiler('cpp').get_argument_syntax() == 'msvc' ? ['/GS-'] : [],
+)
+
 legacy_dep = declare_dependency(
-  link_with           : [legacy_lib],
+  link_with           : [legacy_lib, legacy_draw_path_lib],
   include_directories : ['.'],
 )

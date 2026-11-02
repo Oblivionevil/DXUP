@@ -1,12 +1,19 @@
 # ---- Direct3D 9 objects (d3d9.dll, and d3d8.dll on top of them) ----
 d3d9_core_lib = static_library('dxup_d3d9_core',
-  ['d3d9_interface.cpp', 'd3d9_device.cpp', 'd3d9_resources.cpp', 'd3d9_worker.cpp'],
+  ['d3d9_interface.cpp', 'd3d9_resources.cpp', 'd3d9_worker.cpp'],
   dependencies        : [util_dep, legacy_dep],
   include_directories : ['.', '..'],
 )
 
+d3d9_draw_path_lib = static_library('dxup_d3d9_draw',
+  ['d3d9_device.cpp'],
+  dependencies        : [util_dep, legacy_dep],
+  include_directories : ['.', '..'],
+  cpp_args            : meson.get_compiler('cpp').get_argument_syntax() == 'msvc' ? ['/GS-'] : [],
+)
+
 d3d9_core_dep = declare_dependency(
-  link_with           : [d3d9_core_lib],
+  link_with           : [d3d9_core_lib, d3d9_draw_path_lib],
   dependencies        : [legacy_dep],
   include_directories : ['.'],
 )
