@@ -259,10 +259,8 @@ namespace dxup {
               if (ptr) {
                 auto* dst = static_cast<uint8_t*>(ptr);
                 auto* src = static_cast<const uint8_t*>(sub.pSysMem);
-                for (uint32_t row = 0; row < uploadLayout.numRows; row++) {
-                  copyUploadRow(dst + row * uploadLayout.rowPitch, src + row * sub.SysMemPitch,
-                    uploadLayout.copyRowBytes, sub.SysMemPitch, desc->Format);
-                }
+                copyUploadRows(dst, uploadLayout.rowPitch, src, sub.SysMemPitch,
+                  uploadLayout.copyRowBytes, uploadLayout.numRows, desc->Format);
                 ctx->unmapBuffer(uploadBuf.get());
                 ImageSubresource subres = {};
                 subres.mipLevel   = mip;

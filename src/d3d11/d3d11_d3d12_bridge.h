@@ -231,6 +231,19 @@ namespace dxup {
       std::memcpy(dst + offset, dst + given - unit, (std::min)(unit, rowBytes - offset));
   }
 
+  // The rows of an upload. With equal pitches in one go: most levels of
+  // power-of-two textures, and a call per row cost more than the data of a
+  // 64x64 texture.
+  inline void copyUploadRows(uint8_t* dst, uint32_t dstPitch, const uint8_t* src, uint32_t srcPitch,
+                             uint32_t rowBytes, uint32_t numRows, DXGI_FORMAT format) {
+    if (srcPitch == dstPitch && srcPitch >= rowBytes && numRows) {
+      std::memcpy(dst, src, size_t(srcPitch) * (numRows - 1) + rowBytes);
+      return;
+    }
+    for (uint32_t row = 0; row < numRows; row++)
+      copyUploadRow(dst + size_t(row) * dstPitch, src + size_t(row) * srcPitch, rowBytes, srcPitch, format);
+  }
+
   // Compute the number of rows for a given height and format
   inline uint32_t computeNumRows(uint32_t height, DXGI_FORMAT format) {
     uint32_t blockSize = getFormatBlockSize(format);

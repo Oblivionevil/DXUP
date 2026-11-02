@@ -2756,10 +2756,8 @@ namespace dxup {
             for (uint32_t z = 0; z < uploadLayout.depth; z++) {
               auto* sliceSrc = src + z * srcDepthPitch;
               auto* sliceDst = dst + z * slicePitch;
-              for (uint32_t row = 0; row < uploadLayout.numRows; row++) {
-                copyUploadRow(sliceDst + row * uploadLayout.rowPitch, sliceSrc + row * SrcRowPitch,
-                  uploadLayout.copyRowBytes, SrcRowPitch, imgDesc.format);
-              }
+              copyUploadRows(sliceDst, uploadLayout.rowPitch, sliceSrc, SrcRowPitch,
+                uploadLayout.copyRowBytes, uploadLayout.numRows, imgDesc.format);
             }
             m_backendCtx->unmapBuffer(uploadBuf.get());
             ImageSubresource subres = {};

@@ -2967,6 +2967,13 @@ namespace dxup::d3d12 {
     if (!m_deviceRemoved && !m_closedForSubmission)
       ensureDescriptorHeapSpace();
     initNullDescriptorsAndRootTables();
+    // The next draw sets the root CBVs of its stages, reading zeros where
+    // nothing is bound: right after a submission nothing has set them yet, and
+    // a shader reading a constant buffer the application never bound hung the
+    // GPU on AMD.
+    m_cbvDirty = true;
+    m_cbvStageDirty.fill(true);
+    m_descriptorDirtyStageMask = (1u << kShaderStages) - 1u;
 #endif
   }
 
@@ -9951,7 +9958,6 @@ namespace dxup::d3d12 {
       srvGpu.ptr = m_shaderVisibleCbvSrvUavHeap->GetGPUDescriptorHandleForHeapStart().ptr + nullSrvOff * m_cbvSrvUavDescSize;
       uavGpu.ptr = m_shaderVisibleCbvSrvUavHeap->GetGPUDescriptorHandleForHeapStart().ptr + nullUavOff * m_cbvSrvUavDescSize;
       sampGpu.ptr = m_shaderVisibleSamplerHeap->GetGPUDescriptorHandleForHeapStart().ptr + nullSampOff * m_samplerDescSize;
-      const D3D12_GPU_VIRTUAL_ADDRESS zeroCb = m_device->getZeroConstantBufferAddress();
 
       if (m_currentRootSignature) {
         for (int i = 0; i < 5; i++) {
@@ -9964,13 +9970,6 @@ namespace dxup::d3d12 {
           m_cmdList->SetGraphicsRootDescriptorTable(15 + i, uavGpu);
           noteGraphicsRootTable(15 + i, uavGpu);
         }
-        // Root CBVs too, reading zeros: ClearState right after a submission
-        // leaves no stage dirty, and a shader reading a constant buffer the
-        // application never bound hung the GPU on AMD.
-        for (uint32_t i = 0; i < kGraphicsRootCbvCount; i++) {
-          m_cmdList->SetGraphicsRootConstantBufferView(kGraphicsRootCbvBase + i, zeroCb);
-          m_currentGraphicsRootCbvs[i] = zeroCb;
-        }
       }
 
       if (m_computeRootSignature) {
@@ -9982,10 +9981,6 @@ namespace dxup::d3d12 {
         noteComputeRootTable(2, sampGpu);
         m_cmdList->SetComputeRootDescriptorTable(3, uavGpu);
         noteComputeRootTable(3, uavGpu);
-        for (uint32_t i = 0; i < m_currentComputeRootCbvs.size(); i++) {
-          m_cmdList->SetComputeRootConstantBufferView(kComputeRootCbvBase + i, zeroCb);
-          m_currentComputeRootCbvs[i] = zeroCb;
-        }
       }
     }
   }
