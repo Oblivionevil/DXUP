@@ -39,6 +39,25 @@ namespace dxup {
     // Enough for a few frames of commands; more are freed.
     constexpr size_t       kMaxPooledChunks = 512;
 
+    // Free data blocks by power of two, 16 KB to 64 MB.
+    constexpr uint32_t     kFirstDataClass = 14;
+    constexpr uint32_t     kDataClasses = 13;
+#ifdef _WIN64
+    constexpr size_t       kMaxPooledData = size_t(128) << 20;
+#else
+    constexpr size_t       kMaxPooledData = size_t(16) << 20;
+#endif
+    std::mutex             g_dataPoolMutex;
+    std::vector<uint8_t*>  g_freeData[kDataClasses];
+    size_t                 g_pooledData = 0;
+
+    uint32_t dataClass(size_t bytes) {
+      uint32_t cls = 0;
+      while (cls < kDataClasses && (size_t(1) << (kFirstDataClass + cls)) < bytes)
+        cls++;
+      return cls;
+    }
+
     // An auto-reset event for each thread that waits for a worker.
     struct ThreadWaitEvent {
       HANDLE handle = CreateEventW(nullptr, FALSE, FALSE, nullptr);
@@ -936,6 +955,36 @@ namespace dxup {
       });
   }
 
+  CsDataBlock::CsDataBlock(size_t bytes) : m_size(bytes) {
+    const uint32_t cls = dataClass(bytes);
+    const size_t capacity = cls < kDataClasses ? size_t(1) << (kFirstDataClass + cls) : bytes;
+    if (cls < kDataClasses) {
+      std::lock_guard<std::mutex> lock(g_dataPoolMutex);
+      auto& blocks = g_freeData[cls];
+      if (!blocks.empty()) {
+        m_data = blocks.back();
+        blocks.pop_back();
+        g_pooledData -= capacity;
+        return;
+      }
+    }
+    m_data = static_cast<uint8_t*>(::operator new(capacity));
+  }
+
+  void CsDataBlock::release() {
+    const uint32_t cls = dataClass(m_size);
+    if (cls < kDataClasses) {
+      const size_t capacity = size_t(1) << (kFirstDataClass + cls);
+      std::lock_guard<std::mutex> lock(g_dataPoolMutex);
+      if (g_pooledData + capacity <= kMaxPooledData) {
+        g_freeData[cls].push_back(m_data);
+        g_pooledData += capacity;
+        return;
+      }
+    }
+    ::operator delete(m_data);
+  }
+
   void CsThreadContext::updateBufferRegions(IBackendBuffer* buffer, const BufferUpdateRegion* regions, uint32_t regionCount) {
     if (!buffer || !regions || !regionCount)
       return;
@@ -950,40 +999,37 @@ namespace dxup {
         total += static_cast<size_t>((regions[i].size + 7) & ~uint64_t(7));
     }
 
-    std::vector<uint64_t> heapBlock;
-    uint8_t* block = nullptr;
-    const bool inlineBlock = total <= kMaxInlineData;
-    if (inlineBlock) {
+    auto fillBlock = [&](uint8_t* block) {
+      auto* table = reinterpret_cast<BufferUpdateRegion*>(block);
+      uint8_t* payload = block + sizeof(BufferUpdateRegion) * regionCount;
+      for (uint32_t i = 0; i < regionCount; i++) {
+        table[i] = regions[i];
+        if (regions[i].data && regions[i].size) {
+          std::memcpy(payload, regions[i].data, static_cast<size_t>(regions[i].size));
+          table[i].data = payload;
+          payload += static_cast<size_t>((regions[i].size + 7) & ~uint64_t(7));
+        }
+      }
+      return table;
+    };
+
+    if (total <= kMaxInlineData) {
       if (m_chunk->remaining() < total + 256)
         submitChunk();
-      block = static_cast<uint8_t*>(m_chunk->allocate(total, 8));
-    } else {
-      heapBlock.resize((total + 7) / 8);
-      block = reinterpret_cast<uint8_t*>(heapBlock.data());
-    }
-
-    auto* table = reinterpret_cast<BufferUpdateRegion*>(block);
-    uint8_t* payload = block + sizeof(BufferUpdateRegion) * regionCount;
-    for (uint32_t i = 0; i < regionCount; i++) {
-      table[i] = regions[i];
-      if (regions[i].data && regions[i].size) {
-        std::memcpy(payload, regions[i].data, static_cast<size_t>(regions[i].size));
-        table[i].data = payload;
-        payload += static_cast<size_t>((regions[i].size + 7) & ~uint64_t(7));
-      }
-    }
-
-    BackendGpuUse* use = trackGpuUse(stagingGpuUse(buffer));
-    if (inlineBlock) {
+      const BufferUpdateRegion* table = fillBlock(static_cast<uint8_t*>(m_chunk->allocate(total, 8)));
+      BackendGpuUse* use = trackGpuUse(stagingGpuUse(buffer));
       emit([buffer, table, regionCount, use](CsWorkerState& s) {
         const GpuUseRelease release{ use };
         s.ctx->updateBufferRegions(s.resolve(buffer), table, regionCount);
       });
     } else {
-      emit([buffer, regionCount, use, heapBlock = std::move(heapBlock)](CsWorkerState& s) {
+      CsDataBlock block(total);
+      fillBlock(block.data());
+      BackendGpuUse* use = trackGpuUse(stagingGpuUse(buffer));
+      emit([buffer, regionCount, use, block = std::move(block)](CsWorkerState& s) {
         const GpuUseRelease release{ use };
         s.ctx->updateBufferRegions(s.resolve(buffer),
-          reinterpret_cast<const BufferUpdateRegion*>(heapBlock.data()), regionCount);
+          reinterpret_cast<const BufferUpdateRegion*>(block.data()), regionCount);
       });
     }
   }

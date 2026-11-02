@@ -864,6 +864,7 @@ namespace dxup::d3d12 {
     std::array<uint32_t, kShaderStages> m_uavBindingEnd = {};
     std::array<std::array<DescriptorSlot, kMaxUAVs>, kShaderStages> m_uavBindings = {};
     std::array<std::array<DescriptorSlot, kMaxSamplers>, kShaderStages> m_samplerBindings = {};
+    std::array<uint32_t, kShaderStages> m_samplerBindingEnd = {};
     struct CbvTableCacheEntry {
       uint32_t descriptorCount = 0;
       uint64_t fingerprint = 0;

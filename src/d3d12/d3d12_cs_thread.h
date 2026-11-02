@@ -207,6 +207,27 @@ namespace dxup {
   // backend objects its commands use, which the application may release
   // while it still executes the list; when the list goes, they retire
   // behind the commands queued so far.
+  // The data of a large update on its way to the worker. new and delete of
+  // such sizes go to the kernel every time (decommit on free, page faults on
+  // first touch: 4-5 GB/s); these blocks come back to a pool instead.
+  class CsDataBlock {
+  public:
+    explicit CsDataBlock(size_t bytes);
+    CsDataBlock(CsDataBlock&& other) noexcept : m_data(other.m_data), m_size(other.m_size) { other.m_data = nullptr; }
+    CsDataBlock& operator=(CsDataBlock&&) = delete;
+    ~CsDataBlock() {
+      if (m_data)
+        release();
+    }
+    uint8_t* data() const { return m_data; }
+    size_t size() const { return m_size; }
+
+  private:
+    void release();
+    uint8_t* m_data = nullptr;
+    size_t m_size = 0;
+  };
+
   class CsCommandList final : public IBackendCommandList {
   public:
     CsCommandList(
@@ -555,11 +576,11 @@ namespace dxup {
 
     // fill(data) writes bytes into the chunk the command lands in, which
     // records fn(state, data, bytes). Sizes above kMaxInlineData go through
-    // a heap copy.
+    // a data block.
     template<typename Fill, typename Fn>
     void emitFilled(size_t bytes, Fill&& fill, Fn&& fn) {
       if (bytes > kMaxInlineData) {
-        std::vector<uint8_t> copy(bytes);
+        CsDataBlock copy(bytes);
         fill(copy.data());
         emit([fn = std::forward<Fn>(fn), copy = std::move(copy)](CsWorkerState& state) mutable {
           fn(state, static_cast<const uint8_t*>(copy.data()), copy.size());
@@ -576,7 +597,7 @@ namespace dxup {
     }
 
     // Copies count items into the chunk the command lands in and records
-    // fn(state, copy). Sizes above kMaxInlineData go through a heap copy.
+    // fn(state, copy). Sizes above kMaxInlineData go through a data block.
     template<typename T, typename Fn>
     void emitArray(const T* items, size_t count, Fn&& fn) {
       static_assert(std::is_trivially_copyable<T>::value, "inline data must be trivially copyable");
@@ -589,9 +610,10 @@ namespace dxup {
       }
 
       if (bytes > kMaxInlineData) {
-        std::vector<T> copy(items, items + count);
-        emit([fn = std::forward<Fn>(fn), copy = std::move(copy)](CsWorkerState& state) mutable {
-          fn(state, copy.data(), copy.size());
+        CsDataBlock copy(bytes);
+        std::memcpy(copy.data(), items, bytes);
+        emit([fn = std::forward<Fn>(fn), copy = std::move(copy), count](CsWorkerState& state) mutable {
+          fn(state, reinterpret_cast<const T*>(copy.data()), count);
         });
         return;
       }

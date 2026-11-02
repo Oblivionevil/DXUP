@@ -1828,7 +1828,11 @@ namespace dxup {
 
     bool prepareRecorded(RecordOp op, uint32_t count, uint32_t instances, uint32_t start, int32_t base) {
       m_dropReason = DropNone;
-      const bool prepared = preparePipeline();
+      // Without a topology the native runtime draws nothing.
+      const bool drawsNothing = m_state.ia.topology == D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED && op != RecordOp::Dispatch;
+      const bool prepared = !drawsNothing && preparePipeline();
+      if (drawsNothing)
+        m_dropReason = DropNoTopology;
       if (m_historyOn && !m_isDeferred) {
         recordCall(op, count, instances, start, base, !prepared);
         if (!prepared)
@@ -1839,7 +1843,7 @@ namespace dxup {
 
     // Draws not drawn (glitch reports): no vertex shader bound, a pipeline
     // that failed to compile, one still compiling (d3d11.asyncShaders).
-    enum DropReason : uint32_t { DropNone, DropNoVertexShader, DropPipelineFailed, DropPipelinePending, DropReasons };
+    enum DropReason : uint32_t { DropNone, DropNoVertexShader, DropPipelineFailed, DropPipelinePending, DropNoTopology, DropReasons };
     DropReason m_dropReason = DropNone;
     uint32_t   m_droppedDraws[DropReasons] = {};
     ReportThrottle m_droppedFrames;

@@ -10782,6 +10782,14 @@ RWByteAddressBuffer result : register(u0);
           error = formatString("round %d: compute shader wrote %u, expected 7", round, values[0]);
           return false;
         }
+        // Without a topology nothing is drawn.
+        recordDraw(m_context.Get());
+        m_context->ClearRenderTargetView(target.rtv.Get(), black);
+        m_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED);
+        m_context->Draw(3, 0);
+        m_context->ClearState();
+        if (!expectTexturePixel(target.texture.Get(), 8, 8, Rgba8{ 0, 0, 0, 0 }, 0, error))
+          return false;
       }
       return true;
     }
