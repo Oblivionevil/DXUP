@@ -65,6 +65,8 @@ dxgi.upscale = spatial         # scale a back buffer smaller than the window wit
 dxgi.spoofVendor = nvidia      # the game sees an NVIDIA, AMD or Intel GPU; DXUP renders on the real one
 d3d9.shaderCompiler = fxc      # Direct3D 7-9 shaders through Microsoft's HLSL compiler, not DXUP's
 d3d9.workerThread = true       # experimental: Direct3D 8/9 draws translated on a thread of their own
+d3d9.backend = d3d12           # experimental: Direct3D 9 straight on DXUP's D3D12 backend, without its d3d11.dll
+d3d8.backend = d3d12           # the same for Direct3D 8
 d3d12.recordThread = true      # experimental: a second thread records DXUP's Direct3D 12 commands
 d3d12.submitThread = true      # command lists go to the GPU on a thread of their own
 ```

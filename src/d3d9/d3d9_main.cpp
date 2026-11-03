@@ -44,6 +44,7 @@ extern "C" {
 
 IDirect3D9* WINAPI Direct3DCreate9(UINT sdkVersion) {
   logMessage(LogLevel::Info, "Direct3DCreate9 (SDK %u)", sdkVersion);
+  dxup::legacy::setLegacyBackend(dxup::UserOverrides::get().d3d9Backend);
   return new d3d9::Interface(false);
 }
 
@@ -51,6 +52,7 @@ HRESULT WINAPI Direct3DCreate9Ex(UINT sdkVersion, IDirect3D9Ex** d3d) {
   if (!d3d)
     return D3DERR_INVALIDCALL;
   logMessage(LogLevel::Info, "Direct3DCreate9Ex (SDK %u)", sdkVersion);
+  dxup::legacy::setLegacyBackend(dxup::UserOverrides::get().d3d9Backend);
   *d3d = new d3d9::Interface(true);
   return D3D_OK;
 }

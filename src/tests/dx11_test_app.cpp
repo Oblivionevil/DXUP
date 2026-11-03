@@ -10741,9 +10741,13 @@ float4 main(float4 position : SV_Position, float4 t0 : TEXCOORD0, float4 t : TEX
       }
       makeOtherGpus(unused);
       DeleteFileA((cache + "gpu_checked.txt").c_str());
-      if (!runChildProcess(argument.c_str(), error)) {
-        error = "third process: " + error;
-        return false;
+      // A process that ends first leaves the rest of the check to the next
+      // (it runs at the lowest priority and stops with the device).
+      for (int run = 0; run < 8 && GetFileAttributesA((cache + "gpu_checked.txt").c_str()) == INVALID_FILE_ATTRIBUTES; run++) {
+        if (!runChildProcess(argument.c_str(), error)) {
+          error = "third process: " + error;
+          return false;
+        }
       }
       if (blobVendor(unused)) {
         DeleteFileA((cache + unused).c_str());

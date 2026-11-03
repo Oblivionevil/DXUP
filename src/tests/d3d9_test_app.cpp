@@ -4473,6 +4473,51 @@ VO main(float3 p : POSITION, float4 c : COLOR0) { VO o; o.p = float4(p.xy, 0.5, 
   }
 
   // Runs this program with the arguments; its exit code (-1: not started).
+  // A device on the D3D12 backend itself (d3d9.backend = d3d12only has no way
+  // back): 1 none, 3 a query that does not finish without a Present, 4 a
+  // failed Present.
+  int directChild(const Runtime& dxup) {
+    IDirect3D9* d3d = dxup.create(D3D_SDK_VERSION);
+    HWND window = createWindow();
+    D3DPRESENT_PARAMETERS pp = {};
+    pp.Windowed = TRUE;
+    pp.SwapEffect = D3DSWAPEFFECT_DISCARD;
+    pp.BackBufferWidth = kWidth;
+    pp.BackBufferHeight = kHeight;
+    pp.BackBufferFormat = D3DFMT_X8R8G8B8;
+    pp.hDeviceWindow = window;
+    IDirect3DDevice9* device = nullptr;
+    int code = 0;
+    if (!d3d || FAILED(d3d->CreateDevice(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, window, D3DCREATE_HARDWARE_VERTEXPROCESSING, &pp, &device))) {
+      code = 1;
+    } else {
+      device->Clear(0, nullptr, D3DCLEAR_TARGET, 0xff102030, 1.0f, 0);
+      for (D3DQUERYTYPE type : { D3DQUERYTYPE_EVENT, D3DQUERYTYPE_OCCLUSION }) {
+        IDirect3DQuery9* query = nullptr;
+        if (FAILED(device->CreateQuery(type, &query)))
+          continue;
+        if (type == D3DQUERYTYPE_OCCLUSION)
+          query->Issue(D3DISSUE_BEGIN);
+        query->Issue(D3DISSUE_END);
+        uint64_t result = 0;
+        const DWORD size = type == D3DQUERYTYPE_EVENT ? sizeof(BOOL) : sizeof(DWORD);
+        const ULONGLONG start = GetTickCount64();
+        HRESULT hr = S_FALSE;
+        while ((hr = query->GetData(&result, size, D3DGETDATA_FLUSH)) == S_FALSE && GetTickCount64() - start < 5000)
+          Sleep(1);
+        if (hr != S_OK)
+          code = 3;
+        query->Release();
+      }
+      if (!code && FAILED(device->Present(nullptr, nullptr, nullptr, nullptr)))
+        code = 4;
+    }
+    if (device) device->Release();
+    if (d3d) d3d->Release();
+    DestroyWindow(window);
+    return code;
+  }
+
   int runSelf(const char* arguments, DWORD timeout = 60000) {
     wchar_t exe[MAX_PATH];
     GetModuleFileNameW(nullptr, exe, MAX_PATH);
@@ -4500,7 +4545,7 @@ int main(int argc, char** argv) {
   int benchFrames = 0, benchDraws = 0;
   const char* benchShadersPath = nullptr;
   size_t benchShadersLimit = 0;
-  bool childForcedMsaa = false, identifier = false, childDpi = false, childFloatStrict = false, childDropped = false;
+  bool childDirect = false, childForcedMsaa = false, identifier = false, childDpi = false, childFloatStrict = false, childDropped = false;
   bool childSelfTest = false, dxupOnly = false, childWorker = false;
   unsigned variantNonce = 0;
   for (int i = 1; i < argc; i++) {
@@ -4508,6 +4553,7 @@ int main(int argc, char** argv) {
     else if (std::strcmp(argv[i], "--trace") == 0) g_trace = true;
     else if (std::strcmp(argv[i], "--memory") == 0) memory = true;
     else if (std::strcmp(argv[i], "--forced-msaa-child") == 0) childForcedMsaa = true;
+    else if (std::strcmp(argv[i], "--direct-child") == 0) childDirect = true;
     else if (std::strcmp(argv[i], "--identifier") == 0) identifier = true;
     else if (std::strcmp(argv[i], "--dpi-child") == 0) childDpi = true;
     else if (std::strcmp(argv[i], "--float-strict-child") == 0) childFloatStrict = true;
@@ -4551,6 +4597,8 @@ int main(int argc, char** argv) {
     return dpiFullscreenChild(dxup);
   if (childDropped)
     return droppedChild(dxup);
+  if (childDirect)
+    return directChild(dxup);
   // A device with diagnostics on runs DXUP's self-test.
   if (childSelfTest) {
     IDirect3D9* d3d = dxup.create(D3D_SDK_VERSION);
@@ -4720,8 +4768,42 @@ int main(int argc, char** argv) {
     }
     ok ? passed++ : skip ? skipped++ : failed++;
   }
+  // DXUP_D3D9_BACKEND beats dxup.conf: d3d12only runs every scene on the
+  // D3D12 backend itself and refuses what needs DXUP's d3d11.dll.
+  char backendChoice[16] = {};
+  GetEnvironmentVariableA("DXUP_D3D9_BACKEND", backendChoice, sizeof(backendChoice));
+  // Direct3D 9 on the D3D12 backend itself (d3d9.backend, children with
+  // dxup.conf). A device that falls back to DXUP's d3d11.dll fails here.
+  if ((!filter || std::strstr("direct_backend", filter)) && !backendChoice[0]) {
+    const std::wstring conf = dir + L"dxup.conf";
+    auto runWith = [&](const char* settings, const char* arguments, DWORD timeout = 60000) {
+      int code = -1;
+      if (FILE* f = _wfopen(conf.c_str(), L"w")) {
+        std::fputs(settings, f);
+        std::fclose(f);
+        code = runSelf(arguments, timeout);
+        DeleteFileW(conf.c_str());
+      }
+      return code;
+    };
+    const int direct = runWith("d3d9.backend = d3d12only\n", "--direct-child");
+    const int worker = runWith("d3d9.backend = d3d12only\nd3d9.workerThread = true\n", "--direct-child");
+    // Settings only d3d11.dll implements: refused when no way back is
+    // allowed, on d3d11.dll (and doing what they say) otherwise.
+    const int refused = runWith("d3d9.backend = d3d12only\nd3d11.msaaSamples = 4\nd3d11.msaaForce = true\n", "--direct-child");
+    const int fellBack = runWith("d3d9.backend = d3d12\nd3d11.msaaSamples = 4\nd3d11.msaaForce = true\n", "--forced-msaa-child");
+    const int scenes = runWith("d3d9.backend = d3d12only\n", "--worker-child", 600000);
+    const int sceneWorker = runWith("d3d9.backend = d3d12only\nd3d9.workerThread = true\n", "--worker-child", 600000);
+    const bool ok = direct == 0 && worker == 0 && refused == 1 && fellBack >= 40 && fellBack < 255 && scenes == 0 && sceneWorker == 0;
+    std::printf("%s %-20s device %d, with worker %d, refused %d, fell back %d, scenes differing %d, with worker %d\n",
+                ok ? "ok  " : "FAIL", "direct_backend", direct, worker, refused, fellBack, scenes, sceneWorker);
+    ok ? passed++ : failed++;
+  }
   // Forced multisampling (dxup.conf next to DXUP's DLLs, in a child).
-  if (!filter || std::strstr("forced_msaa", filter)) {
+  if ((!filter || std::strstr("forced_msaa", filter)) && !_stricmp(backendChoice, "d3d12only")) {
+    std::printf("skip %-20s needs DXUP's d3d11.dll\n", "forced_msaa");
+    skipped++;
+  } else if (!filter || std::strstr("forced_msaa", filter)) {
     const std::wstring conf = dir + L"dxup.conf";
     int with = -1, without = -1;
     if (FILE* f = _wfopen(conf.c_str(), L"w")) {

@@ -540,6 +540,11 @@ namespace dxup {
         : emulation == "false" || emulation == "off" || emulation == "0" ? 0 : -1;
       overrides.d3d9DxupCompiler = config.getString("d3d9.shaderCompiler", "dxup") != "fxc";
       overrides.d3d9WorkerThread = config.getBool("d3d9.workerThread", false);
+      auto legacyBackend = [](const std::string& value) {
+        return value == "d3d12" ? LegacyBackend::D3D12 : value == "d3d12only" ? LegacyBackend::D3D12Only : LegacyBackend::D3D11;
+      };
+      overrides.d3d9Backend = legacyBackend(config.getString("d3d9.backend", "d3d11"));
+      overrides.d3d8Backend = legacyBackend(config.getString("d3d8.backend", "d3d11"));
       const std::string nanDepth = config.getString("d3d9.nanDepth", "auto");
       overrides.d3d9NanDepth = nanDepth == "zero" || nanDepth == "true" || nanDepth == "1" ? 1
         : nanDepth == "discard" || nanDepth == "false" || nanDepth == "0" ? 0 : -1;

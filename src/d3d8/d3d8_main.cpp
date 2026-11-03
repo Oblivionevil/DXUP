@@ -19,6 +19,7 @@ extern "C" {
 
 IDirect3D8* WINAPI Direct3DCreate8(UINT sdkVersion) {
   logMessage(LogLevel::Info, "Direct3DCreate8 (SDK %u)", sdkVersion);
+  dxup::legacy::setLegacyBackend(dxup::UserOverrides::get().d3d8Backend);
   return new d3d8::Interface8(new d3d9::Interface(false));
 }
 

@@ -82,6 +82,12 @@ namespace dxup {
   //                                  translated on a thread of their own,
   //                                  the game's render thread only records
   //                                  them (see d3d9::Worker)
+  //   d3d9.backend = d3d12           Direct3D 9 straight on DXUP's D3D12
+  //                                  backend, without its d3d11.dll (see
+  //                                  legacy_direct.h); d3d11 (default): on
+  //                                  its d3d11.dll; d3d12only: no way back
+  //                                  when settings need d3d11.dll (tests)
+  //   d3d8.backend = d3d12           the same for Direct3D 8
   class Config {
   public:
     static const Config& get();
@@ -111,6 +117,10 @@ namespace dxup {
 
   // Draws that forced multisampling (msaaForce) renders multisampled.
   enum class MsaaScope : uint8_t { Geometry, All };
+
+  // What the legacy core renders on: DXUP's d3d11.dll, or its D3D12 backend
+  // directly (with or without the way back to d3d11.dll when settings need it).
+  enum class LegacyBackend : uint8_t { D3D11, D3D12, D3D12Only };
 
   // Pixel shaders that run per sample on multisampled targets.
   enum class SgssaaMode : uint8_t { Off, Full, Alpha };
@@ -196,6 +206,9 @@ namespace dxup {
     // Direct3D 8/9 calls reach the legacy core on a thread of their own
     // (d3d9.workerThread, see d3d9::Worker).
     bool     d3d9WorkerThread = false;
+    // What Direct3D 9 and 8 run on (d3d9.backend, d3d8.backend).
+    LegacyBackend d3d9Backend = LegacyBackend::D3D11;
+    LegacyBackend d3d8Backend = LegacyBackend::D3D11;
     // Flip model applications draw into the real swap chain buffers, no
     // proxy copied at Present (dxgi.directBackBuffer).
     bool     directBackBuffer = true;

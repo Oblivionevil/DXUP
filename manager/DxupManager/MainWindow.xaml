@@ -284,6 +284,9 @@
                     <RowDefinition Height="Auto" />
                     <RowDefinition Height="Auto" />
                     <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
                   </Grid.RowDefinitions>
                   <TextBlock Text="{DynamicResource FloatEmulation}" Style="{StaticResource Caption}" />
                   <ComboBox x:Name="FloatBox" Grid.Column="1" HorizontalAlignment="Left" DisplayMemberPath="Text" SelectionChanged="OnSettingChanged" />
@@ -297,6 +300,14 @@
                     <TextBlock Text="{DynamicResource D3d9WorkerOn}" TextWrapping="Wrap" />
                   </CheckBox>
                   <TextBlock Grid.Row="5" Grid.Column="1" Text="{DynamicResource D3d9WorkerHint}" Foreground="{DynamicResource Muted}" FontSize="11" Margin="0,4,0,0" TextWrapping="Wrap" />
+                  <TextBlock Grid.Row="6" Text="{DynamicResource LegacyDirect}" Style="{StaticResource Caption}" Margin="0,10,12,0" />
+                  <CheckBox x:Name="D3d9DirectBox" Grid.Row="6" Grid.Column="1" Margin="0,10,0,0" Checked="OnSettingChanged" Unchecked="OnSettingChanged">
+                    <TextBlock Text="{DynamicResource D3d9DirectOn}" TextWrapping="Wrap" />
+                  </CheckBox>
+                  <CheckBox x:Name="D3d8DirectBox" Grid.Row="7" Grid.Column="1" Margin="0,6,0,0" Checked="OnSettingChanged" Unchecked="OnSettingChanged">
+                    <TextBlock Text="{DynamicResource D3d8DirectOn}" TextWrapping="Wrap" />
+                  </CheckBox>
+                  <TextBlock Grid.Row="8" Grid.Column="1" Text="{DynamicResource LegacyDirectHint}" Foreground="{DynamicResource Muted}" FontSize="11" Margin="0,4,0,0" TextWrapping="Wrap" />
                 </Grid>
               </StackPanel>
 

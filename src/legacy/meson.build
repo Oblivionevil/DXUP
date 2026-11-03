@@ -1,3 +1,5 @@
+assert(enable_d3d12_backend, 'the legacy core needs the D3D12 backend (legacy_direct.h)')
+
 # The legacy core of Direct3D 7 to 9 (see legacy_device.h). Its shaders are
 # compiled with fxc while building: no compiler at run time.
 fxc = find_program('fxc', required : true)
@@ -41,7 +43,19 @@ legacy_draw_path_lib = static_library('dxup_legacy_draw',
   cpp_args            : meson.get_compiler('cpp').get_argument_syntax() == 'msvc' ? ['/GS-'] : [],
 )
 
+# The legacy core straight on the D3D12 backend (d3d9.backend): every draw
+# runs through it as well. Outside whole-program optimization: profile-guided
+# builds compile what their training does not reach for size, and d3d9.backend
+# is off in the training so far.
+legacy_direct_lib = static_library('dxup_legacy_direct',
+  ['legacy_direct.cpp', '../d3d11/d3d11_backend_device.cpp'],
+  include_directories : ['.', '..', '../d3d11'],
+  dependencies        : [util_dep, directx_backend_dep, d3d12_backend_dep],
+  cpp_args            : meson.get_compiler('cpp').get_argument_syntax() == 'msvc' ? ['/GS-', '/GL-'] : [],
+)
+
 legacy_dep = declare_dependency(
-  link_with           : [legacy_lib, legacy_draw_path_lib],
+  link_with           : [legacy_lib, legacy_draw_path_lib, legacy_direct_lib],
+  dependencies        : [d3d12_backend_dep],
   include_directories : ['.'],
 )

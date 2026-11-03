@@ -37,6 +37,8 @@ namespace Dxup.Shared
         public string NanDepth;          // Direct3D 7-9 vertices with NaN depth: discard, zero; null = auto
         public bool FxcCompiler;         // Direct3D 7-9 shaders through Microsoft's compiler instead of DXUP's
         public bool D3d9WorkerThread;    // Direct3D 8/9 calls translated on a thread of their own
+        public bool D3d9Direct;          // Direct3D 9 on the D3D12 backend itself, without d3d11.dll
+        public bool D3d8Direct;          // Direct3D 8 the same way
         public bool SubmitThread;        // command lists go to the GPU on a thread of their own
         public bool RecordThread;        // command lists are recorded on a second thread
         public bool PixelOutputMasks = true; // pixel shader outputs no target takes leave the shader
@@ -111,6 +113,8 @@ namespace Dxup.Shared
                     return true;
                 case "d3d9.shadercompiler": FxcCompiler = value.Trim().Equals("fxc", StringComparison.OrdinalIgnoreCase); return true;
                 case "d3d9.workerthread": D3d9WorkerThread = ParseBool(value) ?? false; return true;
+                case "d3d9.backend": D3d9Direct = value.Trim().StartsWith("d3d12", StringComparison.OrdinalIgnoreCase); return true;
+                case "d3d8.backend": D3d8Direct = value.Trim().StartsWith("d3d12", StringComparison.OrdinalIgnoreCase); return true;
                 case "d3d12.submitthread": SubmitThread = ParseBool(value) ?? false; return true;
                 case "d3d12.recordthread": RecordThread = ParseBool(value) ?? false; return true;
                 case "d3d12.pixeloutputmasks": PixelOutputMasks = ParseBool(value) ?? true; return true;
@@ -167,6 +171,8 @@ namespace Dxup.Shared
             if (!string.IsNullOrEmpty(NanDepth)) yield return Entry("d3d9.nanDepth", NanDepth);
             if (FxcCompiler) yield return Entry("d3d9.shaderCompiler", "fxc");
             if (D3d9WorkerThread) yield return Entry("d3d9.workerThread", "true");
+            if (D3d9Direct) yield return Entry("d3d9.backend", "d3d12");
+            if (D3d8Direct) yield return Entry("d3d8.backend", "d3d12");
             if (SubmitThread) yield return Entry("d3d12.submitThread", "true");
             if (RecordThread) yield return Entry("d3d12.recordThread", "true");
             if (!PixelOutputMasks) yield return Entry("d3d12.pixelOutputMasks", "false");

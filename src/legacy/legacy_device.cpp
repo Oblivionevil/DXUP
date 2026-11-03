@@ -2093,41 +2093,73 @@ namespace dxup::legacy {
 
   bool Device::init(HWND window, std::string& error) {
     (void)window;
-    m_d3d11Module = loadD3D11();
-    auto create = m_d3d11Module ? reinterpret_cast<PFN_D3D11_CREATE_DEVICE>(
-      GetProcAddress(m_d3d11Module, "D3D11CreateDevice")) : nullptr;
-    if (!create) {
-      error = "d3d11.dll not found";
-      return false;
+    HRESULT hr = S_OK;
+    const LegacyBackend backend = legacyBackend();
+    if (backend != LegacyBackend::D3D11) {
+      if (const char* obstacle = directBackendObstacle()) {
+        logMessage(LogLevel::Warn, "d3d9.backend = d3d12: on d3d11.dll, for %s", obstacle);
+        if (backend == LegacyBackend::D3D12Only) {
+          error = "d3d9.backend = d3d12only: settings need d3d11.dll";
+          return false;
+        }
+      } else {
+        uint32_t vendorId = 0;
+        hr = createDirectDevice(m_device.put(), m_context.put(), &vendorId);
+        if (SUCCEEDED(hr)) {
+          m_direct = true;
+          m_createMappedView = directCreateMappedView;
+          m_createSampler = directCreateSampler;
+          m_writeBuffer = directWriteBuffer;
+          m_writeBufferWith = directWriteBufferWith;
+          for (WorkerConstants*& constants : m_workerConstants)
+            constants = new WorkerConstants();
+          g_vendorId.store(vendorId, std::memory_order_relaxed);
+          logMessage(LogLevel::Info, "Direct3D 7-9 layer: directly on the D3D12 backend");
+        } else if (backend == LegacyBackend::D3D12Only) {
+          error = "d3d9.backend = d3d12only: no device";
+          return false;
+        } else {
+          logMessage(LogLevel::Warn, "d3d9.backend = d3d12: no device, on d3d11.dll");
+        }
+      }
     }
-    const D3D_FEATURE_LEVEL level = D3D_FEATURE_LEVEL_11_0;
-    HRESULT hr = create(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT, &level, 1,
-      D3D11_SDK_VERSION, m_device.put(), nullptr, m_context.put());
-    if (FAILED(hr)) {
-      error = "D3D11CreateDevice failed";
-      return false;
+    if (!m_direct) {
+      m_d3d11Module = loadD3D11();
+      auto create = m_d3d11Module ? reinterpret_cast<PFN_D3D11_CREATE_DEVICE>(
+        GetProcAddress(m_d3d11Module, "D3D11CreateDevice")) : nullptr;
+      if (!create) {
+        error = "d3d11.dll not found";
+        return false;
+      }
+      const D3D_FEATURE_LEVEL level = D3D_FEATURE_LEVEL_11_0;
+      hr = create(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT, &level, 1,
+        D3D11_SDK_VERSION, m_device.put(), nullptr, m_context.put());
+      if (FAILED(hr)) {
+        error = "D3D11CreateDevice failed";
+        return false;
+      }
+      m_noteBackBufferSize = reinterpret_cast<decltype(m_noteBackBufferSize)>(
+        GetProcAddress(m_d3d11Module, "DXUPNoteBackBufferSize"));
+      m_createMappedView = reinterpret_cast<decltype(m_createMappedView)>(
+        GetProcAddress(m_d3d11Module, "DXUPCreateShaderResourceView"));
+      m_createSampler = reinterpret_cast<decltype(m_createSampler)>(
+        GetProcAddress(m_d3d11Module, "DXUPCreateSamplerState"));
+      // Constants and streamed vertices go straight into the memory DXUP's
+      // D3D11 maps the buffers to, without a Map, an Unmap or a command each.
+      m_writeBuffer = reinterpret_cast<decltype(m_writeBuffer)>(GetProcAddress(m_d3d11Module, "DXUPWriteBuffer"));
+      if (m_writeBuffer && FAILED(m_writeBuffer(m_context.get(), nullptr, 0, nullptr, 0)))
+        m_writeBuffer = nullptr;
+      if (m_writeBuffer) {
+        m_writeBufferWith = reinterpret_cast<decltype(m_writeBufferWith)>(GetProcAddress(m_d3d11Module, "DXUPWriteBufferWith"));
+        if (m_writeBufferWith)
+          for (WorkerConstants*& constants : m_workerConstants)
+            constants = new WorkerConstants();
+      }
+      // The GPU's maker, before the first shader is translated.
+      using GetVendorId = UINT (WINAPI*)(IUnknown*);
+      if (auto getVendorId = reinterpret_cast<GetVendorId>(GetProcAddress(m_d3d11Module, "DXUPGetVendorId")))
+        g_vendorId.store(getVendorId(m_device.get()), std::memory_order_relaxed);
     }
-    m_noteBackBufferSize = reinterpret_cast<decltype(m_noteBackBufferSize)>(
-      GetProcAddress(m_d3d11Module, "DXUPNoteBackBufferSize"));
-    m_createMappedView = reinterpret_cast<decltype(m_createMappedView)>(
-      GetProcAddress(m_d3d11Module, "DXUPCreateShaderResourceView"));
-    m_createSampler = reinterpret_cast<decltype(m_createSampler)>(
-      GetProcAddress(m_d3d11Module, "DXUPCreateSamplerState"));
-    // Constants and streamed vertices go straight into the memory DXUP's
-    // D3D11 maps the buffers to, without a Map, an Unmap or a command each.
-    m_writeBuffer = reinterpret_cast<decltype(m_writeBuffer)>(GetProcAddress(m_d3d11Module, "DXUPWriteBuffer"));
-    if (m_writeBuffer && FAILED(m_writeBuffer(m_context.get(), nullptr, 0, nullptr, 0)))
-      m_writeBuffer = nullptr;
-    if (m_writeBuffer) {
-      m_writeBufferWith = reinterpret_cast<decltype(m_writeBufferWith)>(GetProcAddress(m_d3d11Module, "DXUPWriteBufferWith"));
-      if (m_writeBufferWith)
-        for (WorkerConstants*& constants : m_workerConstants)
-          constants = new WorkerConstants();
-    }
-    // The GPU's maker, before the first shader is translated.
-    using GetVendorId = UINT (WINAPI*)(IUnknown*);
-    if (auto getVendorId = reinterpret_cast<GetVendorId>(GetProcAddress(m_d3d11Module, "DXUPGetVendorId")))
-      g_vendorId.store(getVendorId(m_device.get()), std::memory_order_relaxed);
     // The shaders of earlier runs, compiled while the game loads.
     startShaderWarmup();
     // Constant buffers bound with offsets (Direct3D 11.1).
@@ -2135,7 +2167,7 @@ namespace dxup::legacy {
       error = "no ID3D11DeviceContext1";
       return false;
     }
-    {
+    if (!m_direct) {
       Ref<IDXGIDevice> dxgiDevice;
       Ref<IDXGIAdapter> adapter;
       if (FAILED(m_device->QueryInterface(__uuidof(IDXGIDevice), reinterpret_cast<void**>(dxgiDevice.put())))
@@ -5852,7 +5884,17 @@ namespace dxup::legacy {
     SwapChain* chain = nullptr;
     for (auto& existing : m_swapChains)
       if (existing->window == window) chain = existing.get();
-    if (!chain) {
+    if (!chain && m_direct) {
+      auto created = std::make_unique<SwapChain>();
+      created->window = window;
+      const HRESULT hr = createDirectSwapChain(m_device.get(), window, width, height, created->direct);
+      if (FAILED(hr))
+        return hr;
+      created->width = width;
+      created->height = height;
+      chain = created.get();
+      m_swapChains.push_back(std::move(created));
+    } else if (!chain) {
       auto created = std::make_unique<SwapChain>();
       created->window = window;
       DXGI_SWAP_CHAIN_DESC1 desc = {};
@@ -5888,7 +5930,9 @@ namespace dxup::legacy {
       m_context->OMSetRenderTargets(0, nullptr, nullptr);
       chain->rtv.reset();
       // A failed resize keeps the buffers as they are (tried again next time).
-      if (SUCCEEDED(chain->swapChain->ResizeBuffers(0, width, height, DXGI_FORMAT_UNKNOWN, chain->flags))) {
+      const HRESULT resized = chain->direct ? chain->direct->resize(width, height)
+        : chain->swapChain->ResizeBuffers(0, width, height, DXGI_FORMAT_UNKNOWN, chain->flags);
+      if (SUCCEEDED(resized)) {
         chain->width = width;
         chain->height = height;
       }
@@ -5896,7 +5940,8 @@ namespace dxup::legacy {
 
     if (!chain->rtv) {
       Ref<ID3D11Texture2D> backBuffer;
-      if (FAILED(chain->swapChain->GetBuffer(0, __uuidof(ID3D11Texture2D), reinterpret_cast<void**>(backBuffer.put()))))
+      if (FAILED(chain->direct ? chain->direct->getBuffer(backBuffer.put())
+            : chain->swapChain->GetBuffer(0, __uuidof(ID3D11Texture2D), reinterpret_cast<void**>(backBuffer.put()))))
         return E_FAIL;
       D3D11_TEXTURE2D_DESC bufferDesc = {};
       backBuffer->GetDesc(&bufferDesc);
@@ -5932,6 +5977,8 @@ namespace dxup::legacy {
     ID3D11ShaderResourceView* none[2] = {};
     m_context->PSSetShaderResources(0, 2, none);
     m_context->OMSetRenderTargets(0, nullptr, nullptr);
+    if (chain->direct)
+      return chain->direct->present(syncInterval);
     const UINT presentFlags = !syncInterval && (chain->flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) ? DXGI_PRESENT_ALLOW_TEARING : 0;
     return chain->swapChain->Present(syncInterval, presentFlags);
   }

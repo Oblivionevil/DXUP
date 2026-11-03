@@ -8,6 +8,7 @@
 #include "legacy_types.h"
 #include <atomic>
 #include "d3d9_shader.h"
+#include "legacy_direct.h"
 #include "../util/util_types.h"
 
 #include <windows.h>
@@ -597,6 +598,7 @@ namespace dxup::legacy {
     void updatePointConstants();
 
     // ---- D3D11 objects ----
+    bool                            m_direct = false;   // on the D3D12 backend itself (legacy_direct.h)
     HMODULE                         m_d3d11Module = nullptr;
     void (WINAPI* m_noteBackBufferSize)(IUnknown*, UINT, UINT) = nullptr;   // DXUP's d3d11.dll only
     HRESULT (WINAPI* m_createMappedView)(IUnknown*, ID3D11Resource*, const D3D11_SHADER_RESOURCE_VIEW_DESC*, UINT,
@@ -625,6 +627,7 @@ namespace dxup::legacy {
     struct SwapChain {
       HWND window = nullptr;
       Ref<IDXGISwapChain1> swapChain;
+      std::unique_ptr<DirectSwapChain> direct;   // in place of swapChain (d3d9.backend = d3d12)
       // Buffer 0's view (flip model: always the buffer drawn next), and the
       // buffers' size; both until a resize.
       Ref<ID3D11RenderTargetView> rtv;
