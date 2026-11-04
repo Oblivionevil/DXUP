@@ -8,6 +8,7 @@
 #include "../d3d12/d3d12_backend_context.h"
 #include "../d3d12/d3d12_fps_overlay.h"
 #include "../upscale/upscaler.h"
+#include "../util/util_exception_trace.h"
 #include "../util/util_paths.h"
 
 #include <algorithm>
@@ -3748,6 +3749,17 @@ namespace dxup::legacy {
     *device = nullptr;
     *context = nullptr;
     try {
+      // d3d11.dll does this when it loads; on this path it does not load.
+      struct ExceptionTrace {
+        ExceptionTrace() {
+          HMODULE module = nullptr;
+          GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                             reinterpret_cast<LPCSTR>(&createDirectDevice), &module);
+          installExceptionTrace(module);
+        }
+        ~ExceptionTrace() { removeExceptionTrace(); }
+      };
+      static ExceptionTrace exceptionTrace;
       d3d12::setUpscalerFactory(&createUpscaler);
       auto* created = new DirectDevice();
       try {

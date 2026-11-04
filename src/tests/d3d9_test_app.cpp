@@ -4589,6 +4589,34 @@ VO main(float3 p : POSITION, float4 c : COLOR0) { VO o; o.p = float4(p.xy, 0.5, 
     return code;
   }
 
+  void raiseCaught(DWORD code) {
+    __try {
+      RaiseException(code, 0, 0, nullptr);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+  }
+
+  // An exception of the process, with a device (see the scene exception_trace).
+  int exceptionChild(Runtime& runtime, DWORD code) {
+    IDirect3D9* d3d = runtime.create(D3D_SDK_VERSION);
+    HWND window = createWindow();
+    D3DPRESENT_PARAMETERS pp = {};
+    pp.Windowed = TRUE;
+    pp.SwapEffect = D3DSWAPEFFECT_DISCARD;
+    pp.BackBufferWidth = kWidth;
+    pp.BackBufferHeight = kHeight;
+    pp.BackBufferFormat = D3DFMT_X8R8G8B8;
+    pp.hDeviceWindow = window;
+    IDirect3DDevice9* device = nullptr;
+    if (!d3d || FAILED(d3d->CreateDevice(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, window, D3DCREATE_HARDWARE_VERTEXPROCESSING, &pp, &device)))
+      return 1;
+    raiseCaught(code);
+    device->Release();
+    d3d->Release();
+    DestroyWindow(window);
+    return 0;
+  }
+
   std::string readLogs(const std::wstring& dir) {
     std::string log;
     WIN32_FIND_DATAW found = {};
@@ -4952,6 +4980,7 @@ int main(int argc, char** argv) {
   size_t benchShadersLimit = 0;
   bool childDirect = false, childRaisedMsaa = false, childForcedMsaa = false, childSgssaa = false, childGlitch = false, childInject = false, identifier = false, childDpi = false, childFloatStrict = false, childDropped = false;
   bool childSelfTest = false, dxupOnly = false, childWorker = false, childPresent = false;
+  DWORD childException = 0;
   UINT presentBack[2] = {}, presentDump = 0;
   bool presentOverlay = false;
   unsigned variantNonce = 0;
@@ -4964,6 +4993,7 @@ int main(int argc, char** argv) {
     else if (std::strcmp(argv[i], "--raised-msaa-child") == 0) childRaisedMsaa = true;
     else if (std::strcmp(argv[i], "--sgssaa-child") == 0) childSgssaa = true;
     else if (std::strcmp(argv[i], "--glitch-child") == 0) childGlitch = true;
+    else if (std::strcmp(argv[i], "--exception-child") == 0 && i + 1 < argc) childException = DWORD(std::strtoul(argv[++i], nullptr, 10));
     else if (std::strcmp(argv[i], "--upscaler-inject-child") == 0) childInject = true;
     else if (std::strcmp(argv[i], "--present-child") == 0 && i + 4 < argc) {
       childPresent = true;
@@ -5018,6 +5048,8 @@ int main(int argc, char** argv) {
   }
   if (childGlitch)
     return glitchChild(dxup, dir);
+  if (childException)
+    return exceptionChild(dxup, childException);
   if (childPresent)
     return presentChild(dxup, dir, presentBack[0], presentBack[1], presentDump, presentOverlay);
   if (childInject)
@@ -5287,6 +5319,17 @@ int main(int argc, char** argv) {
       const int code = withMarker(L"dxup_frame_dump.txt", [&] { return runWith(settings("").c_str(), "--glitch-child"); });
       removeImages();
       report("glitch_report", code == 0, "code " + std::to_string(code));
+    }
+    // dxup_exception_trace.txt ("Record a problem" in DXUP Manager): the
+    // exception's code is new in each run, as the logs stay.
+    if (wantScene("exception_trace")) {
+      const DWORD code = 0xE0000000u | (GetTickCount() & 0xFFFFFFu);
+      char arguments[64], expected[64];
+      std::snprintf(arguments, sizeof(arguments), "--exception-child %lu", code);
+      std::snprintf(expected, sizeof(expected), "exception trace: 0x%08lX", code);
+      const int result = withMarker(L"dxup_exception_trace.txt", [&] { return runWith(settings("").c_str(), arguments); });
+      const bool traced = readLogs(dir).find(expected) != std::string::npos;
+      report("exception_trace", result == 0 && traced, "code " + std::to_string(result) + (traced ? ", in the log" : ", not in the log"));
     }
     if (wantScene("present_scaling")) {
       auto scaled = [&](const char* more, const char* arguments) {
