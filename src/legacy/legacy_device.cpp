@@ -2096,13 +2096,19 @@ namespace dxup::legacy {
     HRESULT hr = S_OK;
     const LegacyBackend backend = legacyBackend();
     if (backend != LegacyBackend::D3D11) {
-      if (const char* obstacle = directBackendObstacle()) {
+      // Without DXUP's d3d11.dll next to this DLL the way back would end on
+      // Windows' Direct3D 11, which does not know those settings either.
+      const char* obstacle = directBackendObstacle();
+      if (obstacle && backend == LegacyBackend::D3D12Only) {
+        logMessage(LogLevel::Warn, "d3d9.backend = d3d12only: refused for %s", obstacle);
+        error = "d3d9.backend = d3d12only: settings need d3d11.dll";
+        return false;
+      }
+      if (obstacle && dxupSiblingExists("d3d11.dll")) {
         logMessage(LogLevel::Warn, "d3d9.backend = d3d12: on d3d11.dll, for %s", obstacle);
-        if (backend == LegacyBackend::D3D12Only) {
-          error = "d3d9.backend = d3d12only: settings need d3d11.dll";
-          return false;
-        }
       } else {
+        if (obstacle)
+          logMessage(LogLevel::Warn, "d3d9.backend = d3d12: without DXUP's d3d11.dll, %s stays off", obstacle);
         uint32_t vendorId = 0;
         hr = createDirectDevice(m_device.put(), m_context.put(), &vendorId);
         if (SUCCEEDED(hr)) {

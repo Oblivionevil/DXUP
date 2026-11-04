@@ -4218,6 +4218,64 @@ float4 main(float2 t : TEXCOORD0) : COLOR { float v = tex2D(depth, t).r; return 
     return partial;
   }
 
+  // d3d11.msaaSamples raises what the application asked for. A triangle on a
+  // target with 2 samples: pixels a quarter covered exist only with more.
+  // Returns how many, or -1.
+  int raisedMsaaPixels(Runtime& runtime) {
+    IDirect3D9* d3d = runtime.create(D3D_SDK_VERSION);
+    if (!d3d) return -1;
+    HWND window = createWindow();
+    D3DPRESENT_PARAMETERS pp = {};
+    pp.Windowed = TRUE;
+    pp.SwapEffect = D3DSWAPEFFECT_DISCARD;
+    pp.BackBufferWidth = kWidth;
+    pp.BackBufferHeight = kHeight;
+    pp.BackBufferFormat = D3DFMT_X8R8G8B8;
+    pp.hDeviceWindow = window;
+    IDirect3DDevice9* device = nullptr;
+    int count = -1;
+    IDirect3DSurface9 *target = nullptr, *resolved = nullptr, *copy = nullptr;
+    if (SUCCEEDED(d3d->CreateDevice(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, window, D3DCREATE_HARDWARE_VERTEXPROCESSING, &pp, &device))
+     && SUCCEEDED(device->CreateRenderTarget(kWidth, kHeight, D3DFMT_A8R8G8B8, D3DMULTISAMPLE_2_SAMPLES, 0, FALSE, &target, nullptr))
+     && SUCCEEDED(device->CreateRenderTarget(kWidth, kHeight, D3DFMT_A8R8G8B8, D3DMULTISAMPLE_NONE, 0, FALSE, &resolved, nullptr))
+     && SUCCEEDED(device->CreateOffscreenPlainSurface(kWidth, kHeight, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM, &copy, nullptr))) {
+      struct V { float x, y, z, rhw; DWORD color; };
+      const V triangle[3] = {
+        { 0.0f, 0.0f, 0.5f, 1.0f, 0xffffffffu }, { float(kWidth), 0.0f, 0.5f, 1.0f, 0xffffffffu },
+        { 0.0f, float(kHeight), 0.5f, 1.0f, 0xffffffffu },
+      };
+      device->SetRenderTarget(0, target);
+      device->Clear(0, nullptr, D3DCLEAR_TARGET, 0xff000000u, 1.0f, 0);
+      device->BeginScene();
+      device->SetRenderState(D3DRS_LIGHTING, FALSE);
+      device->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+      device->SetRenderState(D3DRS_ZENABLE, FALSE);
+      device->SetRenderState(D3DRS_MULTISAMPLEANTIALIAS, TRUE);
+      device->SetFVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE);
+      device->DrawPrimitiveUP(D3DPT_TRIANGLELIST, 1, triangle, sizeof(V));
+      device->EndScene();
+      device->StretchRect(target, nullptr, resolved, nullptr, D3DTEXF_NONE);
+      if (SUCCEEDED(device->GetRenderTargetData(resolved, copy))) {
+        D3DLOCKED_RECT rect;
+        copy->LockRect(&rect, nullptr, D3DLOCK_READONLY);
+        count = 0;
+        for (UINT y = 0; y < kHeight; y++)
+          for (UINT x = 0; x < kWidth; x++) {
+            const DWORD red = (reinterpret_cast<const DWORD*>(static_cast<BYTE*>(rect.pBits) + y * rect.Pitch)[x] >> 16) & 255;
+            count += (red > 16 && red < 100) || (red > 160 && red < 240);
+          }
+        copy->UnlockRect();
+      }
+    }
+    if (copy) copy->Release();
+    if (resolved) resolved->Release();
+    if (target) target->Release();
+    if (device) device->Release();
+    d3d->Release();
+    DestroyWindow(window);
+    return count;
+  }
+
   // A vertex shader new to DXUP (nonce in its code), drawn with a user clip
   // plane (a variant its creation does not compile ahead) right after its
   // creation. DXUP records the shaders and variants draws use and compiles
@@ -4545,7 +4603,7 @@ int main(int argc, char** argv) {
   int benchFrames = 0, benchDraws = 0;
   const char* benchShadersPath = nullptr;
   size_t benchShadersLimit = 0;
-  bool childDirect = false, childForcedMsaa = false, identifier = false, childDpi = false, childFloatStrict = false, childDropped = false;
+  bool childDirect = false, childRaisedMsaa = false, childForcedMsaa = false, identifier = false, childDpi = false, childFloatStrict = false, childDropped = false;
   bool childSelfTest = false, dxupOnly = false, childWorker = false;
   unsigned variantNonce = 0;
   for (int i = 1; i < argc; i++) {
@@ -4554,6 +4612,7 @@ int main(int argc, char** argv) {
     else if (std::strcmp(argv[i], "--memory") == 0) memory = true;
     else if (std::strcmp(argv[i], "--forced-msaa-child") == 0) childForcedMsaa = true;
     else if (std::strcmp(argv[i], "--direct-child") == 0) childDirect = true;
+    else if (std::strcmp(argv[i], "--raised-msaa-child") == 0) childRaisedMsaa = true;
     else if (std::strcmp(argv[i], "--identifier") == 0) identifier = true;
     else if (std::strcmp(argv[i], "--dpi-child") == 0) childDpi = true;
     else if (std::strcmp(argv[i], "--float-strict-child") == 0) childFloatStrict = true;
@@ -4599,6 +4658,10 @@ int main(int argc, char** argv) {
     return droppedChild(dxup);
   if (childDirect)
     return directChild(dxup);
+  if (childRaisedMsaa) {
+    const int pixels = raisedMsaaPixels(dxup);
+    return pixels < 0 ? 255 : (std::min)(pixels, 254);
+  }
   // A device with diagnostics on runs DXUP's self-test.
   if (childSelfTest) {
     IDirect3D9* d3d = dxup.create(D3D_SDK_VERSION);
@@ -4791,12 +4854,16 @@ int main(int argc, char** argv) {
     // Settings only d3d11.dll implements: refused when no way back is
     // allowed, on d3d11.dll (and doing what they say) otherwise.
     const int refused = runWith("d3d9.backend = d3d12only\nd3d11.msaaSamples = 4\nd3d11.msaaForce = true\n", "--direct-child");
+    // d3d11.msaaSamples alone stays on the D3D12 backend.
+    const int asked = runWith("d3d9.backend = d3d12only\n", "--raised-msaa-child");
+    const int raised = runWith("d3d9.backend = d3d12only\nd3d11.msaaSamples = 4\n", "--raised-msaa-child");
     const int fellBack = runWith("d3d9.backend = d3d12\nd3d11.msaaSamples = 4\nd3d11.msaaForce = true\n", "--forced-msaa-child");
     const int scenes = runWith("d3d9.backend = d3d12only\n", "--worker-child", 600000);
     const int sceneWorker = runWith("d3d9.backend = d3d12only\nd3d9.workerThread = true\n", "--worker-child", 600000);
-    const bool ok = direct == 0 && worker == 0 && refused == 1 && fellBack >= 40 && fellBack < 255 && scenes == 0 && sceneWorker == 0;
-    std::printf("%s %-20s device %d, with worker %d, refused %d, fell back %d, scenes differing %d, with worker %d\n",
-                ok ? "ok  " : "FAIL", "direct_backend", direct, worker, refused, fellBack, scenes, sceneWorker);
+    const bool ok = direct == 0 && worker == 0 && refused == 1 && asked == 0 && raised > 0 && raised < 255 && fellBack >= 40
+      && fellBack < 255 && scenes == 0 && sceneWorker == 0;
+    std::printf("%s %-20s device %d, with worker %d, refused %d, samples raised %d (asked %d), fell back %d, scenes differing %d, with worker %d\n",
+                ok ? "ok  " : "FAIL", "direct_backend", direct, worker, refused, raised, asked, fellBack, scenes, sceneWorker);
     ok ? passed++ : failed++;
   }
   // Forced multisampling (dxup.conf next to DXUP's DLLs, in a child).

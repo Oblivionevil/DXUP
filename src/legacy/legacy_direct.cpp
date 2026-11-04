@@ -1487,7 +1487,15 @@ namespace dxup::legacy {
         if (!texture)
           return S_FALSE;
         return guarded([&] {
-          auto image = m_backendDevice.createTexture2D(desc, initial);
+          // Multisampled textures may get more samples than asked for
+          // (d3d11.msaaSamples); the application keeps seeing its count.
+          D3D11_TEXTURE2D_DESC backendDesc = *desc;
+          const UINT samples = enhancedSampleCount(desc->Format, desc->SampleDesc.Count);
+          if (samples != desc->SampleDesc.Count) {
+            backendDesc.SampleDesc.Count = samples;
+            backendDesc.SampleDesc.Quality = 0;
+          }
+          auto image = m_backendDevice.createTexture2D(&backendDesc, initial);
           if (!image)
             return HRESULT(E_FAIL);
           D3D11_TEXTURE2D_DESC effective = *desc;
@@ -1830,6 +1838,16 @@ namespace dxup::legacy {
           *shader = new Object(this, std::move(backend));
           return HRESULT(S_OK);
         });
+      }
+
+      UINT enhancedSampleCount(DXGI_FORMAT format, UINT appCount) {
+        const int32_t forced = UserOverrides::get().msaaSamples;
+        if (appCount <= 1 || forced <= static_cast<int32_t>(appCount))
+          return appCount;
+        UINT levels = 0;
+        if (FAILED(CheckMultisampleQualityLevels(format, static_cast<UINT>(forced), &levels)) || !levels)
+          return appCount;
+        return static_cast<UINT>(forced);
       }
 
       FormatSupportQuery formatQuery() {
@@ -2677,8 +2695,8 @@ namespace dxup::legacy {
 
   const char* directBackendObstacle() {
     const UserOverrides& overrides = UserOverrides::get();
-    if (overrides.msaaSamples > 1 || overrides.msaaForce || overrides.sgssaa != SgssaaMode::Off)
-      return "forced multisampling (d3d11.msaaSamples, msaaForce, sgssaa)";
+    if (overrides.msaaForce || overrides.sgssaa != SgssaaMode::Off)
+      return "forced multisampling (d3d11.msaaForce, sgssaa)";
     if (overrides.upscaler || overrides.upscalerAuto || overrides.upscalerInject)
       return "the temporal upscalers (d3d11.upscaler)";
     if (overrides.spatialUpscale || overrides.renderScale < 1.0f)
