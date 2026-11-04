@@ -545,6 +545,7 @@ namespace dxup {
       };
       overrides.d3d9Backend = legacyBackend(config.getString("d3d9.backend", "d3d11"));
       overrides.d3d8Backend = legacyBackend(config.getString("d3d8.backend", "d3d11"));
+      overrides.ddrawBackend = legacyBackend(config.getString("ddraw.backend", "d3d11"));
       const std::string nanDepth = config.getString("d3d9.nanDepth", "auto");
       overrides.d3d9NanDepth = nanDepth == "zero" || nanDepth == "true" || nanDepth == "1" ? 1
         : nanDepth == "discard" || nanDepth == "false" || nanDepth == "0" ? 0 : -1;

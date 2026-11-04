@@ -1,8 +1,13 @@
 #include "legacy_direct.h"
 
 #include "../d3d11/d3d11_device.h"
+#include "../d3d11/d3d11_draw_history.h"
+#include "../d3d11/d3d11_glitch_detect.h"
+#include "../d3d11/d3d11_taa_inject.h"
 #include "../d3d12/d3d12_backend_device.h"
 #include "../d3d12/d3d12_backend_context.h"
+#include "../d3d12/d3d12_fps_overlay.h"
+#include "../upscale/upscaler.h"
 #include "../util/util_paths.h"
 
 #include <algorithm>
@@ -152,10 +157,74 @@ namespace dxup::legacy {
       void STDMETHODCALLTYPE GetDesc(D3D11_TEXTURE2D_DESC* desc) override { *desc = m_desc; }
 
       IBackendImage* raw;
+      bool           swapChainBuffer = false;   // glitch reports
+
+      // Forced multisampling (d3d11.msaaForce), as D3D11Texture2D: which of
+      // the image and its multisampled copy is newer, and whether the copy
+      // holds multisampled contents.
+      enum class MsaaState : uint8_t { Synced, ShadowNewer, ImageNewer };
+
+      MsaaState GetMsaaState() const { return m_msaaState; }
+      bool HasMsaaContent() const { return m_msaaContent; }
+      void SetMsaaState(MsaaState state) {
+        m_msaaState = state;
+        m_msaaImageCopied = false;
+        if (state == MsaaState::ShadowNewer)
+          m_msaaContent = true;
+      }
+      // The contents were cleared, replaced or discarded as a whole.
+      void ResetMsaaState(MsaaState state) {
+        m_msaaState = state;
+        m_msaaImageCopied = false;
+        m_msaaContent = false;
+        m_msaaImageStencilOld = false;
+        m_msaaShadowStencilOld = false;
+      }
+      // Resolving and refilling carry depth only: whose stencil is older.
+      bool IsMsaaImageStencilOld() const { return m_msaaImageStencilOld; }
+      bool IsMsaaShadowStencilOld() const { return m_msaaShadowStencilOld; }
+      void SetMsaaImageStencilOld(bool old) { m_msaaImageStencilOld = old; }
+      void SetMsaaShadowStencilOld(bool old) { m_msaaShadowStencilOld = old; }
+      // After a copy into the image the copy had to be refilled: later copies
+      // take the source's copy along (one copy instead of a refill pass).
+      void MarkMsaaImageCopied() { m_msaaImageCopied = true; }
+      void MarkMsaaRefill() {
+        if (m_msaaImageCopied)
+          m_msaaCopyShadow = true;
+      }
+      bool CopiesMsaaShadow() const { return m_msaaCopyShadow; }
+      void CopyMsaaStateFrom(const DirectTexture2D& source) {
+        m_msaaState = MsaaState::Synced;
+        m_msaaImageCopied = false;
+        m_msaaContent = source.m_msaaContent;
+        m_msaaImageStencilOld = source.m_msaaImageStencilOld;
+        m_msaaShadowStencilOld = source.m_msaaShadowStencilOld;
+      }
+      // Depth-tested geometry was drawn into the copy at some point: it keeps
+      // being drawn multisampled (msaaScope geometry).
+      void MarkMsaaGeometry() { m_msaaGeometry = true; }
+      bool IsMsaaGeometry() const { return m_msaaGeometry; }
+
+      void SetMsaaShadow(Rc<IBackendImage> shadow, const ForcedMsaaFormats& formats) {
+        m_msaaShadow = std::move(shadow);
+        m_msaaFormats = formats;
+      }
+      IBackendImage* GetMsaaShadow() const { return m_msaaShadow.get(); }
+      const ForcedMsaaFormats& GetMsaaFormats() const { return m_msaaFormats; }
+      void SetMsaaColorFormat(DXGI_FORMAT format) { m_msaaFormats.typed = format; }
 
     private:
       D3D11_TEXTURE2D_DESC m_desc;
       Rc<IBackendImage>    m_image;
+      Rc<IBackendImage>    m_msaaShadow;
+      ForcedMsaaFormats    m_msaaFormats;
+      MsaaState            m_msaaState = MsaaState::Synced;
+      bool                 m_msaaContent = false;
+      bool                 m_msaaGeometry = false;
+      bool                 m_msaaImageCopied = false;
+      bool                 m_msaaCopyShadow = false;
+      bool                 m_msaaImageStencilOld = false;
+      bool                 m_msaaShadowStencilOld = false;
     };
 
     class DirectTexture3D final : public Child<ID3D11Texture3D> {
@@ -183,6 +252,18 @@ namespace dxup::legacy {
       if (dimension == D3D11_RESOURCE_DIMENSION_TEXTURE3D)
         return static_cast<DirectTexture3D*>(static_cast<ID3D11Texture3D*>(resource))->raw;
       return nullptr;
+    }
+
+    // A texture with a forced multisampled copy, or null.
+    DirectTexture2D* forcedMsaaTexture(ID3D11Resource* resource) {
+      if (!resource)
+        return nullptr;
+      D3D11_RESOURCE_DIMENSION dimension = D3D11_RESOURCE_DIMENSION_UNKNOWN;
+      resource->GetType(&dimension);
+      if (dimension != D3D11_RESOURCE_DIMENSION_TEXTURE2D)
+        return nullptr;
+      auto* texture = static_cast<DirectTexture2D*>(static_cast<ID3D11Texture2D*>(resource));
+      return texture->GetMsaaShadow() ? texture : nullptr;
     }
 
     DirectBuffer* bufferOf(ID3D11Resource* resource) {
@@ -247,8 +328,10 @@ namespace dxup::legacy {
     public:
       DirectSrv(DirectDevice* device, ID3D11Resource* resource, Rc<IBackendImageView> view, const ViewRange& range,
                 const D3D11_SHADER_RESOURCE_VIEW_DESC& desc)
-      : DirectView(device, resource, std::move(view), range), m_desc(desc) { }
+      : DirectView(device, resource, std::move(view), range), forcedTexture(forcedMsaaTexture(resource)), m_desc(desc) { }
       void STDMETHODCALLTYPE GetDesc(D3D11_SHADER_RESOURCE_VIEW_DESC* desc) override { *desc = m_desc; }
+      DirectTexture2D* forcedTexture;
+      bool readsStencil() const { return range.planes == 2u; }
     private:
       D3D11_SHADER_RESOURCE_VIEW_DESC m_desc;
     };
@@ -256,27 +339,39 @@ namespace dxup::legacy {
     class DirectRtv final : public DirectView<ID3D11RenderTargetView> {
     public:
       DirectRtv(DirectDevice* device, ID3D11Resource* resource, Rc<IBackendImageView> view, const ViewRange& range,
-                const D3D11_RENDER_TARGET_VIEW_DESC& desc, DXGI_FORMAT format, uint32_t samples, uint32_t quality)
+                const D3D11_RENDER_TARGET_VIEW_DESC& desc, DXGI_FORMAT format, uint32_t samples, uint32_t quality,
+                Rc<IBackendImageView> shadowView, bool swapChainBuffer)
       : DirectView(device, resource, std::move(view), range), pipelineFormat(format), sampleCount(samples),
-        sampleQuality(quality), m_desc(desc) { }
+        sampleQuality(quality), shadow(shadowView.get()), swapChain(swapChainBuffer), m_desc(desc), m_shadow(std::move(shadowView)) { }
       void STDMETHODCALLTYPE GetDesc(D3D11_RENDER_TARGET_VIEW_DESC* desc) override { *desc = m_desc; }
       DXGI_FORMAT pipelineFormat;
       uint32_t    sampleCount, sampleQuality;
+      IBackendImageView* shadow;   // of the multisampled copy (forced multisampling)
+      bool        swapChain;
     private:
       D3D11_RENDER_TARGET_VIEW_DESC m_desc;
+      Rc<IBackendImageView> m_shadow;
     };
 
     class DirectDsv final : public DirectView<ID3D11DepthStencilView> {
     public:
       DirectDsv(DirectDevice* device, ID3D11Resource* resource, Rc<IBackendImageView> view, const ViewRange& range,
-                const D3D11_DEPTH_STENCIL_VIEW_DESC& desc, DXGI_FORMAT format, uint32_t samples, uint32_t quality)
+                const D3D11_DEPTH_STENCIL_VIEW_DESC& desc, DXGI_FORMAT format, uint32_t samples, uint32_t quality,
+                Rc<IBackendImageView> shadowView)
       : DirectView(device, resource, std::move(view), range), pipelineFormat(format), sampleCount(samples),
-        sampleQuality(quality), m_desc(desc) { }
+        sampleQuality(quality), shadow(shadowView.get()), m_desc(desc), m_shadow(std::move(shadowView)) { }
       void STDMETHODCALLTYPE GetDesc(D3D11_DEPTH_STENCIL_VIEW_DESC* desc) override { *desc = m_desc; }
       DXGI_FORMAT pipelineFormat;
       uint32_t    sampleCount, sampleQuality;
+      IBackendImageView* shadow;   // of the multisampled copy (forced multisampling)
+      bool isDepthReadOnly() const { return (m_desc.Flags & D3D11_DSV_READ_ONLY_DEPTH) != 0; }
+      bool isStencilReadOnly() const { return (m_desc.Flags & D3D11_DSV_READ_ONLY_STENCIL) != 0; }
+      bool hasStencil() const {
+        return pipelineFormat == DXGI_FORMAT_D24_UNORM_S8_UINT || pipelineFormat == DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+      }
     private:
       D3D11_DEPTH_STENCIL_VIEW_DESC m_desc;
+      Rc<IBackendImageView> m_shadow;
     };
 
     template<typename Base>
@@ -339,6 +434,16 @@ namespace dxup::legacy {
       uint32_t          id;
       DepthStencilState state;
       uint64_t          hash;
+      bool writesDepth() const { return m_desc.DepthEnable && m_desc.DepthWriteMask == D3D11_DEPTH_WRITE_MASK_ALL; }
+      bool writesStencil() const {
+        auto changes = [](const D3D11_DEPTH_STENCILOP_DESC& face) {
+          return face.StencilFailOp != D3D11_STENCIL_OP_KEEP || face.StencilDepthFailOp != D3D11_STENCIL_OP_KEEP
+              || face.StencilPassOp != D3D11_STENCIL_OP_KEEP;
+        };
+        return m_desc.StencilEnable && m_desc.StencilWriteMask && (changes(m_desc.FrontFace) || changes(m_desc.BackFace));
+      }
+      bool usesDepthStencil() const { return m_desc.DepthEnable || m_desc.StencilEnable; }
+      bool usesStencil() const { return m_desc.StencilEnable != FALSE; }
     private:
       D3D11_DEPTH_STENCIL_DESC m_desc;
     };
@@ -399,7 +504,7 @@ namespace dxup::legacy {
       uint32_t sampleMask = D3D11_DEFAULT_SAMPLE_MASK;
       uint32_t formats[2] = {};      // render target formats, a byte each
       uint32_t dsvFormat = 0;
-      uint32_t samples = 1;          // sample count, render target count << 16
+      uint32_t samples = 1;          // sample count, render target count << 16, per-sample shading << 24
       uint32_t sampleQuality = 0;
       uint32_t topology = 0;         // topology, strip cut index type << 8
 
@@ -534,6 +639,10 @@ namespace dxup::legacy {
         m_stages[0].stage = ShaderStage::Vertex;
         m_stages[1].stage = ShaderStage::Geometry;
         m_stages[2].stage = ShaderStage::Pixel;
+        const UserOverrides& overrides = UserOverrides::get();
+        m_sgssaa = overrides.sgssaa != SgssaaMode::Off;
+        m_injectWanted = overrides.upscaler && overrides.upscalerInject;
+        m_slowDraws.store(m_historyOn || m_injectWanted || (overrides.upscaler && overrides.upscalerAuto), std::memory_order_relaxed);
       }
 
       ~DirectContext() {
@@ -544,6 +653,34 @@ namespace dxup::legacy {
       }
 
       IBackendContext* backend() const { return m_ctx; }
+
+      // Draws look at copies from now on: the first multisampled copy exists.
+      void noteForcedMsaa() {
+        m_forcedMsaa.store(true, std::memory_order_relaxed);
+        m_slowDraws.store(true, std::memory_order_relaxed);
+      }
+
+      // The frames' calls, for the swap chain's glitch reports.
+      DrawHistory* drawHistoryOrNull() { return m_historyOn ? &m_history : nullptr; }
+
+      // At each Present of a swap chain.
+      void noteFramePresented() {
+        if (m_historyOn) {
+          m_history.nextFrame();
+          logDroppedDraws();
+        }
+        // No compute pass is a Direct3D 8/9 game's TAA: d3d11.upscalerAuto
+        // turns to the injected one after half a minute, as on d3d11.dll
+        // when no TAA pass shows.
+        const UserOverrides& overrides = UserOverrides::get();
+        if (!m_injectWanted && overrides.upscaler && overrides.upscalerAuto && ++m_presentsWithoutTaa >= 1800)
+          m_injectWanted = true;
+        if (m_injectTaa) {
+          if (m_injectTaa->atPresent())
+            runInjectedPass();
+          m_injectTaa->endFrame();
+        }
+      }
 
       // ---- IUnknown ----
 
@@ -726,6 +863,7 @@ namespace dxup::legacy {
 
         updateTargets();
         rebindOutputMerger();
+        updateSampleKey();
         for (DirectRtv* view : oldTargets)
           if (view)
             view->noteUnbound();
@@ -761,11 +899,16 @@ namespace dxup::legacy {
         auto* value = static_cast<DirectDepthState*>(state);
         DirectDepthState* old = m_depth;
         if (old != value) {
+          // A bound depth view decides the forced multisampling scope only
+          // while draws use it.
+          const bool usedBefore = depthStencilUsed();
           if (value)
             value->noteBound();
           m_depth = value;
           m_key.depth = value ? value->id : 0;
           m_pipelineDirty = true;
+          if (m_dsv && usedBefore != depthStencilUsed())
+            m_msaaScopeDirty = true;
           if (old)
             old->noteUnbound();
         }
@@ -799,6 +942,7 @@ namespace dxup::legacy {
           return;
         if (m_viewportCount == count && (!count || !std::memcmp(m_viewports, viewports, sizeof(D3D11_VIEWPORT) * count)))
           return;
+        m_injectViewportJittered = false;
         for (UINT i = 0; i < count; i++) {
           const D3D11_VIEWPORT& v = viewports[i];
           if (!(v.MinDepth >= 0.0f && v.MaxDepth <= 1.0f && v.MinDepth <= v.MaxDepth
@@ -839,22 +983,22 @@ namespace dxup::legacy {
       // ---- Draws ----
 
       void STDMETHODCALLTYPE Draw(UINT count, UINT start) override {
-        if (prepareDraw())
+        if (prepareDraw(RecordOp::Draw, count, 1, start, 0))
           m_ctx->draw(count, 1, start, 0);
       }
 
       void STDMETHODCALLTYPE DrawIndexed(UINT count, UINT start, INT base) override {
-        if (prepareDraw())
+        if (prepareDraw(RecordOp::DrawIndexed, count, 1, start, base))
           m_ctx->drawIndexed(count, 1, start, base, 0);
       }
 
       void STDMETHODCALLTYPE DrawInstanced(UINT count, UINT instances, UINT start, UINT firstInstance) override {
-        if (prepareDraw())
+        if (prepareDraw(RecordOp::Draw, count, instances, start, 0))
           m_ctx->draw(count, instances, start, firstInstance);
       }
 
       void STDMETHODCALLTYPE DrawIndexedInstanced(UINT count, UINT instances, UINT start, INT base, UINT firstInstance) override {
-        if (prepareDraw())
+        if (prepareDraw(RecordOp::DrawIndexed, count, instances, start, base))
           m_ctx->drawIndexed(count, instances, start, base, firstInstance);
       }
 
@@ -883,6 +1027,12 @@ namespace dxup::legacy {
         mapped->pData = data;
         mapped->RowPitch = layout.rowPitch;
         mapped->DepthPitch = layout.depthPitch;
+        if (m_historyOn && type == D3D11_MAP_READ) {
+          const ImageDesc& d = image->getDesc();
+          const uint32_t mip = subresource % (std::max)(1u, d.mipLevels);
+          checkReadbackForNan(m_nanReadbacks, resource, data, layout.rowPitch, (std::max)(1u, d.height >> mip),
+            (std::max)(1u, d.width >> mip), d.format, false);
+        }
         return S_OK;
       }
 
@@ -925,8 +1075,14 @@ namespace dxup::legacy {
       // ---- Clears ----
 
       void STDMETHODCALLTYPE ClearRenderTargetView(ID3D11RenderTargetView* view, const FLOAT color[4]) override {
-        if (view && color)
-          m_ctx->clearRenderTarget(static_cast<DirectRtv*>(view)->raw, color);
+        if (!view || !color)
+          return;
+        auto* rtv = static_cast<DirectRtv*>(view);
+        if (m_historyOn)
+          recordClear(RecordOp::ClearColor, rtv, rtv->raw, rtv->swapChain, color);
+        if (IBackendImageView* shadow = clearedForcedMsaaShadow(rtv->range.resource, rtv->shadow, true))
+          m_ctx->clearRenderTarget(shadow, color);
+        m_ctx->clearRenderTarget(rtv->raw, color);
       }
 
       void STDMETHODCALLTYPE ClearDepthStencilView(ID3D11DepthStencilView* view, UINT flags, FLOAT depth, UINT8 stencil) override {
@@ -934,9 +1090,24 @@ namespace dxup::legacy {
           return;
         auto* dsv = static_cast<DirectDsv*>(view);
         // Only planes the view writes are cleared (native runtime).
+        const UINT allPlanes = dsv->hasStencil() ? (D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL) : D3D11_CLEAR_DEPTH;
         flags &= ((dsv->range.planes & 1u) ? D3D11_CLEAR_DEPTH : 0u) | ((dsv->range.planes & 2u) ? D3D11_CLEAR_STENCIL : 0u);
-        if (flags)
-          m_ctx->clearDepthStencil(dsv->raw, depth, stencil, flags);
+        if (!flags)
+          return;
+        if (m_historyOn) {
+          const float value[4] = { depth, float(stencil), float(flags), 0.0f };
+          recordClear(RecordOp::ClearDepth, dsv, dsv->raw, false, value);
+        }
+        // All of it is cleared when every plane of the format is.
+        if (IBackendImageView* shadow = clearedForcedMsaaShadow(dsv->range.resource, dsv->shadow, flags == allPlanes)) {
+          m_ctx->clearDepthStencil(shadow, depth, stencil, flags);
+          if (flags & D3D11_CLEAR_STENCIL) {
+            DirectTexture2D* texture = forcedMsaaTexture(dsv->range.resource);
+            texture->SetMsaaImageStencilOld(false);
+            texture->SetMsaaShadowStencilOld(false);
+          }
+        }
+        m_ctx->clearDepthStencil(dsv->raw, depth, stencil, flags);
       }
 
       void STDMETHODCALLTYPE ClearState() override {
@@ -945,6 +1116,9 @@ namespace dxup::legacy {
         m_key = PipelineKey{};
         m_pipelineDirty = true;
         m_currentPipeline = nullptr;
+        m_injectViewportJittered = false;
+        m_omForcedMsaa = false;
+        m_msaaScopeDirty = false;
         m_topology = D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED;
         m_indexFormat = DXGI_FORMAT_UNKNOWN;
         m_indexOffset = 0;
@@ -1116,6 +1290,7 @@ namespace dxup::legacy {
       struct Stage {
         ShaderStage    stage = ShaderStage::Vertex;
         UINT           viewEnd = 0;
+        uint32_t       forcedSrvs = 0;   // slots of textures with a forced multisampled copy
         DirectSrv*     views[kViewSlots] = {};
         DirectSampler* samplers[kSamplerSlots] = {};
         DirectBuffer*  constants[kConstantSlots] = {};
@@ -1187,6 +1362,8 @@ namespace dxup::legacy {
             view->noteBound();
             if (slot >= stage.viewEnd)
               stage.viewEnd = slot + 1;
+            if (view->forcedTexture)
+              stage.forcedSrvs |= 1u << slot;
           }
           stage.views[slot] = view;
           m_ctx->bindShaderResource(stage.stage, slot, view ? view->raw : static_cast<IBackendImageView*>(nullptr));
@@ -1217,34 +1394,19 @@ namespace dxup::legacy {
       // the sample count, and what views may no longer read.
       void updateTargets() {
         uint32_t formats[2] = {};
-        uint32_t samples = 1, quality = 0;
-        bool sampled = false;
         m_writeCount = 0;
         for (UINT i = 0; i < m_targetCount; i++) {
           DirectRtv* view = m_rtvs[i];
           if (!view)
             continue;
           formats[i / 4] |= uint32_t(uint8_t(view->pipelineFormat)) << (i % 4 * 8);
-          if (!sampled) {
-            samples = view->sampleCount;
-            quality = view->sampleQuality;
-            sampled = true;
-          }
           m_writes[m_writeCount++] = view->range;
         }
-        if (m_dsv) {
-          if (!sampled || samples == 1) {
-            samples = m_dsv->sampleCount;
-            quality = m_dsv->sampleQuality;
-          }
-          if (m_dsv->range.planes)
-            m_writes[m_writeCount++] = m_dsv->range;
-        }
+        if (m_dsv && m_dsv->range.planes)
+          m_writes[m_writeCount++] = m_dsv->range;
         m_key.formats[0] = formats[0];
         m_key.formats[1] = formats[1];
         m_key.dsvFormat = m_dsv ? uint32_t(m_dsv->pipelineFormat) : 0u;
-        m_key.samples = samples | m_targetCount << 16;
-        m_key.sampleQuality = quality;
         m_pipelineDirty = true;
         // Binding for writing unbinds the reads of the same parts.
         for (UINT w = 0; w < m_writeCount; w++)
@@ -1259,11 +1421,402 @@ namespace dxup::legacy {
             }
       }
 
+      // The sample count of the bound targets, of the copies when the draw
+      // renders into those.
+      void updateSampleKey() {
+        const uint32_t forcedSamples = uint32_t((std::max)(UserOverrides::get().msaaSamples, 1));
+        uint32_t samples = 1, quality = 0;
+        bool sampled = false;
+        for (UINT i = 0; i < m_targetCount && !sampled; i++) {
+          if (DirectRtv* view = m_rtvs[i]) {
+            const bool copy = m_omForcedMsaa && view->shadow;
+            samples = copy ? forcedSamples : view->sampleCount;
+            quality = copy ? 0u : view->sampleQuality;
+            sampled = true;
+          }
+        }
+        if (m_dsv && samples == 1) {
+          const bool copy = m_omForcedMsaa && m_dsv->shadow;
+          samples = copy ? forcedSamples : m_dsv->sampleCount;
+          quality = copy ? 0u : m_dsv->sampleQuality;
+        }
+        m_key.samples = samples | m_targetCount << 16;
+        m_key.sampleQuality = quality;
+        m_pipelineDirty = true;
+      }
+
       void rebindOutputMerger() {
+        const bool forced = m_forcedMsaa.load(std::memory_order_relaxed) && wantsForcedMsaa();
+        m_msaaScopeDirty = false;
+        if (forced != m_omForcedMsaa) {
+          m_omForcedMsaa = forced;
+          updateSampleKey();
+        }
         IBackendImageView* targets[kTargets] = {};
-        for (UINT i = 0; i < m_targetCount; i++)
-          targets[i] = m_rtvs[i] ? m_rtvs[i]->raw : nullptr;
-        m_ctx->bindRenderTargets(m_targetCount, targets, m_dsv ? m_dsv->raw : nullptr);
+        for (UINT i = 0; i < m_targetCount; i++) {
+          if (DirectRtv* view = m_rtvs[i])
+            targets[i] = forced && view->shadow ? view->shadow : view->raw;
+        }
+        IBackendImageView* depth = m_dsv ? (forced && m_dsv->shadow ? m_dsv->shadow : m_dsv->raw) : nullptr;
+        m_ctx->bindRenderTargets(m_targetCount, targets, depth);
+      }
+
+      // ---- Forced multisampling (d3d11.msaaForce), as in d3d11_context.h ----
+
+      bool depthStencilUsed() const { return !m_depth || m_depth->usesDepthStencil(); }
+
+      // The passes that refill and resolve copies bind pipelines of their own.
+      void forcedMsaaPassRan() {
+        m_pipelineDirty = true;
+        m_forcedMsaaPassRan = true;
+      }
+
+      static DXGI_FORMAT stencilReadFormat(DXGI_FORMAT format) {
+        switch (format) {
+          case DXGI_FORMAT_D24_UNORM_S8_UINT:    return DXGI_FORMAT_X24_TYPELESS_G8_UINT;
+          case DXGI_FORMAT_D32_FLOAT_S8X24_UINT: return DXGI_FORMAT_X32_TYPELESS_G8X24_UINT;
+          default:                               return DXGI_FORMAT_UNKNOWN;
+        }
+      }
+
+      // The image gets what was drawn into the copy; with stencil false a
+      // depth-stencil image may keep an older stencil (readers of depth only).
+      void resolveForcedMsaa(DirectTexture2D* texture, bool stencil = true) {
+        const ForcedMsaaFormats& formats = texture->GetMsaaFormats();
+        if (texture->GetMsaaState() == DirectTexture2D::MsaaState::ShadowNewer) {
+          if (formats.depth) {
+            m_ctx->resolveSampleZero(texture->raw, texture->GetMsaaShadow(), formats.typed, formats.depthRead);
+            forcedMsaaPassRan();
+          } else if (isMotionVectorFormat(formats.typed)) {
+            // The average of a moving sample and a cleared one is a vector
+            // nothing moved by.
+            m_ctx->resolveSampleZero(texture->raw, texture->GetMsaaShadow(), formats.typed, formats.typed);
+            forcedMsaaPassRan();
+          } else if (isFloatColorFormat(formats.typed)) {
+            // One NaN sample would make the averaged pixel NaN.
+            m_ctx->resolveFinite(texture->raw, texture->GetMsaaShadow(), formats.typed);
+            forcedMsaaPassRan();
+          } else {
+            m_ctx->resolveSubresource(texture->raw, 0, texture->GetMsaaShadow(), 0, formats.typed);
+          }
+          texture->SetMsaaState(DirectTexture2D::MsaaState::Synced);
+          // The depth resolve leaves the image's stencil as it was: older,
+          // unless the copy's stencil was not brought up to date either.
+          if (formats.depth && stencilReadFormat(formats.typed) != DXGI_FORMAT_UNKNOWN && !texture->IsMsaaShadowStencilOld())
+            texture->SetMsaaImageStencilOld(true);
+        }
+        if (stencil && texture->IsMsaaImageStencilOld()) {
+          m_ctx->copyStencil(texture->raw, texture->GetMsaaShadow(), formats.typed, stencilReadFormat(formats.typed));
+          forcedMsaaPassRan();
+          texture->SetMsaaImageStencilOld(false);
+        }
+      }
+
+      // Draws with stencil into a depth-stencil copy refilled from the image:
+      // the copy gets the image's stencil first.
+      void refillForcedMsaaStencil(DirectTexture2D* texture) {
+        if (!texture->IsMsaaShadowStencilOld())
+          return;
+        const ForcedMsaaFormats& formats = texture->GetMsaaFormats();
+        m_ctx->copyStencil(texture->GetMsaaShadow(), texture->raw, formats.typed, stencilReadFormat(formats.typed));
+        forcedMsaaPassRan();
+        texture->SetMsaaShadowStencilOld(false);
+      }
+
+      void readForcedMsaa(ID3D11Resource* resource, bool stencil = true) {
+        if (!m_forcedMsaa.load(std::memory_order_relaxed))
+          return;
+        if (DirectTexture2D* texture = forcedMsaaTexture(resource))
+          resolveForcedMsaa(texture, stencil);
+      }
+
+      // The images the stage's shader reads get what was drawn into their
+      // copies before it runs; slots it does not declare cost nothing.
+      void readForcedMsaaShaderResources(Stage& stage, const IBackendShader* shader) {
+        if (!stage.forcedSrvs || !shader)
+          return;
+        const uint64_t* declared = shader->getShaderResourceSlots();
+        uint32_t slots = stage.forcedSrvs & (declared ? uint32_t(declared[0]) : ~0u);
+        for (uint32_t slot = 0; slots; slot++, slots >>= 1) {
+          if (!(slots & 1))
+            continue;
+          DirectSrv* view = stage.views[slot];
+          if (view && view->forcedTexture)
+            resolveForcedMsaa(view->forcedTexture, view->readsStencil());
+          else
+            stage.forcedSrvs &= ~(1u << slot);
+        }
+      }
+
+      // The image is written by other means than render target views: it
+      // keeps what was drawn into the copy where it is not written, unless all
+      // of it is replaced.
+      void writeForcedMsaaImage(ID3D11Resource* resource, bool whole = false) {
+        if (!m_forcedMsaa.load(std::memory_order_relaxed))
+          return;
+        DirectTexture2D* texture = forcedMsaaTexture(resource);
+        if (!texture)
+          return;
+        if (whole) {
+          texture->ResetMsaaState(DirectTexture2D::MsaaState::ImageNewer);
+        } else {
+          resolveForcedMsaa(texture);
+          texture->SetMsaaState(DirectTexture2D::MsaaState::ImageNewer);
+        }
+        m_msaaScopeDirty = true;
+      }
+
+      // Whether a whole-texture copy takes the source's copy along.
+      bool forcedMsaaShadowCopyable(ID3D11Resource* dstResource, ID3D11Resource* srcResource) const {
+        if (!m_forcedMsaa.load(std::memory_order_relaxed))
+          return false;
+        DirectTexture2D* dst = forcedMsaaTexture(dstResource);
+        DirectTexture2D* src = forcedMsaaTexture(srcResource);
+        if (!dst || !src || !dst->CopiesMsaaShadow() || src->GetMsaaState() == DirectTexture2D::MsaaState::ImageNewer)
+          return false;
+        const ImageDesc& dstDesc = dst->GetMsaaShadow()->getDesc();
+        const ImageDesc& srcDesc = src->GetMsaaShadow()->getDesc();
+        return dstDesc.format == srcDesc.format && dstDesc.sampleCount == srcDesc.sampleCount
+            && dstDesc.width == srcDesc.width && dstDesc.height == srcDesc.height;
+      }
+
+      // A whole texture was copied: the destination takes the source's copy
+      // along, or notes that its image came from a copy.
+      void copyForcedMsaaShadow(ID3D11Resource* dstResource, ID3D11Resource* srcResource, bool along) {
+        if (!m_forcedMsaa.load(std::memory_order_relaxed))
+          return;
+        DirectTexture2D* dst = forcedMsaaTexture(dstResource);
+        if (!dst)
+          return;
+        if (!along) {
+          dst->MarkMsaaImageCopied();
+          return;
+        }
+        DirectTexture2D* src = forcedMsaaTexture(srcResource);
+        m_ctx->copyImage(dst->GetMsaaShadow(), ImageSubresource{}, src->GetMsaaShadow(), ImageSubresource{});
+        dst->CopyMsaaStateFrom(*src);
+      }
+
+      // A view of the copy is drawn into: unless all of it is written, it
+      // first gets what was written into the image.
+      void writeForcedMsaaShadow(DirectTexture2D* texture) {
+        if (texture->GetMsaaState() == DirectTexture2D::MsaaState::ImageNewer) {
+          texture->MarkMsaaRefill();
+          const ForcedMsaaFormats& formats = texture->GetMsaaFormats();
+          m_ctx->upsampleImage(texture->GetMsaaShadow(), texture->raw, formats.typed, formats.depth ? formats.depthRead : formats.typed);
+          forcedMsaaPassRan();
+          // The refill carries depth only.
+          if (formats.depth && stencilReadFormat(formats.typed) != DXGI_FORMAT_UNKNOWN)
+            texture->SetMsaaShadowStencilOld(true);
+        }
+        texture->SetMsaaState(DirectTexture2D::MsaaState::ShadowNewer);
+      }
+
+      // Whether the next draw renders into the multisampled copies: every
+      // bound render target and depth view has one, and under the geometry
+      // scope a depth view is used, or a target holds multisampled contents.
+      bool wantsForcedMsaa() const {
+        bool any = false;
+        bool content = false;
+        for (UINT i = 0; i < m_targetCount; i++) {
+          DirectRtv* view = m_rtvs[i];
+          if (!view)
+            continue;
+          if (!view->shadow)
+            return false;
+          any = true;
+          if (!content) {
+            const DirectTexture2D* texture = forcedMsaaTexture(view->range.resource);
+            content = texture && (texture->IsMsaaGeometry() || (texture->HasMsaaContent()
+                   && texture->GetMsaaState() != DirectTexture2D::MsaaState::ImageNewer));
+          }
+        }
+        if (m_dsv) {
+          if (!m_dsv->shadow)
+            return false;
+          any = true;
+        }
+        return any && ((m_dsv && depthStencilUsed()) || content || UserOverrides::get().msaaScope == MsaaScope::All);
+      }
+
+      // Decides again before a draw whether it renders into the copies.
+      void updateForcedMsaaScope() {
+        if (!m_msaaScopeDirty)
+          return;
+        m_msaaScopeDirty = false;
+        if (wantsForcedMsaa() != m_omForcedMsaa)
+          rebindOutputMerger();
+      }
+
+      // A draw writes its targets.
+      void prepareForcedMsaaDraw() {
+        for (UINT i = 0; i < m_targetCount; i++) {
+          DirectRtv* view = m_rtvs[i];
+          DirectTexture2D* texture = view ? forcedMsaaTexture(view->range.resource) : nullptr;
+          if (!texture)
+            continue;
+          if (m_omForcedMsaa) {
+            writeForcedMsaaShadow(texture);
+            // The copy resolves in the format it was last drawn in.
+            texture->SetMsaaColorFormat(view->pipelineFormat);
+            if (m_dsv && depthStencilUsed())
+              texture->MarkMsaaGeometry();
+          } else {
+            writeForcedMsaaImage(texture);
+          }
+        }
+        if (!m_dsv)
+          return;
+        DirectTexture2D* texture = forcedMsaaTexture(m_dsv->range.resource);
+        if (!texture)
+          return;
+        // Draws that cannot change depth leave the image as current as it was.
+        const bool writesDepth = !m_dsv->isDepthReadOnly() && (!m_depth || m_depth->writesDepth());
+        const bool writesStencil = m_dsv->hasStencil() && !m_dsv->isStencilReadOnly() && m_depth && m_depth->writesStencil();
+        if (!m_omForcedMsaa) {
+          if (writesDepth || writesStencil)
+            writeForcedMsaaImage(texture);
+          else if (depthStencilUsed())
+            readForcedMsaa(texture, m_depth && m_depth->usesStencil());
+        } else {
+          if (writesDepth) {
+            writeForcedMsaaShadow(texture);
+          } else if (texture->GetMsaaState() == DirectTexture2D::MsaaState::ImageNewer) {
+            // Read only: the copy only needs what the image holds.
+            writeForcedMsaaShadow(texture);
+            texture->SetMsaaState(DirectTexture2D::MsaaState::Synced);
+          }
+          if (m_depth && m_depth->usesStencil())
+            refillForcedMsaaStencil(texture);
+          // Stencil written without depth ages the image's stencil.
+          if (writesStencil)
+            texture->SetMsaaImageStencilOld(true);
+        }
+      }
+
+      // Clears write the texture and its copy alike. The copy's view to clear
+      // as well, if any.
+      IBackendImageView* clearedForcedMsaaShadow(ID3D11Resource* resource, IBackendImageView* shadowView, bool whole) {
+        if (!m_forcedMsaa.load(std::memory_order_relaxed))
+          return nullptr;
+        DirectTexture2D* texture = forcedMsaaTexture(resource);
+        if (!texture)
+          return nullptr;
+        if (!shadowView) {
+          writeForcedMsaaImage(resource, whole);
+          return nullptr;
+        }
+        if (whole) {
+          texture->ResetMsaaState(DirectTexture2D::MsaaState::Synced);
+          m_msaaScopeDirty = true;
+        }
+        return shadowView;
+      }
+
+      // d3d11.sgssaa: whether the draw's pixel shader runs per sample.
+      bool pipelineSampleShading(uint32_t sampleCount) const {
+        const UserOverrides& overrides = UserOverrides::get();
+        if (sampleCount <= 1 || !m_ps)
+          return false;
+        if (m_omForcedMsaa && overrides.msaaScope == MsaaScope::Geometry && !m_dsv)
+          return false;
+        const uint32_t traits = m_ps->raw->getPixelShaderTraits();
+        if (!(traits & PixelShaderInterpolates) || (traits & (PixelShaderWritesUavs | PixelShaderReadsCoverage)))
+          return false;
+        if (!(traits & PixelShaderDiscards) && m_dsv && !supersamplesWithDepth())
+          return false;
+        return overrides.sgssaa == SgssaaMode::Full || (traits & PixelShaderDiscards);
+      }
+
+      // With a depth buffer bound, draws are supersampled when they shade
+      // surfaces: they write depth, or test it without adding to the target,
+      // or add with an equal test (see d3d11_context.h).
+      bool supersamplesWithDepth() const {
+        D3D11_DEPTH_STENCIL_DESC depth = {};
+        depth.DepthEnable = TRUE;
+        depth.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL;
+        depth.DepthFunc = D3D11_COMPARISON_LESS;
+        if (m_depth)
+          m_depth->GetDesc(&depth);
+        if (!depth.DepthEnable)
+          return false;
+        if (depth.DepthWriteMask != D3D11_DEPTH_WRITE_MASK_ZERO || depth.DepthFunc == D3D11_COMPARISON_EQUAL)
+          return true;
+        if (!m_blend)
+          return true;
+        D3D11_BLEND_DESC blend = {};
+        m_blend->GetDesc(&blend);
+        return !blend.RenderTarget[0].BlendEnable || blend.RenderTarget[0].DestBlend != D3D11_BLEND_ONE;
+      }
+
+      // ---- Draw history (glitch reports) ----
+
+      void recordCall(RecordOp op, UINT count, UINT instances, UINT start, INT base, bool dropped) {
+        DrawRecord r;
+        r.op = op;
+        r.dropped = dropped;
+        r.count = count;
+        r.instances = instances;
+        r.start = start;
+        r.base = base;
+        r.vs = m_vs ? m_vs->raw->getBytecodeHash() : 0;
+        r.ps = m_ps ? m_ps->raw->getBytecodeHash() : 0;
+        r.targets = uint8_t(m_targetCount);
+        r.target = m_rtvs[0];
+        r.swapChainTarget = m_rtvs[0] && m_rtvs[0]->swapChain;
+        r.depth = m_dsv;
+        describeImageView(m_rtvs[0] ? m_rtvs[0]->raw : nullptr, r.width, r.height, r.format);
+        if (!r.width && m_dsv)
+          describeImageView(m_dsv->raw, r.width, r.height, r.format);
+        const Stage& vertex = m_stages[0];
+        const Stage& pixel = m_stages[2];
+        r.cb[0] = vertex.constants[0];
+        r.cbFirst[0] = vertex.constantFirst[0];
+        r.blend = m_blend;
+        r.depthState = m_depth;
+        r.raster = m_raster;
+        r.stencilRef = m_stencilRef;
+        if (m_viewportCount) {
+          r.viewport[0] = m_viewports[0].Width;
+          r.viewport[1] = m_viewports[0].Height;
+        }
+        r.cb[1] = pixel.constants[0];
+        r.cbFirst[1] = pixel.constantFirst[0];
+        for (uint32_t slot = 0; slot < 4; slot++) {
+          r.srv[slot] = pixel.views[slot];
+          describeImageView(pixel.views[slot] ? pixel.views[slot]->raw : nullptr, r.srvWidth[slot], r.srvHeight[slot], r.srvFormat[slot]);
+        }
+        m_history.add(r);
+      }
+
+      void recordClear(RecordOp op, const void* view, IBackendImageView* backendView, bool swapChain, const float value[4]) {
+        DrawRecord r;
+        r.op = op;
+        r.target = view;
+        r.swapChainTarget = swapChain;
+        describeImageView(backendView, r.width, r.height, r.format);
+        std::memcpy(r.value, value, sizeof(r.value));
+        m_history.add(r);
+      }
+
+      enum DropReason : uint32_t { DropNone, DropNoVertexShader, DropPipelineFailed, DropPipelinePending, DropNoTopology, DropReasons };
+
+      // Per present (the history's frame is the present's number).
+      void logDroppedDraws();
+
+      // ---- d3d11.upscalerInject, as in d3d11_context.h ----
+
+      void injectObserveDraw();
+      void setInjectJitter(bool on);
+      void snapshotInjectCameras(uint32_t wanted);
+      bool snapshotInjectCamera(UINT slot);
+      void runInjectedPass();
+      static bool readsResource(const Stage& stage, ID3D11Resource* resource) {
+        for (UINT slot = 0; slot < stage.viewEnd; slot++) {
+          if (stage.views[slot] && stage.views[slot]->range.resource == resource)
+            return true;
+        }
+        return false;
       }
 
       void updateTopologyKey() {
@@ -1297,7 +1850,41 @@ namespace dxup::legacy {
         }
       }
 
-      __forceinline bool prepareDraw() {
+      // Forced multisampling, the draw history and the injected upscaler look
+      // at every draw; without them draws do not pass through there.
+      bool prepareDrawSlow(RecordOp op, UINT count, UINT instances, UINT start, INT base) {
+        const bool forced = m_forcedMsaa.load(std::memory_order_relaxed);
+        if (forced)
+          updateForcedMsaaScope();
+        m_dropReason = m_topology == D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED ? DropNoTopology : DropNone;
+        const bool prepared = !m_pipelineDirty || preparePipeline();
+        if (m_historyOn) {
+          recordCall(op, count, instances, start, base, !prepared);
+          if (!prepared)
+            m_droppedDraws[m_dropReason]++;
+        }
+        if (!prepared)
+          return false;
+        if (m_injectWanted || m_injectTaa)
+          injectObserveDraw();
+        if (forced) {
+          readForcedMsaaShaderResources(m_stages[0], m_vs ? m_vs->raw : nullptr);
+          readForcedMsaaShaderResources(m_stages[1], m_gs ? m_gs->raw : nullptr);
+          readForcedMsaaShaderResources(m_stages[2], m_ps ? m_ps->raw : nullptr);
+          prepareForcedMsaaDraw();
+          // A pass that refilled a copy bound its own pipeline.
+          if (m_forcedMsaaPassRan && m_currentPipeline)
+            m_ctx->bindGraphicsPipeline(m_currentPipeline);
+          m_forcedMsaaPassRan = false;
+        }
+        if (m_omRebinds && m_ctx->outputMergerStateNeedsRebind() && (m_targetCount || m_dsv))
+          rebindOutputMerger();
+        return true;
+      }
+
+      __forceinline bool prepareDraw(RecordOp op, UINT count, UINT instances, UINT start, INT base) {
+        if (m_slowDraws.load(std::memory_order_relaxed))
+          return prepareDrawSlow(op, count, instances, start, base);
         if (m_pipelineDirty && !preparePipeline())
           return false;
         // Present and copies took the targets out of their state.
@@ -1310,6 +1897,8 @@ namespace dxup::legacy {
         // Without a topology the native runtime draws nothing.
         if (m_topology == D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED)
           return false;
+        if (m_sgssaa)
+          m_key.samples = (m_key.samples & 0xffffffu) | (pipelineSampleShading(m_key.samples & 0xffffu) ? 1u << 24 : 0u);
         const uint32_t hash = m_key.hash();
         IBackendPipeline* pipeline = m_pipelines.find(m_key, hash);
         if (!pipeline) {
@@ -1318,7 +1907,7 @@ namespace dxup::legacy {
             return false;
           m_pipelines.insert(m_key, hash, pipeline);
         }
-        if (pipeline != m_currentPipeline) {
+        if (pipeline != m_currentPipeline || m_forcedMsaaPassRan) {
           m_currentPipeline = pipeline;
           m_ctx->bindGraphicsPipeline(pipeline);
         }
@@ -1333,6 +1922,7 @@ namespace dxup::legacy {
 
       void dropBindings() {
         for (Stage& stage : m_stages) {
+          stage.forcedSrvs = 0;
           for (DirectSrv*& view : stage.views)
             if (DirectSrv* old = std::exchange(view, nullptr))
               old->noteUnbound();
@@ -1371,6 +1961,12 @@ namespace dxup::legacy {
       IBackendContext*     m_ctx;
       bool                 m_omRebinds;
       bool                 m_pipelineDirty = true;
+      std::atomic<bool>    m_slowDraws{false};
+      std::atomic<bool>    m_forcedMsaa{false};
+      bool                 m_sgssaa = false;
+      bool                 m_omForcedMsaa = false;
+      bool                 m_msaaScopeDirty = false;
+      bool                 m_forcedMsaaPassRan = false;
       IBackendPipeline*    m_currentPipeline = nullptr;
       PipelineKey          m_key;
       PipelineTable        m_pipelines;
@@ -1405,6 +2001,21 @@ namespace dxup::legacy {
       UINT                 m_scissorCount = 0;
       D3D11_VIEWPORT       m_viewports[kViewports] = {};
       D3D11_RECT           m_scissors[kViewports] = {};
+
+      DrawHistory          m_history;
+      const bool           m_historyOn = d3d11GlitchReportsEnabled();
+      DropReason           m_dropReason = DropNone;
+      uint32_t             m_droppedDraws[DropReasons] = {};
+      ReportThrottle       m_droppedFrames;
+      uint32_t             m_nanReadbacks = 0;
+
+      bool                 m_injectWanted = false;
+      uint32_t             m_presentsWithoutTaa = 0;
+      std::unique_ptr<InjectTaa> m_injectTaa;
+      bool                 m_injectViewportJittered = false;
+      uint64_t             m_injectJitterFrame = 0;
+      std::shared_ptr<std::atomic<bool>> m_injectReady = std::make_shared<std::atomic<bool>>(false);
+      ID3D11Resource*      m_injectPreparedFor = nullptr;
     };
 
     class DirectDevice final : public ID3D11Device {
@@ -1431,6 +2042,16 @@ namespace dxup::legacy {
       d3d12::D3D12BackendDevice* backend() const { return static_cast<d3d12::D3D12BackendDevice*>(m_backendDevice.getBackend()); }
       DirectContext* context() const { return m_context; }
       D3D11BackendDevice& backendDevice() { return m_backendDevice; }
+
+      // Targets of this size are a swap chain's: d3d11.msaaForce covers them.
+      void noteBackBufferSize(UINT width, UINT height) {
+        std::lock_guard<std::mutex> lock(m_backBufferSizeMutex);
+        for (const auto& size : m_backBufferSizes) {
+          if (size.first == width && size.second == height)
+            return;
+        }
+        m_backBufferSizes.emplace_back(width, height);
+      }
 
       HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** object) override {
         if (!object)
@@ -1489,19 +2110,32 @@ namespace dxup::legacy {
         return guarded([&] {
           // Multisampled textures may get more samples than asked for
           // (d3d11.msaaSamples); the application keeps seeing its count.
+          D3D11_TEXTURE2D_DESC effective = *desc;
+          if (!effective.MipLevels)
+            effective.MipLevels = computeFullMipLevelCount(effective.Width, effective.Height, 1u);
           D3D11_TEXTURE2D_DESC backendDesc = *desc;
           const UINT samples = enhancedSampleCount(desc->Format, desc->SampleDesc.Count);
           if (samples != desc->SampleDesc.Count) {
             backendDesc.SampleDesc.Count = samples;
             backendDesc.SampleDesc.Quality = 0;
           }
+          // Forced multisampling refills the multisampled copy from the
+          // texture with a shader that reads it.
+          ForcedMsaaFormats forcedMsaa;
+          const bool forceMsaa = shouldForceMsaa(effective, forcedMsaa);
+          if (forceMsaa)
+            backendDesc.BindFlags |= D3D11_BIND_SHADER_RESOURCE;
           auto image = m_backendDevice.createTexture2D(&backendDesc, initial);
           if (!image)
             return HRESULT(E_FAIL);
-          D3D11_TEXTURE2D_DESC effective = *desc;
-          if (!effective.MipLevels)
-            effective.MipLevels = computeFullMipLevelCount(effective.Width, effective.Height, 1u);
-          *texture = new DirectTexture2D(this, effective, std::move(image));
+          auto* created = new DirectTexture2D(this, effective, std::move(image));
+          if (forceMsaa) {
+            attachMsaaShadow(created, forcedMsaa);
+            // Initial data is in the texture, not yet in the copy.
+            if (initial)
+              created->ResetMsaaState(DirectTexture2D::MsaaState::ImageNewer);
+          }
+          *texture = created;
           return HRESULT(S_OK);
         });
       }
@@ -1592,8 +2226,26 @@ namespace dxup::legacy {
             return HRESULT(E_FAIL);
           const DXGI_FORMAT format = validateImageViewFormat(resolved.Format, imageDesc.format,
             (imageDesc.miscFlags & kResourceMiscCastable) != 0);
+          // Forced multisampling: draws go into the multisampled copy in the
+          // format of this view. Integer formats cannot be resolved and draw
+          // into the texture itself.
+          Rc<IBackendImageView> shadowView;
+          DirectTexture2D* texture = forcedMsaaTexture(resource);
+          const DXGI_FORMAT viewFormat = viewDesc.format != DXGI_FORMAT_UNKNOWN ? viewDesc.format : imageDesc.format;
+          if (texture && isResolvableColorViewFormat(viewFormat)) {
+            ImageViewDesc shadowDesc = viewDesc;
+            shadowDesc.type = ImageViewType::View2DMS;
+            shadowDesc.format = viewFormat;
+            shadowView = m_backendDevice.getBackend()->createImageView(texture->GetMsaaShadow(), shadowDesc);
+            if (shadowView)
+              texture->SetMsaaColorFormat(viewFormat);
+          }
+          D3D11_RESOURCE_DIMENSION dimension = D3D11_RESOURCE_DIMENSION_UNKNOWN;
+          resource->GetType(&dimension);
+          const bool swapChain = dimension == D3D11_RESOURCE_DIMENSION_TEXTURE2D
+            && static_cast<DirectTexture2D*>(static_cast<ID3D11Texture2D*>(resource))->swapChainBuffer;
           *view = new DirectRtv(this, resource, std::move(backend), rangeOf(resource, image, viewDesc), resolved, format,
-            imageDesc.sampleCount ? imageDesc.sampleCount : 1u, imageDesc.sampleQuality);
+            imageDesc.sampleCount ? imageDesc.sampleCount : 1u, imageDesc.sampleQuality, std::move(shadowView), swapChain);
           return HRESULT(S_OK);
         });
       }
@@ -1629,8 +2281,15 @@ namespace dxup::legacy {
           if (stencil && !(resolved.Flags & D3D11_DSV_READ_ONLY_STENCIL))
             range.planes |= 2u;
           const DXGI_FORMAT format = resolveDepthStencilFormat(validateImageViewFormat(resolved.Format, imageDesc.format));
+          // Forced multisampling: draws go into the multisampled copy.
+          Rc<IBackendImageView> shadowView;
+          if (DirectTexture2D* texture = forcedMsaaTexture(resource)) {
+            ImageViewDesc shadowDesc = viewDesc;
+            shadowDesc.type = ImageViewType::View2DMS;
+            shadowView = m_backendDevice.getBackend()->createImageView(texture->GetMsaaShadow(), shadowDesc);
+          }
           *view = new DirectDsv(this, resource, std::move(backend), range, resolved, format,
-            imageDesc.sampleCount ? imageDesc.sampleCount : 1u, imageDesc.sampleQuality);
+            imageDesc.sampleCount ? imageDesc.sampleCount : 1u, imageDesc.sampleQuality, std::move(shadowView));
           return HRESULT(S_OK);
         });
       }
@@ -1840,6 +2499,47 @@ namespace dxup::legacy {
         });
       }
 
+      // The formats a single-sampled texture of a swap chain's size is
+      // multisampled with (d3d11.msaaForce), or false when it is not.
+      bool shouldForceMsaa(const D3D11_TEXTURE2D_DESC& desc, ForcedMsaaFormats& formats) {
+        const UserOverrides& overrides = UserOverrides::get();
+        const bool depth = (desc.BindFlags & D3D11_BIND_DEPTH_STENCIL) != 0;
+        if (!overrides.msaaForce || desc.SampleDesc.Count != 1 || desc.MipLevels != 1 || desc.ArraySize != 1
+         || desc.Usage != D3D11_USAGE_DEFAULT || !(desc.BindFlags & (D3D11_BIND_RENDER_TARGET | D3D11_BIND_DEPTH_STENCIL))
+         || (desc.MiscFlags & (D3D11_RESOURCE_MISC_TEXTURECUBE | D3D11_RESOURCE_MISC_GENERATE_MIPS))
+         || !getForcedMsaaFormats(desc.Format, depth, formats) || !isBackBufferSize(desc.Width, desc.Height))
+          return false;
+        UINT levels = 0;
+        return SUCCEEDED(CheckMultisampleQualityLevels(formats.typed, static_cast<UINT>(overrides.msaaSamples), &levels)) && levels;
+      }
+
+      void attachMsaaShadow(DirectTexture2D* texture, const ForcedMsaaFormats& formats) {
+        ImageDesc shadowDesc = texture->raw->getDesc();
+        shadowDesc.sampleCount = static_cast<uint32_t>(UserOverrides::get().msaaSamples);
+        shadowDesc.sampleQuality = 0;
+        shadowDesc.mipLevels = 1;
+        // Depth is resolved by a shader that reads it.
+        shadowDesc.bindFlags = formats.depth ? BindFlags::DepthStencil | BindFlags::ShaderResource : BindFlags::RenderTarget;
+        shadowDesc.miscFlags = 0;
+        auto shadow = m_backendDevice.getBackend()->createImage(shadowDesc);
+        if (!shadow) {
+          logMessage(LogLevel::Warn, "forced MSAA: no %ux multisampled copy for a %ux%u texture of format %u",
+            shadowDesc.sampleCount, shadowDesc.width, shadowDesc.height, static_cast<uint32_t>(shadowDesc.format));
+          return;
+        }
+        texture->SetMsaaShadow(std::move(shadow), formats);
+        m_context->noteForcedMsaa();
+      }
+
+      bool isBackBufferSize(UINT width, UINT height) {
+        std::lock_guard<std::mutex> lock(m_backBufferSizeMutex);
+        for (const auto& size : m_backBufferSizes) {
+          if (size.first == width && size.second == height)
+            return true;
+        }
+        return false;
+      }
+
       UINT enhancedSampleCount(DXGI_FORMAT format, UINT appCount) {
         const int32_t forced = UserOverrides::get().msaaSamples;
         if (appCount <= 1 || forced <= static_cast<int32_t>(appCount))
@@ -1937,6 +2637,8 @@ namespace dxup::legacy {
       D3D11BackendDevice  m_backendDevice;
       DirectContext*      m_context = nullptr;
       std::array<std::atomic<uint64_t>, 256> m_formatSupport = {};
+      std::mutex          m_backBufferSizeMutex;
+      std::vector<std::pair<UINT, UINT>> m_backBufferSizes;
     };
 
     void retainDevice(DirectDevice* device) { device->AddRef(); }
@@ -1957,8 +2659,10 @@ namespace dxup::legacy {
     }
 
     IBackendPipeline* DirectContext::createPipeline() {
-      if (!m_vs)
+      if (!m_vs) {
+        m_dropReason = DropNoVertexShader;
         return nullptr;
+      }
       GraphicsPipelineDesc desc = {};
       static const uint64_t kBlendHash = state_hash::blend(BlendState{});
       static const uint64_t kRasterHash = state_hash::rasterizer(RasterizerState{});
@@ -2013,6 +2717,7 @@ namespace dxup::legacy {
       }
       desc.sampleCount = m_key.samples & 0xffffu;
       desc.sampleQuality = m_key.sampleQuality;
+      desc.sampleShading = (m_key.samples >> 24) != 0;
 
       IBackendDevice* backend = m_device->backendDevice().getBackend();
       // With asyncShaders a pipeline that is not compiled yet compiles in the
@@ -2023,8 +2728,233 @@ namespace dxup::legacy {
         pipeline = backend->requestGraphicsPipeline(desc, pending);
       else
         pipeline = backend->createGraphicsPipelineDeferred(desc);
+      if (!pipeline)
+        m_dropReason = pending ? DropPipelinePending : DropPipelineFailed;
       // The device keeps every pipeline.
       return pipeline.get();
+    }
+
+    void DirectContext::logDroppedDraws() {
+      m_droppedDraws[DropPipelineFailed] += m_device->backendDevice().getBackend()->takeFailedPipelineDraws();
+      uint32_t total = 0;
+      for (uint32_t reason = 0; reason < DropReasons; reason++)
+        total += m_droppedDraws[reason];
+      if (!total)
+        return;
+      if (m_droppedFrames.next()) {
+        static const char* const kReasons[DropReasons] = { "other", "without vertex shader",
+          "pipeline failed to compile (see the error above)", "pipeline still compiling (d3d11.asyncShaders)",
+          "without primitive topology" };
+        std::string reasons;
+        for (uint32_t reason = 0; reason < DropReasons; reason++) {
+          if (!m_droppedDraws[reason])
+            continue;
+          char text[96];
+          snprintf(text, sizeof(text), "%s%u %s", reasons.empty() ? "" : ", ", m_droppedDraws[reason], kReasons[reason]);
+          reasons += text;
+        }
+        logMessage(LogLevel::Warn, "glitch: present %u: %u draws not drawn (%s)%s", m_history.frame(), total, reasons.c_str(),
+          m_droppedFrames.suffix());
+      }
+      std::memset(m_droppedDraws, 0, sizeof(m_droppedDraws));
+    }
+
+    // d3d11.upscalerInject: a draw is seen before it is recorded. Scene draws
+    // get the jittered viewport and hand the camera constants over once a
+    // frame; other draws may be where the upscaler goes in.
+    void DirectContext::injectObserveDraw() {
+      if (!m_injectTaa) {
+        m_injectTaa = std::make_unique<InjectTaa>();
+        logMessage(LogLevel::Warn, "upscalerInject: looking for the scene");
+      }
+      if (m_injectTaa->state() == InjectTaa::State::Failed) {
+        if (m_injectViewportJittered)
+          setInjectJitter(false);
+        return;
+      }
+      D3D11_DEPTH_STENCIL_DESC ds = {};
+      ds.DepthEnable = TRUE;
+      ds.DepthFunc = D3D11_COMPARISON_LESS;
+      if (m_depth)
+        m_depth->GetDesc(&ds);
+      const bool greater = ds.DepthFunc == D3D11_COMPARISON_GREATER || ds.DepthFunc == D3D11_COMPARISON_GREATER_EQUAL;
+      const bool scene = m_injectTaa->observeDraw(m_dsv ? m_dsv->range.resource : nullptr,
+        m_rtvs[0] ? m_rtvs[0]->range.resource : nullptr, ds.DepthEnable != FALSE, greater);
+      if (scene) {
+        m_injectTaa->noteSceneDraw();
+        // Scene-depth draws after the upscaler (interface) are not jittered.
+        const bool jitter = (m_injectTaa->state() == InjectTaa::State::Active || m_injectTaa->stillUpscaling())
+          && !m_injectTaa->inserted() && m_injectReady->load(std::memory_order_relaxed);
+        if (jitter != m_injectViewportJittered || (jitter && m_injectJitterFrame != m_injectTaa->frame()))
+          setInjectJitter(jitter);
+        if (const uint32_t wanted = m_injectTaa->cameraSlotsWanted())
+          snapshotInjectCameras(wanted);
+        return;
+      }
+      if (m_injectViewportJittered)
+        setInjectJitter(false);
+      const uint64_t hash = m_ps ? m_ps->raw->getBytecodeHash() : m_vs ? m_vs->raw->getBytecodeHash() : 0;
+      if (m_injectTaa->wantsColorReads() && readsResource(m_stages[2], m_injectTaa->color()))
+        m_injectTaa->noteColorRead(hash);
+      if (m_injectTaa->beforeOtherEvent(hash))
+        runInjectedPass();
+    }
+
+    // The bound viewports, shifted by this frame's jitter or not.
+    void DirectContext::setInjectJitter(bool on) {
+      m_injectViewportJittered = on;
+      m_injectJitterFrame = m_injectTaa ? m_injectTaa->frame() : 0;
+      if (!m_viewportCount)
+        return;
+      float jitter[2] = {};
+      if (on)
+        m_injectTaa->jitter(jitter);
+      Viewport viewports[kViewports];
+      for (UINT i = 0; i < m_viewportCount; i++) {
+        const D3D11_VIEWPORT& viewport = m_viewports[i];
+        viewports[i] = { viewport.TopLeftX + jitter[0], viewport.TopLeftY + jitter[1], viewport.Width, viewport.Height,
+                         viewport.MinDepth, viewport.MaxDepth };
+      }
+      m_ctx->setViewports(m_viewportCount, viewports);
+    }
+
+    // The vertex shader constant buffers as the frame's first scene draw that
+    // binds each sees them.
+    void DirectContext::snapshotInjectCameras(uint32_t wanted) {
+      for (UINT slot = 0; slot < taa_inject::CameraStore::kSlots && slot < kConstantSlots; slot++) {
+        if ((wanted & (1u << slot)) && m_stages[0].constants[slot] && snapshotInjectCamera(slot))
+          m_injectTaa->cameraSlotTaken(slot);
+      }
+    }
+
+    bool DirectContext::snapshotInjectCamera(UINT slot) {
+      const Stage& stage = m_stages[0];
+      auto* backendBuffer = static_cast<d3d12::D3D12BackendBuffer*>(stage.constants[slot]->raw);
+      const auto* data = backendBuffer ? static_cast<const uint8_t*>(backendBuffer->getPersistentMappedData()) : nullptr;
+      if (!data)
+        return false;
+      const BufferDesc& desc = backendBuffer->getDesc();
+      const uint64_t dataSize = desc.dataSize ? desc.dataSize : desc.size;
+      const UINT offset = stage.constantFirst[slot] * 16;
+      const UINT count = stage.constantCount[slot] * 16;
+      if (offset >= dataSize)
+        return false;
+      uint64_t size = (std::min)(dataSize - offset, uint64_t(4096));
+      if (count)
+        size = (std::min)(size, uint64_t(count));
+      m_injectTaa->cameras()->put(slot, m_injectTaa->frame(), std::vector<uint8_t>(data + offset, data + offset + size));
+      return true;
+    }
+
+    // The upscaler (or, while calibrating, the camera measurement) on the
+    // scene color as it is now.
+    void DirectContext::runInjectedPass() {
+      const UserOverrides& overrides = UserOverrides::get();
+      m_injectTaa->markInserted();
+      if (m_injectViewportJittered)
+        setInjectJitter(false);
+      ID3D11Resource* color = m_injectTaa->color();
+      ID3D11Resource* depth = m_injectTaa->depth();
+      if (!color || !depth)
+        return;
+      readForcedMsaa(color);
+      readForcedMsaa(depth, false);
+      auto* colorImage = static_cast<d3d12::D3D12BackendImage*>(imageOf(color));
+      auto* depthImage = static_cast<d3d12::D3D12BackendImage*>(imageOf(depth));
+      if (!colorImage || !depthImage)
+        return;
+      auto cameras = m_injectTaa->cameras();
+      const uint64_t frame = m_injectTaa->frame();
+      // A typed view of the color (typeless textures read as their usual type).
+      DXGI_FORMAT colorFormat = colorImage->getDesc().format;
+      switch (colorFormat) {
+        case DXGI_FORMAT_R8G8B8A8_TYPELESS:     colorFormat = DXGI_FORMAT_R8G8B8A8_UNORM; break;
+        case DXGI_FORMAT_B8G8R8A8_TYPELESS:     colorFormat = DXGI_FORMAT_B8G8R8A8_UNORM; break;
+        case DXGI_FORMAT_R16G16B16A16_TYPELESS: colorFormat = DXGI_FORMAT_R16G16B16A16_FLOAT; break;
+        case DXGI_FORMAT_R10G10B10A2_TYPELESS:  colorFormat = DXGI_FORMAT_R10G10B10A2_UNORM; break;
+        case DXGI_FORMAT_R32G32B32A32_TYPELESS: colorFormat = DXGI_FORMAT_R32G32B32A32_FLOAT; break;
+        default: break;
+      }
+      d3d12::UpscaleRequest request;
+      request.kind = static_cast<upscale::Kind>(overrides.upscaler);
+      request.depth = depthImage;
+      request.velocityMode = 2;
+      request.directJitter = true;
+      m_injectTaa->jitter(request.jitterValue);
+      request.directClip = true;
+      request.jitterScale[0] = overrides.upscalerJitterScale[0];
+      request.jitterScale[1] = overrides.upscalerJitterScale[1];
+      request.sharpness = overrides.upscalerSharpness;
+      request.hdr = colorFormat == DXGI_FORMAT_R16G16B16A16_FLOAT || colorFormat == DXGI_FORMAT_R11G11B10_FLOAT
+                 || colorFormat == DXGI_FORMAT_R32G32B32A32_FLOAT;
+      request.depthInverted = m_injectTaa->depthInverted();
+      request.reset = m_injectTaa->takeHistoryReset();
+      if (m_injectTaa->stillUpscaling()) {
+        // The camera stands still: no motion. Every eighth frame the image is
+        // compared with the one eight frames before.
+        std::memset(request.clipRows, 0, sizeof(request.clipRows));
+        request.clipRows[0] = request.clipRows[5] = request.clipRows[10] = request.clipRows[15] = 1.0f;
+        // The camera moved in this frame: no history (no smear of the still
+        // frames); the motion is measured from the next frame on.
+        if (m_injectTaa->resetOnCameraChange() && taa_inject::cameraBuffersMoved(*cameras, frame) == 1)
+          request.reset = true;
+        auto ready = m_injectReady;
+        auto probe = m_injectTaa->stillProbe();
+        const bool probeFrame = m_injectTaa->stillProbeFrame();
+        m_ctx->executeOnBackend([colorImage, colorFormat, depthImage, request, ready, probe, probeFrame](IBackendContext* backend) {
+          auto* d3d12Backend = static_cast<d3d12::D3D12BackendContext*>(backend);
+          if (probeFrame && probe)
+            d3d12Backend->calibrateCamera(colorImage, colorFormat, depthImage, DXGI_FORMAT_UNKNOWN, 0, nullptr, probe, 0);
+          ready->store(d3d12Backend->runInjectedUpscaler(colorImage, request), std::memory_order_relaxed);
+        });
+        writeForcedMsaaImage(color, true);
+        return;
+      }
+      if (m_injectTaa->state() == InjectTaa::State::Calibrating) {
+        // The upscaler is made while the camera is measured.
+        if (m_injectPreparedFor != color) {
+          m_injectPreparedFor = color;
+          d3d12::UpscaleRequest prepare = request;
+          prepare.prepareOnly = true;
+          m_ctx->executeOnBackend([colorImage, prepare](IBackendContext* backend) {
+            static_cast<d3d12::D3D12BackendContext*>(backend)->runInjectedUpscaler(colorImage, prepare);
+          });
+        }
+        auto candidates = m_injectTaa->calibrationCandidates();
+        if (candidates.empty())
+          return;
+        auto calibration = m_injectTaa->calibration();
+        const uint32_t generation = calibration->generation;   // written on this thread only
+        m_ctx->executeOnBackend([colorImage, colorFormat, depthImage, cameras, frame, candidates, calibration, generation](IBackendContext* backend) {
+          std::vector<uint8_t> current, previous;
+          float rows[d3d12::kCameraCandidates][16] = {};
+          const size_t count = (std::min)(candidates.size(), size_t(d3d12::kCameraCandidates));
+          for (size_t k = 0; k < count; k++) {
+            if (!cameras->pair(candidates[k].slot, frame, current, previous)
+             || !taa_inject::clipToPrevClip(current, previous, candidates[k].offset, candidates[k].layout, rows[k])) {
+              std::memset(rows[k], 0, sizeof(rows[k]));
+              rows[k][0] = rows[k][5] = rows[k][10] = rows[k][15] = 1.0f;
+            }
+          }
+          static_cast<d3d12::D3D12BackendContext*>(backend)->calibrateCamera(colorImage, colorFormat, depthImage,
+            DXGI_FORMAT_UNKNOWN, uint32_t(count), rows, calibration, generation);
+        });
+        return;
+      }
+      const taa_inject::Candidate camera = m_injectTaa->camera();
+      auto ready = m_injectReady;
+      m_ctx->executeOnBackend([colorImage, request, cameras, frame, camera, ready](IBackendContext* backend) mutable {
+        std::vector<uint8_t> current, previous;
+        if (!cameras->pair(camera.slot, frame, current, previous)
+         || !taa_inject::clipToPrevClip(current, previous, camera.offset, camera.layout, request.clipRows)) {
+          std::memset(request.clipRows, 0, sizeof(request.clipRows));
+          request.clipRows[0] = request.clipRows[5] = request.clipRows[10] = request.clipRows[15] = 1.0f;
+        }
+        ready->store(static_cast<d3d12::D3D12BackendContext*>(backend)->runInjectedUpscaler(colorImage, request),
+          std::memory_order_relaxed);
+      });
+      // The image holds the result now, all of it.
+      writeForcedMsaaImage(color, true);
     }
 
     void DirectContext::rebindRenamedBuffer(DirectBuffer* buffer) {
@@ -2096,6 +3026,7 @@ namespace dxup::legacy {
       IBackendImage* image = imageOf(resource);
       if (!image)
         return;
+      writeForcedMsaaImage(resource, !box);
       const ImageDesc& desc = image->getDesc();
       const uint32_t mip = subresource % desc.mipLevels;
       const uint32_t layer = subresource / desc.mipLevels;
@@ -2177,6 +3108,10 @@ namespace dxup::legacy {
        || d.sampleCount != s.sampleCount || getFormatBlockSize(d.format) != getFormatBlockSize(s.format)
        || !copyableFormats(d.format, s.format))
         return;
+      const bool shadowAlong = forcedMsaaShadowCopyable(dst, src);
+      readForcedMsaa(src, !shadowAlong);
+      writeForcedMsaaImage(dst, true);
+      copyForcedMsaaShadow(dst, src, shadowAlong);
       const uint32_t mips = (std::max)(s.mipLevels, 1u);
       const uint32_t layers = s.type == ImageType::Tex3D ? 1u : (std::max)(s.arraySize, 1u);
       for (uint32_t layer = 0; layer < layers; layer++)
@@ -2222,6 +3157,8 @@ namespace dxup::legacy {
       IBackendImage* srcImage = imageOf(src);
       if (!dstImage || !srcImage)
         return;
+      readForcedMsaa(src);
+      writeForcedMsaaImage(dst);
       const ImageDesc& dstDesc = dstImage->getDesc();
       const ImageDesc& srcDesc = srcImage->getDesc();
       ImageSubresource dstSub = {};
@@ -2358,6 +3295,12 @@ namespace dxup::legacy {
       if (srcDesc.sampleCount <= 1) {
         if (dst == src)
           return;
+        // Textures with forced copies have a single subresource: the copy is
+        // one of whole textures, as in CopyResource.
+        const bool shadowAlong = forcedMsaaShadowCopyable(dst, src);
+        readForcedMsaa(src, !shadowAlong);
+        writeForcedMsaaImage(dst, true);
+        copyForcedMsaaShadow(dst, src, shadowAlong);
         ImageSubresource dstSub = {};
         dstSub.mipLevel = dstMip;
         dstSub.arrayLayer = dstSubresource / dstMips;
@@ -2367,6 +3310,7 @@ namespace dxup::legacy {
         m_ctx->copyImage(dstImage, dstSub, srcImage, srcSub);
         return;
       }
+      writeForcedMsaaImage(dst, true);
       m_ctx->resolveSubresource(dstImage, dstSubresource, srcImage, srcSubresource, format);
     }
 
@@ -2387,9 +3331,9 @@ namespace dxup::legacy {
 
     class DirectChain final : public DirectSwapChain {
     public:
-      DirectChain(DirectDevice* device, ComPtr<IDXGISwapChain3> real, HWND window, UINT flags)
+      DirectChain(DirectDevice* device, ComPtr<IDXGISwapChain3> real, HWND window, UINT flags, UINT appWidth, UINT appHeight)
       : m_device(device), m_real(std::move(real)), m_window(window), m_flags(flags),
-        m_tearing((flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) != 0) {
+        m_tearing((flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) != 0), m_appWidth(appWidth), m_appHeight(appHeight) {
         m_device->AddRef();
         ComPtr<IDXGISwapChain2> swapChain2;
         if ((flags & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT) && SUCCEEDED(m_real.As(&swapChain2)))
@@ -2416,10 +3360,12 @@ namespace dxup::legacy {
         return S_OK;
       }
 
-      HRESULT resize(UINT width, UINT height) override {
+      HRESULT resize(UINT width, UINT height, UINT appWidth, UINT appHeight) override {
         // Presents queued on the worker still use the buffers.
         m_device->context()->backend()->waitForQueue();
         releaseBuffer();
+        m_appWidth = appWidth;
+        m_appHeight = appHeight;
         const HRESULT hr = m_real->ResizeBuffers(0, width, height, DXGI_FORMAT_UNKNOWN, m_flags);
         if (SUCCEEDED(hr))
           noteSize();
@@ -2428,6 +3374,7 @@ namespace dxup::legacy {
 
       HRESULT present(UINT syncInterval) override {
         HitchScope hitch("present", syncInterval);
+        noteHitchFrame();
         DirectContext* directContext = m_device->context();
         IBackendContext* context = directContext->backend();
         // A device DXUP lost without the system knowing: the application
@@ -2442,25 +3389,41 @@ namespace dxup::legacy {
           noteWindow();
         if (!m_texture && !createBuffer())
           return E_FAIL;
+        if (m_showOverlay)
+          m_fpsOverlay.count();
         if (m_saveFrames)
           saveFrames();
+        directContext->noteFramePresented();
         // The worker copies, submits and presents the frame while the
-        // application goes on with the next.
-        context->executeOnBackend([this, syncInterval, flags](IBackendContext* backend) {
-          waitForBackBuffer(backend);
-          retarget(backend);
-          backend->presentImage(m_image);
-          backend->waitForQueue();
-          const int64_t start = hitchTraceEnabled() ? hitchTimestamp() : 0;
+        // application goes on with the next; dxup_sync_present.txt (for
+        // comparison): the worker only records, the application presents.
+        static const bool syncPresent = dxupSiblingExists("dxup_sync_present.txt");
+        if (syncPresent) {
+          context->executeOnBackend([this](IBackendContext* backend) { preparePresent(backend); });
+          context->waitForQueue();
           const HRESULT hr = m_real->Present(syncInterval, flags);
-          if (FAILED(hr))
-            logMessage(LogLevel::Error, "d3d9.backend = d3d12: Present failed: hr=0x%08x", unsigned(hr));
-          if (start)
-            notePresentTime(start);
           m_lastPresentFailed.store(FAILED(hr), std::memory_order_release);
-          retarget(backend);
+          if (FAILED(hr)) {
+            logMessage(LogLevel::Error, "d3d9.backend = d3d12: Present failed: hr=0x%08x", unsigned(hr));
+            return hr;
+          }
+          context->executeOnBackend([this](IBackendContext* backend) { retarget(backend); });
           m_lastResult.store(hr, std::memory_order_release);
-        });
+        } else {
+          context->executeOnBackend([this, syncInterval, flags](IBackendContext* backend) {
+            preparePresent(backend);
+            backend->waitForQueue();
+            const int64_t start = hitchTraceEnabled() ? hitchTimestamp() : 0;
+            const HRESULT hr = m_real->Present(syncInterval, flags);
+            if (FAILED(hr))
+              logMessage(LogLevel::Error, "d3d9.backend = d3d12: Present failed: hr=0x%08x", unsigned(hr));
+            if (start)
+              notePresentTime(start);
+            m_lastPresentFailed.store(FAILED(hr), std::memory_order_release);
+            retarget(backend);
+            m_lastResult.store(hr, std::memory_order_release);
+          });
+        }
         context->endFrame();
         // Like a native Present, block while too many frames are queued.
         const UINT latency = overrides.lowLatency ? 1u : overrides.maxFrameLatency > 0 ? UINT(overrides.maxFrameLatency) : 3u;
@@ -2486,6 +3449,11 @@ namespace dxup::legacy {
           m_buffers.push_back(std::move(buffer));
         }
         const D3D12_RESOURCE_DESC real = m_buffers[0]->GetDesc();
+        // Drawn into a texture of its own and copied or scaled at Present
+        // (dxgi.directBackBuffer = false, dxgi.upscale, dxgi.renderScale), or
+        // into the real buffer Present shows next.
+        if (m_appWidth || !UserOverrides::get().directBackBuffer)
+          return createProxy(real);
         D3D11_TEXTURE2D_DESC texture = {};
         texture.Width = UINT(real.Width);
         texture.Height = real.Height;
@@ -2512,7 +3480,91 @@ namespace dxup::legacy {
         image->setRetargetable();
         m_image = image.get();
         m_texture.Attach(new DirectTexture2D(m_device, texture, std::move(image)));
+        m_texture->swapChainBuffer = true;
         return true;
+      }
+
+      bool createProxy(const D3D12_RESOURCE_DESC& real) {
+        ImageDesc bufferDesc = {};
+        bufferDesc.type = ImageType::Tex2D;
+        bufferDesc.width = UINT(real.Width);
+        bufferDesc.height = real.Height;
+        bufferDesc.format = real.Format;
+        bufferDesc.bindFlags = (real.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE)
+          ? BindFlags::RenderTarget : BindFlags::RenderTarget | BindFlags::ShaderResource;
+        m_bufferImages.clear();
+        for (const auto& buffer : m_buffers) {
+          auto image = std::make_shared<d3d12::D3D12BackendImage>(buffer, bufferDesc);
+          image->setCurrentState(D3D12_RESOURCE_STATE_PRESENT);
+          m_bufferImages.push_back(std::move(image));
+        }
+        ImageDesc proxyDesc = bufferDesc;
+        proxyDesc.width = m_appWidth ? m_appWidth : bufferDesc.width;
+        proxyDesc.height = m_appWidth ? m_appHeight : bufferDesc.height;
+        proxyDesc.bindFlags = BindFlags::RenderTarget | BindFlags::ShaderResource;
+        proxyDesc.miscFlags = kResourceMiscCastable;
+        auto proxy = m_device->backendDevice().getBackend()->createImage(proxyDesc);
+        if (!proxy)
+          return false;
+        m_proxy = proxy.get();
+        D3D11_TEXTURE2D_DESC texture = {};
+        texture.Width = proxyDesc.width;
+        texture.Height = proxyDesc.height;
+        texture.MipLevels = 1;
+        texture.ArraySize = 1;
+        texture.Format = proxyDesc.format;
+        texture.SampleDesc = { 1, 0 };
+        texture.Usage = D3D11_USAGE_DEFAULT;
+        texture.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+        m_texture.Attach(new DirectTexture2D(m_device, texture, std::move(proxy)));
+        m_texture->swapChainBuffer = true;
+        return true;
+      }
+
+      // On the thread that records: the frame into the buffer Present shows.
+      void preparePresent(IBackendContext* backend) {
+        waitForBackBuffer(backend);
+        IBackendImage* target = m_image;
+        if (m_proxy) {
+          const UINT index = m_real->GetCurrentBackBufferIndex();
+          target = index < m_bufferImages.size() ? m_bufferImages[index].get() : nullptr;
+          if (target && m_appWidth) {
+            if (!static_cast<d3d12::D3D12BackendContext*>(backend)->scaleImage(target, m_proxy, UserOverrides::get().spatialSharpness)) {
+              static bool warned = false;
+              if (!warned)
+                logMessage(LogLevel::Warn, "dxgi.upscale: scaling the back buffer failed");
+              warned = true;
+            }
+          } else if (target) {
+            backend->copyImage(target, {}, m_proxy, {});
+          }
+        } else {
+          retarget(backend);
+        }
+        if (m_showOverlay && target)
+          m_fpsOverlay.render(static_cast<d3d12::D3D12BackendContext*>(backend), target);
+        backend->presentImage(target);
+      }
+
+      // Hitch trace: frames that took long, to line other lines up with.
+      void noteHitchFrame() {
+        if (!hitchTraceEnabled())
+          return;
+        static const LARGE_INTEGER frequency = [] { LARGE_INTEGER f; QueryPerformanceFrequency(&f); return f; }();
+        const int64_t now = hitchTimestamp();
+        const double ms = m_hitchLast ? double(now - m_hitchLast) * 1000.0 / double(frequency.QuadPart) : 0.0;
+        if (ms >= 25.0)
+          logMessage(LogLevel::Warn, "hitch: frame %llu took %.1f ms", static_cast<unsigned long long>(m_hitchFrame), ms);
+        m_hitchWindowMs += ms;
+        m_hitchWindowMax = (std::max)(m_hitchWindowMax, ms);
+        if (m_hitchFrame && m_hitchFrame % 500 == 0) {
+          logMessage(LogLevel::Warn, "frames: %llu, last 500 average %.2f ms (%.1f fps), max %.1f ms",
+            static_cast<unsigned long long>(m_hitchFrame), m_hitchWindowMs / 500.0, 500000.0 / m_hitchWindowMs, m_hitchWindowMax);
+          m_hitchWindowMs = 0.0;
+          m_hitchWindowMax = 0.0;
+        }
+        m_hitchLast = now;
+        m_hitchFrame++;
       }
 
       // ResizeBuffers fails while the GPU or a backend image still references
@@ -2525,8 +3577,10 @@ namespace dxup::legacy {
           context->waitForWorker();
         }
         m_image = nullptr;
-        m_buffers.clear();
+        m_proxy = nullptr;
         context->synchronize();
+        m_bufferImages.clear();
+        m_buffers.clear();
         m_texture.Reset();
         context->synchronize();
       }
@@ -2573,6 +3627,7 @@ namespace dxup::legacy {
       // seconds, of which the last four stay, as with DXUP's DXGI.
       void saveFrames() {
         const uint32_t frame = ++m_savedPresents;
+        m_glitches.detect(m_device, m_texture.Get(), frame, m_device->context()->drawHistoryOrNull());
         const uint64_t now = GetTickCount64();
         if (frame == 60 || frame == 300 || frame == 301) {
           saveFrame(frame);
@@ -2591,43 +3646,10 @@ namespace dxup::legacy {
       }
 
       void saveFrame(uint32_t frame) {
-        D3D11_TEXTURE2D_DESC desc = {};
-        m_texture->GetDesc(&desc);
-        desc.Usage = D3D11_USAGE_STAGING;
-        desc.BindFlags = 0;
-        desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-        ComPtr<ID3D11Texture2D> staging;
-        if (FAILED(m_device->CreateTexture2D(&desc, nullptr, staging.GetAddressOf())))
-          return;
-        DirectContext* context = m_device->context();
-        context->CopyResource(staging.Get(), m_texture.Get());
-        D3D11_MAPPED_SUBRESOURCE mapped = {};
-        if (FAILED(context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped)))
-          return;
         char name[64];
         sprintf_s(name, "dxup_frame_%u.bmp", frame);
-        if (FILE* file = dxupOpenSibling(name, "wb")) {
-          const uint32_t imageSize = desc.Width * desc.Height * 4;
-          BITMAPFILEHEADER fileHeader = {};
-          BITMAPINFOHEADER infoHeader = {};
-          fileHeader.bfType = 0x4D42;
-          fileHeader.bfOffBits = sizeof(fileHeader) + sizeof(infoHeader);
-          fileHeader.bfSize = fileHeader.bfOffBits + imageSize;
-          infoHeader.biSize = sizeof(infoHeader);
-          infoHeader.biWidth = LONG(desc.Width);
-          infoHeader.biHeight = -LONG(desc.Height);
-          infoHeader.biPlanes = 1;
-          infoHeader.biBitCount = 32;
-          infoHeader.biSizeImage = imageSize;
-          fwrite(&fileHeader, sizeof(fileHeader), 1, file);
-          fwrite(&infoHeader, sizeof(infoHeader), 1, file);
-          // The swap chain's buffers are BGRA, as a bitmap's rows.
-          for (UINT y = 0; y < desc.Height; y++)
-            fwrite(static_cast<const uint8_t*>(mapped.pData) + size_t(y) * mapped.RowPitch, size_t(desc.Width) * 4, 1, file);
-          fclose(file);
+        if (writeTextureBitmap(m_device, m_texture.Get(), name))
           logMessage(LogLevel::Warn, "frame dump: wrote %s", name);
-        }
-        context->Unmap(staging.Get(), 0);
       }
 
       // Hitch trace: how long the real Present takes, every 1000 presents.
@@ -2653,7 +3675,16 @@ namespace dxup::legacy {
       HANDLE                  m_waitable = nullptr;
       std::vector<ComPtr<ID3D12Resource>> m_buffers;
       ComPtr<DirectTexture2D> m_texture;
-      IBackendImage*          m_image = nullptr;
+      IBackendImage*          m_image = nullptr;      // the real buffer drawn into directly
+      IBackendImage*          m_proxy = nullptr;      // or a texture of its own, and the real buffers
+      std::vector<std::shared_ptr<d3d12::D3D12BackendImage>> m_bufferImages;
+      UINT                    m_appWidth = 0, m_appHeight = 0;
+      FpsOverlay              m_fpsOverlay;
+      const bool              m_showOverlay = dxupSiblingExists("dxup_show_fps_overlay.txt");
+      GlitchDetector          m_glitches;
+      int64_t                 m_hitchLast = 0;
+      uint64_t                m_hitchFrame = 0;
+      double                  m_hitchWindowMs = 0.0, m_hitchWindowMax = 0.0;
       std::atomic<HRESULT>    m_lastResult{S_OK};
       std::atomic<bool>       m_lastPresentFailed{false};
       uint32_t                m_presents = 0;
@@ -2693,23 +3724,31 @@ namespace dxup::legacy {
     return g_legacyBackend.load(std::memory_order_relaxed);
   }
 
-  const char* directBackendObstacle() {
-    const UserOverrides& overrides = UserOverrides::get();
-    if (overrides.msaaForce || overrides.sgssaa != SgssaaMode::Off)
-      return "forced multisampling (d3d11.msaaForce, sgssaa)";
-    if (overrides.upscaler || overrides.upscalerAuto || overrides.upscalerInject)
-      return "the temporal upscalers (d3d11.upscaler)";
-    if (overrides.spatialUpscale || overrides.renderScale < 1.0f)
-      return "scaling at Present (dxgi.upscale, dxgi.renderScale)";
-    if (dxupSiblingExists("dxup_show_fps_overlay.txt"))
-      return "the frame rate overlay (dxup_show_fps_overlay.txt)";
-    return nullptr;
+  namespace {
+    // The upscalers' runtime DLLs: the dxup_upscalers folder next to this DLL,
+    // else the installation's, else this DLL's folder.
+    std::unique_ptr<upscale::Upscaler> createUpscaler(const upscale::CreateInfo& info, std::string& error) {
+      auto isFolder = [](const std::wstring& path) {
+        const DWORD attributes = GetFileAttributesW(path.c_str());
+        return attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY);
+      };
+      upscale::CreateInfo withRuntime = info;
+      std::wstring folder = dxupSiblingPathW(L"dxup_upscalers");
+      if (!isFolder(folder)) {
+        const std::wstring install = dxupInstallFolder();
+        folder = !install.empty() && isFolder(install + L"\\bin\\upscalers") ? install + L"\\bin\\upscalers"
+          : dxupSiblingPathW(L".");
+      }
+      withRuntime.runtimeDir = folder;
+      return upscale::create(withRuntime, error);
+    }
   }
 
   HRESULT createDirectDevice(ID3D11Device** device, ID3D11DeviceContext** context, uint32_t* vendorId) {
     *device = nullptr;
     *context = nullptr;
     try {
+      d3d12::setUpscalerFactory(&createUpscaler);
       auto* created = new DirectDevice();
       try {
         created->createContext();
@@ -2727,6 +3766,33 @@ namespace dxup::legacy {
       logMessage(LogLevel::Error, "d3d9.backend = d3d12: no device");
     }
     return E_FAIL;
+  }
+
+  void WINAPI directNoteBackBufferSize(IUnknown* device, UINT width, UINT height) {
+    directDevice(device)->noteBackBufferSize(width, height);
+  }
+
+  bool directAdapterDesc(ID3D11Device* device, DXGI_ADAPTER_DESC* desc) {
+    auto* backend = directDevice(device)->backend();
+    ComPtr<IDXGIAdapter> adapter;
+    return SUCCEEDED(backend->getDxgiFactory()->EnumAdapterByLuid(backend->getDevice()->GetAdapterLuid(), IID_PPV_ARGS(adapter.GetAddressOf())))
+      && SUCCEEDED(adapter->GetDesc(desc));
+  }
+
+  bool directScaledSize(UINT sourceWidth, UINT sourceHeight, UINT clientWidth, UINT clientHeight, UINT& appWidth, UINT& appHeight) {
+    const UserOverrides& overrides = UserOverrides::get();
+    appWidth = appHeight = 0;
+    if (overrides.renderScale < 1.0f) {
+      appWidth = (std::max)(1u, UINT(float(clientWidth) * overrides.renderScale + 0.5f));
+      appHeight = (std::max)(1u, UINT(float(clientHeight) * overrides.renderScale + 0.5f));
+      return true;
+    }
+    if (!overrides.spatialUpscale || clientWidth < sourceWidth || clientHeight < sourceHeight
+     || (clientWidth == sourceWidth && clientHeight == sourceHeight))
+      return false;
+    appWidth = sourceWidth;
+    appHeight = sourceHeight;
+    return true;
   }
 
   HRESULT WINAPI directCreateMappedView(IUnknown* device, ID3D11Resource* resource, const D3D11_SHADER_RESOURCE_VIEW_DESC* desc,
@@ -2752,7 +3818,7 @@ namespace dxup::legacy {
     return S_OK;
   }
 
-  HRESULT createDirectSwapChain(ID3D11Device* device, HWND window, UINT width, UINT height,
+  HRESULT createDirectSwapChain(ID3D11Device* device, HWND window, UINT width, UINT height, UINT appWidth, UINT appHeight,
                                 std::unique_ptr<DirectSwapChain>& swapChain) {
     DirectDevice* direct = directDevice(device);
     auto* backend = direct->backend();
@@ -2788,7 +3854,7 @@ namespace dxup::legacy {
     hr = created.As(&real);
     if (FAILED(hr))
       return hr;
-    swapChain = std::make_unique<DirectChain>(direct, std::move(real), window, desc.Flags);
+    swapChain = std::make_unique<DirectChain>(direct, std::move(real), window, desc.Flags, appWidth, appHeight);
     return S_OK;
   }
 

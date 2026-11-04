@@ -2561,21 +2561,15 @@ namespace dxup::ddraw {
     strcpy_s(identifier->szDriver, "dxup");
     strcpy_s(identifier->szDescription, "DXUP Direct3D 7 on Direct3D 12");
     if (legacy::Device* device = legacyDevice()) {
-      IDXGIDevice* dxgiDevice = nullptr;
-      if (SUCCEEDED(device->d3d11()->QueryInterface(__uuidof(IDXGIDevice), reinterpret_cast<void**>(&dxgiDevice)))) {
-        IDXGIAdapter* adapter = nullptr;
-        DXGI_ADAPTER_DESC desc = {};
-        if (SUCCEEDED(dxgiDevice->GetAdapter(&adapter)) && SUCCEEDED(adapter->GetDesc(&desc))) {
-          spoofAdapterDesc(desc);
-          identifier->dwVendorId = desc.VendorId;
-          identifier->dwDeviceId = desc.DeviceId;
-          identifier->dwSubSysId = desc.SubSysId;
-          identifier->dwRevision = desc.Revision;
-          WideCharToMultiByte(CP_ACP, 0, desc.Description, -1, identifier->szDescription,
-            sizeof(identifier->szDescription), nullptr, nullptr);
-        }
-        if (adapter) adapter->Release();
-        dxgiDevice->Release();
+      DXGI_ADAPTER_DESC desc = {};
+      if (device->adapterDesc(&desc)) {
+        spoofAdapterDesc(desc);
+        identifier->dwVendorId = desc.VendorId;
+        identifier->dwDeviceId = desc.DeviceId;
+        identifier->dwSubSysId = desc.SubSysId;
+        identifier->dwRevision = desc.Revision;
+        WideCharToMultiByte(CP_ACP, 0, desc.Description, -1, identifier->szDescription,
+          sizeof(identifier->szDescription), nullptr, nullptr);
       }
     }
     identifier->liDriverVersion.QuadPart = 0x0007000000000000ll;

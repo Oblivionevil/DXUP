@@ -371,6 +371,8 @@ namespace dxup::legacy {
     ID3D11Device*        d3d11() const { return m_device.get(); }
     // The PCI vendor of the GPU DXUP renders on (DXUPGetVendorId), 0 unknown.
     static uint32_t vendorId();
+    // The adapter it renders on.
+    bool adapterDesc(DXGI_ADAPTER_DESC* desc) const;
     // On DXUP's D3D11: targets of this size are a swap chain's (dxup.conf
     // d3d11.msaaForce covers them). Before the back buffer is made.
     void noteBackBufferSize(uint32_t width, uint32_t height);
@@ -600,7 +602,7 @@ namespace dxup::legacy {
     // ---- D3D11 objects ----
     bool                            m_direct = false;   // on the D3D12 backend itself (legacy_direct.h)
     HMODULE                         m_d3d11Module = nullptr;
-    void (WINAPI* m_noteBackBufferSize)(IUnknown*, UINT, UINT) = nullptr;   // DXUP's d3d11.dll only
+    void (WINAPI* m_noteBackBufferSize)(IUnknown*, UINT, UINT) = nullptr;   // not on Windows' d3d11.dll
     HRESULT (WINAPI* m_createMappedView)(IUnknown*, ID3D11Resource*, const D3D11_SHADER_RESOURCE_VIEW_DESC*, UINT,
                                          ID3D11ShaderResourceView**) = nullptr;   // DXUP's d3d11.dll only
     HRESULT (WINAPI* m_createSampler)(IUnknown*, const D3D11_SAMPLER_DESC*, ID3D11SamplerState**) = nullptr;
@@ -633,6 +635,7 @@ namespace dxup::legacy {
       Ref<ID3D11RenderTargetView> rtv;
       UINT bufferWidth = 0, bufferHeight = 0;
       UINT width = 0, height = 0;
+      UINT appWidth = 0, appHeight = 0;   // the picture scaled up at Present (direct, 0: none)
       UINT flags = 0;
     };
     int m_tearing = -1;   // whether presents without VSync may tear (unknown: -1)

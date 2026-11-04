@@ -313,6 +313,7 @@ namespace Dxup.Manager
             D3d9WorkerBox.IsChecked = settings.D3d9WorkerThread;
             D3d9DirectBox.IsChecked = settings.D3d9Direct;
             D3d8DirectBox.IsChecked = settings.D3d8Direct;
+            DdrawDirectBox.IsChecked = settings.DdrawDirect;
             LegacySection.Visibility = item.UsesLegacy ? Visibility.Visible : Visibility.Collapsed;
             SubmitThreadBox.IsChecked = settings.SubmitThread;
             RecordThreadBox.IsChecked = settings.RecordThread;
@@ -634,6 +635,7 @@ namespace Dxup.Manager
             settings.D3d9WorkerThread = D3d9WorkerBox.IsChecked == true;
             settings.D3d9Direct = D3d9DirectBox.IsChecked == true;
             settings.D3d8Direct = D3d8DirectBox.IsChecked == true;
+            settings.DdrawDirect = DdrawDirectBox.IsChecked == true;
             settings.SubmitThread = SubmitThreadBox.IsChecked == true;
             settings.RecordThread = RecordThreadBox.IsChecked == true;
             settings.DirectBackBuffer = DirectBackBufferBox.IsChecked == true;

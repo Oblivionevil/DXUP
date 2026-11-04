@@ -56,6 +56,6 @@ legacy_direct_lib = static_library('dxup_legacy_direct',
 
 legacy_dep = declare_dependency(
   link_with           : [legacy_lib, legacy_draw_path_lib, legacy_direct_lib],
-  dependencies        : [d3d12_backend_dep],
+  dependencies        : [d3d12_backend_dep, upscale_dep],
   include_directories : ['.'],
 )

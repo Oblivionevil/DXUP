@@ -15,7 +15,7 @@ R=$PWD/artifacts/run_pgo$BITS
 
 if [ "$STEP" = all ] || [ "$STEP" = gen ]; then
   rm -rf "${B:?}"
-  MSYS_NO_PATHCONV=1 meson setup "$B" --buildtype=release -Ddebug=true "-Dcpp_args=/GL $PGO_CPP_ARGS" "-Dcpp_link_args=/LTCG /GENPROFILE /OPT:REF /OPT:ICF" || exit 1
+  MSYS_NO_PATHCONV=1 meson setup "$B" --buildtype=release -Ddebug=true "-Dcpp_args=/GL $PGO_CPP_ARGS" "-Dcpp_link_args=/LTCG /GENPROFILE /OPT:REF /OPT:ICF" $PGO_SETUP_ARGS || exit 1
   ninja -C "$B" || exit 1
 fi
 

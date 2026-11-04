@@ -25,15 +25,12 @@ namespace dxup::legacy {
   void setLegacyBackend(LegacyBackend backend);
   LegacyBackend legacyBackend();
 
-  // What keeps the legacy core on DXUP's Direct3D 11 although d3d9.backend
-  // asks for D3D12: settings only that front end implements. Null: nothing.
-  const char* directBackendObstacle();
-
   // A device and its immediate context on the D3D12 backend. vendorId: the
   // PCI vendor of its GPU.
   HRESULT createDirectDevice(ID3D11Device** device, ID3D11DeviceContext** context, uint32_t* vendorId);
 
   // The private exports of DXUP's d3d11.dll for such a device.
+  void WINAPI directNoteBackBufferSize(IUnknown* device, UINT width, UINT height);
   HRESULT WINAPI directCreateMappedView(IUnknown* device, ID3D11Resource* resource, const D3D11_SHADER_RESOURCE_VIEW_DESC* desc,
                                         UINT mapping, ID3D11ShaderResourceView** view);
   HRESULT WINAPI directCreateSampler(IUnknown* device, const D3D11_SAMPLER_DESC* desc, ID3D11SamplerState** sampler);
@@ -48,12 +45,20 @@ namespace dxup::legacy {
   public:
     virtual ~DirectSwapChain() = default;
     virtual HRESULT getBuffer(ID3D11Texture2D** texture) = 0;
-    // Nothing may hold the buffer's views.
-    virtual HRESULT resize(UINT width, UINT height) = 0;
+    // Nothing may hold the buffer's views. appWidth: see directScaledSize.
+    virtual HRESULT resize(UINT width, UINT height, UINT appWidth, UINT appHeight) = 0;
     virtual HRESULT present(UINT syncInterval) = 0;
   };
 
-  HRESULT createDirectSwapChain(ID3D11Device* device, HWND window, UINT width, UINT height,
+  HRESULT createDirectSwapChain(ID3D11Device* device, HWND window, UINT width, UINT height, UINT appWidth, UINT appHeight,
                                 std::unique_ptr<DirectSwapChain>& swapChain);
+
+  // The size the core's picture has before DXUP scales it up to the window at
+  // Present: dxgi.renderScale's share of the window, or with dxgi.upscale the
+  // source's size when smaller than the window. False: the window's own.
+  bool directScaledSize(UINT sourceWidth, UINT sourceHeight, UINT clientWidth, UINT clientHeight, UINT& appWidth, UINT& appHeight);
+
+  // The adapter the device renders on.
+  bool directAdapterDesc(ID3D11Device* device, DXGI_ADAPTER_DESC* desc);
 
 }

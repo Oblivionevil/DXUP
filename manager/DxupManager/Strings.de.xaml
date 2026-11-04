@@ -137,7 +137,8 @@ Läuft das Spiel noch?</sys:String>
   <sys:String x:Key="LegacyDirect">Direkt auf D3D12</sys:String>
   <sys:String x:Key="D3d9DirectOn">Direct3D 9 ohne Umweg über d3d11.dll (experimentell)</sys:String>
   <sys:String x:Key="D3d8DirectOn">Direct3D 8 ohne Umweg über d3d11.dll (experimentell)</sys:String>
-  <sys:String x:Key="LegacyDirectHint">Rund ein Viertel weniger Arbeit pro Draw auf dem Thread des Spiels. „Multisampling erzwingen“, SGSSAA, die Upscaler und die Render-Skalierung brauchen d3d11.dll: Sind sie gesetzt, bleibt das Spiel dort, ohne DXUPs d3d11.dll im Spielordner bleiben sie aus.</sys:String>
+  <sys:String x:Key="DdrawDirectOn">DirectDraw und Direct3D 7 ohne Umweg über d3d11.dll (experimentell)</sys:String>
+  <sys:String x:Key="LegacyDirectHint">Rund ein Viertel weniger Arbeit pro Draw auf dem Thread des Spiels. Multisampling, SGSSAA, die Upscaler und die Render-Skalierung gelten auch hier; im Spielordner wird keine d3d11.dll gebraucht.</sys:String>
   <sys:String x:Key="LegacyHint">Wirkt nur bei Spielen mit Direct3D 7, 8 oder 9.</sys:String>
   <sys:String x:Key="SectionAdvanced">Erweitert</sys:String>
   <sys:String x:Key="AdvancedHint">Für Tests und Fehlersuche. Die Voreinstellungen passen für fast alle Spiele.</sys:String>

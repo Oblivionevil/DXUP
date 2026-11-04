@@ -2086,6 +2086,15 @@ namespace dxup::legacy {
     return m_device->CreateShaderResourceView(resource, desc, view);
   }
 
+  bool Device::adapterDesc(DXGI_ADAPTER_DESC* desc) const {
+    if (m_direct)
+      return directAdapterDesc(m_device.get(), desc);
+    Ref<IDXGIDevice> dxgiDevice;
+    Ref<IDXGIAdapter> adapter;
+    return SUCCEEDED(m_device->QueryInterface(__uuidof(IDXGIDevice), reinterpret_cast<void**>(dxgiDevice.put())))
+      && SUCCEEDED(dxgiDevice->GetAdapter(adapter.put())) && SUCCEEDED(adapter->GetDesc(desc));
+  }
+
   void Device::noteBackBufferSize(uint32_t width, uint32_t height) {
     if (m_noteBackBufferSize && m_device)
       m_noteBackBufferSize(m_device.get(), width, height);
@@ -2096,37 +2105,24 @@ namespace dxup::legacy {
     HRESULT hr = S_OK;
     const LegacyBackend backend = legacyBackend();
     if (backend != LegacyBackend::D3D11) {
-      // Without DXUP's d3d11.dll next to this DLL the way back would end on
-      // Windows' Direct3D 11, which does not know those settings either.
-      const char* obstacle = directBackendObstacle();
-      if (obstacle && backend == LegacyBackend::D3D12Only) {
-        logMessage(LogLevel::Warn, "d3d9.backend = d3d12only: refused for %s", obstacle);
-        error = "d3d9.backend = d3d12only: settings need d3d11.dll";
+      uint32_t vendorId = 0;
+      hr = createDirectDevice(m_device.put(), m_context.put(), &vendorId);
+      if (SUCCEEDED(hr)) {
+        m_direct = true;
+        m_noteBackBufferSize = directNoteBackBufferSize;
+        m_createMappedView = directCreateMappedView;
+        m_createSampler = directCreateSampler;
+        m_writeBuffer = directWriteBuffer;
+        m_writeBufferWith = directWriteBufferWith;
+        for (WorkerConstants*& constants : m_workerConstants)
+          constants = new WorkerConstants();
+        g_vendorId.store(vendorId, std::memory_order_relaxed);
+        logMessage(LogLevel::Info, "Direct3D 7-9 layer: directly on the D3D12 backend");
+      } else if (backend == LegacyBackend::D3D12Only) {
+        error = "d3d9.backend = d3d12only: no device";
         return false;
-      }
-      if (obstacle && dxupSiblingExists("d3d11.dll")) {
-        logMessage(LogLevel::Warn, "d3d9.backend = d3d12: on d3d11.dll, for %s", obstacle);
       } else {
-        if (obstacle)
-          logMessage(LogLevel::Warn, "d3d9.backend = d3d12: without DXUP's d3d11.dll, %s stays off", obstacle);
-        uint32_t vendorId = 0;
-        hr = createDirectDevice(m_device.put(), m_context.put(), &vendorId);
-        if (SUCCEEDED(hr)) {
-          m_direct = true;
-          m_createMappedView = directCreateMappedView;
-          m_createSampler = directCreateSampler;
-          m_writeBuffer = directWriteBuffer;
-          m_writeBufferWith = directWriteBufferWith;
-          for (WorkerConstants*& constants : m_workerConstants)
-            constants = new WorkerConstants();
-          g_vendorId.store(vendorId, std::memory_order_relaxed);
-          logMessage(LogLevel::Info, "Direct3D 7-9 layer: directly on the D3D12 backend");
-        } else if (backend == LegacyBackend::D3D12Only) {
-          error = "d3d9.backend = d3d12only: no device";
-          return false;
-        } else {
-          logMessage(LogLevel::Warn, "d3d9.backend = d3d12: no device, on d3d11.dll");
-        }
+        logMessage(LogLevel::Warn, "d3d9.backend = d3d12: no device, on d3d11.dll");
       }
     }
     if (!m_direct) {
@@ -5890,14 +5886,19 @@ namespace dxup::legacy {
     SwapChain* chain = nullptr;
     for (auto& existing : m_swapChains)
       if (existing->window == window) chain = existing.get();
+    UINT appWidth = 0, appHeight = 0;
+    if (m_direct)
+      directScaledSize(source->width(0), source->height(0), width, height, appWidth, appHeight);
     if (!chain && m_direct) {
       auto created = std::make_unique<SwapChain>();
       created->window = window;
-      const HRESULT hr = createDirectSwapChain(m_device.get(), window, width, height, created->direct);
+      const HRESULT hr = createDirectSwapChain(m_device.get(), window, width, height, appWidth, appHeight, created->direct);
       if (FAILED(hr))
         return hr;
       created->width = width;
       created->height = height;
+      created->appWidth = appWidth;
+      created->appHeight = appHeight;
       chain = created.get();
       m_swapChains.push_back(std::move(created));
     } else if (!chain) {
@@ -5932,15 +5933,17 @@ namespace dxup::legacy {
       created->height = height;
       chain = created.get();
       m_swapChains.push_back(std::move(created));
-    } else if (chain->width != width || chain->height != height) {
+    } else if (chain->width != width || chain->height != height || chain->appWidth != appWidth || chain->appHeight != appHeight) {
       m_context->OMSetRenderTargets(0, nullptr, nullptr);
       chain->rtv.reset();
       // A failed resize keeps the buffers as they are (tried again next time).
-      const HRESULT resized = chain->direct ? chain->direct->resize(width, height)
+      const HRESULT resized = chain->direct ? chain->direct->resize(width, height, appWidth, appHeight)
         : chain->swapChain->ResizeBuffers(0, width, height, DXGI_FORMAT_UNKNOWN, chain->flags);
       if (SUCCEEDED(resized)) {
         chain->width = width;
         chain->height = height;
+        chain->appWidth = appWidth;
+        chain->appHeight = appHeight;
       }
     }
 

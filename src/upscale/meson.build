@@ -1,5 +1,6 @@
-# Temporal upscalers: linked into d3d11.dll only, whose backend context runs
-# them (dxgi.dll links the backend too and has no use for them).
+# Temporal upscalers: linked into the DLLs whose backend context runs them,
+# d3d11.dll and the legacy core's (dxgi.dll links the backend too and has no
+# use for them).
 fs = import('fs')
 
 upscale_args = []

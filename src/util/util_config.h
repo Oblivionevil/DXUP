@@ -86,8 +86,9 @@ namespace dxup {
   //                                  backend, without its d3d11.dll (see
   //                                  legacy_direct.h); d3d11 (default): on
   //                                  its d3d11.dll; d3d12only: no way back
-  //                                  when settings need d3d11.dll (tests)
+  //                                  without a D3D12 device (tests)
   //   d3d8.backend = d3d12           the same for Direct3D 8
+  //   ddraw.backend = d3d12          the same for DirectDraw and Direct3D 7
   class Config {
   public:
     static const Config& get();
@@ -119,7 +120,8 @@ namespace dxup {
   enum class MsaaScope : uint8_t { Geometry, All };
 
   // What the legacy core renders on: DXUP's d3d11.dll, or its D3D12 backend
-  // directly (with or without the way back to d3d11.dll when settings need it).
+  // directly (with or without the way back to d3d11.dll when there is no D3D12
+  // device).
   enum class LegacyBackend : uint8_t { D3D11, D3D12, D3D12Only };
 
   // Pixel shaders that run per sample on multisampled targets.
@@ -206,9 +208,10 @@ namespace dxup {
     // Direct3D 8/9 calls reach the legacy core on a thread of their own
     // (d3d9.workerThread, see d3d9::Worker).
     bool     d3d9WorkerThread = false;
-    // What Direct3D 9 and 8 run on (d3d9.backend, d3d8.backend).
+    // What Direct3D 9, 8 and 7 run on (d3d9.backend, d3d8.backend, ddraw.backend).
     LegacyBackend d3d9Backend = LegacyBackend::D3D11;
     LegacyBackend d3d8Backend = LegacyBackend::D3D11;
+    LegacyBackend ddrawBackend = LegacyBackend::D3D11;
     // Flip model applications draw into the real swap chain buffers, no
     // proxy copied at Present (dxgi.directBackBuffer).
     bool     directBackBuffer = true;

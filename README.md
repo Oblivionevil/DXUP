@@ -67,6 +67,7 @@ d3d9.shaderCompiler = fxc      # Direct3D 7-9 shaders through Microsoft's HLSL c
 d3d9.workerThread = true       # experimental: Direct3D 8/9 draws translated on a thread of their own
 d3d9.backend = d3d12           # experimental: Direct3D 9 straight on DXUP's D3D12 backend, without its d3d11.dll
 d3d8.backend = d3d12           # the same for Direct3D 8
+ddraw.backend = d3d12          # the same for DirectDraw and Direct3D 7
 d3d12.recordThread = true      # experimental: a second thread records DXUP's Direct3D 12 commands
 d3d12.submitThread = true      # command lists go to the GPU on a thread of their own
 ```

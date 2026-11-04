@@ -2,6 +2,8 @@
 
 #include "ddraw_objects.h"
 
+#include "../legacy/legacy_direct.h"
+#include "../util/util_config.h"
 #include "../util/util_types.h"
 
 #include <atomic>
@@ -38,6 +40,7 @@ namespace {
 extern "C" {
 
 HRESULT WINAPI DirectDrawCreateEx(GUID* guid, LPVOID* dd, REFIID riid, IUnknown* outer) {
+  dxup::legacy::setLegacyBackend(dxup::UserOverrides::get().ddrawBackend);
   (void)guid;
   if (!dd) return DDERR_INVALIDPARAMS;
   *dd = nullptr;

@@ -44,7 +44,7 @@ namespace {
     CreateFunction create = nullptr;
   };
 
-  HWND createWindow() {
+  HWND createWindow(UINT width = kWidth, UINT height = kHeight) {
     static bool registered = false;
     if (!registered) {
       WNDCLASSW wc = {};
@@ -54,7 +54,7 @@ namespace {
       RegisterClassW(&wc);
       registered = true;
     }
-    RECT r = { 0, 0, LONG(kWidth), LONG(kHeight) };
+    RECT r = { 0, 0, LONG(width), LONG(height) };
     AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
     return CreateWindowW(L"dxup_d3d9_test", L"d3d9 test", WS_OVERLAPPEDWINDOW, 0, 0, r.right - r.left, r.bottom - r.top,
                          nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
@@ -4160,9 +4160,11 @@ float4 main(float2 t : TEXCOORD0) : COLOR { float v = tex2D(depth, t).r; return 
   // with the device are a swap chain's size, so they get forced samples (on
   // DXUP's D3D11, the swap chain comes only at the first Present). A white
   // triangle on black: its edge has partly covered pixels with forced
-  // multisampling, none without. Returns how many (first frame, before any
-  // Present), or -1.
-  int forcedMsaaEdgePixels(Runtime& runtime) {
+  // multisampling, none without. With alphaGradient, a quad over the whole
+  // target that the alpha test cuts along a diagonal instead: partly covered
+  // pixels only when the test runs per sample (d3d11.sgssaa). Returns how many
+  // (first frame, before any Present), or -1.
+  int forcedMsaaEdgePixels(Runtime& runtime, bool alphaGradient = false) {
     IDirect3D9* d3d = runtime.create(D3D_SDK_VERSION);
     if (!d3d) return -1;
     HWND window = createWindow();
@@ -4192,7 +4194,18 @@ float4 main(float2 t : TEXCOORD0) : COLOR { float v = tex2D(depth, t).r; return 
     device->SetRenderState(D3DRS_LIGHTING, FALSE);
     device->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
     device->SetFVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE);
-    device->DrawPrimitiveUP(D3DPT_TRIANGLELIST, 1, triangle, sizeof(V));
+    if (alphaGradient) {
+      const V quad[4] = {
+        { 0.0f, 0.0f, 0.5f, 1.0f, 0x00ffffffu }, { float(kWidth), 0.0f, 0.5f, 1.0f, 0x92ffffffu },
+        { 0.0f, float(kHeight), 0.5f, 1.0f, 0x6dffffffu }, { float(kWidth), float(kHeight), 0.5f, 1.0f, 0xffffffffu },
+      };
+      device->SetRenderState(D3DRS_ALPHATESTENABLE, TRUE);
+      device->SetRenderState(D3DRS_ALPHAREF, 128);
+      device->SetRenderState(D3DRS_ALPHAFUNC, D3DCMP_GREATER);
+      device->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, quad, sizeof(V));
+    } else {
+      device->DrawPrimitiveUP(D3DPT_TRIANGLELIST, 1, triangle, sizeof(V));
+    }
     device->EndScene();
     int partial = -1;
     IDirect3DSurface9 *back = nullptr, *copy = nullptr;
@@ -4576,6 +4589,340 @@ VO main(float3 p : POSITION, float4 c : COLOR0) { VO o; o.p = float4(p.xy, 0.5, 
     return code;
   }
 
+  std::string readLogs(const std::wstring& dir) {
+    std::string log;
+    WIN32_FIND_DATAW found = {};
+    HANDLE find = FindFirstFileW((dir + L"logdxup*.log").c_str(), &found);
+    if (find == INVALID_HANDLE_VALUE)
+      return log;
+    do {
+      if (FILE* file = _wfsopen((dir + found.cFileName).c_str(), L"rb", _SH_DENYNO)) {
+        char chunk[4096];
+        for (size_t read; (read = std::fread(chunk, 1, sizeof(chunk), file)) > 0;)
+          log.append(chunk, read);
+        std::fclose(file);
+      }
+    } while (FindNextFileW(find, &found));
+    FindClose(find);
+    return log;
+  }
+
+  // Glitch reports (dxup_frame_dump.txt next to the DLLs): a triangle that goes
+  // black for one frame is seen as a flicker, the frame is saved and the log
+  // lists the calls. Returns 0 or the failed check.
+  int glitchChild(Runtime& runtime, const std::wstring& dir) {
+    IDirect3D9* d3d = runtime.create(D3D_SDK_VERSION);
+    HWND window = createWindow(320, 180);
+    D3DPRESENT_PARAMETERS pp = {};
+    pp.Windowed = TRUE;
+    pp.SwapEffect = D3DSWAPEFFECT_DISCARD;
+    pp.BackBufferWidth = 320;
+    pp.BackBufferHeight = 180;
+    pp.BackBufferFormat = D3DFMT_X8R8G8B8;
+    pp.hDeviceWindow = window;
+    pp.PresentationInterval = D3DPRESENT_INTERVAL_IMMEDIATE;
+    IDirect3DDevice9* device = nullptr;
+    if (!d3d || FAILED(d3d->CreateDevice(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, window, D3DCREATE_HARDWARE_VERTEXPROCESSING, &pp, &device)))
+      return 2;
+    device->SetRenderState(D3DRS_LIGHTING, FALSE);
+    device->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+    device->SetRenderState(D3DRS_ZENABLE, FALSE);
+    device->SetFVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE);
+    struct V { float x, y, z, rhw; DWORD color; };
+    for (int frame = 1; frame <= 40; frame++) {
+      const DWORD color = frame == 20 ? 0xff000000u : 0xffffffffu;
+      const V triangle[3] = {
+        { 0.0f, 0.0f, 0.5f, 1.0f, color }, { 160.0f, 0.0f, 0.5f, 1.0f, color }, { 0.0f, 180.0f, 0.5f, 1.0f, color },
+      };
+      device->Clear(0, nullptr, D3DCLEAR_TARGET, 0xff808080u, 1.0f, 0);
+      device->BeginScene();
+      // As many calls as a game frame has at least (fewer count as video).
+      for (int draw = 0; draw < 12; draw++)
+        device->DrawPrimitiveUP(D3DPT_TRIANGLELIST, 1, triangle, sizeof(V));
+      device->EndScene();
+      if (FAILED(device->Present(nullptr, nullptr, nullptr, nullptr)))
+        return 3;
+      Sleep(5);
+    }
+    device->Release();
+    d3d->Release();
+    DestroyWindow(window);
+    if (GetFileAttributesW((dir + L"dxup_glitch_20.bmp").c_str()) == INVALID_FILE_ATTRIBUTES
+     || GetFileAttributesW((dir + L"dxup_glitch_20_before.bmp").c_str()) == INVALID_FILE_ATTRIBUTES)
+      return 4;
+    const std::string log = readLogs(dir);
+    if (log.find("glitch 1: present 20, 1 frame") == std::string::npos)
+      return 5;
+    return log.find("glitch 1: the frame before (present 19) has 14 calls") == std::string::npos ? 6 : 0;
+  }
+
+  // What reaches the window at Present: a client area of 320x240, a back
+  // buffer of the size given, red on the left and blue on the right. Taken
+  // from the compositor. dumpWidth: the width of DXUP's picture before it is
+  // scaled (needs dxup_frame_dump.txt). Returns 0 or the failed check.
+  int presentChild(Runtime& runtime, const std::wstring& dir, UINT backWidth, UINT backHeight, UINT dumpWidth, bool overlay) {
+    IDirect3D9* d3d = runtime.create(D3D_SDK_VERSION);
+    HWND window = createWindow(320, 240);
+    ShowWindow(window, SW_SHOWNOACTIVATE);
+    D3DPRESENT_PARAMETERS pp = {};
+    pp.Windowed = TRUE;
+    pp.SwapEffect = D3DSWAPEFFECT_DISCARD;
+    pp.BackBufferWidth = backWidth;
+    pp.BackBufferHeight = backHeight;
+    pp.BackBufferFormat = D3DFMT_X8R8G8B8;
+    pp.hDeviceWindow = window;
+    pp.PresentationInterval = D3DPRESENT_INTERVAL_IMMEDIATE;
+    IDirect3DDevice9* device = nullptr;
+    if (!d3d || FAILED(d3d->CreateDevice(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, window, D3DCREATE_HARDWARE_VERTEXPROCESSING, &pp, &device)))
+      return 20;
+    for (int frame = 0; frame < 70; frame++) {
+      const D3DRECT left = { 0, 0, LONG(backWidth / 2), LONG(backHeight) };
+      const D3DRECT right = { LONG(backWidth / 2), 0, LONG(backWidth), LONG(backHeight) };
+      device->Clear(1, &left, D3DCLEAR_TARGET, 0xffff0000u, 1.0f, 0);
+      device->Clear(1, &right, D3DCLEAR_TARGET, 0xff0000ffu, 1.0f, 0);
+      if (FAILED(device->Present(nullptr, nullptr, nullptr, nullptr)))
+        return 21;
+      Sleep(3);
+      MSG message;
+      while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE))
+        DispatchMessageW(&message);
+    }
+    Sleep(200);
+    BITMAPINFO info = {};
+    info.bmiHeader.biSize = sizeof(info.bmiHeader);
+    info.bmiHeader.biWidth = 320;
+    info.bmiHeader.biHeight = -240;
+    info.bmiHeader.biPlanes = 1;
+    info.bmiHeader.biBitCount = 32;
+    void* bits = nullptr;
+    HDC screen = GetDC(nullptr);
+    HDC memory = CreateCompatibleDC(screen);
+    HBITMAP bitmap = CreateDIBSection(screen, &info, DIB_RGB_COLORS, &bits, nullptr, 0);
+    HGDIOBJ old = SelectObject(memory, bitmap);
+    // PW_CLIENTONLY | PW_RENDERFULLCONTENT
+    const bool taken = PrintWindow(window, memory, 3) != FALSE;
+    GdiFlush();
+    int result = 0;
+    // By share of pixels of that hue: the driver's own overlay may lie over
+    // the small window, darker and with text (Radeon's metrics do).
+    const auto* pixels = static_cast<const DWORD*>(bits);
+    auto share = [&](int left, int top, int right, int bottom, int channel) {
+      int matching = 0;
+      for (int y = top; y < bottom; y++)
+        for (int x = left; x < right; x++) {
+          const DWORD color = pixels[y * 320 + x];
+          const int values[3] = { int((color >> 16) & 255), int((color >> 8) & 255), int(color & 255) };
+          matching += values[channel] > 60 && values[channel] > 2 * values[(channel + 1) % 3] && values[channel] > 2 * values[(channel + 2) % 3];
+        }
+      return matching;
+    };
+    const int reds = taken ? share(10, 40, 150, 200, 0) : 0, blues = taken ? share(170, 40, 310, 200, 2) : 0;
+    // Its green digits at the top right corner of the window's buffer.
+    const int digits = taken ? share(190, 8, 312, 32, 1) : 0;
+    const int enough = 140 * 160 * 6 / 10;
+    if (!taken)
+      result = 22;
+    else if (reds < enough)
+      result = 23;
+    else if (blues < enough)
+      result = 24;
+    else if (overlay ? digits < 20 : digits > 0)
+      result = 25;
+    if (result && taken) {
+      std::printf("window: %d of %d red on the left, %d blue on the right, %d digit pixels\n", reds, 140 * 160, blues, digits);
+      // To look at.
+      if (FILE* file = _wfopen((dir + L"present_capture.bmp").c_str(), L"wb")) {
+        BITMAPFILEHEADER header = {};
+        header.bfType = 0x4d42;
+        header.bfOffBits = sizeof(header) + sizeof(info.bmiHeader);
+        header.bfSize = header.bfOffBits + 320 * 240 * 4;
+        std::fwrite(&header, sizeof(header), 1, file);
+        std::fwrite(&info.bmiHeader, sizeof(info.bmiHeader), 1, file);
+        std::fwrite(bits, 4, 320 * 240, file);
+        std::fclose(file);
+      }
+    }
+    SelectObject(memory, old);
+    DeleteObject(bitmap);
+    DeleteDC(memory);
+    ReleaseDC(nullptr, screen);
+    device->Release();
+    d3d->Release();
+    DestroyWindow(window);
+    if (!result && dumpWidth) {
+      LONG width = 0;
+      if (FILE* file = _wfopen((dir + L"dxup_frame_60.bmp").c_str(), L"rb")) {
+        std::fseek(file, 18, SEEK_SET);
+        if (std::fread(&width, sizeof(width), 1, file) != 1)
+          width = 0;
+        std::fclose(file);
+      }
+      if (UINT(width) != dumpWidth) {
+        std::printf("dumped width %ld, expected %u\n", width, dumpWidth);
+        result = 26;
+      }
+    }
+    return result;
+  }
+
+  // d3d11.upscalerInject on Direct3D 9: a turning camera over a floor with
+  // pillars (View, Proj and ViewProj in c0-c11), then an interface pass onto
+  // the back buffer. DXUP finds ViewProj by reprojection and keeps it; while
+  // the camera stands still it upscales without motion, and jittered frames
+  // differ (with the upscalers next to the DLLs). Returns 0 or the failed check.
+  int upscalerInjectChild(Runtime& runtime, const std::wstring& dir) {
+    const std::wstring profile = dir + L"dxup_upscaler_inject.txt";
+    DeleteFileW(profile.c_str());
+    const UINT size = 128;
+    IDirect3D9* d3d = runtime.create(D3D_SDK_VERSION);
+    HWND window = createWindow(size, size);
+    D3DPRESENT_PARAMETERS pp = {};
+    pp.Windowed = TRUE;
+    pp.SwapEffect = D3DSWAPEFFECT_DISCARD;
+    pp.BackBufferWidth = size;
+    pp.BackBufferHeight = size;
+    pp.BackBufferFormat = D3DFMT_X8R8G8B8;
+    pp.hDeviceWindow = window;
+    pp.PresentationInterval = D3DPRESENT_INTERVAL_IMMEDIATE;
+    IDirect3DDevice9* device = nullptr;
+    if (!d3d || FAILED(d3d->CreateDevice(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, window, D3DCREATE_HARDWARE_VERTEXPROCESSING, &pp, &device)))
+      return 30;
+    const auto vsCode = compile("row_major float4x4 view : register(c0); row_major float4x4 proj : register(c4);\n"
+      "row_major float4x4 viewProj : register(c8);\n"
+      "struct Out { float4 position : POSITION; float3 world : TEXCOORD0; };\n"
+      "Out main(float3 world : POSITION) { Out o; o.world = world; o.position = mul(float4(world, 1.0f), viewProj); return o; }\n", "vs_3_0");
+    const auto psCode = compile("float4 main(float3 world : TEXCOORD0) : COLOR {\n"
+      "  float a = 0.5f + 0.5f * sin(world.x * 0.9f + world.y * 0.7f) * sin(world.z * 1.1f);\n"
+      "  float b = 0.5f + 0.5f * sin(world.x * 0.37f + world.z * 0.61f + world.y * 0.9f);\n"
+      "  return float4(a, b, 1.0f - a * 0.5f, 1.0f);\n}\n", "ps_3_0");
+    IDirect3DVertexShader9* vs = nullptr;
+    IDirect3DPixelShader9* ps = nullptr;
+    IDirect3DTexture9* scene = nullptr;
+    IDirect3DSurface9 *sceneSurface = nullptr, *depth = nullptr, *back = nullptr, *reads[2] = {};
+    if (vsCode.empty() || psCode.empty() || FAILED(device->CreateVertexShader(vsCode.data(), &vs)) || FAILED(device->CreatePixelShader(psCode.data(), &ps))
+     || FAILED(device->CreateTexture(size, size, 1, D3DUSAGE_RENDERTARGET, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, &scene, nullptr))
+     || FAILED(scene->GetSurfaceLevel(0, &sceneSurface))
+     || FAILED(device->CreateDepthStencilSurface(size, size, D3DFMT_D24S8, D3DMULTISAMPLE_NONE, 0, FALSE, &depth, nullptr))
+     || FAILED(device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &back))
+     || FAILED(device->CreateOffscreenPlainSurface(size, size, D3DFMT_X8R8G8B8, D3DPOOL_SYSTEMMEM, &reads[0], nullptr))
+     || FAILED(device->CreateOffscreenPlainSurface(size, size, D3DFMT_X8R8G8B8, D3DPOOL_SYSTEMMEM, &reads[1], nullptr)))
+      return 31;
+    // The floor and pillars around the camera (only the real camera matrix
+    // fits every surface).
+    struct Position { float x, y, z; };
+    std::vector<Position> world;
+    const float floorCorners[6][2] = { { -25, -25 }, { -25, 25 }, { 25, 25 }, { -25, -25 }, { 25, 25 }, { 25, -25 } };
+    for (const auto& corner : floorCorners)
+      world.push_back({ corner[0], 0.0f, corner[1] });
+    const Position cube[8] = { { -1, 0, -1 }, { 1, 0, -1 }, { 1, 0, 1 }, { -1, 0, 1 }, { -1, 6, -1 }, { 1, 6, -1 }, { 1, 6, 1 }, { -1, 6, 1 } };
+    const int faces[24] = { 0, 1, 5, 4,  1, 2, 6, 5,  2, 3, 7, 6,  3, 0, 4, 7,  4, 5, 6, 7,  1, 0, 3, 2 };
+    const int quad[6] = { 0, 1, 2, 0, 2, 3 };
+    for (int pillar = 1; pillar <= 8; pillar++) {
+      const float angle = float(pillar) * 0.785f, radius = 6.0f + float(pillar % 3) * 3.0f;
+      for (int i = 0; i < 36; i++) {
+        const Position& corner = cube[faces[(i / 6) * 4 + quad[i % 6]]];
+        world.push_back({ std::sin(angle) * radius + corner.x, corner.y, std::cos(angle) * radius + corner.z });
+      }
+    }
+    auto multiply = [](const float* a, const float* b, float* out) {
+      for (int r = 0; r < 4; r++)
+        for (int c = 0; c < 4; c++)
+          out[r * 4 + c] = a[r * 4] * b[c] + a[r * 4 + 1] * b[4 + c] + a[r * 4 + 2] * b[8 + c] + a[r * 4 + 3] * b[12 + c];
+    };
+    const float nearPlane = 0.5f, farPlane = 200.0f, focal = 1.0f / std::tan(0.6f);
+    const float proj[16] = { focal, 0, 0, 0, 0, focal, 0, 0, 0, 0, farPlane / (farPlane - nearPlane), 1,
+                             0, 0, -nearPlane * farPlane / (farPlane - nearPlane), 0 };
+    struct Screen { float x, y, z, rhw, u, v; };
+    const float extent = float(size) - 0.5f;
+    const Screen fullscreen[4] = { { -0.5f, -0.5f, 0.5f, 1.0f, 0.0f, 0.0f }, { extent, -0.5f, 0.5f, 1.0f, 1.0f, 0.0f },
+                                   { -0.5f, extent, 0.5f, 1.0f, 0.0f, 1.0f }, { extent, extent, 0.5f, 1.0f, 1.0f, 1.0f } };
+    device->SetRenderState(D3DRS_LIGHTING, FALSE);
+    device->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+    device->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_POINT);
+    device->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
+    constexpr uint32_t kStill = 150;
+    uint32_t foundAt = 0;
+    for (uint32_t step = 0; step < 480 + kStill; step++) {
+      const uint32_t frame = step > kStill ? step - kStill : 0;
+      const float yaw = 0.025f * float(frame), pitch = 0.5f;
+      const float cy = std::cos(yaw), sy = std::sin(yaw), cp = std::cos(pitch), sp = std::sin(pitch);
+      const float right[3] = { cy, 0.0f, -sy };
+      const float forward[3] = { sy * cp, -sp, cy * cp };
+      const float up[3] = { forward[1] * right[2] - forward[2] * right[1], forward[2] * right[0] - forward[0] * right[2],
+                            forward[0] * right[1] - forward[1] * right[0] };
+      const float eye[3] = { 2.0f * std::sin(0.02f * float(frame)), 3.0f, 2.0f * std::cos(0.02f * float(frame)) };
+      auto dot3 = [](const float* a, const float* b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; };
+      const float view[16] = { right[0], up[0], forward[0], 0, right[1], up[1], forward[1], 0,
+                               right[2], up[2], forward[2], 0, -dot3(eye, right), -dot3(eye, up), -dot3(eye, forward), 1 };
+      float viewProj[16];
+      multiply(view, proj, viewProj);
+      device->SetRenderTarget(0, sceneSurface);
+      device->SetDepthStencilSurface(depth);
+      device->Clear(0, nullptr, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, 0xff334d80u, 1.0f, 0);
+      device->BeginScene();
+      device->SetRenderState(D3DRS_ZENABLE, TRUE);
+      device->SetVertexShader(vs);
+      device->SetPixelShader(ps);
+      device->SetVertexShaderConstantF(0, view, 4);
+      device->SetVertexShaderConstantF(4, proj, 4);
+      device->SetVertexShaderConstantF(8, viewProj, 4);
+      device->SetTexture(0, nullptr);
+      device->SetFVF(D3DFVF_XYZ);
+      // In a few draws, as a scene has many.
+      for (int i = 0; i < 12; i++)
+        device->DrawPrimitiveUP(D3DPT_TRIANGLELIST, UINT(world.size() / 3), world.data(), sizeof(Position));
+      // The interface: the scene onto the back buffer.
+      device->SetRenderTarget(0, back);
+      device->SetDepthStencilSurface(nullptr);
+      device->SetRenderState(D3DRS_ZENABLE, FALSE);
+      device->SetVertexShader(nullptr);
+      device->SetPixelShader(nullptr);
+      device->SetTexture(0, scene);
+      device->SetFVF(D3DFVF_XYZRHW | D3DFVF_TEX1);
+      device->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, fullscreen, sizeof(Screen));
+      device->EndScene();
+      if (step == 120 || step == 121)
+        device->GetRenderTargetData(back, reads[step - 120]);
+      if (FAILED(device->Present(nullptr, nullptr, nullptr, nullptr)))
+        return 32;
+      if (!foundAt && GetFileAttributesW(profile.c_str()) != INVALID_FILE_ATTRIBUTES)
+        foundAt = step;
+    }
+    uint32_t stillChanges = 0;
+    D3DLOCKED_RECT first = {}, second = {};
+    if (SUCCEEDED(reads[0]->LockRect(&first, nullptr, D3DLOCK_READONLY))) {
+      if (SUCCEEDED(reads[1]->LockRect(&second, nullptr, D3DLOCK_READONLY))) {
+        for (UINT y = 0; y < size; y++) {
+          const auto* a = reinterpret_cast<const DWORD*>(static_cast<const BYTE*>(first.pBits) + y * first.Pitch);
+          const auto* b = reinterpret_cast<const DWORD*>(static_cast<const BYTE*>(second.pBits) + y * second.Pitch);
+          for (UINT x = 0; x < size; x++)
+            stillChanges += a[x] != b[x] ? 1u : 0u;
+        }
+        reads[1]->UnlockRect();
+      }
+      reads[0]->UnlockRect();
+    }
+    for (IUnknown* object : std::initializer_list<IUnknown*>{ reads[1], reads[0], back, depth, sceneSurface, scene, ps, vs, device, d3d })
+      object->Release();
+    DestroyWindow(window);
+    FILE* file = _wfopen(profile.c_str(), L"r");
+    if (!file)
+      return 40;
+    unsigned slot = 99, offset = 99, layout = 99;
+    const int read = std::fscanf(file, "%u %u %u", &slot, &offset, &layout);
+    std::fclose(file);
+    DeleteFileW(profile.c_str());
+    std::printf("upscaler inject: camera cb%u+%u layout %u, found %u frames after it moved; %u pixels changed while "
+      "it stood still\n", slot, offset, layout, foundAt > kStill ? foundAt - kStill : 0, stillChanges);
+    if (read != 3 || offset != 128 || layout != 0)
+      return 41;
+    if (foundAt <= kStill || foundAt > kStill + 240)
+      return 42;
+    if (!stillChanges && sizeof(void*) == 8 && GetFileAttributesW((dir + L"dxup_upscalers").c_str()) != INVALID_FILE_ATTRIBUTES)
+      return 43;
+    return 0;
+  }
+
   int runSelf(const char* arguments, DWORD timeout = 60000) {
     wchar_t exe[MAX_PATH];
     GetModuleFileNameW(nullptr, exe, MAX_PATH);
@@ -4603,8 +4950,10 @@ int main(int argc, char** argv) {
   int benchFrames = 0, benchDraws = 0;
   const char* benchShadersPath = nullptr;
   size_t benchShadersLimit = 0;
-  bool childDirect = false, childRaisedMsaa = false, childForcedMsaa = false, identifier = false, childDpi = false, childFloatStrict = false, childDropped = false;
-  bool childSelfTest = false, dxupOnly = false, childWorker = false;
+  bool childDirect = false, childRaisedMsaa = false, childForcedMsaa = false, childSgssaa = false, childGlitch = false, childInject = false, identifier = false, childDpi = false, childFloatStrict = false, childDropped = false;
+  bool childSelfTest = false, dxupOnly = false, childWorker = false, childPresent = false;
+  UINT presentBack[2] = {}, presentDump = 0;
+  bool presentOverlay = false;
   unsigned variantNonce = 0;
   for (int i = 1; i < argc; i++) {
     if (std::strcmp(argv[i], "--dump") == 0) dumpImages = true;
@@ -4613,6 +4962,17 @@ int main(int argc, char** argv) {
     else if (std::strcmp(argv[i], "--forced-msaa-child") == 0) childForcedMsaa = true;
     else if (std::strcmp(argv[i], "--direct-child") == 0) childDirect = true;
     else if (std::strcmp(argv[i], "--raised-msaa-child") == 0) childRaisedMsaa = true;
+    else if (std::strcmp(argv[i], "--sgssaa-child") == 0) childSgssaa = true;
+    else if (std::strcmp(argv[i], "--glitch-child") == 0) childGlitch = true;
+    else if (std::strcmp(argv[i], "--upscaler-inject-child") == 0) childInject = true;
+    else if (std::strcmp(argv[i], "--present-child") == 0 && i + 4 < argc) {
+      childPresent = true;
+      presentBack[0] = UINT(std::atoi(argv[i + 1]));
+      presentBack[1] = UINT(std::atoi(argv[i + 2]));
+      presentDump = UINT(std::atoi(argv[i + 3]));
+      presentOverlay = std::atoi(argv[i + 4]) != 0;
+      i += 4;
+    }
     else if (std::strcmp(argv[i], "--identifier") == 0) identifier = true;
     else if (std::strcmp(argv[i], "--dpi-child") == 0) childDpi = true;
     else if (std::strcmp(argv[i], "--float-strict-child") == 0) childFloatStrict = true;
@@ -4651,6 +5011,17 @@ int main(int argc, char** argv) {
     std::printf("%d\n", partial);
     return partial < 0 ? 255 : (std::min)(partial, 254);
   }
+
+  if (childSgssaa) {
+    const int partial = forcedMsaaEdgePixels(dxup, true);
+    return partial < 0 ? 255 : (std::min)(partial, 254);
+  }
+  if (childGlitch)
+    return glitchChild(dxup, dir);
+  if (childPresent)
+    return presentChild(dxup, dir, presentBack[0], presentBack[1], presentDump, presentOverlay);
+  if (childInject)
+    return upscalerInjectChild(dxup, dir);
 
   if (childDpi)
     return dpiFullscreenChild(dxup);
@@ -4832,46 +5203,119 @@ int main(int argc, char** argv) {
     ok ? passed++ : skip ? skipped++ : failed++;
   }
   // DXUP_D3D9_BACKEND beats dxup.conf: d3d12only runs every scene on the
-  // D3D12 backend itself and refuses what needs DXUP's d3d11.dll.
+  // D3D12 backend itself, with no way back to DXUP's d3d11.dll.
   char backendChoice[16] = {};
   GetEnvironmentVariableA("DXUP_D3D9_BACKEND", backendChoice, sizeof(backendChoice));
+  const std::wstring conf = dir + L"dxup.conf";
+  auto runWith = [&](const char* settings, const char* arguments, DWORD timeout = 60000) {
+    int code = -1;
+    if (FILE* f = _wfopen(conf.c_str(), L"w")) {
+      std::fputs(settings, f);
+      std::fclose(f);
+      code = runSelf(arguments, timeout);
+      DeleteFileW(conf.c_str());
+    }
+    return code;
+  };
   // Direct3D 9 on the D3D12 backend itself (d3d9.backend, children with
   // dxup.conf). A device that falls back to DXUP's d3d11.dll fails here.
   if ((!filter || std::strstr("direct_backend", filter)) && !backendChoice[0]) {
-    const std::wstring conf = dir + L"dxup.conf";
-    auto runWith = [&](const char* settings, const char* arguments, DWORD timeout = 60000) {
-      int code = -1;
-      if (FILE* f = _wfopen(conf.c_str(), L"w")) {
-        std::fputs(settings, f);
-        std::fclose(f);
-        code = runSelf(arguments, timeout);
-        DeleteFileW(conf.c_str());
-      }
-      return code;
-    };
     const int direct = runWith("d3d9.backend = d3d12only\n", "--direct-child");
     const int worker = runWith("d3d9.backend = d3d12only\nd3d9.workerThread = true\n", "--direct-child");
-    // Settings only d3d11.dll implements: refused when no way back is
-    // allowed, on d3d11.dll (and doing what they say) otherwise.
-    const int refused = runWith("d3d9.backend = d3d12only\nd3d11.msaaSamples = 4\nd3d11.msaaForce = true\n", "--direct-child");
+    // No Direct3D 12 device (DXUP_FAIL_D3D12): no device when no way back is
+    // allowed, one by way of d3d11.dll otherwise.
+    SetEnvironmentVariableA("DXUP_FAIL_D3D12", "1");
+    const int refused = runWith("d3d9.backend = d3d12only\n", "--direct-child");
+    const int fellBack = runWith("d3d9.backend = d3d12\n", "--direct-child");
+    SetEnvironmentVariableA("DXUP_FAIL_D3D12", nullptr);
     // d3d11.msaaSamples alone stays on the D3D12 backend.
     const int asked = runWith("d3d9.backend = d3d12only\n", "--raised-msaa-child");
     const int raised = runWith("d3d9.backend = d3d12only\nd3d11.msaaSamples = 4\n", "--raised-msaa-child");
-    const int fellBack = runWith("d3d9.backend = d3d12\nd3d11.msaaSamples = 4\nd3d11.msaaForce = true\n", "--forced-msaa-child");
+    const int forced = runWith("d3d9.backend = d3d12only\nd3d11.msaaSamples = 4\nd3d11.msaaForce = true\n", "--forced-msaa-child");
+    const int forcedWorker = runWith("d3d9.backend = d3d12only\nd3d9.workerThread = true\nd3d11.msaaSamples = 4\nd3d11.msaaForce = true\n", "--forced-msaa-child");
     const int scenes = runWith("d3d9.backend = d3d12only\n", "--worker-child", 600000);
     const int sceneWorker = runWith("d3d9.backend = d3d12only\nd3d9.workerThread = true\n", "--worker-child", 600000);
-    const bool ok = direct == 0 && worker == 0 && refused == 1 && asked == 0 && raised > 0 && raised < 255 && fellBack >= 40
-      && fellBack < 255 && scenes == 0 && sceneWorker == 0;
-    std::printf("%s %-20s device %d, with worker %d, refused %d, samples raised %d (asked %d), fell back %d, scenes differing %d, with worker %d\n",
-                ok ? "ok  " : "FAIL", "direct_backend", direct, worker, refused, raised, asked, fellBack, scenes, sceneWorker);
+    const bool ok = direct == 0 && worker == 0 && refused == 1 && fellBack == 0 && asked == 0 && raised > 0 && raised < 255
+      && forced >= 40 && forced < 255 && forcedWorker >= 40 && forcedWorker < 255 && scenes == 0 && sceneWorker == 0;
+    std::printf("%s %-20s device %d, with worker %d, without D3D12 %d (way back %d), samples raised %d (asked %d), forced %d (with worker %d), scenes differing %d, with worker %d\n",
+                ok ? "ok  " : "FAIL", "direct_backend", direct, worker, refused, fellBack, raised, asked, forced, forcedWorker, scenes, sceneWorker);
     ok ? passed++ : failed++;
   }
+  // What the swap chains of both ways do besides drawing: alpha tests per
+  // sample, glitch reports, scaling at Present, the frame rate overlay, the
+  // injected upscaler.
+  for (const char* prefix : { "", "d3d9.backend = d3d12only\n" }) {
+    const bool onDirect = prefix[0] || !_stricmp(backendChoice, "d3d12only");
+    const std::string label = prefix[0] ? "direct" : "default";
+    auto settings = [&](const char* more) { return std::string(prefix) + more; };
+    auto wantScene = [&](const char* name) { return !filter || std::strstr(name, filter); };
+    auto report = [&](const char* name, bool ok, const std::string& detail) {
+      std::printf("%s %-20s %s: %s\n", ok ? "ok  " : "FAIL", name, label.c_str(), detail.c_str());
+      ok ? passed++ : failed++;
+    };
+    if (wantScene("forced_sgssaa")) {
+      const std::string force = settings("d3d11.msaaSamples = 4\nd3d11.msaaForce = true\n");
+      const int full = runWith((force + "d3d11.sgssaa = true\n").c_str(), "--sgssaa-child");
+      const int alpha = runWith((force + "d3d11.sgssaa = alpha\n").c_str(), "--sgssaa-child");
+      const int off = runWith(force.c_str(), "--sgssaa-child");
+      // Without: pixels on the seam of the quad's triangles, which test alpha apart.
+      report("forced_sgssaa", full >= 30 && full < 255 && alpha >= 30 && alpha < 255 && off >= 0 && off < 20,
+        "alpha test edge pixels " + std::to_string(full) + ", alpha only " + std::to_string(alpha) + ", without " + std::to_string(off));
+    }
+    auto removeImages = [&] {
+      WIN32_FIND_DATAW found = {};
+      for (const wchar_t* pattern : { L"dxup_frame_*.bmp", L"dxup_glitch_*.bmp" }) {
+        HANDLE find = FindFirstFileW((dir + pattern).c_str(), &found);
+        if (find == INVALID_HANDLE_VALUE)
+          continue;
+        do
+          DeleteFileW((dir + found.cFileName).c_str());
+        while (FindNextFileW(find, &found));
+        FindClose(find);
+      }
+    };
+    auto withMarker = [&](const wchar_t* name, const std::function<int()>& run) {
+      if (FILE* f = _wfopen((dir + name).c_str(), L"w"))
+        std::fclose(f);
+      const int code = run();
+      DeleteFileW((dir + name).c_str());
+      return code;
+    };
+    if (wantScene("glitch_report")) {
+      removeImages();
+      DeleteFileW((dir + L"logdxup_dxgi.log").c_str());
+      const int code = withMarker(L"dxup_frame_dump.txt", [&] { return runWith(settings("").c_str(), "--glitch-child"); });
+      removeImages();
+      report("glitch_report", code == 0, "code " + std::to_string(code));
+    }
+    if (wantScene("present_scaling")) {
+      auto scaled = [&](const char* more, const char* arguments) {
+        removeImages();
+        const int code = withMarker(L"dxup_frame_dump.txt", [&] { return runWith(settings(more).c_str(), arguments); });
+        removeImages();
+        return code;
+      };
+      const int render = scaled("dxgi.renderScale = 0.5\n", onDirect ? "--present-child 320 240 160 0" : "--present-child 320 240 0 0");
+      const int spatial = scaled("dxgi.upscale = spatial\n", onDirect ? "--present-child 160 120 160 0" : "--present-child 160 120 0 0");
+      const int copied = scaled("dxgi.directBackBuffer = false\n", "--present-child 320 240 320 0");
+      const int plain = scaled("", "--present-child 320 240 320 0");
+      report("present_scaling", !render && !spatial && !copied && !plain, "renderScale " + std::to_string(render) + ", upscale " + std::to_string(spatial)
+        + ", through a copy " + std::to_string(copied) + ", direct " + std::to_string(plain));
+    }
+    if (wantScene("fps_overlay")) {
+      const int shown = withMarker(L"dxup_show_fps_overlay.txt", [&] { return runWith(settings("").c_str(), "--present-child 320 240 0 1"); });
+      const int scaledShown = withMarker(L"dxup_show_fps_overlay.txt", [&] {
+        return runWith(settings("dxgi.renderScale = 0.5\n").c_str(), "--present-child 320 240 0 1");
+      });
+      report("fps_overlay", !shown && !scaledShown, "code " + std::to_string(shown) + ", scaled " + std::to_string(scaledShown));
+    }
+    if (wantScene("upscaler_inject")) {
+      const int code = runWith(settings("d3d11.upscaler = fsr\nd3d11.upscalerInject = true\n").c_str(), "--upscaler-inject-child", 180000);
+      report("upscaler_inject", code == 0, "code " + std::to_string(code));
+    }
+  }
   // Forced multisampling (dxup.conf next to DXUP's DLLs, in a child).
-  if ((!filter || std::strstr("forced_msaa", filter)) && !_stricmp(backendChoice, "d3d12only")) {
-    std::printf("skip %-20s needs DXUP's d3d11.dll\n", "forced_msaa");
-    skipped++;
-  } else if (!filter || std::strstr("forced_msaa", filter)) {
-    const std::wstring conf = dir + L"dxup.conf";
+  if (!filter || std::strstr("forced_msaa", filter)) {
     int with = -1, without = -1;
     if (FILE* f = _wfopen(conf.c_str(), L"w")) {
       std::fputs("d3d11.msaaSamples = 4\nd3d11.msaaForce = true\n", f);
