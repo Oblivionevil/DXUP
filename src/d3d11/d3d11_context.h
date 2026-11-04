@@ -18,6 +18,7 @@
 #include "../util/com_private_data.h"
 #include "d3d11_d3d12_bridge.h"
 #include "d3d11_draw_history.h"
+#include "d3d11_trace_tools.h"
 #include "../d3d12/d3d12_backend_context.h"
 #include "d3d11_binding_hazards.h"
 #include "d3d11_pipeline_key.h"
@@ -4387,13 +4388,6 @@ namespace dxup {
       }
     }
 
-    template<typename... Args>
-    static std::string formatTrace(const char* format, Args... args) {
-      char text[512];
-      sprintf_s(text, format, args...);
-      return text;
-    }
-
     void traceCall(const std::string& line) {
       if (m_probing)
         return;
@@ -4405,155 +4399,28 @@ namespace dxup {
     // the textures the pixel shader reads are written as BMPs before each
     // listed call.
     void dumpCallTargets(uint32_t index) {
-      static const std::vector<uint32_t> calls = [] {
-        std::vector<uint32_t> list;
-        if (FILE* file = dxupOpenSibling("dxup_dump_calls.txt", "r")) {
-          unsigned value = 0;
-          while (fscanf_s(file, "%u", &value) == 1)
-            list.push_back(value);
-          fclose(file);
-        }
-        return list;
-      }();
+      const std::vector<uint32_t>& calls = traceCallsToDump();
       if (m_isDeferred || m_probing || std::find(calls.begin(), calls.end(), index) == calls.end())
         return;
       if (m_state.om.renderTargets[0]) {
         ComPtr<ID3D11Resource> resource;
         m_state.om.renderTargets[0]->GetResource(resource.GetAddressOf());
-        dumpTexture(resource.Get(), formatTrace("dxup_call_%u_rt0.bmp", index).c_str());
+        dumpTraceTexture(m_device, this, m_probing, resource.Get(), formatTrace("dxup_call_%u_rt0.bmp", index).c_str());
       }
       for (UINT slot = 0; slot < 16; slot++) {
         if (!m_state.ps.srvs[slot])
           continue;
         ComPtr<ID3D11Resource> resource;
         m_state.ps.srvs[slot]->GetResource(resource.GetAddressOf());
-        dumpTexture(resource.Get(), formatTrace("dxup_call_%u_ps%u.bmp", index, slot).c_str());
+        dumpTraceTexture(m_device, this, m_probing, resource.Get(), formatTrace("dxup_call_%u_ps%u.bmp", index, slot).c_str());
       }
-    }
-
-    static float halfToFloat(uint16_t half) {
-      const uint32_t sign = uint32_t(half & 0x8000) << 16;
-      const uint32_t exponent = (half >> 10) & 0x1f;
-      const uint32_t mantissa = half & 0x3ff;
-      if (!exponent)
-        return (half & 0x8000 ? -1.0f : 1.0f) * float(mantissa) * (1.0f / 16777216.0f);
-      const uint32_t bits = exponent == 31
-        ? sign | 0x7f800000 | (mantissa << 13)
-        : sign | ((exponent + 112) << 23) | (mantissa << 13);
-      float value;
-      std::memcpy(&value, &bits, 4);
-      return value;
-    }
-
-    void dumpTexture(ID3D11Resource* resource, const char* name) {
-      D3D11_RESOURCE_DIMENSION dim = D3D11_RESOURCE_DIMENSION_UNKNOWN;
-      resource->GetType(&dim);
-      if (dim != D3D11_RESOURCE_DIMENSION_TEXTURE2D)
-        return;
-      D3D11_TEXTURE2D_DESC desc = {};
-      static_cast<ID3D11Texture2D*>(resource)->GetDesc(&desc);
-      if (desc.SampleDesc.Count != 1 || desc.Width < 256)
-        return;
-      const uint32_t texelBytes = getFormatBpp(desc.Format);
-      if (texelBytes != 4 && texelBytes != 8)
-        return;
-      D3D11_TEXTURE2D_DESC stagingDesc = { desc.Width, desc.Height, 1, 1, desc.Format, { 1, 0 },
-        D3D11_USAGE_STAGING, 0, D3D11_CPU_ACCESS_READ, 0 };
-      ComPtr<ID3D11Texture2D> staging;
-      if (FAILED(m_device->CreateTexture2D(&stagingDesc, nullptr, staging.GetAddressOf())))
-        return;
-      m_probing = true;
-      CopySubresourceRegion(staging.Get(), 0, 0, 0, 0, resource, 0, nullptr);
-      D3D11_MAPPED_SUBRESOURCE mapped = {};
-      if (SUCCEEDED(Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped))) {
-        if (FILE* file = dxupOpenSibling(name, "wb")) {
-          const uint32_t imageSize = desc.Width * desc.Height * 4;
-          BITMAPFILEHEADER fileHeader = {};
-          BITMAPINFOHEADER infoHeader = {};
-          fileHeader.bfType = 0x4D42;
-          fileHeader.bfOffBits = sizeof(fileHeader) + sizeof(infoHeader);
-          fileHeader.bfSize = fileHeader.bfOffBits + imageSize;
-          infoHeader.biSize = sizeof(infoHeader);
-          infoHeader.biWidth = LONG(desc.Width);
-          infoHeader.biHeight = -LONG(desc.Height);
-          infoHeader.biPlanes = 1;
-          infoHeader.biBitCount = 32;
-          infoHeader.biSizeImage = imageSize;
-          fwrite(&fileHeader, sizeof(fileHeader), 1, file);
-          fwrite(&infoHeader, sizeof(infoHeader), 1, file);
-          auto toByte = [](float value) {
-            value = value != value ? 0.0f : (std::min)((std::max)(value, 0.0f), 1.0f);
-            return uint8_t(std::pow(value, 1.0f / 2.2f) * 255.0f + 0.5f);
-          };
-          std::vector<uint8_t> row(desc.Width * 4);
-          for (UINT y = 0; y < desc.Height; y++) {
-            const uint8_t* src = static_cast<const uint8_t*>(mapped.pData) + size_t(y) * mapped.RowPitch;
-            for (UINT x = 0; x < desc.Width; x++) {
-              float rgb[3] = {};
-              if (texelBytes == 8) {
-                const uint16_t* halves = reinterpret_cast<const uint16_t*>(src + x * 8);
-                const bool unorm = desc.Format == DXGI_FORMAT_R16G16B16A16_UNORM;
-                for (int c = 0; c < 3; c++)
-                  rgb[c] = unorm ? halves[c] / 65535.0f : halfToFloat(halves[c]);
-              } else {
-                uint32_t word = 0;
-                std::memcpy(&word, src + x * 4, 4);
-                switch (desc.Format) {
-                  case DXGI_FORMAT_R11G11B10_FLOAT:
-                    // Small floats moved into the half layout.
-                    rgb[0] = halfToFloat(uint16_t((word & 0x7ff) << 4));
-                    rgb[1] = halfToFloat(uint16_t(((word >> 11) & 0x7ff) << 4));
-                    rgb[2] = halfToFloat(uint16_t(((word >> 22) & 0x3ff) << 5));
-                    break;
-                  case DXGI_FORMAT_R16G16_TYPELESS: case DXGI_FORMAT_R16G16_FLOAT:
-                    rgb[0] = halfToFloat(uint16_t(word));
-                    rgb[1] = halfToFloat(uint16_t(word >> 16));
-                    break;
-                  case DXGI_FORMAT_R32_TYPELESS: case DXGI_FORMAT_R32_FLOAT: case DXGI_FORMAT_D32_FLOAT: {
-                    float value;
-                    std::memcpy(&value, &word, 4);
-                    rgb[0] = rgb[1] = rgb[2] = value;
-                    break;
-                  }
-                  case DXGI_FORMAT_R10G10B10A2_TYPELESS: case DXGI_FORMAT_R10G10B10A2_UNORM:
-                    rgb[0] = (word & 0x3ff) / 1023.0f;
-                    rgb[1] = ((word >> 10) & 0x3ff) / 1023.0f;
-                    rgb[2] = ((word >> 20) & 0x3ff) / 1023.0f;
-                    break;
-                  default:
-                    // 8-bit channels: the stored values as they are.
-                    for (int c = 0; c < 3; c++)
-                      rgb[c] = std::pow(((word >> (c * 8)) & 0xff) / 255.0f, 2.2f);
-                    break;
-                }
-              }
-              row[x * 4 + 0] = toByte(rgb[2]);
-              row[x * 4 + 1] = toByte(rgb[1]);
-              row[x * 4 + 2] = toByte(rgb[0]);
-              row[x * 4 + 3] = 255;
-            }
-            fwrite(row.data(), row.size(), 1, file);
-          }
-          fclose(file);
-        }
-        Unmap(staging.Get(), 0);
-      }
-      m_probing = false;
     }
 
     // With dxup_probe_pixel.txt ("x y" in 3840x2160 coordinates), every
     // traced call also logs that pixel of the first render target: the
     // effect of the calls before it.
     void probeRenderTarget(std::string& line) {
-      static const POINT probe = [] {
-        POINT point = { -1, -1 };
-        if (FILE* file = dxupOpenSibling("dxup_probe_pixel.txt", "r")) {
-          if (fscanf_s(file, "%ld %ld", &point.x, &point.y) != 2)
-            point = { -1, -1 };
-          fclose(file);
-        }
-        return point;
-      }();
+      const POINT probe = traceProbePixel();
       if (probe.x < 0 || m_isDeferred || m_probing)
         return;
       // Full-resolution textures the pixel shader reads, at the same pixel.
@@ -4562,88 +4429,21 @@ namespace dxup {
           continue;
         ComPtr<ID3D11Resource> srvResource;
         m_state.ps.srvs[slot]->GetResource(srvResource.GetAddressOf());
-        probeTexture(line, formatTrace(" ps.t%u", slot).c_str(), srvResource.Get(), probe, true);
+        probeTraceTexture(m_device, this, m_probing, line, formatTrace(" ps.t%u", slot).c_str(), srvResource.Get(), probe, true);
       }
       // The first texture's mips: how much data each holds.
       if (m_state.ps.srvs[0]) {
         ComPtr<ID3D11Resource> srvResource;
         m_state.ps.srvs[0]->GetResource(srvResource.GetAddressOf());
-        probeMips(line, srvResource.Get());
+        probeTraceMips(m_device, this, m_probing, line, srvResource.Get());
       }
       if (!m_state.om.renderTargets[0])
         return;
       ComPtr<ID3D11Resource> resource;
       m_state.om.renderTargets[0]->GetResource(resource.GetAddressOf());
-      probeTexture(line, " probe", resource.Get(), probe, false);
+      probeTraceTexture(m_device, this, m_probing, line, " probe", resource.Get(), probe, false);
     }
 
-    void probeMips(std::string& line, ID3D11Resource* resource) {
-      D3D11_RESOURCE_DIMENSION dim = D3D11_RESOURCE_DIMENSION_UNKNOWN;
-      resource->GetType(&dim);
-      if (dim != D3D11_RESOURCE_DIMENSION_TEXTURE2D)
-        return;
-      D3D11_TEXTURE2D_DESC desc = {};
-      static_cast<ID3D11Texture2D*>(resource)->GetDesc(&desc);
-      if (desc.Width > 512 || desc.SampleDesc.Count != 1 || desc.ArraySize != 1)
-        return;
-      D3D11_TEXTURE2D_DESC stagingDesc = desc;
-      stagingDesc.Usage = D3D11_USAGE_STAGING;
-      stagingDesc.BindFlags = 0;
-      stagingDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-      stagingDesc.MiscFlags = 0;
-      ComPtr<ID3D11Texture2D> staging;
-      if (FAILED(m_device->CreateTexture2D(&stagingDesc, nullptr, staging.GetAddressOf())))
-        return;
-      m_probing = true;
-      CopyResource(staging.Get(), resource);
-      line += " mips(";
-      for (UINT mip = 0; mip < desc.MipLevels; mip++) {
-        D3D11_MAPPED_SUBRESOURCE mapped = {};
-        if (FAILED(Map(staging.Get(), mip, D3D11_MAP_READ, 0, &mapped)))
-          continue;
-        const UINT rows = (std::max)(1u, (desc.Height >> mip) / 4u);
-        uint64_t sum = 0, nonzero = 0;
-        for (UINT row = 0; row < rows; row++) {
-          const uint8_t* bytes = static_cast<const uint8_t*>(mapped.pData) + row * mapped.RowPitch;
-          const UINT rowBytes = (std::min)(mapped.RowPitch, UINT(((std::max)(1u, (desc.Width >> mip) / 4u)) * 16u));
-          for (UINT i = 0; i < rowBytes; i++) {
-            sum += bytes[i];
-            nonzero += bytes[i] != 0;
-          }
-        }
-        line += formatTrace("%s%u:%llu/%llu", mip ? " " : "", mip, static_cast<unsigned long long>(nonzero),
-          static_cast<unsigned long long>(sum));
-        Unmap(staging.Get(), mip);
-      }
-      line += ")";
-      m_probing = false;
-    }
-
-    void probeTexture(std::string& line, const char* name, ID3D11Resource* resource, POINT probe, bool fullResolutionOnly) {
-      D3D11_RESOURCE_DIMENSION dim = D3D11_RESOURCE_DIMENSION_UNKNOWN;
-      resource->GetType(&dim);
-      if (dim != D3D11_RESOURCE_DIMENSION_TEXTURE2D)
-        return;
-      D3D11_TEXTURE2D_DESC desc = {};
-      static_cast<ID3D11Texture2D*>(resource)->GetDesc(&desc);
-      if (desc.SampleDesc.Count != 1 || (fullResolutionOnly && desc.Width != 3840))
-        return;
-      const UINT x = UINT(probe.x) * desc.Width / 3840, y = UINT(probe.y) * desc.Height / 2160;
-      D3D11_TEXTURE2D_DESC stagingDesc = { 1, 1, 1, 1, desc.Format, { 1, 0 }, D3D11_USAGE_STAGING, 0, D3D11_CPU_ACCESS_READ, 0 };
-      ComPtr<ID3D11Texture2D> staging;
-      if (FAILED(m_device->CreateTexture2D(&stagingDesc, nullptr, staging.GetAddressOf())))
-        return;
-      m_probing = true;
-      const D3D11_BOX box = { x, y, 0, x + 1, y + 1, 1 };
-      CopySubresourceRegion(staging.Get(), 0, 0, 0, 0, resource, 0, &box);
-      D3D11_MAPPED_SUBRESOURCE mapped = {};
-      if (SUCCEEDED(Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped))) {
-        const auto* words = static_cast<const uint32_t*>(mapped.pData);
-        line += formatTrace("%s(%p@%u,%u=%08x %08x)", name, static_cast<void*>(resource), x, y, words[0], words[1]);
-        Unmap(staging.Get(), 0);
-      }
-      m_probing = false;
-    }
     bool m_probing = false;
 
     // The arguments an indirect call finds in its buffer when it is

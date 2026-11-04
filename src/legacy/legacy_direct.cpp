@@ -4,6 +4,7 @@
 #include "../d3d11/d3d11_draw_history.h"
 #include "../d3d11/d3d11_glitch_detect.h"
 #include "../d3d11/d3d11_taa_inject.h"
+#include "../d3d11/d3d11_trace_tools.h"
 #include "../d3d12/d3d12_backend_device.h"
 #include "../d3d12/d3d12_backend_context.h"
 #include "../d3d12/d3d12_fps_overlay.h"
@@ -643,7 +644,8 @@ namespace dxup::legacy {
         const UserOverrides& overrides = UserOverrides::get();
         m_sgssaa = overrides.sgssaa != SgssaaMode::Off;
         m_injectWanted = overrides.upscaler && overrides.upscalerInject;
-        m_slowDraws.store(m_historyOn || m_injectWanted || (overrides.upscaler && overrides.upscalerAuto), std::memory_order_relaxed);
+        m_slowDraws.store(m_historyOn || m_finalPassTrace || m_injectWanted || (overrides.upscaler && overrides.upscalerAuto),
+                          std::memory_order_relaxed);
       }
 
       ~DirectContext() {
@@ -659,6 +661,16 @@ namespace dxup::legacy {
       void noteForcedMsaa() {
         m_forcedMsaa.store(true, std::memory_order_relaxed);
         m_slowDraws.store(true, std::memory_order_relaxed);
+      }
+
+      // dxup_trace_go.txt: calls go into the log. Draws keep passing through
+      // the slow path afterwards: this is a run for looking at the log.
+      void setDrawTrace(bool on) {
+        m_trace = on;
+        if (on) {
+          m_traceIndex = 0;
+          m_slowDraws.store(true, std::memory_order_relaxed);
+        }
       }
 
       // The frames' calls, for the swap chain's glitch reports.
@@ -1009,6 +1021,9 @@ namespace dxup::legacy {
                                     D3D11_MAPPED_SUBRESOURCE* mapped) override {
         if (!resource || !mapped)
           return E_INVALIDARG;
+        if (m_trace && !m_probing)
+          logMessage(LogLevel::Warn, "draw trace: Map %p sub=%u type=%u flags=0x%x", static_cast<void*>(resource), subresource,
+            unsigned(type), flags);
         if (DirectBuffer* buffer = bufferOf(resource))
           return mapBuffer(buffer, type, flags, mapped);
 
@@ -1069,8 +1084,11 @@ namespace dxup::legacy {
                                                 DXGI_FORMAT format) override;
 
       void STDMETHODCALLTYPE GenerateMips(ID3D11ShaderResourceView* view) override {
-        if (view)
-          m_ctx->generateMips(static_cast<DirectSrv*>(view)->raw);
+        if (!view)
+          return;
+        if (m_trace)
+          traceCall(formatTrace("GenerateMips %p", static_cast<void*>(view)));
+        m_ctx->generateMips(static_cast<DirectSrv*>(view)->raw);
       }
 
       // ---- Clears ----
@@ -1079,7 +1097,7 @@ namespace dxup::legacy {
         if (!view || !color)
           return;
         auto* rtv = static_cast<DirectRtv*>(view);
-        if (m_historyOn)
+        if (m_historyOn || m_trace)
           recordClear(RecordOp::ClearColor, rtv, rtv->raw, rtv->swapChain, color);
         if (IBackendImageView* shadow = clearedForcedMsaaShadow(rtv->range.resource, rtv->shadow, true))
           m_ctx->clearRenderTarget(shadow, color);
@@ -1095,7 +1113,7 @@ namespace dxup::legacy {
         flags &= ((dsv->range.planes & 1u) ? D3D11_CLEAR_DEPTH : 0u) | ((dsv->range.planes & 2u) ? D3D11_CLEAR_STENCIL : 0u);
         if (!flags)
           return;
-        if (m_historyOn) {
+        if (m_historyOn || m_trace) {
           const float value[4] = { depth, float(stencil), float(flags), 0.0f };
           recordClear(RecordOp::ClearDepth, dsv, dsv->raw, false, value);
         }
@@ -1507,6 +1525,8 @@ namespace dxup::legacy {
             texture->SetMsaaImageStencilOld(true);
         }
         if (stencil && texture->IsMsaaImageStencilOld()) {
+          if (m_trace)
+            traceCall(formatTrace("forced MSAA resolve stencil %p", static_cast<void*>(static_cast<ID3D11Texture2D*>(texture))));
           m_ctx->copyStencil(texture->raw, texture->GetMsaaShadow(), formats.typed, stencilReadFormat(formats.typed));
           forcedMsaaPassRan();
           texture->SetMsaaImageStencilOld(false);
@@ -1519,6 +1539,8 @@ namespace dxup::legacy {
         if (!texture->IsMsaaShadowStencilOld())
           return;
         const ForcedMsaaFormats& formats = texture->GetMsaaFormats();
+        if (m_trace)
+          traceCall(formatTrace("forced MSAA upsample stencil %p", static_cast<void*>(static_cast<ID3D11Texture2D*>(texture))));
         m_ctx->copyStencil(texture->GetMsaaShadow(), texture->raw, formats.typed, stencilReadFormat(formats.typed));
         forcedMsaaPassRan();
         texture->SetMsaaShadowStencilOld(false);
@@ -1752,7 +1774,7 @@ namespace dxup::legacy {
 
       // ---- Draw history (glitch reports) ----
 
-      void recordCall(RecordOp op, UINT count, UINT instances, UINT start, INT base, bool dropped) {
+      DrawRecord describeCall(RecordOp op, UINT count, UINT instances, UINT start, INT base, bool dropped) {
         DrawRecord r;
         r.op = op;
         r.dropped = dropped;
@@ -1787,7 +1809,7 @@ namespace dxup::legacy {
           r.srv[slot] = pixel.views[slot];
           describeImageView(pixel.views[slot] ? pixel.views[slot]->raw : nullptr, r.srvWidth[slot], r.srvHeight[slot], r.srvFormat[slot]);
         }
-        m_history.add(r);
+        return r;
       }
 
       void recordClear(RecordOp op, const void* view, IBackendImageView* backendView, bool swapChain, const float value[4]) {
@@ -1797,8 +1819,39 @@ namespace dxup::legacy {
         r.swapChainTarget = swapChain;
         describeImageView(backendView, r.width, r.height, r.format);
         std::memcpy(r.value, value, sizeof(r.value));
-        m_history.add(r);
+        if (m_trace)
+          traceCall(describeRecord(r));
+        if (m_historyOn)
+          m_history.add(r);
       }
+
+      // ---- The draw trace (dxup_trace_go.txt) ----
+
+      void traceCall(const std::string& line) {
+        if (!m_probing)
+          logMessage(LogLevel::Warn, "draw trace: #%u %s", ++m_traceIndex, line.c_str());
+      }
+
+      void traceDraw(const DrawRecord& record) {
+        if (m_probing)
+          return;
+        dumpCallTargets(m_traceIndex + 1);
+        std::string line = describeRecord(record);
+        probeTargets(line);
+        const Stage& pixel = m_stages[2];
+        for (UINT slot = 4; slot < pixel.viewEnd; slot++) {
+          if (pixel.views[slot])
+            line += formatTrace(" t%u=%p", slot, static_cast<void*>(pixel.views[slot]));
+        }
+        traceCall(line);
+      }
+
+      void dumpCallTargets(uint32_t index);
+      void probeTargets(std::string& line);
+
+      // dxup_final_pass_trace.txt: passes over one target without depth, with
+      // the start of their constants (at most 96).
+      void traceFinalPass(const DrawRecord& record);
 
       enum DropReason : uint32_t { DropNone, DropNoVertexShader, DropPipelineFailed, DropPipelinePending, DropNoTopology, DropReasons };
 
@@ -1859,10 +1912,17 @@ namespace dxup::legacy {
           updateForcedMsaaScope();
         m_dropReason = m_topology == D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED ? DropNoTopology : DropNone;
         const bool prepared = !m_pipelineDirty || preparePipeline();
-        if (m_historyOn) {
-          recordCall(op, count, instances, start, base, !prepared);
-          if (!prepared)
-            m_droppedDraws[m_dropReason]++;
+        if (m_historyOn || m_trace || m_finalPassTrace) {
+          const DrawRecord record = describeCall(op, count, instances, start, base, !prepared);
+          if (m_trace)
+            traceDraw(record);
+          if (m_finalPassTrace)
+            traceFinalPass(record);
+          if (m_historyOn) {
+            m_history.add(record);
+            if (!prepared)
+              m_droppedDraws[m_dropReason]++;
+          }
         }
         if (!prepared)
           return false;
@@ -2002,6 +2062,12 @@ namespace dxup::legacy {
       UINT                 m_scissorCount = 0;
       D3D11_VIEWPORT       m_viewports[kViewports] = {};
       D3D11_RECT           m_scissors[kViewports] = {};
+
+      bool                 m_trace = false;
+      uint32_t             m_traceIndex = 0;
+      bool                 m_probing = false;
+      const bool           m_finalPassTrace = d3d11FinalPassTraceEnabled();
+      uint32_t             m_finalPassLines = 0;
 
       DrawHistory          m_history;
       const bool           m_historyOn = d3d11GlitchReportsEnabled();
@@ -2735,6 +2801,58 @@ namespace dxup::legacy {
       return pipeline.get();
     }
 
+    void DirectContext::dumpCallTargets(uint32_t index) {
+      const std::vector<uint32_t>& calls = traceCallsToDump();
+      if (std::find(calls.begin(), calls.end(), index) == calls.end())
+        return;
+      if (m_rtvs[0])
+        dumpTraceTexture(m_device, this, m_probing, m_rtvs[0]->range.resource, formatTrace("dxup_call_%u_rt0.bmp", index).c_str());
+      const Stage& pixel = m_stages[2];
+      for (UINT slot = 0; slot < 16; slot++) {
+        if (pixel.views[slot])
+          dumpTraceTexture(m_device, this, m_probing, pixel.views[slot]->range.resource, formatTrace("dxup_call_%u_ps%u.bmp", index, slot).c_str());
+      }
+    }
+
+    void DirectContext::probeTargets(std::string& line) {
+      const POINT probe = traceProbePixel();
+      if (probe.x < 0)
+        return;
+      const Stage& pixel = m_stages[2];
+      for (UINT slot = 0; slot < 16; slot++) {
+        if (pixel.views[slot])
+          probeTraceTexture(m_device, this, m_probing, line, formatTrace(" ps.t%u", slot).c_str(), pixel.views[slot]->range.resource, probe, true);
+      }
+      if (pixel.views[0])
+        probeTraceMips(m_device, this, m_probing, line, pixel.views[0]->range.resource);
+      if (m_rtvs[0])
+        probeTraceTexture(m_device, this, m_probing, line, " probe", m_rtvs[0]->range.resource, probe, false);
+    }
+
+    void DirectContext::traceFinalPass(const DrawRecord& record) {
+      if (m_probing || m_finalPassLines >= 96 || record.dropped || record.targets != 1 || record.depth || record.count > 6)
+        return;
+      m_finalPassLines++;
+      std::string line = describeRecord(record);
+      auto constants = [&](const char* name, const Stage& stage) {
+        if (!stage.constants[0])
+          return;
+        auto* buffer = static_cast<d3d12::D3D12BackendBuffer*>(stage.constants[0]->raw);
+        const auto* data = static_cast<const uint8_t*>(buffer->getPersistentMappedData());
+        const BufferDesc& desc = buffer->getDesc();
+        const uint64_t offset = uint64_t(stage.constantFirst[0]) * 16;
+        if (!data || offset + 32 > (desc.dataSize ? desc.dataSize : desc.size))
+          return;
+        float values[8];
+        std::memcpy(values, data + offset, sizeof(values));
+        line += formatTrace(" %s.b0=%g,%g,%g,%g,%g,%g,%g,%g", name, values[0], values[1], values[2], values[3], values[4], values[5],
+          values[6], values[7]);
+      };
+      constants("vs", m_stages[0]);
+      constants("ps", m_stages[2]);
+      logMessage(LogLevel::Warn, "final pass: %s", line.c_str());
+    }
+
     void DirectContext::logDroppedDraws() {
       m_droppedDraws[DropPipelineFailed] += m_device->backendDevice().getBackend()->takeFailedPipelineDraws();
       uint32_t total = 0;
@@ -3027,6 +3145,8 @@ namespace dxup::legacy {
       IBackendImage* image = imageOf(resource);
       if (!image)
         return;
+      if (m_trace)
+        traceCall(formatTrace("UpdateSubresource %p sub=%u box=%d", static_cast<void*>(resource), subresource, box ? 1 : 0));
       writeForcedMsaaImage(resource, !box);
       const ImageDesc& desc = image->getDesc();
       const uint32_t mip = subresource % desc.mipLevels;
@@ -3087,6 +3207,8 @@ namespace dxup::legacy {
     }
 
     void STDMETHODCALLTYPE DirectContext::CopyResource(ID3D11Resource* dst, ID3D11Resource* src) {
+      if (m_trace)
+        traceCall(formatTrace("CopyResource dst=%p src=%p", static_cast<void*>(dst), static_cast<void*>(src)));
       if (!dst || !src || dst == src)
         return;
       DirectBuffer* dstBuffer = bufferOf(dst);
@@ -3128,6 +3250,9 @@ namespace dxup::legacy {
                                                                 ID3D11Resource* src, UINT srcSubresource, const D3D11_BOX* srcBox) {
       if (!dst || !src)
         return;
+      if (m_trace)
+        traceCall(formatTrace("CopySubresourceRegion dst=%p sub=%u at %u,%u,%u src=%p sub=%u box=%d", static_cast<void*>(dst), dstSubresource,
+          dstX, dstY, dstZ, static_cast<void*>(src), srcSubresource, srcBox ? 1 : 0));
       DirectBuffer* dstBuffer = bufferOf(dst);
       DirectBuffer* srcBuffer = bufferOf(src);
       if (dstBuffer && srcBuffer) {
@@ -3272,6 +3397,9 @@ namespace dxup::legacy {
                                                              DXGI_FORMAT format) {
       if (!dst || !src)
         return;
+      if (m_trace)
+        traceCall(formatTrace("ResolveSubresource dst=%p sub=%u src=%p sub=%u fmt=%u", static_cast<void*>(dst), dstSubresource,
+          static_cast<void*>(src), srcSubresource, unsigned(format)));
       IBackendImage* dstImage = imageOf(dst);
       IBackendImage* srcImage = imageOf(src);
       if (!dstImage || !srcImage)
@@ -3392,6 +3520,24 @@ namespace dxup::legacy {
           return E_FAIL;
         if (m_showOverlay)
           m_fpsOverlay.count();
+        // With dxup_trace_go.txt next to the DLL (looked for every two
+        // seconds), the calls of the two frames after it appears go into the
+        // log.
+        if (!m_traceGoDone) {
+          if (m_traceGoFrames) {
+            if (--m_traceGoFrames == 0) {
+              directContext->setDrawTrace(false);
+              m_traceGoDone = true;
+            }
+          } else if (const uint64_t now = GetTickCount64(); now - m_traceGoLastCheck >= 2000) {
+            m_traceGoLastCheck = now;
+            if (dxupSiblingExists("dxup_trace_go.txt")) {
+              m_traceGoFrames = 2;
+              directContext->setDrawTrace(true);
+              logMessage(LogLevel::Warn, "draw trace: go");
+            }
+          }
+        }
         if (m_saveFrames)
           saveFrames();
         directContext->noteFramePresented();
@@ -3683,6 +3829,9 @@ namespace dxup::legacy {
       FpsOverlay              m_fpsOverlay;
       const bool              m_showOverlay = dxupSiblingExists("dxup_show_fps_overlay.txt");
       GlitchDetector          m_glitches;
+      uint32_t                m_traceGoFrames = 0;
+      bool                    m_traceGoDone = false;
+      uint64_t                m_traceGoLastCheck = 0;
       int64_t                 m_hitchLast = 0;
       uint64_t                m_hitchFrame = 0;
       double                  m_hitchWindowMs = 0.0, m_hitchWindowMax = 0.0;

@@ -4617,10 +4617,10 @@ VO main(float3 p : POSITION, float4 c : COLOR0) { VO o; o.p = float4(p.xy, 0.5, 
     return 0;
   }
 
-  std::string readLogs(const std::wstring& dir) {
+  std::string readLogs(const std::wstring& dir, const wchar_t* pattern = L"logdxup*.log") {
     std::string log;
     WIN32_FIND_DATAW found = {};
-    HANDLE find = FindFirstFileW((dir + L"logdxup*.log").c_str(), &found);
+    HANDLE find = FindFirstFileW((dir + pattern).c_str(), &found);
     if (find == INVALID_HANDLE_VALUE)
       return log;
     do {
@@ -4637,8 +4637,8 @@ VO main(float3 p : POSITION, float4 c : COLOR0) { VO o; o.p = float4(p.xy, 0.5, 
 
   // Glitch reports (dxup_frame_dump.txt next to the DLLs): a triangle that goes
   // black for one frame is seen as a flicker, the frame is saved and the log
-  // lists the calls. Returns 0 or the failed check.
-  int glitchChild(Runtime& runtime, const std::wstring& dir) {
+  // lists the calls. check false: only the frames. Returns 0 or the failed check.
+  int glitchChild(Runtime& runtime, const std::wstring& dir, bool check = true) {
     IDirect3D9* d3d = runtime.create(D3D_SDK_VERSION);
     HWND window = createWindow(320, 180);
     D3DPRESENT_PARAMETERS pp = {};
@@ -4675,6 +4675,8 @@ VO main(float3 p : POSITION, float4 c : COLOR0) { VO o; o.p = float4(p.xy, 0.5, 
     device->Release();
     d3d->Release();
     DestroyWindow(window);
+    if (!check)
+      return 0;
     if (GetFileAttributesW((dir + L"dxup_glitch_20.bmp").c_str()) == INVALID_FILE_ATTRIBUTES
      || GetFileAttributesW((dir + L"dxup_glitch_20_before.bmp").c_str()) == INVALID_FILE_ATTRIBUTES)
       return 4;
@@ -4978,7 +4980,7 @@ int main(int argc, char** argv) {
   int benchFrames = 0, benchDraws = 0;
   const char* benchShadersPath = nullptr;
   size_t benchShadersLimit = 0;
-  bool childDirect = false, childRaisedMsaa = false, childForcedMsaa = false, childSgssaa = false, childGlitch = false, childInject = false, identifier = false, childDpi = false, childFloatStrict = false, childDropped = false;
+  bool childDirect = false, childRaisedMsaa = false, childForcedMsaa = false, childSgssaa = false, childGlitch = false, childTrace = false, childInject = false, identifier = false, childDpi = false, childFloatStrict = false, childDropped = false;
   bool childSelfTest = false, dxupOnly = false, childWorker = false, childPresent = false;
   DWORD childException = 0;
   UINT presentBack[2] = {}, presentDump = 0;
@@ -4993,6 +4995,7 @@ int main(int argc, char** argv) {
     else if (std::strcmp(argv[i], "--raised-msaa-child") == 0) childRaisedMsaa = true;
     else if (std::strcmp(argv[i], "--sgssaa-child") == 0) childSgssaa = true;
     else if (std::strcmp(argv[i], "--glitch-child") == 0) childGlitch = true;
+    else if (std::strcmp(argv[i], "--trace-child") == 0) childTrace = true;
     else if (std::strcmp(argv[i], "--exception-child") == 0 && i + 1 < argc) childException = DWORD(std::strtoul(argv[++i], nullptr, 10));
     else if (std::strcmp(argv[i], "--upscaler-inject-child") == 0) childInject = true;
     else if (std::strcmp(argv[i], "--present-child") == 0 && i + 4 < argc) {
@@ -5048,6 +5051,8 @@ int main(int argc, char** argv) {
   }
   if (childGlitch)
     return glitchChild(dxup, dir);
+  if (childTrace)
+    return glitchChild(dxup, dir, false);
   if (childException)
     return exceptionChild(dxup, childException);
   if (childPresent)
@@ -5296,7 +5301,7 @@ int main(int argc, char** argv) {
     }
     auto removeImages = [&] {
       WIN32_FIND_DATAW found = {};
-      for (const wchar_t* pattern : { L"dxup_frame_*.bmp", L"dxup_glitch_*.bmp" }) {
+      for (const wchar_t* pattern : { L"dxup_frame_*.bmp", L"dxup_glitch_*.bmp", L"dxup_call_*.bmp" }) {
         HANDLE find = FindFirstFileW((dir + pattern).c_str(), &found);
         if (find == INVALID_HANDLE_VALUE)
           continue;
@@ -5330,6 +5335,40 @@ int main(int argc, char** argv) {
       const int result = withMarker(L"dxup_exception_trace.txt", [&] { return runWith(settings("").c_str(), arguments); });
       const bool traced = readLogs(dir).find(expected) != std::string::npos;
       report("exception_trace", result == 0 && traced, "code " + std::to_string(result) + (traced ? ", in the log" : ", not in the log"));
+    }
+    // The draw trace: two frames' calls in the log, with the pixel of
+    // dxup_probe_pixel.txt and images of the calls dxup_dump_calls.txt lists.
+    if (wantScene("draw_trace")) {
+      removeImages();
+      if (FILE* f = _wfopen((dir + L"dxup_dump_calls.txt").c_str(), L"w")) {
+        std::fputs("1 2 3 4 5 6 7 8\n", f);
+        std::fclose(f);
+      }
+      if (FILE* f = _wfopen((dir + L"dxup_probe_pixel.txt").c_str(), L"w")) {
+        std::fputs("960 540\n", f);
+        std::fclose(f);
+      }
+      const int code = withMarker(L"dxup_trace_go.txt", [&] { return runWith(settings("").c_str(), "--trace-child"); });
+      DeleteFileW((dir + L"dxup_dump_calls.txt").c_str());
+      DeleteFileW((dir + L"dxup_probe_pixel.txt").c_str());
+      // The direct way writes only this log; d3d11.dll's may be from before.
+      const std::string log = onDirect ? readLogs(dir, L"logdxup_dxup_d3d9.log") : readLogs(dir);
+      const bool traced = log.find("draw trace: #") != std::string::npos;
+      const bool probed = log.find(" probe(") != std::string::npos;
+      WIN32_FIND_DATAW found = {};
+      HANDLE image = FindFirstFileW((dir + L"dxup_call_*_rt0.bmp").c_str(), &found);
+      const bool dumped = image != INVALID_HANDLE_VALUE;
+      if (dumped)
+        FindClose(image);
+      removeImages();
+      // Passes over one target without depth, with their constants.
+      bool finalPass = true;
+      if (onDirect) {
+        withMarker(L"dxup_final_pass_trace.txt", [&] { return runWith(settings("").c_str(), "--trace-child"); });
+        finalPass = readLogs(dir, L"logdxup_dxup_d3d9.log").find("final pass: Draw") != std::string::npos;
+      }
+      report("draw_trace", code == 0 && traced && probed && dumped && finalPass, "code " + std::to_string(code) + ", calls " + (traced ? "yes" : "no")
+        + ", pixel " + (probed ? "yes" : "no") + ", images " + (dumped ? "yes" : "no") + ", final passes " + (finalPass ? "yes" : "no"));
     }
     if (wantScene("present_scaling")) {
       auto scaled = [&](const char* more, const char* arguments) {
