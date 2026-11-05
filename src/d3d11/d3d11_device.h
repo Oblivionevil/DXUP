@@ -6016,7 +6016,7 @@ namespace dxup {
     void SetMaximumFrameLatency(UINT latency) { m_maxFrameLatency.store(latency, std::memory_order_relaxed); }
     UINT GetEffectiveFrameLatency() const {
       // dxgi.lowLatency: one frame queued, the rest of the wait is paced.
-      if (UserOverrides::get().lowLatency)
+      if (UserOverrides::get().lowLatency || (UserOverrides::get().frameLimiter == FrameLimiterMode::Latency && UserOverrides::get().maxFrameRate > 0.0f))
         return 1u;
       const int32_t forced = UserOverrides::get().maxFrameLatency;
       if (forced > 0)

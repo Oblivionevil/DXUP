@@ -4690,6 +4690,43 @@ VO main(float3 p : POSITION, float4 c : COLOR0) { VO o; o.p = float4(p.xy, 0.5, 
   // buffer of the size given, red on the left and blue on the right. Taken
   // from the compositor. dumpWidth: the width of DXUP's picture before it is
   // scaled (needs dxup_frame_dump.txt). Returns 0 or the failed check.
+  // dxgi.maxFrameRate = 50: how far apart Present returns (with either limiter
+  // the application is held to the rate, a frame at most ahead).
+  int frameLimiterChild(Runtime& runtime) {
+    IDirect3D9* d3d = runtime.create(D3D_SDK_VERSION);
+    HWND window = createWindow(320, 240);
+    D3DPRESENT_PARAMETERS pp = {};
+    pp.Windowed = TRUE;
+    pp.SwapEffect = D3DSWAPEFFECT_DISCARD;
+    pp.BackBufferWidth = 320;
+    pp.BackBufferHeight = 240;
+    pp.BackBufferFormat = D3DFMT_X8R8G8B8;
+    pp.hDeviceWindow = window;
+    pp.PresentationInterval = D3DPRESENT_INTERVAL_IMMEDIATE;
+    IDirect3DDevice9* device = nullptr;
+    if (!d3d || FAILED(d3d->CreateDevice(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, window, D3DCREATE_HARDWARE_VERTEXPROCESSING, &pp, &device)))
+      return 20;
+    LARGE_INTEGER frequency, first = {}, last = {};
+    QueryPerformanceFrequency(&frequency);
+    for (int frame = 0; frame < 70; frame++) {
+      device->Clear(0, nullptr, D3DCLEAR_TARGET, 0xff102030u, 1.0f, 0);
+      if (FAILED(device->Present(nullptr, nullptr, nullptr, nullptr)))
+        return 21;
+      if (frame == 10)
+        QueryPerformanceCounter(&first);
+      QueryPerformanceCounter(&last);
+      MSG message;
+      while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE))
+        DispatchMessageW(&message);
+    }
+    const double ms = double(last.QuadPart - first.QuadPart) * 1000.0 / double(frequency.QuadPart) / 59.0;
+    std::printf("  Present every %.2f ms\n", ms);
+    device->Release();
+    d3d->Release();
+    DestroyWindow(window);
+    return ms > 19.0 && ms < 21.5 ? 0 : 22;
+  }
+
   int presentChild(Runtime& runtime, const std::wstring& dir, UINT backWidth, UINT backHeight, UINT dumpWidth, bool overlay) {
     IDirect3D9* d3d = runtime.create(D3D_SDK_VERSION);
     HWND window = createWindow(320, 240);
@@ -4980,7 +5017,7 @@ int main(int argc, char** argv) {
   int benchFrames = 0, benchDraws = 0;
   const char* benchShadersPath = nullptr;
   size_t benchShadersLimit = 0;
-  bool childDirect = false, childRaisedMsaa = false, childForcedMsaa = false, childSgssaa = false, childGlitch = false, childTrace = false, childInject = false, identifier = false, childDpi = false, childFloatStrict = false, childDropped = false;
+  bool childLimiter = false, childDirect = false, childRaisedMsaa = false, childForcedMsaa = false, childSgssaa = false, childGlitch = false, childTrace = false, childInject = false, identifier = false, childDpi = false, childFloatStrict = false, childDropped = false;
   bool childSelfTest = false, dxupOnly = false, childWorker = false, childPresent = false;
   DWORD childException = 0;
   UINT presentBack[2] = {}, presentDump = 0;
@@ -4998,6 +5035,7 @@ int main(int argc, char** argv) {
     else if (std::strcmp(argv[i], "--trace-child") == 0) childTrace = true;
     else if (std::strcmp(argv[i], "--exception-child") == 0 && i + 1 < argc) childException = DWORD(std::strtoul(argv[++i], nullptr, 10));
     else if (std::strcmp(argv[i], "--upscaler-inject-child") == 0) childInject = true;
+    else if (std::strcmp(argv[i], "--frame-limiter-child") == 0) childLimiter = true;
     else if (std::strcmp(argv[i], "--present-child") == 0 && i + 4 < argc) {
       childPresent = true;
       presentBack[0] = UINT(std::atoi(argv[i + 1]));
@@ -5059,6 +5097,8 @@ int main(int argc, char** argv) {
     return presentChild(dxup, dir, presentBack[0], presentBack[1], presentDump, presentOverlay);
   if (childInject)
     return upscalerInjectChild(dxup, dir);
+  if (childLimiter)
+    return frameLimiterChild(dxup);
 
   if (childDpi)
     return dpiFullscreenChild(dxup);
@@ -5383,6 +5423,11 @@ int main(int argc, char** argv) {
       const int plain = scaled("", "--present-child 320 240 320 0");
       report("present_scaling", !render && !spatial && !copied && !plain, "renderScale " + std::to_string(render) + ", upscale " + std::to_string(spatial)
         + ", through a copy " + std::to_string(copied) + ", direct " + std::to_string(plain));
+    }
+    if (wantScene("frame_limiter")) {
+      const int latency = runWith(settings("dxgi.maxFrameRate = 50\ndxgi.frameLimiter = latency\n").c_str(), "--frame-limiter-child");
+      const int smooth = runWith(settings("dxgi.maxFrameRate = 50\ndxgi.frameLimiter = smooth\n").c_str(), "--frame-limiter-child");
+      report("frame_limiter", !latency && !smooth, "latency " + std::to_string(latency) + ", smooth " + std::to_string(smooth));
     }
     if (wantScene("fps_overlay")) {
       const int shown = withMarker(L"dxup_show_fps_overlay.txt", [&] { return runWith(settings("").c_str(), "--present-child 320 240 0 1"); });

@@ -32,6 +32,11 @@
   <sys:String x:Key="Frames">Vorgerenderte Frames</sys:String>
   <sys:String x:Key="LowLatency">Niedrige Eingabelatenz</sys:String>
   <sys:String x:Key="LowLatencyHint">Ein vorgerenderter Frame; wenn die Grafikkarte die Bildrate begrenzt, hält DXUP den nächsten Frame zurück, bis sie ihn braucht. Das Spiel liest die Eingabe später, die Bildrate bleibt fast gleich.</sys:String>
+  <sys:String x:Key="FrameLimiter">Frame-Limiter</sys:String>
+  <sys:String x:Key="FrameRate">Bilder pro Sekunde</sys:String>
+  <sys:String x:Key="FrameLimiterHint">Geringste Latenz: Das Spiel beginnt jeden Frame erst im Takt und liest die Eingabe so spät wie möglich; seine langen Frames sieht man in den Frametimes. Beste Frametimes: DXUP zeigt jeden Frame im gleichen Abstand, das Spiel läuft einen Frame voraus und fängt so seine langen Frames ab; das kostet einen Frame Latenz. Ein Limit in RTSS oder im Treiber dann ausschalten.</sys:String>
+  <sys:String x:Key="OptLimiterLatency">Geringste Latenz</sys:String>
+  <sys:String x:Key="OptLimiterSmooth">Beste Frametimes</sys:String>
   <sys:String x:Key="SectionShaders">Shader</sys:String>
   <sys:String x:Key="Precompile">Vorkompilieren</sys:String>
   <sys:String x:Key="PrecompileOn">Pipelines früherer Starts beim Laden kompilieren (empfohlen)</sys:String>

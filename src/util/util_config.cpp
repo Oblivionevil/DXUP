@@ -500,6 +500,9 @@ namespace dxup {
     // At least one frame is always queued; DXGI allows up to 16.
     overrides.maxFrameLatency = clampSetting(config.getInt("dxgi.maxFrameLatency", -1), 1, 16);
     overrides.lowLatency = config.getBool("dxgi.lowLatency", true);
+    const float maxFrameRate = config.getFloat("dxgi.maxFrameRate", 0.0f);
+    overrides.maxFrameRate = maxFrameRate >= 1.0f ? (std::min)(maxFrameRate, 10000.0f) : 0.0f;
+    overrides.frameLimiter = config.getString("dxgi.frameLimiter", "smooth") == "latency" ? FrameLimiterMode::Latency : FrameLimiterMode::Smooth;
     // Sample counts D3D11 hardware offers.
     const int32_t samples = config.getInt("d3d11.msaaSamples", 0);
     overrides.msaaSamples = (samples == 2 || samples == 4 || samples == 8 || samples == 16) ? samples : 0;
@@ -564,11 +567,12 @@ namespace dxup {
       UserOverrides result = fromConfig(Config::get());
       logMessage(LogLevel::Info, "dxup.conf: settings from %s", configSource().c_str());
       logMessage(LogLevel::Info,
-        "dxup.conf: samplerAnisotropy %d, samplerLodBias %.2f, msaaSamples %d, msaaForce %d, msaaScope %s, sgssaa %s, syncInterval %d, maxFrameLatency %d, lowLatency %d, asyncShaders %d, shaderPrecompile %d, upscaler %u (sharpness %.2f, shader %016llx, auto %d), spatial upscale %d (sharpness %.2f, render scale %.2f), relaxedUavBarriers %d, recordThread %d, submitThread %d, d3d9 workerThread %d",
+        "dxup.conf: samplerAnisotropy %d, samplerLodBias %.2f, msaaSamples %d, msaaForce %d, msaaScope %s, sgssaa %s, syncInterval %d, maxFrameLatency %d, lowLatency %d, maxFrameRate %.1f (%s), asyncShaders %d, shaderPrecompile %d, upscaler %u (sharpness %.2f, shader %016llx, auto %d), spatial upscale %d (sharpness %.2f, render scale %.2f), relaxedUavBarriers %d, recordThread %d, submitThread %d, d3d9 workerThread %d",
         result.samplerAnisotropy, result.samplerLodBias, result.msaaSamples, result.msaaForce ? 1 : 0,
         result.msaaScope == MsaaScope::All ? "all" : "geometry",
         result.sgssaa == SgssaaMode::Full ? "full" : result.sgssaa == SgssaaMode::Alpha ? "alpha" : "off",
-        result.syncInterval, result.maxFrameLatency, result.lowLatency ? 1 : 0, result.asyncShaders ? 1 : 0, result.shaderPrecompile ? 1 : 0,
+        result.syncInterval, result.maxFrameLatency, result.lowLatency ? 1 : 0, double(result.maxFrameRate),
+        result.frameLimiter == FrameLimiterMode::Latency ? "latency" : "smooth", result.asyncShaders ? 1 : 0, result.shaderPrecompile ? 1 : 0,
         result.upscaler, result.upscalerSharpness, static_cast<unsigned long long>(result.upscalerShader),
         result.upscalerAuto ? 1 : 0, result.spatialUpscale ? 1 : 0, result.spatialSharpness, result.renderScale,
         result.relaxedUavBarriers ? 1 : 0, result.recordThread ? 1 : 0, result.submitThread ? 1 : 0,

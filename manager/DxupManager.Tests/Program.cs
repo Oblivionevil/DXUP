@@ -66,6 +66,8 @@ namespace Dxup.Tests
             game.Settings.Sgssaa = "alpha";
             game.Settings.MaxFrameLatency = 1;
             game.Settings.LowLatency = false;
+            game.Settings.MaxFrameRate = 224.5f;
+            game.Settings.FrameLimiterLatency = true;
             game.Settings.AsyncShaders = true;
             game.Settings.ShaderPrecompile = false;
             game.Settings.Upscaler = "xess";
@@ -102,7 +104,7 @@ namespace Dxup.Tests
                 "games.cfg keeps names and paths with [ ] # and umlauts");
             Check(back.Settings.Anisotropy == 16 && back.Settings.LodBias == -0.5f && back.Settings.MsaaSamples == 8
                && back.Settings.MsaaForce && back.Settings.Sgssaa == "alpha" && back.Settings.MaxFrameLatency == 1
-               && !back.Settings.LowLatency
+               && !back.Settings.LowLatency && back.Settings.MaxFrameRate == 224.5f && back.Settings.FrameLimiterLatency
                && back.Settings.AsyncShaders && !back.Settings.ShaderPrecompile && back.Settings.Upscaler == "xess"
                && back.Settings.UpscalerAuto && back.Settings.UpscalerInject && back.Settings.SpatialUpscale
                && back.Settings.RenderScale == 75 && back.Settings.Adapter == "intel(r) uhd graphics 770"
@@ -118,7 +120,7 @@ namespace Dxup.Tests
             Check(!parsed[1].Enabled && parsed[1].Settings.Entries().Count() == 0 && parsed[1].Settings.ShaderPrecompile,
                 "a game without settings writes none and precompiles");
             Check(text.Contains("d3d11.sgssaa = alpha") && text.Contains("dxgi.maxFrameLatency = 1") && text.Contains("d3d11.asyncShaders = true")
-               && text.Contains("dxgi.lowLatency = false")
+               && text.Contains("dxgi.lowLatency = false") && text.Contains("dxgi.maxFrameRate = 224.5") && text.Contains("dxgi.frameLimiter = latency")
                && text.Contains("d3d11.upscaler = xess") && text.Contains("d3d11.upscalerAuto = true")
                && text.Contains("dxgi.upscale = spatial") && text.Contains("dxgi.renderScale = 0.75")
                && text.Contains("dxgi.spoofVendor = amd") && text.Contains("dxgi.upscaleSharpness = 0.5")

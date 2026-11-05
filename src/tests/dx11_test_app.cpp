@@ -501,6 +501,7 @@ void main(uint2 id : SV_DispatchThreadID) {
         {"submit_thread", &Dx11TestApp::testSubmitThread},
         {"low_latency_gpu_pacing", &Dx11TestApp::testLowLatencyGpuPacing},
         {"frame_timing_clock", &Dx11TestApp::testFrameTimingClock},
+        {"frame_limiter", &Dx11TestApp::testFrameLimiter},
         {"native_fallback", &Dx11TestApp::testNativeFallback},
         {"fullscreen_swap_chain", &Dx11TestApp::testFullscreenSwapChain},
         {"window_ghosting", &Dx11TestApp::testWindowGhosting},
@@ -10287,6 +10288,71 @@ float4 main(float4 position : SV_Position, float4 t0 : TEXCOORD0, float4 t : TEX
         std::printf("  frame start to GPU done: %.2f ms in DXUP's statistics, %.2f ms by a fence, %.2f ms a frame\n", logged, measured, frame);
         if (std::abs(logged - measured) > 1.0)
           error = formatString("%.2f ms in DXUP's statistics, %.2f ms by a fence", logged, measured);
+        else
+          passed = true;
+      }
+      DeleteFileA(marker.c_str());
+      return passed;
+    }
+
+    // dxgi.maxFrameRate with both limiters, by DXUP's statistics: the rate
+    // holds. An application whose every 16th frame takes longer than a step:
+    // frameLimiter = smooth keeps the real Presents even, frameLimiter =
+    // latency keeps the time from a frame's start to its Present short.
+    bool testFrameLimiter(std::string& error) {
+      if (!runsOnDxup()) {
+        error = "SKIP: needs DXUP";
+        return false;
+      }
+      char path[MAX_PATH] = {};
+      GetModuleFileNameA(nullptr, path, MAX_PATH);
+      std::string dir = path;
+      dir.resize(dir.find_last_of('\\') + 1);
+      const std::string marker = dir + "dxup_latency_stats.txt";
+      if (FILE* file = _fsopen(marker.c_str(), "w", _SH_DENYNO))
+        std::fclose(file);
+      // Well below the display's refresh, which a window's Present may wait for.
+      HDC screen = GetDC(nullptr);
+      const int refresh = GetDeviceCaps(screen, VREFRESH);
+      ReleaseDC(nullptr, screen);
+      const double rate = refresh >= 130 ? 125.0 : (std::max)(refresh, 30) * 0.5;
+      const double step = 1000.0 / rate;
+      struct Numbers { double toPresent = 0.0, every = 0.0, p99 = 0.0; };
+      auto run = [&](const char* mode, Numbers& numbers) {
+        const std::string config = formatString("dxgi.maxFrameRate = %.1f\ndxgi.frameLimiter = %s\n", rate, mode);
+        const std::string argument = formatString("--frame-limiter-child %.3f", step);
+        if (!runChildWithConfig(config.c_str(), argument.c_str(), error))
+          return false;
+        if (FILE* log = _fsopen((dir + "logdxup.log").c_str(), "rb", _SH_DENYNO)) {
+          std::string text(1 << 20, '\0');
+          text.resize(std::fread(text.data(), 1, text.size(), log));
+          std::fclose(log);
+          const char* const kLine = "to Present and GPU done ";
+          const size_t at = text.rfind(kLine);
+          const size_t every = at == std::string::npos ? at : text.find("Present every ", at);
+          if (every != std::string::npos
+           && std::sscanf(text.c_str() + at + std::strlen(kLine), "%lf", &numbers.toPresent) == 1
+           && std::sscanf(text.c_str() + every, "Present every %lf ms (p99 %lf", &numbers.every, &numbers.p99) == 2)
+            return true;
+        }
+        error = "no statistics in the child's log";
+        return false;
+      };
+      bool passed = false;
+      // Timing: other work on the machine can spoil one try.
+      for (int attempt = 0; attempt < 2 && !passed; attempt++) {
+        error.clear();
+        Numbers latency, smooth;
+        if (!run("latency", latency) || !run("smooth", smooth))
+          break;
+        std::printf("  frame limiter %.1f fps: latency %.2f ms to Present, every %.2f ms (p99 %.2f); smooth %.2f ms, every %.2f ms (p99 %.2f)\n",
+          rate, latency.toPresent, latency.every, latency.p99, smooth.toPresent, smooth.every, smooth.p99);
+        if (std::abs(latency.every - step) > step * 0.06 || std::abs(smooth.every - step) > step * 0.06)
+          error = formatString("Presents every %.2f ms (latency), %.2f ms (smooth), %.2f ms asked for", latency.every, smooth.every, step);
+        else if (latency.toPresent > smooth.toPresent - step * 0.5)
+          error = formatString("%.2f ms from a frame's start to its Present (latency), %.2f ms (smooth)", latency.toPresent, smooth.toPresent);
+        else if (smooth.p99 > latency.p99 - step * 0.1)
+          error = formatString("Presents p99 %.2f ms apart (smooth), %.2f ms (latency)", smooth.p99, latency.p99);
         else
           passed = true;
       }
@@ -25790,6 +25856,73 @@ float4 main(float4 p : SV_Position) : SV_Target {
     return result;
   }
 
+  // See testFrameLimiter. Spins for a tenth of a step a frame, for 1.4 steps
+  // every 16th; long enough for DXUP's statistics, every 1000 frames.
+  int runFrameLimiterChild(double stepMs) {
+    WNDCLASSA windowClass = {};
+    windowClass.lpfnWndProc = DefWindowProcA;
+    windowClass.hInstance = GetModuleHandleA(nullptr);
+    windowClass.lpszClassName = "Dx11TestFrameLimiter";
+    RegisterClassA(&windowClass);
+    HWND window = CreateWindowExA(0, windowClass.lpszClassName, "frame limiter", WS_OVERLAPPEDWINDOW,
+      CW_USEDEFAULT, CW_USEDEFAULT, 640, 360, nullptr, nullptr, windowClass.hInstance, nullptr);
+    if (!window)
+      return 2;
+    int result = 0;
+    {
+      ComPtr<ID3D11Device> device;
+      ComPtr<ID3D11DeviceContext> context;
+      D3D_FEATURE_LEVEL level = D3D_FEATURE_LEVEL_11_0;
+      ComPtr<IDXGIDevice> dxgiDevice;
+      ComPtr<IDXGIAdapter> adapter;
+      ComPtr<IDXGIFactory2> factory;
+      ComPtr<IDXGISwapChain1> swapChain;
+      DXGI_SWAP_CHAIN_DESC1 desc = {};
+      desc.Width = 640;
+      desc.Height = 360;
+      desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+      desc.SampleDesc.Count = 1;
+      desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+      desc.BufferCount = 2;
+      desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+      if (FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, &level, 1, D3D11_SDK_VERSION,
+            device.GetAddressOf(), nullptr, context.GetAddressOf()))
+       || FAILED(device.As(&dxgiDevice)) || FAILED(dxgiDevice->GetAdapter(adapter.GetAddressOf()))
+       || FAILED(adapter->GetParent(IID_PPV_ARGS(factory.GetAddressOf())))
+       || FAILED(factory->CreateSwapChainForHwnd(device.Get(), window, &desc, nullptr, nullptr, swapChain.GetAddressOf()))) {
+        DestroyWindow(window);
+        return 3;
+      }
+      LARGE_INTEGER frequency;
+      QueryPerformanceFrequency(&frequency);
+      for (uint32_t frame = 0; frame < 1100 && !result; frame++) {
+        LARGE_INTEGER start, now;
+        QueryPerformanceCounter(&start);
+        const double workMs = stepMs * (frame % 16 == 15 ? 1.4 : 0.1);
+        do {
+          YieldProcessor();
+          QueryPerformanceCounter(&now);
+        } while (double(now.QuadPart - start.QuadPart) * 1000.0 / double(frequency.QuadPart) < workMs);
+        ComPtr<ID3D11Texture2D> back;
+        ComPtr<ID3D11RenderTargetView> rtv;
+        if (FAILED(swapChain->GetBuffer(0, IID_PPV_ARGS(back.GetAddressOf())))
+         || FAILED(device->CreateRenderTargetView(back.Get(), nullptr, rtv.GetAddressOf()))) {
+          result = 4;
+          break;
+        }
+        const float color[4] = { 0.1f, 0.2f, 0.3f, 1.0f };
+        context->ClearRenderTargetView(rtv.Get(), color);
+        if (FAILED(swapChain->Present(0, 0)))
+          result = 5;
+        MSG msg;
+        while (PeekMessageA(&msg, nullptr, 0, 0, PM_REMOVE))
+          DispatchMessageA(&msg);
+      }
+    }
+    DestroyWindow(window);
+    return result;
+  }
+
   int runSubmitThreadChild() {
     WNDCLASSA windowClass = {};
     windowClass.lpfnWndProc = DefWindowProcA;
@@ -26296,6 +26429,8 @@ int main(int argc, char** argv) {
     return runRecordThreadChild();
   if (argc > 1 && std::strcmp(argv[1], "--submit-thread-child") == 0)
     return runSubmitThreadChild();
+  if (argc > 2 && std::strcmp(argv[1], "--frame-limiter-child") == 0)
+    return runFrameLimiterChild(std::atof(argv[2]));
   if (argc > 2 && std::strcmp(argv[1], "--low-latency-child") == 0)
     return runLowLatencyChild(argv[2]);
   if (argc > 1 && std::strcmp(argv[1], "--native-fallback-child") == 0)

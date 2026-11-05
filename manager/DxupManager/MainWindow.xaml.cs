@@ -97,6 +97,8 @@ namespace Dxup.Manager
                 new Option(Loc.T("OptGame"), null), new Option(Loc.T("OptOff"), 0), new Option(Loc.T("OptOn"), 1));
             SetOptions(FramesBox, plain,
                 new Option(Loc.T("OptGame"), null), new Option("1", 1), new Option("2", 2), new Option("3", 3), new Option("4", 4));
+            SetOptions(LimiterBox, plain,
+                new Option(Loc.T("OptOff"), null), new Option(Loc.T("OptLimiterLatency"), "latency"), new Option(Loc.T("OptLimiterSmooth"), "smooth"));
             SetOptions(RenderScaleBox, value => ((double)value).ToString("0.##", CultureInfo.CurrentCulture) + " %",
                 new Option(Loc.T("OptOff"), null), new Option("90 %", 90.0), new Option("75 %", 75.0), new Option("67 %", 67.0),
                 new Option("50 %", 50.0));
@@ -325,6 +327,8 @@ namespace Dxup.Manager
             Select(VSyncBox, settings.SyncInterval);
             Select(FramesBox, settings.MaxFrameLatency);
             LowLatencyBox.IsChecked = settings.LowLatency;
+            Select(LimiterBox, settings.MaxFrameRate.HasValue ? (settings.FrameLimiterLatency ? "latency" : "smooth") : null);
+            ShowFrameRate(settings);
             AsyncBox.IsChecked = settings.AsyncShaders;
             PrecompileBox.IsChecked = settings.ShaderPrecompile;
             ShowLargeAddress(item);
@@ -596,6 +600,35 @@ namespace Dxup.Manager
             LodText.Text = LodSlider.Value == 0.0 ? Loc.T("OptGame") : LodSlider.Value.ToString("+0.00;-0.00", CultureInfo.CurrentCulture);
         }
 
+        void ShowFrameRate(GameSettings settings)
+        {
+            FrameRateBox.Text = settings.MaxFrameRate?.ToString("0.##", CultureInfo.CurrentCulture) ?? "";
+            FrameRateBox.IsEnabled = settings.MaxFrameRate.HasValue;
+        }
+
+        static float? ParseFrameRate(string text)
+        {
+            float rate;
+            return float.TryParse(text, NumberStyles.Float, CultureInfo.CurrentCulture, out rate) && rate >= 1.0f && rate <= 10000.0f
+                ? (float?)rate : null;
+        }
+
+        [System.Runtime.InteropServices.DllImport("user32.dll")]
+        static extern IntPtr GetDC(IntPtr window);
+        [System.Runtime.InteropServices.DllImport("user32.dll")]
+        static extern int ReleaseDC(IntPtr window, IntPtr dc);
+        [System.Runtime.InteropServices.DllImport("gdi32.dll")]
+        static extern int GetDeviceCaps(IntPtr dc, int index);
+
+        // 3 % below the main display's refresh: within its variable refresh range.
+        static float DefaultFrameRate()
+        {
+            IntPtr dc = GetDC(IntPtr.Zero);
+            int refresh = GetDeviceCaps(dc, 116);   // VREFRESH
+            ReleaseDC(IntPtr.Zero, dc);
+            return (float)Math.Floor((refresh > 1 ? refresh : 60) * 0.97);
+        }
+
         // DXUP's sharpening when dxgi.upscaleSharpness is not set.
         const double DefaultSharpness = 0.2;
 
@@ -646,6 +679,14 @@ namespace Dxup.Manager
             settings.SyncInterval = IntValue(VSyncBox);
             settings.MaxFrameLatency = IntValue(FramesBox);
             settings.LowLatency = LowLatencyBox.IsChecked == true;
+            // A limiter needs a rate: what was typed, else just below the display's.
+            string limiter = Value<string>(LimiterBox);
+            settings.FrameLimiterLatency = limiter == "latency";
+            settings.MaxFrameRate = limiter == null ? null
+                : ParseFrameRate(FrameRateBox.Text) ?? settings.MaxFrameRate ?? DefaultFrameRate();
+            m_loading = true;
+            ShowFrameRate(settings);
+            m_loading = false;
             settings.AsyncShaders = AsyncBox.IsChecked == true;
             settings.ShaderPrecompile = PrecompileBox.IsChecked == true;
             // Forcing MSAA needs a sample count.

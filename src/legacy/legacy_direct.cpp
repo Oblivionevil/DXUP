@@ -3546,6 +3546,7 @@ namespace dxup::legacy {
         if (syncPresent) {
           context->executeOnBackend([this](IBackendContext* backend) { preparePresent(backend); });
           context->waitForQueue();
+          limitPresent();
           const HRESULT hr = m_real->Present(syncInterval, flags);
           m_lastPresentFailed.store(FAILED(hr), std::memory_order_release);
           if (FAILED(hr)) {
@@ -3558,6 +3559,7 @@ namespace dxup::legacy {
           context->executeOnBackend([this, syncInterval, flags](IBackendContext* backend) {
             preparePresent(backend);
             backend->waitForQueue();
+            limitPresent();
             const int64_t start = hitchTraceEnabled() ? hitchTimestamp() : 0;
             const HRESULT hr = m_real->Present(syncInterval, flags);
             if (FAILED(hr))
@@ -3571,12 +3573,18 @@ namespace dxup::legacy {
         }
         context->endFrame();
         // Like a native Present, block while too many frames are queued.
-        const UINT latency = overrides.lowLatency ? 1u : overrides.maxFrameLatency > 0 ? UINT(overrides.maxFrameLatency) : 3u;
+        const UINT latency = overrides.lowLatency || d3d12::latencyFrameRate() > 0.0 ? 1u : overrides.maxFrameLatency > 0 ? UINT(overrides.maxFrameLatency) : 3u;
         context->waitForFrameLatency(latency);
         return m_lastResult.load(std::memory_order_acquire);
       }
 
     private:
+      // dxgi.frameLimiter = smooth: the frame goes out at its step.
+      d3d12::FrameLimiter m_presentLimiter{ d3d12::smoothFrameRate(), d3d12::kPresentLimiterShortestStep };
+      void limitPresent() {
+        m_presentLimiter.hold([](HANDLE timer, DWORD timeout) { WaitForSingleObject(timer, timeout); });
+      }
+
       bool createBuffer() {
         DXGI_SWAP_CHAIN_DESC1 desc = {};
         if (FAILED(m_real->GetDesc1(&desc)) || desc.BufferCount < 2)

@@ -62,6 +62,14 @@ namespace dxup {
   //                                  shortly before the GPU needs it (see
   //                                  LatencyPacer); false: the application's
   //                                  frame latency (3 unless it sets one)
+  //   dxgi.maxFrameRate = 225        frames per second at most (0: no limit)
+  //   dxgi.frameLimiter = smooth     how: smooth (default) holds the real Present
+  //                                  back: the application runs a frame ahead,
+  //                                  which evens out its long frames and costs
+  //                                  a frame of latency; latency holds the start
+  //                                  of the application's next frame back: as
+  //                                  little input lag as possible, with its
+  //                                  long frames showing in the frame times
   //   dxgi.spoofVendor = nvidia      the application sees a GPU of this maker
   //                                  (nvidia, amd, intel): its name, ids and
   //                                  a driver version of that maker; DXUP
@@ -124,6 +132,9 @@ namespace dxup {
   // device).
   enum class LegacyBackend : uint8_t { D3D11, D3D12, D3D12Only };
 
+  // Where dxgi.maxFrameRate holds frames back.
+  enum class FrameLimiterMode : uint8_t { Smooth, Latency };
+
   // Pixel shaders that run per sample on multisampled targets.
   enum class SgssaaMode : uint8_t { Off, Full, Alpha };
 
@@ -133,6 +144,8 @@ namespace dxup {
     int32_t syncInterval      = -1;
     int32_t maxFrameLatency   = -1;
     bool    lowLatency        = true;
+    float   maxFrameRate      = 0.0f;
+    FrameLimiterMode frameLimiter = FrameLimiterMode::Smooth;
     // 0 when unset.
     int32_t msaaSamples       = 0;
     bool    msaaForce         = false;

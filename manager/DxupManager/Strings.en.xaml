@@ -32,6 +32,11 @@
   <sys:String x:Key="Frames">Pre-rendered frames</sys:String>
   <sys:String x:Key="LowLatency">Low input latency</sys:String>
   <sys:String x:Key="LowLatencyHint">One pre-rendered frame; when the graphics card limits the frame rate, DXUP holds the next frame back until the card needs it. The game reads its input later, the frame rate stays about the same.</sys:String>
+  <sys:String x:Key="FrameLimiter">Frame limiter</sys:String>
+  <sys:String x:Key="FrameRate">Frames per second</sys:String>
+  <sys:String x:Key="FrameLimiterHint">Lowest latency: the game starts each frame on the beat and reads input as late as possible; its long frames show in the frame times. Best frame times: DXUP shows each frame at the same distance, the game runs a frame ahead and absorbs its long frames that way, at the cost of a frame of latency. Turn off a limit in RTSS or the driver then.</sys:String>
+  <sys:String x:Key="OptLimiterLatency">Lowest latency</sys:String>
+  <sys:String x:Key="OptLimiterSmooth">Best frame times</sys:String>
   <sys:String x:Key="SectionShaders">Shaders</sys:String>
   <sys:String x:Key="Precompile">Precompile</sys:String>
   <sys:String x:Key="PrecompileOn">Compile pipelines of earlier runs while loading (recommended)</sys:String>

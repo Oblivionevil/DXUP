@@ -1343,6 +1343,7 @@ namespace dxup::d3d12 {
     int64_t m_pacedGpuEnd = 0;
     FrameTimer m_frameTimer;
     LatencyPacer m_latencyPacer;
+    FrameLimiter m_frameLimiter{ latencyFrameRate(), 0.0 };
     uint64_t m_pacedFrame = 0;
     int64_t m_pacingReturn = 0;
     HANDLE m_pacingTimer = nullptr;

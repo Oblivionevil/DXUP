@@ -1574,29 +1574,35 @@ namespace dxup {
     for (; m_pacedFrame < done; m_pacedFrame++) {
       double busyMs = 0.0, lateMs = 0.0;
       int64_t ended = 0;
+      if (m_pacedFrame + kPresentHistory <= m_presents)
+        continue;
       const uint64_t index = m_presentIndices[m_pacedFrame % kPresentHistory];
-      if (m_pacedFrame + kPresentHistory > m_presents && index != UINT64_MAX
-       && real->frameGpuTiming(index, busyMs, lateMs, &ended)) {
+      const int64_t start = m_frameStarts[m_pacedFrame % kPresentHistory];
+      // A frame whose first list went to the queue with its present has no
+      // timing, but it was presented like the others.
+      if (index != UINT64_MAX && real->frameGpuTiming(index, busyMs, lateMs, &ended)) {
         m_latencyPacer.noteGpuFrame(busyMs, lateMs);
         m_pacedGpuEnd = ended;
-        const int64_t start = m_frameStarts[m_pacedFrame % kPresentHistory];
         if (start && ended > start)
           m_frameLatencies.push_back(double(ended - start) * msPerTick);
-        const int64_t done = m_presentDone[m_pacedFrame % kPresentHistory];
-        if (start && done > start)
-          m_presentLatencies.push_back(double((std::max)(done, ended) - start) * msPerTick);
       }
+      const int64_t presented = m_presentDone[m_pacedFrame % kPresentHistory];
+      if (start && presented > start)
+        m_presentLatencies.push_back(double((std::max)(presented, ended) - start) * msPerTick);
+      if (m_pacedPresentDone && presented > m_pacedPresentDone)
+        m_presentIntervals.push_back(double(presented - m_pacedPresentDone) * msPerTick);
+      m_pacedPresentDone = presented;
     }
     QueryPerformanceCounter(&now);
-    const double sleepMs = m_lowLatency && m_pacedGpuEnd
-      ? m_latencyPacer.sleepMs(double(now.QuadPart - m_pacedGpuEnd) * msPerTick) : 0.0;
+    const double sleepMs = (std::max)(m_lowLatency && m_pacedGpuEnd
+      ? m_latencyPacer.sleepMs(double(now.QuadPart - m_pacedGpuEnd) * msPerTick) : 0.0, m_frameLimiter.waitMs(now.QuadPart));
     if (sleepMs > 0.0) {
       HitchScope hitch("app lowLatency sleep");
       d3d12::paceSleep(m_pacingTimer, sleepMs, [](HANDLE timer, DWORD timeout) { waitTakingSentMessages(timer, timeout); });
     }
     m_pacingSleptMs += sleepMs;
     if (++m_pacingFrames == 1000) {
-      double median = 0.0, p95 = 0.0, presentMedian = 0.0, presentP95 = 0.0;
+      double median = 0.0, p95 = 0.0, presentMedian = 0.0, presentP95 = 0.0, intervalMedian = 0.0, intervalP99 = 0.0;
       if (!m_frameLatencies.empty()) {
         std::sort(m_frameLatencies.begin(), m_frameLatencies.end());
         median = m_frameLatencies[m_frameLatencies.size() / 2];
@@ -1607,14 +1613,20 @@ namespace dxup {
         presentMedian = m_presentLatencies[m_presentLatencies.size() / 2];
         presentP95 = m_presentLatencies[m_presentLatencies.size() * 95 / 100];
       }
+      if (!m_presentIntervals.empty()) {
+        std::sort(m_presentIntervals.begin(), m_presentIntervals.end());
+        intervalMedian = m_presentIntervals[m_presentIntervals.size() / 2];
+        intervalP99 = m_presentIntervals[m_presentIntervals.size() * 99 / 100];
+      }
       // The marker asks for them; else with the info log.
       static const bool asked = dxupSiblingExists("dxup_latency_stats.txt");
-      logMessage(asked ? LogLevel::Warn : LogLevel::Info, "frame latency: frame start to GPU done %.2f ms (p95 %.2f), to Present and GPU done %.2f ms (p95 %.2f) over %zu frames; "
+      logMessage(asked ? LogLevel::Warn : LogLevel::Info, "frame latency: frame start to GPU done %.2f ms (p95 %.2f), to Present and GPU done %.2f ms (p95 %.2f), Present every %.2f ms (p99 %.2f) over %zu frames; "
         "low latency %s: held back %.3f ms a frame, margin %.2f ms, %llu frames late so far",
-        median, p95, presentMedian, presentP95, m_frameLatencies.size(), m_lowLatency ? "on" : "off", m_pacingSleptMs / m_pacingFrames,
+        median, p95, presentMedian, presentP95, intervalMedian, intervalP99, m_frameLatencies.size(), m_lowLatency ? "on" : "off", m_pacingSleptMs / m_pacingFrames,
         m_latencyPacer.marginMs(), static_cast<unsigned long long>(m_latencyPacer.lateFrames()));
       m_frameLatencies.clear();
       m_presentLatencies.clear();
+      m_presentIntervals.clear();
       m_pacingSleptMs = 0.0;
       m_pacingFrames = 0;
     }

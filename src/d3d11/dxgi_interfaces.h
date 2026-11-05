@@ -1648,6 +1648,13 @@ namespace dxup {
       return !exclusiveFullscreen() && !dxupSyncPresentEnabled();
     }
 
+    // dxgi.frameLimiter = smooth: the frame goes out at its step, whenever
+    // the application got done with it.
+    d3d12::FrameLimiter m_presentLimiter{ d3d12::smoothFrameRate(), d3d12::kPresentLimiterShortestStep };
+    void limitPresent() {
+      m_presentLimiter.hold([](HANDLE timer, DWORD timeout) { WaitForSingleObject(timer, timeout); });
+    }
+
     // The real Present, of whole frames: DXUP copies (and scales) the whole
     // buffer, and the real flip discard swap chain takes no dirty or scroll
     // rectangles. Tearing DXUP decided needs a window: in a full screen the
@@ -1851,6 +1858,7 @@ namespace dxup {
           // reach the queue first. Present stays here: on the submit thread
           // NVIDIA's Present spun and held the next frame's lists back.
           backend->waitForQueue();
+          limitPresent();
           const int64_t start = hitchTraceEnabled() ? hitchTimestamp() : 0;
           const HRESULT hr = presentReal(syncInterval, flags, present1, dxupTearing);
           if (start)
@@ -1869,6 +1877,8 @@ namespace dxup {
         ctx->waitForQueue();
       }
 
+      if (!(flags & DXGI_PRESENT_TEST))
+        limitPresent();
       HRESULT hr = presentReal(syncInterval, flags, present1, dxupTearing);
       if (SUCCEEDED(hr) && !(flags & DXGI_PRESENT_TEST)) {
         if (ctx && m_direct)

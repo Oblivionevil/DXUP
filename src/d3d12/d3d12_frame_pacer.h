@@ -4,6 +4,7 @@
 #include <windows.h>
 #include <d3d12.h>
 #include "../util/com_ptr.h"
+#include "../util/util_config.h"
 #endif
 
 #include <algorithm>
@@ -238,6 +239,79 @@ namespace dxup::d3d12 {
       YieldProcessor();
       QueryPerformanceCounter(&now);
     } while (now.QuadPart < target);
+  }
+#endif
+
+#ifdef _WIN32
+  // dxgi.maxFrameRate: at most so many frames a second, on a grid of even
+  // steps, so that the average stays at the limit. A frame later than a step
+  // lets the next one catch up, or starts the grid anew.
+  class FrameLimiter {
+  public:
+    // shortestStep: how close to the frame before one may follow while
+    // catching up, in steps.
+    FrameLimiter(double framesPerSecond, double shortestStep) {
+      LARGE_INTEGER frequency;
+      QueryPerformanceFrequency(&frequency);
+      m_msPerTick = 1000.0 / double(frequency.QuadPart);
+      m_step = framesPerSecond > 0.0 ? int64_t(double(frequency.QuadPart) / framesPerSecond) : 0;
+      m_shortestStep = int64_t(double(m_step) * shortestStep);
+    }
+    FrameLimiter(const FrameLimiter&) = delete;
+    FrameLimiter& operator=(const FrameLimiter&) = delete;
+    ~FrameLimiter() {
+      if (m_timer)
+        CloseHandle(m_timer);
+    }
+
+    bool enabled() const { return m_step != 0; }
+
+    // How long this frame has to wait from `now` (QPC); the next is counted
+    // from the moment it may go.
+    double waitMs(int64_t now) {
+      if (!m_step)
+        return 0.0;
+      const int64_t due = (std::max)(m_next, m_released + m_shortestStep);
+      const int64_t released = (std::max)(due, now);
+      m_released = released;
+      m_next = (std::max)(m_next, released - m_step) + m_step;
+      return double(released - now) * m_msPerTick;
+    }
+
+    // Waits for that moment. wait as for paceSleep.
+    template<typename Wait>
+    void hold(Wait&& wait) {
+      if (!m_step)
+        return;
+      LARGE_INTEGER now;
+      QueryPerformanceCounter(&now);
+      const double ms = waitMs(now.QuadPart);
+      if (ms > 0.0)
+        paceSleep(m_timer, ms, wait);
+    }
+
+  private:
+    double  m_msPerTick = 0.0;
+    int64_t m_step = 0;
+    int64_t m_shortestStep = 0;
+    int64_t m_next = 0;
+    int64_t m_released = 0;
+    HANDLE  m_timer = nullptr;
+  };
+
+  // A frame behind the grid of the limiter before the real Present follows the
+  // one before at this share of a step at the least.
+  constexpr double kPresentLimiterShortestStep = 0.9;
+
+  // Before the real Present, on the thread that presents.
+  inline double smoothFrameRate() {
+    const UserOverrides& overrides = UserOverrides::get();
+    return overrides.frameLimiter == FrameLimiterMode::Smooth ? double(overrides.maxFrameRate) : 0.0;
+  }
+  // At the start of the application's next frame.
+  inline double latencyFrameRate() {
+    const UserOverrides& overrides = UserOverrides::get();
+    return overrides.frameLimiter == FrameLimiterMode::Latency ? double(overrides.maxFrameRate) : 0.0;
   }
 #endif
 

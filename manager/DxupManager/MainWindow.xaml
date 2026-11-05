@@ -195,6 +195,8 @@
                   <RowDefinition Height="Auto" />
                   <RowDefinition Height="Auto" />
                   <RowDefinition Height="Auto" />
+                  <RowDefinition Height="Auto" />
+                  <RowDefinition Height="Auto" />
                 </Grid.RowDefinitions>
                 <TextBlock Text="{DynamicResource VSync}" Style="{StaticResource Caption}" />
                 <ComboBox x:Name="VSyncBox" Grid.Column="1" HorizontalAlignment="Left" DisplayMemberPath="Text" SelectionChanged="OnSettingChanged" />
@@ -206,26 +208,35 @@
                   </CheckBox>
                   <TextBlock Text="{DynamicResource LowLatencyHint}" Foreground="{DynamicResource Muted}" FontSize="11" Margin="0,4,0,0" TextWrapping="Wrap" />
                 </StackPanel>
-                <CheckBox x:Name="SpatialBox" Grid.Row="2" Grid.Column="1" Margin="0,10,0,0" Checked="OnSettingChanged" Unchecked="OnSettingChanged">
+                <TextBlock Grid.Row="2" Text="{DynamicResource FrameLimiter}" Style="{StaticResource Caption}" Margin="0,10,12,0" />
+                <StackPanel Grid.Row="2" Grid.Column="1" Orientation="Horizontal" Margin="0,10,0,0">
+                  <ComboBox x:Name="LimiterBox" DisplayMemberPath="Text" SelectionChanged="OnSettingChanged"
+                            AutomationProperties.Name="{DynamicResource FrameLimiter}" />
+                  <TextBox x:Name="FrameRateBox" Width="56" MaxLength="7" Margin="8,0,0,0" VerticalContentAlignment="Center" LostFocus="OnSettingChanged" KeyDown="OnSettingKeyDown"
+                           AutomationProperties.Name="{DynamicResource FrameRate}" />
+                  <TextBlock Text="fps" VerticalAlignment="Center" Margin="6,0,0,0" />
+                </StackPanel>
+                <TextBlock Grid.Row="3" Grid.Column="1" Text="{DynamicResource FrameLimiterHint}" Foreground="{DynamicResource Muted}" FontSize="11" Margin="0,4,0,0" TextWrapping="Wrap" />
+                <CheckBox x:Name="SpatialBox" Grid.Row="4" Grid.Column="1" Margin="0,10,0,0" Checked="OnSettingChanged" Unchecked="OnSettingChanged">
                   <TextBlock Text="{DynamicResource SpatialUpscale}" TextWrapping="Wrap" />
                 </CheckBox>
-                <TextBlock Grid.Row="3" Text="{DynamicResource RenderScale}" Style="{StaticResource Caption}" Margin="0,10,12,0" />
-                <ComboBox x:Name="RenderScaleBox" Grid.Row="3" Grid.Column="1" HorizontalAlignment="Left" Margin="0,10,0,0" DisplayMemberPath="Text" SelectionChanged="OnSettingChanged" />
-                <TextBlock Grid.Row="4" Grid.Column="1" Text="{DynamicResource RenderScaleHint}" Foreground="{DynamicResource Muted}" FontSize="11" Margin="0,4,0,0" TextWrapping="Wrap" />
-                <TextBlock Grid.Row="5" Text="{DynamicResource Sharpness}" Style="{StaticResource Caption}" Margin="0,10,12,0" />
-                <StackPanel Grid.Row="5" Grid.Column="1" Orientation="Horizontal" Margin="0,10,0,0">
+                <TextBlock Grid.Row="5" Text="{DynamicResource RenderScale}" Style="{StaticResource Caption}" Margin="0,10,12,0" />
+                <ComboBox x:Name="RenderScaleBox" Grid.Row="5" Grid.Column="1" HorizontalAlignment="Left" Margin="0,10,0,0" DisplayMemberPath="Text" SelectionChanged="OnSettingChanged" />
+                <TextBlock Grid.Row="6" Grid.Column="1" Text="{DynamicResource RenderScaleHint}" Foreground="{DynamicResource Muted}" FontSize="11" Margin="0,4,0,0" TextWrapping="Wrap" />
+                <TextBlock Grid.Row="7" Text="{DynamicResource Sharpness}" Style="{StaticResource Caption}" Margin="0,10,12,0" />
+                <StackPanel Grid.Row="7" Grid.Column="1" Orientation="Horizontal" Margin="0,10,0,0">
                   <Slider x:Name="SharpnessSlider" Width="200" Minimum="0" Maximum="1" TickFrequency="0.05" IsSnapToTickEnabled="True"
                           VerticalAlignment="Center" ValueChanged="OnSharpnessChanged" />
                   <TextBlock x:Name="SharpnessText" Width="110" Margin="10,0,0,0" VerticalAlignment="Center" />
                 </StackPanel>
-                <TextBlock Grid.Row="6" Text="{DynamicResource Adapter}" Style="{StaticResource Caption}" Margin="0,10,12,0" />
-                <ComboBox x:Name="AdapterBox" Grid.Row="6" Grid.Column="1" HorizontalAlignment="Left" Margin="0,10,0,0" DisplayMemberPath="Text" SelectionChanged="OnSettingChanged" />
-                <TextBlock Grid.Row="7" Grid.Column="1" Text="{DynamicResource AdapterHint}" Foreground="{DynamicResource Muted}" FontSize="11" Margin="0,4,0,0" TextWrapping="Wrap" />
-                <TextBlock Grid.Row="8" Text="{DynamicResource SpoofVendor}" Style="{StaticResource Caption}" Margin="0,10,12,0" />
-                <ComboBox x:Name="SpoofBox" Grid.Row="8" Grid.Column="1" HorizontalAlignment="Left" Margin="0,10,0,0" DisplayMemberPath="Text" SelectionChanged="OnSettingChanged" />
-                <TextBlock Grid.Row="9" Grid.Column="1" Text="{DynamicResource SpoofVendorHint}" Foreground="{DynamicResource Muted}" FontSize="11" Margin="0,4,0,0" TextWrapping="Wrap" />
-                <TextBlock Grid.Row="10" Text="{DynamicResource CustomGpu}" Style="{StaticResource Caption}" Margin="0,10,12,0" />
-                <WrapPanel Grid.Row="10" Grid.Column="1" Margin="0,10,0,0">
+                <TextBlock Grid.Row="8" Text="{DynamicResource Adapter}" Style="{StaticResource Caption}" Margin="0,10,12,0" />
+                <ComboBox x:Name="AdapterBox" Grid.Row="8" Grid.Column="1" HorizontalAlignment="Left" Margin="0,10,0,0" DisplayMemberPath="Text" SelectionChanged="OnSettingChanged" />
+                <TextBlock Grid.Row="9" Grid.Column="1" Text="{DynamicResource AdapterHint}" Foreground="{DynamicResource Muted}" FontSize="11" Margin="0,4,0,0" TextWrapping="Wrap" />
+                <TextBlock Grid.Row="10" Text="{DynamicResource SpoofVendor}" Style="{StaticResource Caption}" Margin="0,10,12,0" />
+                <ComboBox x:Name="SpoofBox" Grid.Row="10" Grid.Column="1" HorizontalAlignment="Left" Margin="0,10,0,0" DisplayMemberPath="Text" SelectionChanged="OnSettingChanged" />
+                <TextBlock Grid.Row="11" Grid.Column="1" Text="{DynamicResource SpoofVendorHint}" Foreground="{DynamicResource Muted}" FontSize="11" Margin="0,4,0,0" TextWrapping="Wrap" />
+                <TextBlock Grid.Row="12" Text="{DynamicResource CustomGpu}" Style="{StaticResource Caption}" Margin="0,10,12,0" />
+                <WrapPanel Grid.Row="12" Grid.Column="1" Margin="0,10,0,0">
                   <StackPanel Orientation="Horizontal" Margin="0,0,14,4">
                     <TextBlock Text="{DynamicResource CustomVendor}" VerticalAlignment="Center" Margin="0,0,6,0" />
                     <TextBox x:Name="VendorIdBox" Width="56" MaxLength="10" LostFocus="OnSettingChanged" KeyDown="OnSettingKeyDown"
@@ -242,7 +253,7 @@
                              AutomationProperties.Name="{DynamicResource CustomDesc}" />
                   </StackPanel>
                 </WrapPanel>
-                <TextBlock Grid.Row="11" Grid.Column="1" Text="{DynamicResource CustomGpuHint}" Foreground="{DynamicResource Muted}" FontSize="11" Margin="0,0,0,0" TextWrapping="Wrap" />
+                <TextBlock Grid.Row="13" Grid.Column="1" Text="{DynamicResource CustomGpuHint}" Foreground="{DynamicResource Muted}" FontSize="11" Margin="0,0,0,0" TextWrapping="Wrap" />
               </Grid>
 
               <TextBlock Text="{DynamicResource SectionShaders}" Style="{StaticResource Section}" />

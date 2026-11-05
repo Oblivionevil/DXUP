@@ -965,7 +965,7 @@ namespace dxup::d3d12 {
       const std::wstring profileOut = dxupSiblingPathW("dxup_gpu_profile_out.txt");
       if (!profileMarker.empty() && !profileOut.empty())
         m_gpuProfiler.init(d3d12Device, device->getCommandQueue(), profileMarker, profileOut);
-      if (UserOverrides::get().lowLatency || dxupSiblingExists("dxup_latency_stats.txt"))
+      if (UserOverrides::get().lowLatency || latencyFrameRate() > 0.0 || dxupSiblingExists("dxup_latency_stats.txt"))
         m_frameTimer.init(d3d12Device, device->getCommandQueue());
 
     }
@@ -7966,7 +7966,8 @@ namespace dxup::d3d12 {
     }
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
-    const double sleepMs = m_pacedGpuEnd ? m_latencyPacer.sleepMs(double(now.QuadPart - m_pacedGpuEnd) * msPerTick) : 0.0;
+    const double sleepMs = (std::max)(UserOverrides::get().lowLatency && m_pacedGpuEnd
+      ? m_latencyPacer.sleepMs(double(now.QuadPart - m_pacedGpuEnd) * msPerTick) : 0.0, m_frameLimiter.waitMs(now.QuadPart));
     if (sleepMs > 0.0) {
       paceSleep(m_pacingTimer, sleepMs, [](HANDLE timer, DWORD timeout) { WaitForSingleObject(timer, timeout); });
       QueryPerformanceCounter(&now);

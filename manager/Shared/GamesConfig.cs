@@ -19,6 +19,8 @@ namespace Dxup.Shared
         public int? SyncInterval;        // 0 = VSync off, 1-4 on
         public int? MaxFrameLatency;     // 1-16
         public bool LowLatency = true;   // one pre-rendered frame, the next held back until the GPU needs it
+        public float? MaxFrameRate;      // frames per second at most; null = no limit
+        public bool FrameLimiterLatency; // false: even frame times (the real Present waits), true: least input lag (the next frame waits)
         public bool AsyncShaders;        // pipelines compile in the background
         public bool ShaderPrecompile = true; // pipelines of earlier runs compile at load
         public string Upscaler = "off";  // off, dlss, fsr, xess: in place of the game's TAA
@@ -69,6 +71,11 @@ namespace Dxup.Shared
                 case "dxgi.syncinterval": SyncInterval = ParseInt(value); return true;
                 case "dxgi.maxframelatency": MaxFrameLatency = ParseInt(value); return true;
                 case "dxgi.lowlatency": LowLatency = ParseBool(value) ?? true; return true;
+                case "dxgi.maxframerate":
+                    float? rate = ParseFloat(value);
+                    MaxFrameRate = rate >= 1.0f ? rate : null;
+                    return true;
+                case "dxgi.framelimiter": FrameLimiterLatency = value.Trim().Equals("latency", StringComparison.OrdinalIgnoreCase); return true;
                 case "d3d11.asyncshaders": AsyncShaders = ParseBool(value) ?? false; return true;
                 case "d3d11.shaderprecompile": ShaderPrecompile = ParseBool(value) ?? true; return true;
                 case "d3d11.upscaler":
@@ -153,6 +160,8 @@ namespace Dxup.Shared
             if (SyncInterval.HasValue) yield return Entry("dxgi.syncInterval", SyncInterval.Value.ToString(CultureInfo.InvariantCulture));
             if (MaxFrameLatency.HasValue) yield return Entry("dxgi.maxFrameLatency", MaxFrameLatency.Value.ToString(CultureInfo.InvariantCulture));
             if (!LowLatency) yield return Entry("dxgi.lowLatency", "false");
+            if (MaxFrameRate.HasValue) yield return Entry("dxgi.maxFrameRate", MaxFrameRate.Value.ToString("0.#####", CultureInfo.InvariantCulture));
+            if (FrameLimiterLatency) yield return Entry("dxgi.frameLimiter", "latency");
             if (AsyncShaders) yield return Entry("d3d11.asyncShaders", "true");
             if (!ShaderPrecompile) yield return Entry("d3d11.shaderPrecompile", "false");
             if (Upscaler != "off") yield return Entry("d3d11.upscaler", Upscaler);
