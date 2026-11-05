@@ -1228,8 +1228,10 @@ static bool windowedPrimary(Context&, std::string& error) {
       DeleteObject(bitmap);
       DeleteDC(memory);
       ReleaseDC(window, windowDc);
+      // 30 blits take 0.1 ms; waiting for the display each would take 30
+      // refreshes. A thread that lost the CPU once may take 12 at 240 Hz.
       ok = SUCCEEDED(hr) && hue(pixels[0], 0xff00ff) && hue(pixels[1], 0x0000ff) && hue(pixels[2], 0) && hue(pixels[3], 0xff00ff)
-        && hue(pixels[4], 0xff00ff) && elapsed < 10.0 * period;
+        && hue(pixels[4], 0xff00ff) && elapsed < 20.0 * period;
       if (!ok)
         error = format("hr 0x%08lx, pixels 0x%06lx 0x%06lx 0x%06lx, dots 0x%06lx 0x%06lx, 30 blits took %.1f ms (refresh %.1f ms)",
           hr, pixels[0], pixels[1], pixels[2], pixels[3], pixels[4], elapsed, period);

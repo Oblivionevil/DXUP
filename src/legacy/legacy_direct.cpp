@@ -2090,11 +2090,9 @@ namespace dxup::legacy {
       DirectDevice() : m_backendDevice(BackendType::D3D12, nullptr) { }
 
       void createContext() {
-        // With the Direct3D 9 worker thread that thread records too: no
-        // second worker behind it. Not "externally synchronized": without
-        // the CS thread's retiring, the context keeps what its lists use.
-        Rc<IBackendContext> context = UserOverrides::get().d3d9WorkerThread
-          ? m_backendDevice.createImmediateContext() : m_backendDevice.createThreadedImmediateContext();
+        // Also behind the Direct3D 9 worker thread: recording on that thread
+        // as well took Mirror's Edge from 932 to 601 fps.
+        Rc<IBackendContext> context = m_backendDevice.createThreadedImmediateContext();
         if (!context)
           throw std::runtime_error("no immediate context");
         m_context = new DirectContext(this, std::move(context));
