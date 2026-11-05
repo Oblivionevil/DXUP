@@ -46,6 +46,7 @@ namespace dxup::d3d12 {
       m_ticks = static_cast<const volatile uint64_t*>(mapped);
       for (auto& frame : m_frames)
         frame.store(UINT64_MAX, std::memory_order_relaxed);
+      measureCalibrationError(device);
     }
 
     bool enabled() const { return m_heap.Get() != nullptr; }
@@ -117,8 +118,7 @@ namespace dxup::d3d12 {
         return false;
       times.busyMs = double(end - begin) * 1000.0 / double(m_frequency);
       times.submitted = m_submitted[index];
-      times.ended = m_frameCalibrationCpu[index]
-        + int64_t(double(int64_t(end - m_frameCalibrationGpu[index])) * double(m_qpcFrequency) / double(m_frequency));
+      times.ended = toQpc(end, m_frameCalibrationGpu[index], m_frameCalibrationCpu[index]) - m_calibrationError;
       return true;
     }
 
@@ -127,6 +127,60 @@ namespace dxup::d3d12 {
   private:
     static constexpr uint32_t kFrames = 64;
     static uint32_t slot(uint64_t frame) { return uint32_t(frame % kFrames); }
+
+    int64_t toQpc(uint64_t ticks, uint64_t calibrationGpu, uint64_t calibrationCpu) const {
+      return int64_t(calibrationCpu)
+        + int64_t(double(int64_t(ticks - calibrationGpu)) * double(m_qpcFrequency) / double(m_frequency));
+    }
+
+    // GetClockCalibration need not be on the clock of the queue's timestamps:
+    // with AMD's driver (RX 9070 XT) a timestamp converted with it lies 2.9 ms
+    // ahead of the moment its fence completes. A timestamp cannot be later
+    // than its fence is seen: a few small lists on the idle queue tell how
+    // much later it reads, the closest of them being the least delayed.
+    void measureCalibrationError(ID3D12Device* device) {
+      ComPtr<ID3D12CommandAllocator> allocator;
+      ComPtr<ID3D12GraphicsCommandList> list;
+      ComPtr<ID3D12Fence> fence;
+      if (FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator)))
+       || FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), nullptr, IID_PPV_ARGS(&list)))
+       || FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence))))
+        return;
+      list->Close();
+      int64_t error = INT64_MIN;
+      for (uint32_t i = 1; i <= kCalibrationLists; i++) {
+        if (FAILED(allocator->Reset()) || FAILED(list->Reset(allocator.Get(), nullptr)))
+          return;
+        list->EndQuery(m_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0);
+        list->ResolveQueryData(m_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0, 1, m_readback.Get(), 0);
+        if (FAILED(list->Close()))
+          return;
+        uint64_t calibrationGpu = 0, calibrationCpu = 0;
+        if (FAILED(m_queue->GetClockCalibration(&calibrationGpu, &calibrationCpu)))
+          return;
+        ID3D12CommandList* lists[] = { list.Get() };
+        m_queue->ExecuteCommandLists(1, lists);
+        if (FAILED(m_queue->Signal(fence.Get(), i)))
+          return;
+        // Spinning: a wake-up would be what it measures.
+        LARGE_INTEGER seen, deadline;
+        QueryPerformanceCounter(&deadline);
+        deadline.QuadPart += m_qpcFrequency / 10;
+        while (fence->GetCompletedValue() < i) {
+          QueryPerformanceCounter(&seen);
+          if (seen.QuadPart > deadline.QuadPart)
+            return;
+          YieldProcessor();
+        }
+        QueryPerformanceCounter(&seen);
+        error = (std::max)(error, toQpc(m_ticks[0], calibrationGpu, calibrationCpu) - seen.QuadPart);
+      }
+      if (error > 0)
+        m_calibrationError = error;
+    }
+
+    static constexpr uint32_t kCalibrationLists = 8;
+    int64_t                  m_calibrationError = 0;   // QPC ticks
 
     ComPtr<ID3D12QueryHeap>  m_heap;
     ComPtr<ID3D12Resource>   m_readback;

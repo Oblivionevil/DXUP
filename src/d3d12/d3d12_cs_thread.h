@@ -497,11 +497,14 @@ namespace dxup {
     bool                    m_lowLatency = false;
     // dxup_latency_stats.txt (or lowLatency): how long from each frame's
     // start (the return of the Present before) to the end of its GPU work,
-    // logged every 1000 frames.
+    // and until the worker's real Present returned as well (a frame limiter
+    // hooked into Present waits there), logged every 1000 frames.
     bool                    m_latencyStats = false;
     int64_t                 m_frameStarts[kPresentHistory] = {};
+    int64_t                 m_presentDone[kPresentHistory] = {};
     int64_t                 m_pacedGpuEnd = 0;    // the end of the latest frame's GPU work known (QPC)
     std::vector<double>     m_frameLatencies;
+    std::vector<double>     m_presentLatencies;
     uint64_t                m_pacedFrame = 0;
     int64_t                 m_pacingReturn = 0;
     void*                   m_pacingTimer = nullptr;

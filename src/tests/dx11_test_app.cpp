@@ -500,6 +500,7 @@ void main(uint2 id : SV_DispatchThreadID) {
         {"record_thread", &Dx11TestApp::testRecordThread},
         {"submit_thread", &Dx11TestApp::testSubmitThread},
         {"low_latency_gpu_pacing", &Dx11TestApp::testLowLatencyGpuPacing},
+        {"frame_timing_clock", &Dx11TestApp::testFrameTimingClock},
         {"native_fallback", &Dx11TestApp::testNativeFallback},
         {"fullscreen_swap_chain", &Dx11TestApp::testFullscreenSwapChain},
         {"window_ghosting", &Dx11TestApp::testWindowGhosting},
@@ -10236,6 +10237,61 @@ float4 main(float4 position : SV_Position, float4 t0 : TEXCOORD0, float4 t : TEX
           return true;
       }
       return false;
+    }
+
+    // The end of a frame's GPU work on the CPU's clock, by which dxgi.lowLatency
+    // holds frames back: DXUP's statistics (dxup_latency_stats.txt) against
+    // the moment a fence signaled with that work completes. GetClockCalibration
+    // of AMD's driver is 2.9 ms off the queue's timestamps: taken as it is,
+    // frames started too late and Kena lost 13-24 % of its frame rate.
+    bool testFrameTimingClock(std::string& error) {
+      if (!runsOnDxup()) {
+        error = "SKIP: needs DXUP";
+        return false;
+      }
+      char path[MAX_PATH] = {};
+      GetModuleFileNameA(nullptr, path, MAX_PATH);
+      std::string dir = path;
+      dir.resize(dir.find_last_of('\\') + 1);
+      const std::string marker = dir + "dxup_latency_stats.txt";
+      if (FILE* file = _fsopen(marker.c_str(), "w", _SH_DENYNO))
+        std::fclose(file);
+      bool passed = false;
+      // GPU timing: other work on the GPU can spoil one try.
+      for (int attempt = 0; attempt < 2 && !passed; attempt++) {
+        error.clear();
+        if (!runChildWithConfig("", "--low-latency-child clock", error))
+          break;
+        const std::string resultFile = dir + "low_latency_clock.txt";
+        double measured = 0.0, frame = 0.0, logged = 0.0;
+        bool read = false;
+        if (FILE* in = _fsopen(resultFile.c_str(), "r", _SH_DENYNO)) {
+          read = std::fscanf(in, "%lf %lf", &measured, &frame) == 2;
+          std::fclose(in);
+        }
+        DeleteFileA(resultFile.c_str());
+        if (FILE* log = _fsopen((dir + "logdxup.log").c_str(), "rb", _SH_DENYNO)) {
+          std::string text(1 << 20, '\0');
+          text.resize(std::fread(text.data(), 1, text.size(), log));
+          std::fclose(log);
+          const char* const kLine = "frame start to GPU done ";
+          const size_t at = text.rfind(kLine);
+          read = read && at != std::string::npos && std::sscanf(text.c_str() + at + std::strlen(kLine), "%lf", &logged) == 1;
+        } else {
+          read = false;
+        }
+        if (!read) {
+          error = "no result from the child or no statistics in its log";
+          continue;
+        }
+        std::printf("  frame start to GPU done: %.2f ms in DXUP's statistics, %.2f ms by a fence, %.2f ms a frame\n", logged, measured, frame);
+        if (std::abs(logged - measured) > 1.0)
+          error = formatString("%.2f ms in DXUP's statistics, %.2f ms by a fence", logged, measured);
+        else
+          passed = true;
+      }
+      DeleteFileA(marker.c_str());
+      return passed;
     }
 
     // A pixel shader that writes an unordered access view runs once per
@@ -25601,7 +25657,10 @@ float4 main(float4 p : SV_Position) : SV_Target {
       }
 
       // Fence value v completes with frame v - 1; the thread notes when.
-      constexpr uint32_t kFrames = 480;
+      // "clock" (testFrameTimingClock): long enough for DXUP's second line
+      // of statistics, every 1000 frames.
+      const bool clockRun = std::strcmp(tag, "clock") == 0;
+      const uint32_t kFrames = clockRun ? 2100 : 480;
       std::vector<std::atomic<int64_t>> done(kFrames + 1);
       std::vector<int64_t> start(kFrames, 0);
       std::atomic<uint64_t> signaled{0};
@@ -25652,7 +25711,7 @@ float4 main(float4 p : SV_Position) : SV_Target {
           std::sort(drawMs.begin(), drawMs.end());
           const double ms = drawMs[drawMs.size() / 2];
           drawMs.clear();
-          const double scale = (std::min)(64.0, (std::max)(1.0 / 64.0, 7.0 / (std::max)(ms, 0.01)));
+          const double scale = (std::min)(64.0, (std::max)(1.0 / 64.0, (clockRun ? 2.0 : 7.0) / (std::max)(ms, 0.01)));
           iterations = uint32_t((std::min)(double(1u << 24), (std::max)(16.0, iterations * scale)));
         }
         LARGE_INTEGER now;
@@ -25701,10 +25760,10 @@ float4 main(float4 p : SV_Position) : SV_Target {
       }
       if (!result) {
         // The frames after the last sizing, with the pacing settled.
-        const uint32_t first = 240;
+        const uint32_t first = clockRun ? 1000 : 240;
         const double frame = frameMs(first, kFrames - 1);
         std::vector<double> latencies;
-        for (uint32_t f = first; f < kFrames; f++)
+        for (uint32_t f = first; f < (clockRun ? 2000 : kFrames); f++)
           latencies.push_back(double(done[f + 1].load() - start[f]) * msPerTick);
         std::sort(latencies.begin(), latencies.end());
         char path[MAX_PATH] = {};

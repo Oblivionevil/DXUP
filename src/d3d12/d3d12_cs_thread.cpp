@@ -1502,6 +1502,11 @@ namespace dxup {
       auto* ctx = static_cast<d3d12::D3D12BackendContext*>(s.ctx);
       m_presentFences[slot] = ctx->getLastPresentFenceValue();
       m_presentIndices[slot] = ctx->getPresentCount() ? ctx->getPresentCount() - 1 : UINT64_MAX;
+      if (m_latencyStats) {
+        LARGE_INTEGER done;
+        QueryPerformanceCounter(&done);
+        m_presentDone[slot] = done.QuadPart;
+      }
       m_framesExecuted.fetch_add(1, std::memory_order_release);
       SetEvent(m_frameEvent);
     });
@@ -1577,6 +1582,9 @@ namespace dxup {
         const int64_t start = m_frameStarts[m_pacedFrame % kPresentHistory];
         if (start && ended > start)
           m_frameLatencies.push_back(double(ended - start) * msPerTick);
+        const int64_t done = m_presentDone[m_pacedFrame % kPresentHistory];
+        if (start && done > start)
+          m_presentLatencies.push_back(double((std::max)(done, ended) - start) * msPerTick);
       }
     }
     QueryPerformanceCounter(&now);
@@ -1588,19 +1596,25 @@ namespace dxup {
     }
     m_pacingSleptMs += sleepMs;
     if (++m_pacingFrames == 1000) {
-      double median = 0.0, p95 = 0.0;
+      double median = 0.0, p95 = 0.0, presentMedian = 0.0, presentP95 = 0.0;
       if (!m_frameLatencies.empty()) {
         std::sort(m_frameLatencies.begin(), m_frameLatencies.end());
         median = m_frameLatencies[m_frameLatencies.size() / 2];
         p95 = m_frameLatencies[m_frameLatencies.size() * 95 / 100];
       }
+      if (!m_presentLatencies.empty()) {
+        std::sort(m_presentLatencies.begin(), m_presentLatencies.end());
+        presentMedian = m_presentLatencies[m_presentLatencies.size() / 2];
+        presentP95 = m_presentLatencies[m_presentLatencies.size() * 95 / 100];
+      }
       // The marker asks for them; else with the info log.
       static const bool asked = dxupSiblingExists("dxup_latency_stats.txt");
-      logMessage(asked ? LogLevel::Warn : LogLevel::Info, "frame latency: frame start to GPU done %.2f ms (p95 %.2f) over %zu frames; "
+      logMessage(asked ? LogLevel::Warn : LogLevel::Info, "frame latency: frame start to GPU done %.2f ms (p95 %.2f), to Present and GPU done %.2f ms (p95 %.2f) over %zu frames; "
         "low latency %s: held back %.3f ms a frame, margin %.2f ms, %llu frames late so far",
-        median, p95, m_frameLatencies.size(), m_lowLatency ? "on" : "off", m_pacingSleptMs / m_pacingFrames,
+        median, p95, presentMedian, presentP95, m_frameLatencies.size(), m_lowLatency ? "on" : "off", m_pacingSleptMs / m_pacingFrames,
         m_latencyPacer.marginMs(), static_cast<unsigned long long>(m_latencyPacer.lateFrames()));
       m_frameLatencies.clear();
+      m_presentLatencies.clear();
       m_pacingSleptMs = 0.0;
       m_pacingFrames = 0;
     }
