@@ -3178,6 +3178,12 @@ namespace dxup {
         const FLOAT             ColorRGBA[4]) override {
       DXUP_CONTEXT_MT_GUARD;
       if (!pRenderTargetView || !ColorRGBA) return;
+      if (m_device->diagTraceDraws.load(std::memory_order_relaxed)) {
+        ComPtr<ID3D11Resource> resource;
+        pRenderTargetView->GetResource(resource.GetAddressOf());
+        traceCall(formatTrace("ClearRenderTargetView %p %s color=%.3f,%.3f,%.3f,%.3f", static_cast<void*>(resource.Get()), describeTraceResource(resource.Get()).c_str(),
+          ColorRGBA[0], ColorRGBA[1], ColorRGBA[2], ColorRGBA[3]));
+      }
       IBackendImageView* backendRTV = getBackendRTV(pRenderTargetView);
       if (m_historyOn && !m_isDeferred)
         recordClear(RecordOp::ClearColor, pRenderTargetView, backendRTV, ColorRGBA);
@@ -3208,6 +3214,12 @@ namespace dxup {
       const UINT writtenPlanes = depthStencilWriteRange(pDepthStencilView).planes;
       ClearFlags &= ((writtenPlanes & 1u) ? D3D11_CLEAR_DEPTH : 0u) | ((writtenPlanes & 2u) ? D3D11_CLEAR_STENCIL : 0u);
       if (!ClearFlags) return;
+      if (m_device->diagTraceDraws.load(std::memory_order_relaxed)) {
+        ComPtr<ID3D11Resource> resource;
+        pDepthStencilView->GetResource(resource.GetAddressOf());
+        traceCall(formatTrace("ClearDepthStencilView %p %s flags=%u depth=%.3f stencil=%u", static_cast<void*>(resource.Get()), describeTraceResource(resource.Get()).c_str(),
+          ClearFlags, Depth, unsigned(Stencil)));
+      }
       IBackendImageView* backendDSV = getBackendDSV(pDepthStencilView);
       if (m_historyOn && !m_isDeferred) {
         const float value[4] = { Depth, float(Stencil), float(ClearFlags), 0.0f };
@@ -3994,6 +4006,13 @@ namespace dxup {
         return;
       if (NumRects && !pRect)
         return;
+      if (m_device->diagTraceDraws.load(std::memory_order_relaxed)) {
+        ComPtr<ID3D11Resource> resource;
+        pView->GetResource(resource.GetAddressOf());
+        traceCall(formatTrace("ClearView %p %s color=%.3f,%.3f,%.3f,%.3f rects=%u first=%ld,%ld,%ld,%ld", static_cast<void*>(resource.Get()), describeTraceResource(resource.Get()).c_str(),
+          Color[0], Color[1], Color[2], Color[3], NumRects, NumRects ? pRect[0].left : 0L, NumRects ? pRect[0].top : 0L,
+          NumRects ? pRect[0].right : 0L, NumRects ? pRect[0].bottom : 0L));
+      }
 
       std::vector<Rect> rects(NumRects);
       for (UINT i = 0; i < NumRects; i++)
@@ -4379,6 +4398,14 @@ namespace dxup {
       for (UINT i = 0; i < 16; i++) {
         if (state.srvs[i])
           line += formatTrace(" %s.t%u(%s)", name, i, traceView(state.srvs[i], false).c_str());
+      }
+      for (UINT i = 0; i < 4; i++) {
+        if (!state.samplers[i])
+          continue;
+        D3D11_SAMPLER_DESC d = {};
+        state.samplers[i]->GetDesc(&d);
+        line += formatTrace(" %s.s%u(filter=0x%x addr=%u,%u,%u aniso=%u lod=%.1f..%.1f)", name, i, unsigned(d.Filter),
+          unsigned(d.AddressU), unsigned(d.AddressV), unsigned(d.AddressW), d.MaxAnisotropy, d.MinLOD, d.MaxLOD);
       }
       if (uavs) {
         for (UINT i = 0; i < 8; i++) {

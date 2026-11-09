@@ -1969,6 +1969,9 @@ namespace dxup {
     // without unordered access; sRGB buffers, multisampling (also forced),
     // dxgi.upscale and renderScale keep the proxy, as do bitblt model
     // applications, which may count on the buffer keeping its contents.
+    // (Bitblt discard ones may not, but on an AMD Radeon RX 9070 XT Heroes
+    // of the Storm drew 0.11 ms a frame slower into the real buffers than
+    // into the proxy with its copy at Present.)
     bool createDirectBackBuffer(UINT bufferCount) {
       if (!UserOverrides::get().directBackBuffer || !m_appFlipModel || m_appUnorderedAccess || m_appWidth
        || m_appSampleDesc.Count > 1 || bufferCount < 2 || !fetchDirectBuffers(bufferCount))
@@ -2640,8 +2643,9 @@ namespace dxup {
 
     *ppSwapChain = nullptr;
 
-    logMessage(LogLevel::Info, "DXGIFactory::CreateSwapChain(BufferCount=%u, Format=%d, HWND=0x%p, device=%p)",
-      pDesc->BufferCount, pDesc->BufferDesc.Format, pDesc->OutputWindow, static_cast<void*>(pDevice));
+    logMessage(LogLevel::Info, "DXGIFactory::CreateSwapChain(BufferCount=%u, Format=%d, SwapEffect=%d, BufferUsage=0x%x, Flags=0x%x, Windowed=%d, HWND=0x%p, device=%p)",
+      pDesc->BufferCount, pDesc->BufferDesc.Format, pDesc->SwapEffect, pDesc->BufferUsage, pDesc->Flags, pDesc->Windowed,
+      pDesc->OutputWindow, static_cast<void*>(pDevice));
 
     // The pDevice should be our D3D11Device. We need to get
     // the D3D12 command queue from the backend to create a

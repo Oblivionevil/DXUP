@@ -466,6 +466,7 @@ void main(uint2 id : SV_DispatchThreadID) {
         {"unrelated_transition_gpu_cost", &Dx11TestApp::testUnrelatedTransitionGpuCost},
         {"heavy_pass_chain_gpu_cost", &Dx11TestApp::testHeavyPassChainGpuCost},
         {"clear_gpu_cost", &Dx11TestApp::testClearGpuCost},
+        {"glow_chain_gpu_cost", &Dx11TestApp::testGlowChainGpuCost},
         {"pixel_output_masks", &Dx11TestApp::testPixelOutputMasks},
         {"pixel_output_masks_later", &Dx11TestApp::testPixelOutputMasksLater},
         {"constant_buffer_same_data_updates", &Dx11TestApp::testConstantBufferSameDataUpdates},
@@ -19047,6 +19048,184 @@ float4 main(float4 p : SV_Position) : SV_Target { return value; }
       return true;
     }
 
+    // Heroes of the Storm's score screen glows each of its 32 elements the
+    // same way: two 4K RGBA16F targets cleared to (0,0,0,1), the element drawn
+    // into the first, blurred into the second and back (full viewport, a quad
+    // around the element, the depth buffer bound), then added to a 4K BGRA
+    // target with the element itself. GPU time per element. Performance only.
+    bool testGlowChainGpuCost(std::string& error) {
+      static const char* kQuadVs = R"(
+cbuffer Rect : register(b0) { float4 rect; };
+float4 main(uint id : SV_VertexID, out float2 uv : TEXCOORD0) : SV_Position {
+  float2 corner = float2(id & 1, (id >> 1) & 1);
+  uv = corner;
+  float2 pixel = rect.xy + corner * rect.zw;
+  return float4(pixel.x / 1920.0f - 1.0f, 1.0f - pixel.y / 1080.0f, 0.0f, 1.0f);
+}
+)";
+      static const char* kElementPs = R"(
+float4 main(float4 p : SV_Position, float2 uv : TEXCOORD0) : SV_Target { return float4(uv, 0.5f, 1.0f); }
+)";
+      static const char* kBlurPs = R"(
+Texture2D source : register(t0);
+SamplerState linearSampler : register(s0);
+cbuffer Step : register(b1) { float4 step; };
+float4 main(float4 p : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
+  float2 at = p.xy / float2(3840.0f, 2160.0f);
+  float4 sum = 0;
+  [unroll] for (int i = -4; i <= 4; i++)
+    sum += source.SampleLevel(linearSampler, at + step.xy * i, 0);
+  return sum / 9.0f;
+}
+)";
+      static const char* kCompositePs = R"(
+Texture2D source : register(t0);
+SamplerState linearSampler : register(s0);
+float4 main(float4 p : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
+  return source.SampleLevel(linearSampler, p.xy / float2(3840.0f, 2160.0f), 0);
+}
+)";
+      TextureTarget glowA, glowB, backBuffer;
+      auto hdrTarget = [&](TextureTarget& target) {
+        D3D11_TEXTURE2D_DESC desc = { 3840, 2160, 1, 1, DXGI_FORMAT_R16G16B16A16_FLOAT, { 1, 0 }, D3D11_USAGE_DEFAULT,
+          D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE, 0, 0 };
+        return SUCCEEDED(m_device->CreateTexture2D(&desc, nullptr, target.texture.GetAddressOf()))
+          && SUCCEEDED(m_device->CreateRenderTargetView(target.texture.Get(), nullptr, target.rtv.GetAddressOf()))
+          && SUCCEEDED(m_device->CreateShaderResourceView(target.texture.Get(), nullptr, target.srv.GetAddressOf()));
+      };
+      D3D11_TEXTURE2D_DESC backDesc = { 3840, 2160, 1, 1, DXGI_FORMAT_B8G8R8A8_UNORM, { 1, 0 }, D3D11_USAGE_DEFAULT,
+        D3D11_BIND_RENDER_TARGET, 0, 0 };
+      D3D11_TEXTURE2D_DESC depthDesc = { 3840, 2160, 1, 1, DXGI_FORMAT_R24G8_TYPELESS, { 1, 0 }, D3D11_USAGE_DEFAULT,
+        D3D11_BIND_DEPTH_STENCIL | D3D11_BIND_SHADER_RESOURCE, 0, 0 };
+      D3D11_DEPTH_STENCIL_VIEW_DESC dsvDesc = {};
+      dsvDesc.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+      dsvDesc.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
+      ComPtr<ID3D11Texture2D> depth;
+      ComPtr<ID3D11DepthStencilView> dsv;
+      if (!hdrTarget(glowA) || !hdrTarget(glowB)
+       || FAILED(m_device->CreateTexture2D(&backDesc, nullptr, backBuffer.texture.GetAddressOf()))
+       || FAILED(m_device->CreateRenderTargetView(backBuffer.texture.Get(), nullptr, backBuffer.rtv.GetAddressOf()))
+       || FAILED(m_device->CreateTexture2D(&depthDesc, nullptr, depth.GetAddressOf()))
+       || FAILED(m_device->CreateDepthStencilView(depth.Get(), &dsvDesc, dsv.GetAddressOf()))) {
+        error = "targets failed";
+        return false;
+      }
+      ComPtr<ID3D11VertexShader> vs;
+      ComPtr<ID3DBlob> vsBytecode;
+      ComPtr<ID3D11PixelShader> elementPs, blurPs, compositePs;
+      if (!createVertexShader(kQuadVs, "main", vs, vsBytecode, error) || !createPixelShader(kElementPs, "main", elementPs, error)
+       || !createPixelShader(kBlurPs, "main", blurPs, error) || !createPixelShader(kCompositePs, "main", compositePs, error))
+        return false;
+      D3D11_SAMPLER_DESC samplerDesc = {};
+      samplerDesc.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+      samplerDesc.AddressU = samplerDesc.AddressV = samplerDesc.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+      samplerDesc.MaxLOD = D3D11_FLOAT32_MAX;
+      ComPtr<ID3D11SamplerState> sampler;
+      D3D11_BLEND_DESC addDesc = {};
+      addDesc.RenderTarget[0].BlendEnable = TRUE;
+      addDesc.RenderTarget[0].SrcBlend = addDesc.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
+      addDesc.RenderTarget[0].DestBlend = addDesc.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ONE;
+      addDesc.RenderTarget[0].BlendOp = addDesc.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+      addDesc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+      ComPtr<ID3D11BlendState> add;
+      D3D11_DEPTH_STENCIL_DESC noDepthDesc = {};
+      ComPtr<ID3D11DepthStencilState> noDepth;
+      if (FAILED(m_device->CreateSamplerState(&samplerDesc, sampler.GetAddressOf()))
+       || FAILED(m_device->CreateBlendState(&addDesc, add.GetAddressOf()))
+       || FAILED(m_device->CreateDepthStencilState(&noDepthDesc, noDepth.GetAddressOf()))) {
+        error = "states failed";
+        return false;
+      }
+      D3D11_BUFFER_DESC cbDesc = { 16, D3D11_USAGE_DYNAMIC, D3D11_BIND_CONSTANT_BUFFER, D3D11_CPU_ACCESS_WRITE, 0, 0 };
+      ComPtr<ID3D11Buffer> rectBuffer, stepBuffer;
+      if (FAILED(m_device->CreateBuffer(&cbDesc, nullptr, rectBuffer.GetAddressOf()))
+       || FAILED(m_device->CreateBuffer(&cbDesc, nullptr, stepBuffer.GetAddressOf()))) {
+        error = "constant buffers failed";
+        return false;
+      }
+      auto setConstants = [&](ID3D11Buffer* buffer, float x, float y, float z, float w) {
+        D3D11_MAPPED_SUBRESOURCE mapped = {};
+        if (SUCCEEDED(m_context->Map(buffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
+          const float values[4] = { x, y, z, w };
+          std::memcpy(mapped.pData, values, sizeof(values));
+          m_context->Unmap(buffer, 0);
+        }
+      };
+      ComPtr<ID3D11Query> disjoint, begin, end;
+      if (!createQueryObject(D3D11_QUERY_TIMESTAMP_DISJOINT, disjoint, error)
+       || !createQueryObject(D3D11_QUERY_TIMESTAMP, begin, error)
+       || !createQueryObject(D3D11_QUERY_TIMESTAMP, end, error))
+        return false;
+      const D3D11_VIEWPORT full = { 0.0f, 0.0f, 3840.0f, 2160.0f, 0.0f, 1.0f };
+      const float glowClear[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+      constexpr UINT kElements = 32;
+      auto group = [&](UINT element) {
+        const float x = 600.0f + float(element % 4) * 700.0f, y = 300.0f + float(element / 4) * 200.0f;
+        ID3D11ShaderResourceView* none = nullptr;
+        m_context->ClearRenderTargetView(glowA.rtv.Get(), glowClear);
+        m_context->ClearRenderTargetView(glowB.rtv.Get(), glowClear);
+        // The element into the first target, no depth buffer.
+        setConstants(rectBuffer.Get(), x, y, 90.0f, 54.0f);
+        m_context->OMSetRenderTargets(1, glowA.rtv.GetAddressOf(), nullptr);
+        m_context->PSSetShader(elementPs.Get(), nullptr, 0);
+        m_context->Draw(4, 0);
+        // Blurred across, then down, around it.
+        setConstants(rectBuffer.Get(), x - 32.0f, y - 32.0f, 154.0f, 118.0f);
+        m_context->OMSetRenderTargets(1, glowB.rtv.GetAddressOf(), dsv.Get());
+        m_context->PSSetShaderResources(0, 1, glowA.srv.GetAddressOf());
+        setConstants(stepBuffer.Get(), 1.0f / 3840.0f, 0.0f, 0.0f, 0.0f);
+        m_context->PSSetShader(blurPs.Get(), nullptr, 0);
+        m_context->Draw(4, 0);
+        m_context->PSSetShaderResources(0, 1, &none);
+        m_context->OMSetRenderTargets(1, glowA.rtv.GetAddressOf(), dsv.Get());
+        m_context->PSSetShaderResources(0, 1, glowB.srv.GetAddressOf());
+        setConstants(stepBuffer.Get(), 0.0f, 1.0f / 2160.0f, 0.0f, 0.0f);
+        m_context->Draw(4, 0);
+        m_context->PSSetShaderResources(0, 1, &none);
+        // Added to the screen, then the element itself.
+        m_context->OMSetRenderTargets(1, backBuffer.rtv.GetAddressOf(), dsv.Get());
+        m_context->PSSetShaderResources(0, 1, glowA.srv.GetAddressOf());
+        m_context->OMSetBlendState(add.Get(), nullptr, 0xffffffff);
+        m_context->PSSetShader(compositePs.Get(), nullptr, 0);
+        m_context->Draw(4, 0);
+        m_context->PSSetShaderResources(0, 1, &none);
+        setConstants(rectBuffer.Get(), x, y, 90.0f, 54.0f);
+        m_context->PSSetShader(elementPs.Get(), nullptr, 0);
+        m_context->Draw(4, 0);
+        m_context->OMSetBlendState(nullptr, nullptr, 0xffffffff);
+      };
+      auto timed = [&] {
+        m_context->ClearState();
+        m_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+        m_context->VSSetShader(vs.Get(), nullptr, 0);
+        m_context->VSSetConstantBuffers(0, 1, rectBuffer.GetAddressOf());
+        m_context->PSSetConstantBuffers(1, 1, stepBuffer.GetAddressOf());
+        m_context->PSSetSamplers(0, 1, sampler.GetAddressOf());
+        m_context->RSSetViewports(1, &full);
+        m_context->OMSetDepthStencilState(noDepth.Get(), 0);
+        m_context->Begin(disjoint.Get());
+        m_context->End(begin.Get());
+        for (UINT i = 0; i < kElements; i++)
+          group(i);
+        m_context->End(end.Get());
+        m_context->End(disjoint.Get());
+        D3D11_QUERY_DATA_TIMESTAMP_DISJOINT disjointData = {};
+        UINT64 t0 = 0, t1 = 0;
+        while (m_context->GetData(disjoint.Get(), &disjointData, sizeof(disjointData), 0) != S_OK) {}
+        while (m_context->GetData(begin.Get(), &t0, sizeof(t0), 0) != S_OK) {}
+        while (m_context->GetData(end.Get(), &t1, sizeof(t1), 0) != S_OK) {}
+        return disjointData.Disjoint || t1 <= t0 ? 0.0 : double(t1 - t0) * 1e6 / double(disjointData.Frequency) / kElements;
+      };
+      timed();
+      std::vector<double> samples;
+      for (int r = 0; r < 9; r++)
+        samples.push_back(timed());
+      std::sort(samples.begin(), samples.end());
+      std::printf("  glow chain gpu (4K, score screen of Heroes of the Storm): %.1f us per element (min %.1f, max %.1f)%c",
+        samples[4], samples[0], samples[8], 10);
+      return true;
+    }
+
     // GPU time of a 4K pass writing depth followed by a pass reading that
     // depth as a texture (with a read-only depth view bound, as engines do
     // for soft particles and decals), over and over. Performance only.
@@ -20881,7 +21060,8 @@ float4 main() : SV_Target {
     // it), a draw per frame into whatever buffer 0 is now, read back before
     // Present; an sRGB view encodes; the size changes in between
     // (ResizeBuffers once the application let go). DXUP draws into the real
-    // buffers of the flip model swap chains here (no proxy).
+    // buffers of the flip model and bitblt discard swap chains here (no
+    // proxy); the bitblt one stays bound across Presents, as there.
     bool testBackBufferAcrossPresents(std::string& error) {
       static const char* kVs = R"(
 float4 main(uint id : SV_VertexID) : SV_Position {
@@ -20992,7 +21172,9 @@ float4 main() : SV_Target { return color; }
           m_context->PSSetShader(ps.Get(), nullptr, 0);
           m_context->PSSetConstantBuffers(0, 1, colorBuffer.GetAddressOf());
           for (uint32_t frame = 0; frame < 7; frame++) {
-            m_context->OMSetRenderTargets(1, &target, nullptr);
+            // Bitblt model Presents leave it bound: such games bind it once.
+            if (effect != DXGI_SWAP_EFFECT_DISCARD || frame == 0 || frame == 6)
+              m_context->OMSetRenderTargets(1, &target, nullptr);
             uint32_t value = 0, expected = 0;
             if (frame == 3) {
               // Through the sRGB view: 0.5 is stored as 188.
