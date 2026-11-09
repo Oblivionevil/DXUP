@@ -247,9 +247,10 @@ namespace dxup::d3d12 {
 #endif
 
 #ifdef _WIN32
-  // Fixed-step game loops simulate at a rate of their own, whatever the
-  // frame rate (Heroes of the Storm every 64 ms): the first frame that begins
-  // after a tick's time takes milliseconds longer. From each frame's start
+  // In some games one frame takes milliseconds longer at a fixed rate of its
+  // own, whatever the frame rate (Heroes of the Storm's replays every 64 ms;
+  // normal play does not): the first frame that begins after such a tick's
+  // time. From each frame's start
   // and CPU time TickPredictor finds the period and phase of those ticks, so
   // that the latency limiter can begin the frames before a tick early enough
   // for the tick frame to present on time (FrameLimiter::waitMs). Times in ms
