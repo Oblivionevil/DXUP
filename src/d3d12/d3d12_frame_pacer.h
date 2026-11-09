@@ -5,11 +5,15 @@
 #include <d3d12.h>
 #include "../util/com_ptr.h"
 #include "../util/util_config.h"
+#include "../util/util_paths.h"
 #endif
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstdint>
+#include <cstdio>
+#include <vector>
 
 namespace dxup::d3d12 {
 
@@ -243,6 +247,256 @@ namespace dxup::d3d12 {
 #endif
 
 #ifdef _WIN32
+  // Fixed-step game loops simulate at a rate of their own, whatever the
+  // frame rate (Heroes of the Storm every 64 ms): the first frame that begins
+  // after a tick's time takes milliseconds longer. From each frame's start
+  // and CPU time TickPredictor finds the period and phase of those ticks, so
+  // that the latency limiter can begin the frames before a tick early enough
+  // for the tick frame to present on time (FrameLimiter::waitMs). Times in ms
+  // on the QPC clock.
+  class TickPredictor {
+  public:
+    struct Next {
+      double lo = 0.0, hi = 0.0;      // the tick's time lies in [lo, hi]
+      double tickCpuMs = 0.0;         // a tick frame's CPU time (90th percentile)
+      double normalCpuMs = 0.0;       // another frame's (90th percentile)
+      double normalMedianMs = 0.0;    // and its median
+    };
+
+    // A frame that began at start, after the frame before began at
+    // prevStart, and took cpuMs until its Present.
+    void noteFrame(double prevStart, double start, double cpuMs) {
+      m_intervals[m_frames % kFrames] = start - prevStart;
+      m_cpu[m_frames++ % kFrames] = cpuMs;
+      if (m_frames < kFrames)
+        return;
+      if ((m_frames & 63) == 0)
+        refreshThresholds();
+      if (cpuMs <= m_spikeMs || start <= prevStart || start - prevStart > kMaxFrameMs)
+        return;
+      m_spikes[m_spikeCount++ % kSpikes] = { prevStart, start, cpuMs };
+      m_lastSpike = start;
+      // Every fourth spike, every 16th while no period held for a while: a
+      // search across periods takes up to some 0.4 ms.
+      if (m_spikeCount >= kMinSpikes && (m_spikeCount & (m_failedFits >= 8 ? 15 : 3)) == 0) {
+        fit();
+        m_failedFits = m_valid ? 0 : m_failedFits + 1;
+      }
+    }
+
+    // The first tick after `after` (when the frame before began), as long as
+    // a steady period holds and ticks still come (the latest within a few
+    // periods of now).
+    bool next(double after, double now, Next& next) const {
+      if (!m_valid || now - m_lastSpike > 3.0 * m_period)
+        return false;
+      const double k = std::ceil((after - (m_base + m_phaseHi)) / m_period);
+      next.lo = m_base + m_phaseLo + k * m_period;
+      next.hi = m_base + m_phaseHi + k * m_period;
+      if (next.hi <= after) {
+        next.lo += m_period;
+        next.hi += m_period;
+      }
+      next.tickCpuMs = m_tickCpuMs;
+      next.normalCpuMs = m_normalCpuMs;
+      next.normalMedianMs = m_normalMedianMs;
+      return true;
+    }
+
+    bool valid() const { return m_valid; }
+    double periodMs() const { return m_valid ? m_period : 0.0; }
+    double windowMs() const { return m_valid ? m_phaseHi - m_phaseLo : 0.0; }
+
+  private:
+    static constexpr uint32_t kFrames = 256;
+    static constexpr uint32_t kSpikes = 48;
+    static constexpr uint32_t kMinSpikes = 16;
+    static constexpr double   kMaxFrameMs = 50.0;
+    // Steps of 0.002 ms the periods as many spikes agree at may lie apart.
+    static constexpr int      kPeriodSteps = 50;
+
+    struct Spike {
+      double lo, hi, cpu;   // the frame before began at lo, the tick frame at hi
+    };
+
+    void refreshThresholds() {
+      double sorted[kFrames];
+      std::copy(m_cpu, m_cpu + kFrames, sorted);
+      std::sort(sorted, sorted + kFrames);
+      const double median = sorted[kFrames / 2];
+      m_spikeMs = median + (std::max)(1.5, median * 0.5);
+      // The other frames' times, without the spikes.
+      const uint32_t normal = uint32_t(std::upper_bound(sorted, sorted + kFrames, m_spikeMs) - sorted);
+      if (normal) {
+        m_normalCpuMs = sorted[normal * 9 / 10];
+        m_normalMedianMs = sorted[normal / 2];
+      }
+      std::copy(m_intervals, m_intervals + kFrames, sorted);
+      std::nth_element(sorted, sorted + kFrames / 2, sorted + kFrames);
+      m_frameMs = sorted[kFrames / 2];
+    }
+
+    // Finds the period around the spikes' median spacing at which the most
+    // spikes agree on the phase of the ticks: each spike says the tick lay
+    // after the frame before began and no later than the tick frame began.
+    void fit() {
+      const uint32_t count = uint32_t((std::min<uint64_t>)(m_spikeCount, kSpikes));
+      Spike spikes[kSpikes];
+      for (uint32_t i = 0; i < count; i++)
+        spikes[i] = m_spikes[(m_spikeCount - count + i) % kSpikes];
+      double gaps[kSpikes], cpus[kSpikes];
+      for (uint32_t i = 0; i < count; i++) {
+        gaps[i] = i ? spikes[i].hi - spikes[i - 1].hi : 0.0;
+        cpus[i] = spikes[i].cpu;
+      }
+      std::sort(gaps + 1, gaps + count);
+      std::sort(cpus, cpus + count);
+      const double spacing = gaps[1 + (count - 1) / 2];
+      const double frame = m_frameMs;
+      m_valid = false;
+      // Ticks are slower than frames, and a tick frame must take clearly
+      // longer than the others for planning to help.
+      if (frame <= 0.0 || spacing < 2.0 * frame || spacing > 2000.0)
+        return;
+      m_tickCpuMs = cpus[count * 9 / 10];
+      if (cpus[count / 2] < m_normalCpuMs + 1.0)
+        return;
+      const double base = spikes[count - 1].hi;
+      Agreement best;
+      const bool refine = m_period > 0.0 && std::abs(m_period - spacing) < frame;
+      if (refine)
+        best = agreement(spikes, count, base, m_period, best);
+      // Steps of 0.002 ms around the period found before, if it still
+      // holds; else first coarse steps (0.05 ms, at most 100) across the
+      // spacing give or take a frame. (A period costs some 3 us.)
+      double around = 0.02;
+      if (!refine || best.count < count * 9 / 10) {
+        const double coarse = (std::max)(0.05, frame / 50.0);
+        for (double period = spacing - frame; period <= spacing + frame; period += coarse) {
+          const Agreement a = agreement(spikes, count, base, period, best);
+          if (a.better(best))
+            best = a;
+        }
+        around = coarse;
+      }
+      const double center = best.period;
+      for (double period = center - around; period <= center + around; period += 0.002) {
+        const Agreement a = agreement(spikes, count, base, period, best);
+        if (a.better(best))
+          best = a;
+      }
+      if (best.count < count * 85 / 100)
+        return;
+      // Every period as many spikes agree at, and the next tick's window
+      // over all of them: with spikes at few phases of the frames (ticks
+      // every so many frames exactly) the windows span most of a frame, and
+      // the narrowest of them says nothing. The narrowest lies at an end of
+      // those periods (the spikes' windows tilt against each other), the
+      // middle is the better guess.
+      double lo = base + best.period + best.phaseLo, hi = base + best.period + best.phaseHi;
+      double periods[2] = { best.period, best.period };
+      for (int side = 0; side < 2; side++) {
+        const double direction = side ? 0.002 : -0.002;
+        int steps = 0;
+        for (; steps < kPeriodSteps; steps++) {
+          const Agreement a = agreement(spikes, count, base, best.period + direction * (steps + 1), best);
+          if (a.count < best.count)
+            break;
+          periods[side] = a.period;
+          lo = (std::min)(lo, base + a.period + a.phaseLo);
+          hi = (std::max)(hi, base + a.period + a.phaseHi);
+        }
+        if (steps == kPeriodSteps)
+          return;
+      }
+      if (hi - lo > frame * 0.5)
+        return;
+      Agreement middle = agreement(spikes, count, base, 0.5 * (periods[0] + periods[1]), Agreement());
+      if (middle.count < best.count)
+        middle = best;
+      if (middle.phaseHi - middle.phaseLo > frame * 0.25)
+        return;
+      m_period = middle.period;
+      m_base = base;
+      m_phaseLo = middle.phaseLo;
+      m_phaseHi = middle.phaseHi;
+      m_valid = true;
+    }
+
+    struct Agreement {
+      uint32_t count = 0;
+      double   period = 0.0, phaseLo = 0.0, phaseHi = 0.0;
+      bool better(const Agreement& other) const {
+        return count > other.count || (count == other.count && phaseHi - phaseLo < other.phaseHi - other.phaseLo);
+      }
+    };
+
+    // How many spikes agree on one phase of the ticks at this period, and the
+    // phase window they leave (relative to base).
+    // Only windows of a point at least as good as `beat` are worked out.
+    static Agreement agreement(const Spike* spikes, uint32_t count, double base, double period, const Agreement& beat) {
+      // Each spike's window (lo, hi], moved by whole periods next to base,
+      // where the windows of the spikes that agree overlap.
+      double lo[kSpikes], hi[kSpikes], los[kSpikes], his[kSpikes];
+      for (uint32_t i = 0; i < count; i++) {
+        const double k = std::round((base - spikes[i].hi) / period);
+        hi[i] = his[i] = spikes[i].hi + k * period - base;
+        lo[i] = los[i] = hi[i] - (spikes[i].hi - spikes[i].lo);
+      }
+      std::sort(los, los + count);
+      std::sort(his, his + count);
+      // The point inside the most windows lies at a window's end: inside
+      // are the windows that begin before it, but for those that end before.
+      auto inside = [&](double x) {
+        return uint32_t(std::lower_bound(los, los + count, x) - los) - uint32_t(std::lower_bound(his, his + count, x) - his);
+      };
+      uint32_t most = 0;
+      for (uint32_t c = 0; c < count; c++)
+        most = (std::max)(most, inside(his[c]));
+      Agreement best;
+      best.period = period;
+      best.count = most;
+      best.phaseLo = -1e9;
+      best.phaseHi = 1e9;
+      if (most < beat.count)
+        return best;
+      best.count = 0;
+      // Of the points inside that many, the one whose windows leave the
+      // narrowest phase.
+      for (uint32_t c = 0; c < count; c++) {
+        if ((c && his[c] == his[c - 1]) || inside(his[c]) != most)
+          continue;
+        Agreement a;
+        a.count = most;
+        a.period = period;
+        a.phaseLo = -1e9;
+        a.phaseHi = 1e9;
+        for (uint32_t i = 0; i < count; i++) {
+          if (lo[i] < his[c] && his[c] <= hi[i]) {
+            a.phaseLo = (std::max)(a.phaseLo, lo[i]);
+            a.phaseHi = (std::min)(a.phaseHi, hi[i]);
+          }
+        }
+        if (a.better(best))
+          best = a;
+      }
+      return best;
+    }
+
+    double   m_cpu[kFrames] = {};
+    double   m_intervals[kFrames] = {};   // from the frame before's start
+    double   m_frameMs = 0.0;             // their median
+    uint64_t m_frames = 0;
+    Spike    m_spikes[kSpikes] = {};
+    uint64_t m_spikeCount = 0;
+    double   m_spikeMs = 1e9;
+    double   m_normalCpuMs = 0.0, m_normalMedianMs = 0.0, m_tickCpuMs = 0.0;
+    double   m_lastSpike = 0.0;
+    uint32_t m_failedFits = 0;
+    bool     m_valid = false;
+    double   m_period = 0.0, m_base = 0.0, m_phaseLo = 0.0, m_phaseHi = 0.0;
+  };
+
   // dxgi.maxFrameRate: at most so many frames a second, on a grid of even
   // steps, so that the average stays at the limit. A frame later than a step
   // lets the next one catch up, or starts the grid anew.
@@ -267,12 +521,42 @@ namespace dxup::d3d12 {
     bool enabled() const { return m_step != 0; }
 
     // How long this frame has to wait from `now` (QPC); the next is counted
-    // from the moment it may go.
-    double waitMs(int64_t now) {
+    // from the moment it may go. With ticks (the latency limiter of a
+    // fixed-step game loop) the frames before a tick begin early enough, one
+    // after the other, that the tick frame, which takes longer, still
+    // presents on time; each frame that began early waits at Present for the
+    // time it would have presented at (presentTarget).
+    double waitMs(int64_t now, const TickPredictor* ticks = nullptr) {
       if (!m_step)
         return 0.0;
       const int64_t due = (std::max)(m_next, m_released + m_shortestStep);
-      const int64_t released = (std::max)(due, now);
+      int64_t release = due;
+      m_presentTarget = 0;
+      TickPredictor::Next tick;
+      if (ticks && m_released && ticks->next(double(m_released) * m_msPerTick, double(now) * m_msPerTick, tick)) {
+        const double step = double(m_step) * m_msPerTick;
+        const double grid = double(due) * m_msPerTick;
+        const double longer = tick.tickCpuMs - tick.normalMedianMs;
+        // The tick frame: the first whose start on the grid, earlier by how
+        // much longer it takes, lies after the tick.
+        int frames = 0;
+        while (frames < kTickHorizon && grid + frames * step - longer < tick.hi)
+          frames++;
+        if (frames < kTickHorizon) {
+          double start = grid + frames * step - longer;
+          // The frames before it begin before the tick, each done before
+          // the next begins.
+          for (int i = frames - 1; i >= 0; i--)
+            start = (std::min)({ grid + i * step, start - tick.normalCpuMs, tick.lo - kTickMarginMs });
+          const int64_t early = int64_t(start / m_msPerTick);
+          if (early < due) {
+            release = early;
+            m_presentTarget = due + int64_t(tick.normalMedianMs / m_msPerTick);
+            m_earlyFrames++;
+          }
+        }
+      }
+      const int64_t released = (std::max)(release, now);
       m_released = released;
       m_next = (std::max)(m_next, released - m_step) + m_step;
       return double(released - now) * m_msPerTick;
@@ -290,18 +574,128 @@ namespace dxup::d3d12 {
         paceSleep(m_timer, ms, wait);
     }
 
+    // The QPC time before which the frame just let go should not present
+    // (0: whenever it is ready), and how many frames began early so far.
+    int64_t presentTarget() const { return m_presentTarget; }
+    uint64_t earlyFrames() const { return m_earlyFrames; }
+
+    // On the presenting thread: waits until the QPC time target (0: not at
+    // all), for a frame the latency limiter began early.
+    void holdUntil(int64_t target) {
+      if (!target)
+        return;
+      LARGE_INTEGER now;
+      QueryPerformanceCounter(&now);
+      if (now.QuadPart < target)
+        paceSleep(m_timer, double(target - now.QuadPart) * m_msPerTick,
+          [](HANDLE timer, DWORD timeout) { WaitForSingleObject(timer, timeout); });
+    }
+
   private:
-    double  m_msPerTick = 0.0;
-    int64_t m_step = 0;
-    int64_t m_shortestStep = 0;
-    int64_t m_next = 0;
-    int64_t m_released = 0;
-    HANDLE  m_timer = nullptr;
+    // Frames ahead a tick is planned for, and how long before the tick the
+    // frames before it begin.
+    static constexpr int    kTickHorizon = 8;
+    static constexpr double kTickMarginMs = 0.25;
+
+    double   m_msPerTick = 0.0;
+    int64_t  m_step = 0;
+    int64_t  m_shortestStep = 0;
+    int64_t  m_next = 0;
+    int64_t  m_released = 0;
+    int64_t  m_presentTarget = 0;
+    uint64_t m_earlyFrames = 0;
+    HANDLE   m_timer = nullptr;
+  };
+
+  // dxup_pacing_dump.txt holding a count N: once dxup_pacing_dump_go.txt lies
+  // next to the DLL too, the next N frames' times go to
+  // dxup_pacing_dump_out.csv (ms from the first frame's start): when the
+  // application began each frame (its Present before returned), when it
+  // presented it, how long DXUP held the frame back before it began, when
+  // the real Present returned and when the frame's GPU work ended.
+  class PacingDump {
+  public:
+    void init() {
+      FILE* file = dxupOpenSibling("dxup_pacing_dump.txt", "r");
+      if (!file)
+        return;
+      unsigned count = 0;
+      if (fscanf_s(file, "%u", &count) != 1)
+        count = 0;
+      fclose(file);
+      m_records.resize((std::min)(count, 1u << 20));
+      LARGE_INTEGER frequency;
+      QueryPerformanceFrequency(&frequency);
+      m_msPerTick = 1000.0 / double(frequency.QuadPart);
+    }
+
+    // The frame the application begins now (start), the frame before it
+    // presented at entry, and how long the start was held back.
+    void noteStart(uint64_t frame, int64_t start, int64_t entry, double sleptMs) {
+      if (m_records.empty())
+        return;
+      if (m_first == UINT64_MAX) {
+        if ((frame & 255) != 0 || !dxupSiblingExists("dxup_pacing_dump_go.txt"))
+          return;
+        m_first = frame;
+      }
+      if (frame > m_first && frame - 1 - m_first < m_records.size())
+        m_records[frame - 1 - m_first].entry = entry;
+      if (frame - m_first < m_records.size()) {
+        m_records[frame - m_first].start = start;
+        m_records[frame - m_first].sleptMs = sleptMs;
+      }
+    }
+
+    // A frame the worker presented and the GPU finished.
+    void noteDone(uint64_t frame, int64_t presented, int64_t gpuEnd) {
+      if (m_records.empty() || m_first == UINT64_MAX || frame < m_first)
+        return;
+      if (frame - m_first < m_records.size()) {
+        m_records[frame - m_first].presented = presented;
+        m_records[frame - m_first].gpuEnd = gpuEnd;
+      }
+      if (frame - m_first + 1 == m_records.size())
+        write();
+    }
+
+  private:
+    struct Record {
+      int64_t start = 0, entry = 0, presented = 0, gpuEnd = 0;
+      double  sleptMs = 0.0;
+    };
+
+    void write() {
+      FILE* out = dxupOpenSibling("dxup_pacing_dump_out.csv", "w");
+      if (out) {
+        const int64_t origin = m_records[0].start;
+        auto ms = [&](int64_t t) { return t ? double(t - origin) * m_msPerTick : -1.0; };
+        fprintf(out, "frame,start,entry,slept,presented,gpuEnd\n");
+        for (size_t i = 0; i < m_records.size(); i++) {
+          const Record& r = m_records[i];
+          fprintf(out, "%zu,%.3f,%.3f,%.3f,%.3f,%.3f\n", i, ms(r.start), ms(r.entry), r.sleptMs, ms(r.presented), ms(r.gpuEnd));
+        }
+        fclose(out);
+      }
+      m_records.clear();
+      m_records.shrink_to_fit();
+    }
+
+    std::vector<Record> m_records;
+    uint64_t            m_first = UINT64_MAX;
+    double              m_msPerTick = 0.0;
   };
 
   // A frame behind the grid of the limiter before the real Present follows the
   // one before at this share of a step at the least.
   constexpr double kPresentLimiterShortestStep = 0.9;
+
+  // The latency limiter plans for the ticks of fixed-step game loops, but
+  // with dxup_no_tick_plan.txt next to the DLL (for comparison).
+  inline bool tickPlanning() {
+    static const bool off = dxupSiblingExists("dxup_no_tick_plan.txt");
+    return !off;
+  }
 
   // Before the real Present, on the thread that presents.
   inline double smoothFrameRate() {

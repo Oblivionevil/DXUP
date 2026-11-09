@@ -1245,6 +1245,12 @@ namespace dxup {
     // that waitForFrameLatency can count it.
     virtual void endFrame() {}
 
+    // dxgi.frameLimiter = latency: the QPC time before which the frame being
+    // presented should not reach the display, 0 for as soon as it is ready
+    // (the limiter began it early, ahead of a tick of a fixed-step game
+    // loop). Read on the application thread before endFrame.
+    virtual int64_t framePresentTarget() const { return 0; }
+
     // Runs fn with the context that records the commands, in order with
     // every command issued before. Contexts that record on the calling
     // thread run it right away.

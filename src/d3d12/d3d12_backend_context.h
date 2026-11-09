@@ -290,6 +290,7 @@ namespace dxup::d3d12 {
     void synchronize() override;
     void presentImage(IBackendImage* backBuffer) override;
     void waitForFrameLatency(uint32_t maxLatency) override;
+    int64_t framePresentTarget() const override;
     // The fence value that completes with the latest present (recording
     // thread), and a wait for a fence value any one other thread may call.
     uint64_t getLastPresentFenceValue() const;
@@ -1344,8 +1345,11 @@ namespace dxup::d3d12 {
     FrameTimer m_frameTimer;
     LatencyPacer m_latencyPacer;
     FrameLimiter m_frameLimiter{ latencyFrameRate(), 0.0 };
+    TickPredictor m_ticks;
+    int64_t m_presentTarget = 0;
     uint64_t m_pacedFrame = 0;
     int64_t m_pacingReturn = 0;
+    int64_t m_previousPacingReturn = 0;
     HANDLE m_pacingTimer = nullptr;
     // The wait of waitForFrameLatency for the GPU.
     void waitForPresentFence(uint32_t maxLatency);

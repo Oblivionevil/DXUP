@@ -3546,7 +3546,7 @@ namespace dxup::legacy {
         if (syncPresent) {
           context->executeOnBackend([this](IBackendContext* backend) { preparePresent(backend); });
           context->waitForQueue();
-          limitPresent();
+          limitPresent(context->framePresentTarget());
           const HRESULT hr = m_real->Present(syncInterval, flags);
           m_lastPresentFailed.store(FAILED(hr), std::memory_order_release);
           if (FAILED(hr)) {
@@ -3556,10 +3556,11 @@ namespace dxup::legacy {
           context->executeOnBackend([this](IBackendContext* backend) { retarget(backend); });
           m_lastResult.store(hr, std::memory_order_release);
         } else {
-          context->executeOnBackend([this, syncInterval, flags](IBackendContext* backend) {
+          const int64_t target = context->framePresentTarget();
+          context->executeOnBackend([this, syncInterval, flags, target](IBackendContext* backend) {
             preparePresent(backend);
             backend->waitForQueue();
-            limitPresent();
+            limitPresent(target);
             const int64_t start = hitchTraceEnabled() ? hitchTimestamp() : 0;
             const HRESULT hr = m_real->Present(syncInterval, flags);
             if (FAILED(hr))
@@ -3581,8 +3582,10 @@ namespace dxup::legacy {
     private:
       // dxgi.frameLimiter = smooth: the frame goes out at its step.
       d3d12::FrameLimiter m_presentLimiter{ d3d12::smoothFrameRate(), d3d12::kPresentLimiterShortestStep };
-      void limitPresent() {
+      // target: the time the latency limiter wants the frame presented at.
+      void limitPresent(int64_t target) {
         m_presentLimiter.hold([](HANDLE timer, DWORD timeout) { WaitForSingleObject(timer, timeout); });
+        m_presentLimiter.holdUntil(target);
       }
 
       bool createBuffer() {

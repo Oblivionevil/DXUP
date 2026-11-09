@@ -388,6 +388,7 @@ namespace dxup {
     void presentImage(IBackendImage* backBuffer) override;
     void waitForFrameLatency(uint32_t maxLatency) override;
     void endFrame() override;
+    int64_t framePresentTarget() const override { return m_presentTargets[m_presents % kPresentHistory]; }
     void executeOnBackend(std::function<void(IBackendContext*)> fn) override;
     void waitForWorker() override;
     void waitForQueue() override;
@@ -495,6 +496,11 @@ namespace dxup {
     uint64_t                m_presentIndices[kPresentHistory] = {};
     d3d12::LatencyPacer     m_latencyPacer;
     d3d12::FrameLimiter     m_frameLimiter{ d3d12::latencyFrameRate(), 0.0 };
+    // The latency limiter's view of a fixed-step game loop's ticks, and the
+    // time each frame it began early waits for at Present.
+    d3d12::TickPredictor    m_ticks;
+    int64_t                 m_presentTargets[kPresentHistory] = {};
+    d3d12::PacingDump       m_pacingDump;
     bool                    m_lowLatency = false;
     // dxup_latency_stats.txt (or lowLatency): how long from each frame's
     // start (the return of the Present before) to the end of its GPU work,

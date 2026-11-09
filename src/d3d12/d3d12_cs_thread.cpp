@@ -249,6 +249,8 @@ namespace dxup {
     m_frameEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     m_lowLatency = UserOverrides::get().lowLatency;
     m_latencyStats = static_cast<d3d12::D3D12BackendContext*>(m_real.get())->frameTimingEnabled();
+    if (m_latencyStats)
+      m_pacingDump.init();
     m_worker = Thread([this] { workerMain(); });
   }
 
@@ -1565,8 +1567,14 @@ namespace dxup {
     LARGE_INTEGER frequency, now;
     QueryPerformanceFrequency(&frequency);
     const double msPerTick = 1000.0 / double(frequency.QuadPart);
-    if (m_pacingReturn)
+    if (m_pacingReturn) {
       m_latencyPacer.noteCpuFrame(double(entry - m_pacingReturn) * msPerTick);
+      // The frame just presented began at m_pacingReturn, the one before it
+      // a frame earlier.
+      if (m_frameLimiter.enabled() && m_presents >= 2)
+        m_ticks.noteFrame(double(m_frameStarts[(m_presents - 2) % kPresentHistory]) * msPerTick,
+          double(m_pacingReturn) * msPerTick, double(entry - m_pacingReturn) * msPerTick);
+    }
     // The frames whose GPU work is done (or not counted: frameGpuTiming
     // tells), all of which the worker has finished.
     const uint64_t done = (std::min)(m_presents > maxLatency ? m_presents - maxLatency : 0,
@@ -1587,6 +1595,7 @@ namespace dxup {
           m_frameLatencies.push_back(double(ended - start) * msPerTick);
       }
       const int64_t presented = m_presentDone[m_pacedFrame % kPresentHistory];
+      m_pacingDump.noteDone(m_pacedFrame, presented, ended);
       if (start && presented > start)
         m_presentLatencies.push_back(double((std::max)(presented, ended) - start) * msPerTick);
       if (m_pacedPresentDone && presented > m_pacedPresentDone)
@@ -1595,7 +1604,8 @@ namespace dxup {
     }
     QueryPerformanceCounter(&now);
     const double sleepMs = (std::max)(m_lowLatency && m_pacedGpuEnd
-      ? m_latencyPacer.sleepMs(double(now.QuadPart - m_pacedGpuEnd) * msPerTick) : 0.0, m_frameLimiter.waitMs(now.QuadPart));
+      ? m_latencyPacer.sleepMs(double(now.QuadPart - m_pacedGpuEnd) * msPerTick) : 0.0, m_frameLimiter.waitMs(now.QuadPart, d3d12::tickPlanning() ? &m_ticks : nullptr));
+    m_presentTargets[m_presents % kPresentHistory] = m_frameLimiter.presentTarget();
     if (sleepMs > 0.0) {
       HitchScope hitch("app lowLatency sleep");
       d3d12::paceSleep(m_pacingTimer, sleepMs, [](HANDLE timer, DWORD timeout) { waitTakingSentMessages(timer, timeout); });
@@ -1621,9 +1631,10 @@ namespace dxup {
       // The marker asks for them; else with the info log.
       static const bool asked = dxupSiblingExists("dxup_latency_stats.txt");
       logMessage(asked ? LogLevel::Warn : LogLevel::Info, "frame latency: frame start to GPU done %.2f ms (p95 %.2f), to Present and GPU done %.2f ms (p95 %.2f), Present every %.2f ms (p99 %.2f) over %zu frames; "
-        "low latency %s: held back %.3f ms a frame, margin %.2f ms, %llu frames late so far",
+        "low latency %s: held back %.3f ms a frame, margin %.2f ms, %llu frames late so far; ticks every %.3f ms, %llu frames began early",
         median, p95, presentMedian, presentP95, intervalMedian, intervalP99, m_frameLatencies.size(), m_lowLatency ? "on" : "off", m_pacingSleptMs / m_pacingFrames,
-        m_latencyPacer.marginMs(), static_cast<unsigned long long>(m_latencyPacer.lateFrames()));
+        m_latencyPacer.marginMs(), static_cast<unsigned long long>(m_latencyPacer.lateFrames()), m_ticks.periodMs(),
+        static_cast<unsigned long long>(m_frameLimiter.earlyFrames()));
       m_frameLatencies.clear();
       m_presentLatencies.clear();
       m_presentIntervals.clear();
@@ -1634,6 +1645,7 @@ namespace dxup {
     m_pacingReturn = now.QuadPart;
     // The application starts frame m_presents now.
     m_frameStarts[m_presents % kPresentHistory] = now.QuadPart;
+    m_pacingDump.noteStart(m_presents, now.QuadPart, entry, sleepMs);
   }
 
   void CsThreadContext::executeOnBackend(std::function<void(IBackendContext*)> fn) {
