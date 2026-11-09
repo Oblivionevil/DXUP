@@ -2161,9 +2161,9 @@ namespace dxup {
       }
 
       // Create a proxy render target that the game renders to instead of
-      // directly using swap chain buffers.  This proxy has ALLOW_RENDER_TARGET
-      // and ALLOW_UNORDERED_ACCESS so the game can use it for both RT and
-      // compute UAV operations.  At Present time we copy proxy → current BB.
+      // directly using swap chain buffers (unordered access as the
+      // application's buffer usage allows). At Present time we copy proxy →
+      // current BB.
       if (!m_proxyRenderTarget && bufferCount > 0 && m_d3d11Device && !createDirectBackBuffer(bufferCount)) {
         ComPtr<ID3D12Resource> d3d12Res;
         HRESULT hr = m_realSwapChain->GetBuffer(0,
@@ -2188,7 +2188,11 @@ namespace dxup {
           proxyDesc.sampleCount   = m_d3d11Device->EnhancedSampleCount(proxyFormat, m_appSampleDesc.Count);
           proxyDesc.sampleQuality = proxyDesc.sampleCount == m_appSampleDesc.Count ? m_appSampleDesc.Quality : 0;
           proxyDesc.bindFlags     = BindFlags::RenderTarget | BindFlags::ShaderResource;
-          if (!multisampled && !isSrgbFormat(proxyFormat))
+          // Unordered access only when the application asked for it
+          // (DXGI_USAGE_UNORDERED_ACCESS; DXGI gives buffers none else): an
+          // AMD Radeon RX 9070 XT draws into a target without it a little
+          // faster (Heroes of the Storm 0.01-0.015 ms a frame).
+          if (!multisampled && !isSrgbFormat(proxyFormat) && m_appUnorderedAccess)
             proxyDesc.bindFlags = proxyDesc.bindFlags | BindFlags::UnorderedAccess;
           // Games render to UNORM buffers through sRGB views.
           proxyDesc.miscFlags = kResourceMiscCastable;
@@ -2233,8 +2237,9 @@ namespace dxup {
             proxyTex->QueryInterface(__uuidof(IUnknown), reinterpret_cast<void**>(unknown.GetAddressOf()));
             m_proxyRenderTarget = unknown;
             proxyTex->Release();
-            logMessage(LogLevel::Info, "Created proxy render target: %ux%u fmt=%u (RT+UAV+SRV)",
-              proxyDesc.width, proxyDesc.height, static_cast<uint32_t>(proxyDesc.format));
+            logMessage(LogLevel::Info, "Created proxy render target: %ux%u fmt=%u (RT+SRV%s)",
+              proxyDesc.width, proxyDesc.height, static_cast<uint32_t>(proxyDesc.format),
+              static_cast<uint32_t>(proxyDesc.bindFlags & BindFlags::UnorderedAccess) ? "+UAV" : "");
           } else {
             logMessage(LogLevel::Error, "Failed to create proxy render target!");
           }
