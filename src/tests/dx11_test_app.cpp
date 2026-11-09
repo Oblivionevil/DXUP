@@ -466,6 +466,7 @@ void main(uint2 id : SV_DispatchThreadID) {
         {"unrelated_transition_gpu_cost", &Dx11TestApp::testUnrelatedTransitionGpuCost},
         {"heavy_pass_chain_gpu_cost", &Dx11TestApp::testHeavyPassChainGpuCost},
         {"clear_gpu_cost", &Dx11TestApp::testClearGpuCost},
+        {"clear_skip", &Dx11TestApp::testClearSkip},
         {"glow_chain_gpu_cost", &Dx11TestApp::testGlowChainGpuCost},
         {"pixel_output_masks", &Dx11TestApp::testPixelOutputMasks},
         {"pixel_output_masks_later", &Dx11TestApp::testPixelOutputMasksLater},
@@ -19129,6 +19130,307 @@ float4 main(float4 p : SV_Position) : SV_Target { return value; }
       std::printf("  clear gpu (4K): depth 1 %.1f us, depth 0 %.1f us, color zero %.1f us, color other %.1f us, "
         "alternating color %.1f us, alternating depth %.1f us%c",
         depthOne, depthZero, colorZero, colorOther, colorAlternating, depthAlternating, 10);
+      return true;
+    }
+
+    // DXUP leaves out clears that repeat what their target holds, as
+    // Direct3D 11's drivers do. Every way of writing a target between two
+    // equal clears must make the second one happen: each case clears red,
+    // writes the target, clears red again and reads red.
+    bool testClearSkip(std::string& error) {
+      static const char* kVs = "float4 main(uint id : SV_VertexID) : SV_Position {"
+        " float2 p = float2((id << 1) & 2, id & 2); return float4(p * float2(2, -2) + float2(-1, 1), 0.5, 1); }";
+      static const char* kPs = "float4 main() : SV_Target { return float4(0, 1, 0, 1); }";
+      static const char* kCs = "RWTexture2D<unorm float4> t : register(u0);"
+        " [numthreads(8, 8, 1)] void main(uint3 id : SV_DispatchThreadID) { t[id.xy] = float4(0, 0, 1, 1); }";
+      ComPtr<ID3D11VertexShader> vs;
+      ComPtr<ID3DBlob> vsBytecode;
+      ComPtr<ID3D11PixelShader> ps;
+      ComPtr<ID3D11ComputeShader> cs;
+      if (!createVertexShader(kVs, "main", vs, vsBytecode, error) || !createPixelShader(kPs, "main", ps, error)
+       || !createComputeShader(kCs, "main", cs, error))
+        return false;
+
+      D3D11_TEXTURE2D_DESC desc = { 8, 8, 1, 1, DXGI_FORMAT_R8G8B8A8_TYPELESS, { 1, 0 }, D3D11_USAGE_DEFAULT,
+        D3D11_BIND_RENDER_TARGET | D3D11_BIND_UNORDERED_ACCESS, 0, 0 };
+      std::vector<uint32_t> bluePixels(64, 0xffff0000u);
+      const D3D11_SUBRESOURCE_DATA blueData = { bluePixels.data(), 8 * 4, 0 };
+      ComPtr<ID3D11Texture2D> target, blue, msaa, mips, depth;
+      ComPtr<ID3D11RenderTargetView> rtv, srgbRtv, msaaRtv, mip0Rtv, mip1Rtv;
+      ComPtr<ID3D11UnorderedAccessView> uav;
+      ComPtr<ID3D11ShaderResourceView> mipsSrv;
+      ComPtr<ID3D11DepthStencilView> dsv;
+      HRESULT hr = m_device->CreateTexture2D(&desc, nullptr, target.GetAddressOf());
+      D3D11_RENDER_TARGET_VIEW_DESC rtvDesc = {};
+      rtvDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+      rtvDesc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+      if (SUCCEEDED(hr)) hr = m_device->CreateRenderTargetView(target.Get(), &rtvDesc, rtv.GetAddressOf());
+      rtvDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+      if (SUCCEEDED(hr)) hr = m_device->CreateRenderTargetView(target.Get(), &rtvDesc, srgbRtv.GetAddressOf());
+      D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc = {};
+      uavDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+      uavDesc.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
+      if (SUCCEEDED(hr)) hr = m_device->CreateUnorderedAccessView(target.Get(), &uavDesc, uav.GetAddressOf());
+      desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+      if (SUCCEEDED(hr)) hr = m_device->CreateTexture2D(&desc, &blueData, blue.GetAddressOf());
+      desc.BindFlags = D3D11_BIND_RENDER_TARGET;
+      desc.SampleDesc.Count = 4;
+      if (SUCCEEDED(hr)) hr = m_device->CreateTexture2D(&desc, nullptr, msaa.GetAddressOf());
+      rtvDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+      rtvDesc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2DMS;
+      if (SUCCEEDED(hr)) hr = m_device->CreateRenderTargetView(msaa.Get(), &rtvDesc, msaaRtv.GetAddressOf());
+      D3D11_TEXTURE2D_DESC mipDesc = { 8, 8, 2, 1, DXGI_FORMAT_R8G8B8A8_UNORM, { 1, 0 }, D3D11_USAGE_DEFAULT,
+        D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE, 0, D3D11_RESOURCE_MISC_GENERATE_MIPS };
+      if (SUCCEEDED(hr)) hr = m_device->CreateTexture2D(&mipDesc, nullptr, mips.GetAddressOf());
+      rtvDesc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+      rtvDesc.Texture2D.MipSlice = 0;
+      if (SUCCEEDED(hr)) hr = m_device->CreateRenderTargetView(mips.Get(), &rtvDesc, mip0Rtv.GetAddressOf());
+      rtvDesc.Texture2D.MipSlice = 1;
+      if (SUCCEEDED(hr)) hr = m_device->CreateRenderTargetView(mips.Get(), &rtvDesc, mip1Rtv.GetAddressOf());
+      if (SUCCEEDED(hr)) hr = m_device->CreateShaderResourceView(mips.Get(), nullptr, mipsSrv.GetAddressOf());
+      D3D11_TEXTURE2D_DESC depthDesc = { 8, 8, 1, 1, DXGI_FORMAT_R24G8_TYPELESS, { 1, 0 }, D3D11_USAGE_DEFAULT,
+        D3D11_BIND_DEPTH_STENCIL, 0, 0 };
+      if (SUCCEEDED(hr)) hr = m_device->CreateTexture2D(&depthDesc, nullptr, depth.GetAddressOf());
+      D3D11_DEPTH_STENCIL_VIEW_DESC dsvDesc = {};
+      dsvDesc.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+      dsvDesc.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
+      if (SUCCEEDED(hr)) hr = m_device->CreateDepthStencilView(depth.Get(), &dsvDesc, dsv.GetAddressOf());
+      ComPtr<ID3D11DepthStencilState> depthWrite, depthTest, stencilReplace;
+      ComPtr<ID3D11BlendState> noColor;
+      D3D11_DEPTH_STENCIL_DESC dsDesc = {};
+      dsDesc.DepthEnable = TRUE;
+      dsDesc.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL;
+      dsDesc.DepthFunc = D3D11_COMPARISON_ALWAYS;
+      dsDesc.FrontFace = { D3D11_STENCIL_OP_KEEP, D3D11_STENCIL_OP_KEEP, D3D11_STENCIL_OP_REPLACE, D3D11_COMPARISON_ALWAYS };
+      dsDesc.BackFace = dsDesc.FrontFace;
+      if (SUCCEEDED(hr)) hr = m_device->CreateDepthStencilState(&dsDesc, depthWrite.GetAddressOf());
+      dsDesc.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO;
+      if (SUCCEEDED(hr)) hr = m_device->CreateDepthStencilState(&dsDesc, depthTest.GetAddressOf());
+      dsDesc.DepthEnable = FALSE;
+      dsDesc.StencilEnable = TRUE;
+      dsDesc.StencilReadMask = 0xff;
+      dsDesc.StencilWriteMask = 0xff;
+      if (SUCCEEDED(hr)) hr = m_device->CreateDepthStencilState(&dsDesc, stencilReplace.GetAddressOf());
+      D3D11_BLEND_DESC blendDesc = {};
+      blendDesc.RenderTarget[0].SrcBlend = D3D11_BLEND_ONE;
+      blendDesc.RenderTarget[0].DestBlend = D3D11_BLEND_ZERO;
+      blendDesc.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
+      blendDesc.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
+      blendDesc.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ZERO;
+      blendDesc.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+      blendDesc.RenderTarget[0].RenderTargetWriteMask = 0;
+      if (SUCCEEDED(hr)) hr = m_device->CreateBlendState(&blendDesc, noColor.GetAddressOf());
+      if (FAILED(hr)) {
+        error = "resources failed: " + formatHResult(hr);
+        return false;
+      }
+
+      // The first texel of a subresource.
+      auto readTexel = [&](ID3D11Texture2D* texture, UINT subresource, uint32_t& texel) {
+        D3D11_TEXTURE2D_DESC stagingDesc = {};
+        texture->GetDesc(&stagingDesc);
+        stagingDesc.Usage = D3D11_USAGE_STAGING;
+        stagingDesc.BindFlags = 0;
+        stagingDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        stagingDesc.MiscFlags = 0;
+        ComPtr<ID3D11Texture2D> staging;
+        HRESULT result = m_device->CreateTexture2D(&stagingDesc, nullptr, staging.GetAddressOf());
+        if (FAILED(result)) {
+          error = "staging texture failed: " + formatHResult(result);
+          return false;
+        }
+        m_context->CopyResource(staging.Get(), texture);
+        D3D11_MAPPED_SUBRESOURCE mapped = {};
+        if (FAILED(result = m_context->Map(staging.Get(), subresource, D3D11_MAP_READ, 0, &mapped))) {
+          error = "Map failed: " + formatHResult(result);
+          return false;
+        }
+        texel = *static_cast<const uint32_t*>(mapped.pData);
+        m_context->Unmap(staging.Get(), subresource);
+        return true;
+      };
+      auto expectTexel = [&](ID3D11Texture2D* texture, UINT subresource, uint32_t expected, const char* step) {
+        uint32_t texel = 0;
+        if (!readTexel(texture, subresource, texel))
+          return false;
+        if (texel != expected) {
+          error = formatString("%s: reads %08X, expected %08X", step, texel, expected);
+          return false;
+        }
+        return true;
+      };
+      // A full-screen triangle at depth 0.5, green; binds the targets first
+      // unless bind is false.
+      auto drawGreen = [&](ID3D11DeviceContext* context, ID3D11RenderTargetView* color, ID3D11DepthStencilView* depthView,
+                           bool bind = true) {
+        if (bind)
+          context->OMSetRenderTargets(color ? 1 : 0, color ? &color : nullptr, depthView);
+        const D3D11_VIEWPORT viewport = { 0.0f, 0.0f, 8.0f, 8.0f, 0.0f, 1.0f };
+        context->RSSetViewports(1, &viewport);
+        context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        context->VSSetShader(vs.Get(), nullptr, 0);
+        context->PSSetShader(ps.Get(), nullptr, 0);
+        context->Draw(3, 0);
+      };
+      const float red[4] = { 1.0f, 0.0f, 0.0f, 1.0f }, blueColor[4] = { 0.0f, 0.0f, 1.0f, 1.0f };
+      constexpr uint32_t kRed = 0xff0000ffu;
+      ID3D11RenderTargetView* rt = rtv.Get();
+
+      m_context->ClearState();
+      m_context->ClearRenderTargetView(rtv.Get(), red);
+      m_context->ClearRenderTargetView(rtv.Get(), red);
+      if (!expectTexel(target.Get(), 0, kRed, "two clears"))
+        return false;
+
+      // Bound before the clear, drawn without binding again; a clear left
+      // out in between keeps that.
+      m_context->ClearState();
+      m_context->OMSetRenderTargets(1, &rt, nullptr);
+      m_context->ClearRenderTargetView(rtv.Get(), red);
+      m_context->ClearRenderTargetView(rtv.Get(), red);
+      drawGreen(m_context.Get(), rtv.Get(), nullptr, false);
+      m_context->ClearRenderTargetView(rtv.Get(), red);
+      if (!expectTexel(target.Get(), 0, kRed, "draw, target bound before the clears"))
+        return false;
+
+      m_context->ClearState();
+      m_context->ClearRenderTargetView(rtv.Get(), red);
+      drawGreen(m_context.Get(), rtv.Get(), nullptr);
+      m_context->ClearRenderTargetView(rtv.Get(), red);
+      if (!expectTexel(target.Get(), 0, kRed, "draw, target bound after the clear"))
+        return false;
+
+      // A draw that writes no color leaves the target alone; the one after
+      // it writes.
+      m_context->ClearState();
+      m_context->ClearRenderTargetView(rtv.Get(), red);
+      m_context->OMSetBlendState(noColor.Get(), nullptr, 0xffffffffu);
+      drawGreen(m_context.Get(), rtv.Get(), nullptr);
+      m_context->ClearRenderTargetView(rtv.Get(), red);
+      if (!expectTexel(target.Get(), 0, kRed, "draw without color writes"))
+        return false;
+      m_context->ClearRenderTargetView(rtv.Get(), red);
+      drawGreen(m_context.Get(), rtv.Get(), nullptr);
+      m_context->OMSetBlendState(nullptr, nullptr, 0xffffffffu);
+      drawGreen(m_context.Get(), rtv.Get(), nullptr);
+      m_context->ClearRenderTargetView(rtv.Get(), red);
+      if (!expectTexel(target.Get(), 0, kRed, "draw after a draw without color writes"))
+        return false;
+
+      m_context->ClearState();
+      m_context->ClearRenderTargetView(rtv.Get(), red);
+      m_context->CopyResource(target.Get(), blue.Get());
+      m_context->ClearRenderTargetView(rtv.Get(), red);
+      if (!expectTexel(target.Get(), 0, kRed, "copy"))
+        return false;
+
+      m_context->ClearRenderTargetView(rtv.Get(), red);
+      m_context->UpdateSubresource(target.Get(), 0, nullptr, bluePixels.data(), 8 * 4, 0);
+      m_context->ClearRenderTargetView(rtv.Get(), red);
+      if (!expectTexel(target.Get(), 0, kRed, "UpdateSubresource"))
+        return false;
+
+      m_context->ClearRenderTargetView(rtv.Get(), red);
+      m_context->CSSetShader(cs.Get(), nullptr, 0);
+      ID3D11UnorderedAccessView* uavs[1] = { uav.Get() };
+      m_context->CSSetUnorderedAccessViews(0, 1, uavs, nullptr);
+      m_context->Dispatch(1, 1, 1);
+      uavs[0] = nullptr;
+      m_context->CSSetUnorderedAccessViews(0, 1, uavs, nullptr);
+      m_context->ClearRenderTargetView(rtv.Get(), red);
+      if (!expectTexel(target.Get(), 0, kRed, "compute shader"))
+        return false;
+
+      m_context->ClearRenderTargetView(rtv.Get(), red);
+      m_context->ClearRenderTargetView(msaaRtv.Get(), blueColor);
+      m_context->ResolveSubresource(target.Get(), 0, msaa.Get(), 0, DXGI_FORMAT_R8G8B8A8_UNORM);
+      m_context->ClearRenderTargetView(rtv.Get(), red);
+      if (!expectTexel(target.Get(), 0, kRed, "resolve"))
+        return false;
+
+      ComPtr<ID3D11DeviceContext> deferred;
+      ComPtr<ID3D11CommandList> commandList;
+      if (FAILED(hr = m_device->CreateDeferredContext(0, deferred.GetAddressOf()))) {
+        error = "CreateDeferredContext failed: " + formatHResult(hr);
+        return false;
+      }
+      m_context->ClearRenderTargetView(rtv.Get(), red);
+      drawGreen(deferred.Get(), rtv.Get(), nullptr);
+      if (FAILED(hr = deferred->FinishCommandList(FALSE, commandList.GetAddressOf()))) {
+        error = "FinishCommandList failed: " + formatHResult(hr);
+        return false;
+      }
+      m_context->ExecuteCommandList(commandList.Get(), FALSE);
+      m_context->ClearRenderTargetView(rtv.Get(), red);
+      if (!expectTexel(target.Get(), 0, kRed, "deferred context"))
+        return false;
+
+      ComPtr<ID3D11DeviceContext1> context1;
+      if (SUCCEEDED(m_context.As(&context1))) {
+        m_context->ClearRenderTargetView(rtv.Get(), red);
+        const D3D11_RECT rect = { 0, 0, 1, 1 };
+        context1->ClearView(rtv.Get(), blueColor, &rect, 1);
+        m_context->ClearRenderTargetView(rtv.Get(), red);
+        if (!expectTexel(target.Get(), 0, kRed, "ClearView of a rect"))
+          return false;
+      }
+
+      // The same values through an sRGB view are other bits. (Windows' AMD
+      // driver leaves this clear out too, comparing the values only: checked
+      // with DXUP's d3d11.dll, next to the program.)
+      wchar_t exePath[MAX_PATH] = {}, d3d11Path[MAX_PATH] = {};
+      HMODULE d3d11Module = GetModuleHandleW(L"d3d11.dll");
+      const DWORD exeLength = GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+      const DWORD d3d11Length = d3d11Module ? GetModuleFileNameW(d3d11Module, d3d11Path, MAX_PATH) : 0;
+      const wchar_t* exeName = std::wcsrchr(exePath, L'\\');
+      const wchar_t* d3d11Name = std::wcsrchr(d3d11Path, L'\\');
+      const bool dxupD3d11 = exeLength && d3d11Length && exeName && d3d11Name && exeName - exePath == d3d11Name - d3d11Path
+        && !_wcsnicmp(exePath, d3d11Path, size_t(exeName - exePath));
+      const float gray[4] = { 0.5f, 0.5f, 0.5f, 1.0f };
+      m_context->ClearRenderTargetView(rtv.Get(), gray);
+      m_context->ClearRenderTargetView(srgbRtv.Get(), gray);
+      uint32_t texel = 0;
+      if (!readTexel(target.Get(), 0, texel))
+        return false;
+      if (dxupD3d11 && ((texel & 0xff) < 0xba || (texel & 0xff) > 0xbe)) {
+        error = formatString("sRGB view after the UNORM view: reads %08X, expected red near BC", texel);
+        return false;
+      }
+
+      m_context->ClearRenderTargetView(mip1Rtv.Get(), red);
+      m_context->ClearRenderTargetView(mip0Rtv.Get(), blueColor);
+      m_context->GenerateMips(mipsSrv.Get());
+      m_context->ClearRenderTargetView(mip1Rtv.Get(), red);
+      if (!expectTexel(mips.Get(), 1, kRed, "GenerateMips"))
+        return false;
+
+      // Depth and stencil, each plane on its own: depth 1 is 00FFFFFF with
+      // stencil 0.
+      m_context->ClearState();
+      m_context->ClearDepthStencilView(dsv.Get(), D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.0f, 0);
+      m_context->OMSetDepthStencilState(depthWrite.Get(), 0);
+      drawGreen(m_context.Get(), nullptr, dsv.Get());
+      m_context->ClearDepthStencilView(dsv.Get(), D3D11_CLEAR_DEPTH, 1.0f, 0);
+      if (!expectTexel(depth.Get(), 0, 0x00ffffffu, "depth written"))
+        return false;
+      m_context->OMSetDepthStencilState(depthTest.Get(), 0);
+      drawGreen(m_context.Get(), nullptr, dsv.Get());
+      m_context->ClearDepthStencilView(dsv.Get(), D3D11_CLEAR_DEPTH, 1.0f, 0);
+      m_context->OMSetDepthStencilState(depthWrite.Get(), 0);
+      drawGreen(m_context.Get(), nullptr, dsv.Get());
+      m_context->ClearDepthStencilView(dsv.Get(), D3D11_CLEAR_DEPTH, 1.0f, 0);
+      if (!expectTexel(depth.Get(), 0, 0x00ffffffu, "depth written after a depth test"))
+        return false;
+      m_context->OMSetDepthStencilState(stencilReplace.Get(), 7);
+      drawGreen(m_context.Get(), nullptr, dsv.Get());
+      m_context->ClearDepthStencilView(dsv.Get(), D3D11_CLEAR_STENCIL, 1.0f, 0);
+      if (!expectTexel(depth.Get(), 0, 0x00ffffffu, "stencil written"))
+        return false;
+      // The depth repeats, the stencil does not.
+      m_context->ClearDepthStencilView(dsv.Get(), D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.0f, 5);
+      if (!expectTexel(depth.Get(), 0, 0x05ffffffu, "stencil cleared, depth repeated"))
+        return false;
+      m_context->ClearState();
       return true;
     }
 

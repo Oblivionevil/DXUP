@@ -213,6 +213,8 @@ namespace dxup {
 
     void onCopy() { m_cur.copies++; }
     void onClear() { m_cur.clears++; }
+    // A clear left out: the target held its values already.
+    void onClearSkipped() { m_clearsSkipped++; }
 
     // A barrier batch classified by BarrierAccessTracker (0 written, 1 read,
     // 2 neither: it could have gone with the batch before).
@@ -484,6 +486,7 @@ namespace dxup {
       fprintf(out, "barrier batches per frame: %.1f transition what the work since the batch before wrote, %.1f what it "
         "only read, %.1f neither (could go with the batch before)\n", double(m_batchKinds[0]) / n, double(m_batchKinds[1]) / n,
         double(m_batchKinds[2]) / n);
+      fprintf(out, "clears left out per frame (the target held their values already): %.1f\n", double(m_clearsSkipped) / n);
       fprintf(out, "\nper frame by pass kind: ms passes draws dispatches copies clears barriers batches submits mid-pass | pass\n");
       for (const auto& s : sorted)
         fprintf(out, "%7.3f %6.1f %7.1f %6.1f %6.1f %6.1f %7.1f %6.1f %5.2f %5.1f | %s\n", s.second.ms / n,
@@ -528,6 +531,7 @@ namespace dxup {
     bool m_enabled = false, m_capturing = false, m_open = false, m_overflowed = false, m_batchSinceDraw = false;
     std::vector<std::string> m_lastBatchKeys;
     uint64_t m_batchKinds[3] = {};
+    uint64_t m_clearsSkipped = 0;
     std::map<std::string, uint64_t> m_midKinds;
     uint32_t m_frame = 0, m_firstFrame = 0, m_frameCount = 0;
     uint32_t m_next = 0, m_resolved = 0, m_end = 0;

@@ -533,6 +533,21 @@ namespace dxup::d3d12 {
       return m_stagingBuffer ? m_staging.textureDesc : m_resource->GetDesc();
     }
 
+    // What the last clear of a view left in the image while nothing wrote it
+    // since: the context leaves out a clear that would write the same again,
+    // as Direct3D 11's drivers do (Direct3D 12's clear every time). Only the
+    // immediate context's command thread uses it.
+    struct ClearRecord {
+      static constexpr uint8_t Color = 1, Depth = 2, Stencil = 4;
+      uint64_t epoch = 0;       // valid while the context's clear epoch is this
+      uint64_t view = 0;        // the view's format, mip and layers
+      uint32_t color[4] = {};   // bits of the values
+      uint32_t depth = 0;
+      uint8_t  stencil = 0;
+      uint8_t  planes = 0;      // which of them hold
+    };
+    ClearRecord& clearRecord() { return m_clearRecord; }
+
     bool isCpuAccessible() const override { return m_stagingBuffer != nullptr; }
     uint8_t* mapStaging(uint32_t subresource, MapMode mode, ImageSubresourceLayout& layout) override;
     void unmapStaging(uint32_t subresource) override;
@@ -628,6 +643,7 @@ namespace dxup::d3d12 {
     bool                      m_simultaneousAccess = false;
     bool                      m_retargetable = false;
     std::shared_ptr<D3D12SharedSync> m_sharedSync;
+    ClearRecord               m_clearRecord;
 #endif
     ImageDesc                 m_desc;
   };
@@ -870,6 +886,12 @@ namespace dxup::d3d12 {
     // gives the compiled one.
     bool isPending() const { return m_pending; }
 #endif
+    // What its draws may write but unordered access views: the render
+    // targets with a write mask (a bit per slot), depth, stencil.
+    void setTargetWrites(const GraphicsPipelineDesc& desc);
+    uint8_t colorWrites() const { return m_colorWrites; }
+    bool depthWrites() const { return m_depthWrites; }
+    bool stencilWrites() const { return m_stencilWrites; }
 
   private:
 #ifdef _WIN32
@@ -890,6 +912,9 @@ namespace dxup::d3d12 {
 #endif
     uint32_t                     m_nullVertexSlot = UINT32_MAX;
     PrimitiveTopology            m_topology;
+    uint8_t                      m_colorWrites = 0xFF;
+    bool                         m_depthWrites = true;
+    bool                         m_stencilWrites = true;
   };
 
   // ============================================================

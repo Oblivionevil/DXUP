@@ -145,6 +145,15 @@ namespace dxup::d3d12 {
       | D3D12_RESOURCE_STATE_UNORDERED_ACCESS | D3D12_RESOURCE_STATE_DEPTH_WRITE | D3D12_RESOURCE_STATE_COPY_DEST
       | D3D12_RESOURCE_STATE_RESOLVE_DEST;
 
+    // What tells clears of an image apart besides their values: the view's
+    // format, type, first mip and layers.
+    inline uint64_t clearViewKey(const D3D12BackendImageView* view) {
+      const ImageViewDesc& desc = view->getDesc();
+      return (1ull << 63) | (uint64_t(static_cast<uint32_t>(desc.type) & 0x7Fu) << 56)
+        | (uint64_t(desc.arrayLayerCount & 0xFFFFu) << 40) | (uint64_t(desc.baseArrayLayer & 0xFFFFu) << 24)
+        | (uint64_t(desc.baseMipLevel & 0xFFFFu) << 8) | uint64_t(static_cast<uint32_t>(desc.format) & 0xFFu);
+    }
+
     inline bool isImageReadOnlyPromotableState(D3D12_RESOURCE_STATES state) {
       constexpr D3D12_RESOURCE_STATES kReadOnlyTextureStates =
         D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
@@ -822,6 +831,10 @@ namespace dxup::d3d12 {
     m_infoDiagnosticsEnabled = infoDiagnosticsEnabled();
     m_recentOpsEnabled = recentOpsEnabled();
     m_barrierStatsEnabled = barrierStatsEnabled();
+    {
+      static const bool noClearSkip = dxupSiblingExists("dxup_no_clear_skip.txt");
+      m_clearSkip = !copyOnly && !noClearSkip;
+    }
 
     logMessage(LogLevel::Debug, "D3D12BackendContext: Initializing (copyOnly=%d)...", copyOnly);
 
@@ -2783,7 +2796,11 @@ namespace dxup::d3d12 {
       auto* d3d12View = static_cast<D3D12BackendImageView*>(rtvs[i]);
       auto* d3d12Image = static_cast<D3D12BackendImage*>(d3d12View->getImage());
       m_currentRenderTargetResources[i] = d3d12Image->getResource();
-      transitionResource(d3d12Image, d3d12View, D3D12_RESOURCE_STATE_RENDER_TARGET);
+      {
+        // Binding writes nothing (the draws do: noteTargetWrites).
+        TargetBindingScope binding(m_bindingTargets);
+        transitionResource(d3d12Image, d3d12View, D3D12_RESOURCE_STATE_RENDER_TARGET);
+      }
       holdBatchResourceOnce(d3d12Image->getResource(),
         m_trackedRTVResourceHeld[i],
         m_trackedRTVResourceHeldGeneration[i]);
@@ -2847,10 +2864,13 @@ namespace dxup::d3d12 {
       }
 
       m_currentDepthStencilResource = d3d12Image->getResource();
-      if (splitPlanes)
-        transitionDepthStencilPlanes(d3d12Image, d3d12View, depthState, stencilState);
-      else
-        transitionResource(d3d12Image, d3d12View, depthState);
+      {
+        TargetBindingScope binding(m_bindingTargets);
+        if (splitPlanes)
+          transitionDepthStencilPlanes(d3d12Image, d3d12View, depthState, stencilState);
+        else
+          transitionResource(d3d12Image, d3d12View, depthState);
+      }
       holdBatchResourceOnce(d3d12Image->getResource(),
         m_trackedDSVResourceHeld,
         m_trackedDSVResourceHeldGeneration);
@@ -2880,6 +2900,7 @@ namespace dxup::d3d12 {
       bindRtPhaseLogCount++;
     }
 
+    noteBoundTargets(effectiveCount, rtvs, dsv);
     flushBarriers();
     if (logBindings && (bindRtPhaseLogCount < 32 || logDepthOnly)) {
       logMessage(LogLevel::Info,
@@ -3021,6 +3042,11 @@ namespace dxup::d3d12 {
     m_outputMergerRebindRequired.store(false, std::memory_order_relaxed);
     m_trackedDSVResourceHeld = nullptr;
     m_trackedDSVResourceHeldGeneration = 0;
+    m_boundColorImages.fill(nullptr);
+    m_boundDepthImage = nullptr;
+    m_boundDepthWritable = false;
+    m_boundStencilWritable = false;
+    m_clearedTargetsBound = 0;
 
     m_cbvBindings = {};
     m_cbvBindingEnd = {};
@@ -3178,6 +3204,9 @@ namespace dxup::d3d12 {
     m_graphicsPipelineFailed = !gfxPipeline;
     if (!gfxPipeline)
       return;
+    m_pipelineColorWrites = gfxPipeline->colorWrites();
+    m_pipelineDepthWrites = gfxPipeline->depthWrites();
+    m_pipelineStencilWrites = gfxPipeline->stencilWrites();
     auto* newPSO = gfxPipeline->getPSO();
     auto* newRootSig = gfxPipeline->getRootSignature();
 
@@ -4185,8 +4214,87 @@ namespace dxup::d3d12 {
 #endif
   }
 
+  void D3D12BackendContext::noteTargetWrites() {
+#ifdef _WIN32
+    using ClearRecord = D3D12BackendImage::ClearRecord;
+    uint32_t bits = m_clearedTargetsBound;
+    for (uint32_t slot = 0; slot < kMaxRenderTargets; slot++) {
+      const uint32_t bit = 1u << slot;
+      if ((bits & bit) && (m_pipelineColorWrites & bit)) {
+        if (D3D12BackendImage* image = m_boundColorImages[slot])
+          image->clearRecord().planes &= uint8_t(~ClearRecord::Color);
+        bits &= ~bit;
+      }
+    }
+    if ((bits & kClearedDepthBit) && m_pipelineDepthWrites && m_boundDepthWritable) {
+      if (m_boundDepthImage)
+        m_boundDepthImage->clearRecord().planes &= uint8_t(~ClearRecord::Depth);
+      bits &= ~kClearedDepthBit;
+    }
+    if ((bits & kClearedStencilBit) && m_pipelineStencilWrites && m_boundStencilWritable) {
+      if (m_boundDepthImage)
+        m_boundDepthImage->clearRecord().planes &= uint8_t(~ClearRecord::Stencil);
+      bits &= ~kClearedStencilBit;
+    }
+    m_clearedTargetsBound = bits;
+#endif
+  }
+
+  void D3D12BackendContext::noteBoundTargets(uint32_t count, IBackendImageView* const* rtvs, IBackendImageView* dsv) {
+#ifdef _WIN32
+    m_clearedTargetsBound = 0;
+    for (uint32_t slot = 0; slot < kMaxRenderTargets; slot++) {
+      m_boundColorImages[slot] = slot < count && rtvs && rtvs[slot]
+        ? static_cast<D3D12BackendImage*>(rtvs[slot]->getImage()) : nullptr;
+    }
+    m_boundDepthImage = nullptr;
+    m_boundDepthWritable = false;
+    m_boundStencilWritable = false;
+    if (dsv) {
+      const auto* view = static_cast<const D3D12BackendImageView*>(dsv);
+      m_boundDepthImage = static_cast<D3D12BackendImage*>(dsv->getImage());
+      m_boundDepthWritable = !view->isReadOnlyDepth();
+      m_boundStencilWritable = !view->isReadOnlyStencil();
+    }
+    for (uint32_t slot = 0; slot < kMaxRenderTargets; slot++) {
+      if (m_boundColorImages[slot])
+        noteClearedBoundTargets(m_boundColorImages[slot]);
+    }
+    if (m_boundDepthImage)
+      noteClearedBoundTargets(m_boundDepthImage);
+#else
+    (void)count;
+    (void)rtvs;
+    (void)dsv;
+#endif
+  }
+
+  void D3D12BackendContext::noteClearedBoundTargets(D3D12BackendImage* image) {
+#ifdef _WIN32
+    using ClearRecord = D3D12BackendImage::ClearRecord;
+    const auto& record = image->clearRecord();
+    if (record.epoch != m_clearEpoch || !record.planes)
+      return;
+    for (uint32_t slot = 0; slot < kMaxRenderTargets; slot++) {
+      if (m_boundColorImages[slot] == image && (record.planes & ClearRecord::Color))
+        m_clearedTargetsBound |= 1u << slot;
+    }
+    if (m_boundDepthImage == image) {
+      if (record.planes & ClearRecord::Depth)
+        m_clearedTargetsBound |= kClearedDepthBit;
+      if (record.planes & ClearRecord::Stencil)
+        m_clearedTargetsBound |= kClearedStencilBit;
+    }
+#else
+    (void)image;
+#endif
+  }
+
   void D3D12BackendContext::prepareShaderAccess(bool compute) {
 #ifdef _WIN32
+    // Draws write the bound targets: what clears left there goes.
+    if (!compute && m_clearedTargetsBound)
+      noteTargetWrites();
     // A submission for descriptor space comes first: it forgets the
     // unordered access written so far, which then must not include this
     // draw's (its next reader would get no barrier).
@@ -4231,6 +4339,8 @@ namespace dxup::d3d12 {
 #ifdef _WIN32
     if (memstats::enabled() && ((depthState | stencilState) & kImageWriteStates))
       memstats::noteWritten(image->getResource());
+    if ((depthState | stencilState) & kImageWriteStates)
+      noteImageWrite(image);
     noteSharedUse(image);
     const auto& imageDesc = image->getDesc();
     const auto& viewDesc = view->getDesc();
@@ -7244,6 +7354,9 @@ namespace dxup::d3d12 {
       m_perfIntervalCloseExecuteMs += qpcElapsedMs(timingStart, timingEnd, perfFreq.QuadPart);
     }
     if (!closeOk) {
+      // The dropped list's clears never ran: what clears left is unknown.
+      m_clearEpoch++;
+      m_clearedTargetsBound = 0;
       // ROLLBACK: revert all tracked state transitions since the last successful flush,
       // because the failed command list's transitions were never executed on the GPU.
       for (auto it = m_stateRollback.rbegin(); it != m_stateRollback.rend(); ++it) {
@@ -8036,10 +8149,24 @@ namespace dxup::d3d12 {
   void D3D12BackendContext::clearRenderTarget(IBackendImageView* rtv, const float color[4]) {
 #ifdef _WIN32
     ContextLock ctxLock(*this);
-    if (m_gpuProfiler.capturing())
-      m_gpuProfiler.onClear();
     auto* d3d12View = static_cast<D3D12BackendImageView*>(rtv);
     auto* d3d12Image = static_cast<D3D12BackendImage*>(d3d12View->getImage());
+
+    // A whole view cleared to what it holds already, nothing written since.
+    const bool wholeView = m_clearRects.empty();
+    const bool skippable = wholeView && clearSkipAllowed(d3d12Image);
+    const uint64_t viewKey = clearViewKey(d3d12View);
+    uint32_t bits[4];
+    std::memcpy(bits, color, sizeof(bits));
+    auto& record = d3d12Image->clearRecord();
+    if (skippable && record.epoch == m_clearEpoch && (record.planes & D3D12BackendImage::ClearRecord::Color)
+     && record.view == viewKey && !std::memcmp(record.color, bits, sizeof(bits))) {
+      if (m_gpuProfiler.capturing())
+        m_gpuProfiler.onClearSkipped();
+      return;
+    }
+    if (m_gpuProfiler.capturing())
+      m_gpuProfiler.onClear();
 
     DXUP_RECENT_OP(
       "ClearRTV res=%p fmt=%u color=%.3f,%.3f,%.3f,%.3f",
@@ -8049,12 +8176,25 @@ namespace dxup::d3d12 {
       color[1],
       color[2],
       color[3]);
-    transitionResource(d3d12Image, d3d12View, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    {
+      TargetBindingScope clearing(m_bindingTargets);
+      transitionResource(d3d12Image, d3d12View, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    }
     holdBatchResource(d3d12Image->getResource());
     flushBarriers();
 
     m_cmdList->ClearRenderTargetView(d3d12View->getRtvHandle(), color,
       static_cast<UINT>(m_clearRects.size()), m_clearRects.empty() ? nullptr : m_clearRects.data());
+    // Rects leave the rest as it was: no record then.
+    if (skippable) {
+      record.epoch = m_clearEpoch;
+      record.view = viewKey;
+      std::memcpy(record.color, bits, sizeof(bits));
+      record.planes = D3D12BackendImage::ClearRecord::Color;
+      noteClearedBoundTargets(d3d12Image);
+    } else if (m_clearSkip) {
+      record.planes = 0;
+    }
 #endif
   }
 
@@ -8085,23 +8225,69 @@ namespace dxup::d3d12 {
   void D3D12BackendContext::clearDepthStencil(IBackendImageView* dsv, float depth, uint8_t stencil, uint32_t flags) {
 #ifdef _WIN32
     ContextLock ctxLock(*this);
-    if (m_gpuProfiler.capturing())
-      m_gpuProfiler.onClear();
     auto* d3d12View = static_cast<D3D12BackendImageView*>(dsv);
     auto* d3d12Image = static_cast<D3D12BackendImage*>(d3d12View->getImage());
 
+    using ClearRecord = D3D12BackendImage::ClearRecord;
+    bool clearDepth = (flags & static_cast<uint32_t>(ClearFlags::Depth)) != 0;
+    bool clearStencil = (flags & static_cast<uint32_t>(ClearFlags::Stencil)) != 0;
+    // A plane cleared to what it holds already, nothing written since, is
+    // left out; with both left out, the whole clear.
+    const bool skippable = clearSkipAllowed(d3d12Image);
+    const uint64_t viewKey = clearViewKey(d3d12View);
+    uint32_t depthBits;
+    std::memcpy(&depthBits, &depth, sizeof(depthBits));
+    auto& record = d3d12Image->clearRecord();
+    const bool recordHolds = skippable && record.epoch == m_clearEpoch && record.view == viewKey;
+    const bool stencilPlane = d3d12Image->getPlaneCount() > 1;
+    const bool depthRepeats = clearDepth && recordHolds && (record.planes & ClearRecord::Depth) && record.depth == depthBits;
+    const bool stencilRepeats = clearStencil && stencilPlane && recordHolds && (record.planes & ClearRecord::Stencil)
+      && record.stencil == stencil;
+    if ((clearDepth || clearStencil) && (!clearDepth || depthRepeats) && (!clearStencil || !stencilPlane || stencilRepeats)) {
+      if (m_gpuProfiler.capturing())
+        m_gpuProfiler.onClearSkipped();
+      return;
+    }
+    if (depthRepeats)
+      clearDepth = false;
+    if (stencilRepeats)
+      clearStencil = false;
+    if (m_gpuProfiler.capturing())
+      m_gpuProfiler.onClear();
+
     DXUP_RECENT_OP("ClearDSV dsv=%p img=%p fmt=%u flags=0x%x", dsv, d3d12Image, static_cast<uint32_t>(d3d12Image->getFormat()), flags);
-    transitionResource(d3d12Image, d3d12View, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+    {
+      TargetBindingScope clearing(m_bindingTargets);
+      transitionResource(d3d12Image, d3d12View, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+    }
     holdBatchResource(d3d12Image->getResource());
     flushBarriers();
 
     D3D12_CLEAR_FLAGS d3d12Flags = {};
-    if (flags & static_cast<uint32_t>(ClearFlags::Depth))
+    if (clearDepth)
       d3d12Flags |= D3D12_CLEAR_FLAG_DEPTH;
-    if (flags & static_cast<uint32_t>(ClearFlags::Stencil))
+    if (clearStencil)
       d3d12Flags |= D3D12_CLEAR_FLAG_STENCIL;
 
     m_cmdList->ClearDepthStencilView(d3d12View->getDsvHandle(), d3d12Flags, depth, stencil, 0, nullptr);
+    if (skippable) {
+      if (!recordHolds) {
+        record.epoch = m_clearEpoch;
+        record.view = viewKey;
+        record.planes = 0;
+      }
+      if (clearDepth) {
+        record.depth = depthBits;
+        record.planes |= ClearRecord::Depth;
+      }
+      if (clearStencil && stencilPlane) {
+        record.stencil = stencil;
+        record.planes |= ClearRecord::Stencil;
+      }
+      noteClearedBoundTargets(d3d12Image);
+    } else if (m_clearSkip) {
+      record.planes = 0;
+    }
 #endif
   }
 
@@ -9356,6 +9542,8 @@ namespace dxup::d3d12 {
       commitLazyImage(image);
     if (memstats::enabled() && (newState & kImageWriteStates))
       memstats::noteWritten(image->getResource());
+    if (newState & kImageWriteStates)
+      noteImageWrite(image);
     noteSharedUse(image);
     noteLearnedImage(image);
     if (image->hasUniformState() && image->getCurrentState() == newState)
@@ -9405,6 +9593,8 @@ namespace dxup::d3d12 {
       commitLazyImage(image);
     if (memstats::enabled() && (newState & kImageWriteStates))
       memstats::noteWritten(image->getResource());
+    if (newState & kImageWriteStates)
+      noteImageWrite(image);
     noteSharedUse(image);
     noteLearnedImage(image);
     if (subresource >= image->getSubresourceCount()) {
@@ -9453,6 +9643,8 @@ namespace dxup::d3d12 {
       commitLazyImage(image);
     if (memstats::enabled() && (newState & kImageWriteStates))
       memstats::noteWritten(image->getResource());
+    if (newState & kImageWriteStates)
+      noteImageWrite(image);
     const auto& imageDesc = image->getDesc();
 
     if (subresource.mipLevel >= image->getMipLevelCount())
@@ -9491,6 +9683,8 @@ namespace dxup::d3d12 {
       commitLazyImage(image);
     if (memstats::enabled() && (newState & kImageWriteStates))
       memstats::noteWritten(image->getResource());
+    if (newState & kImageWriteStates)
+      noteImageWrite(image);
     noteSharedUse(image);
 
     // Every subresource is already in the requested state.

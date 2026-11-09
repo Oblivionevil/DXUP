@@ -1437,6 +1437,18 @@ namespace dxup::d3d12 {
 #endif
   }
 
+  void D3D12BackendGraphicsPipeline::setTargetWrites(const GraphicsPipelineDesc& desc) {
+    const BlendState& blend = desc.blendState;
+    m_colorWrites = 0;
+    for (uint32_t i = 0; i < 8; i++) {
+      if (blend.renderTargets[blend.independentBlendEnable ? i : 0].writeMask)
+        m_colorWrites |= uint8_t(1u << i);
+    }
+    const DepthStencilState& depthStencil = desc.depthStencilState;
+    m_depthWrites = depthStencil.depthEnable && depthStencil.depthWriteEnable;
+    m_stencilWrites = depthStencil.stencilEnable && depthStencil.stencilWriteMask;
+  }
+
   // ============================================================
   // D3D12BackendComputePipeline
   // ============================================================
@@ -4283,6 +4295,7 @@ namespace dxup::d3d12 {
       auto owned = std::make_shared<OwnedGraphicsPipelineDesc>(desc);
       auto pipeline = std::make_shared<D3D12BackendGraphicsPipeline>(
         ComPtr<ID3D12PipelineState>(), m_graphicsRootSignature.Get(), desc.topology);
+      pipeline->setTargetWrites(desc);
       pipeline->m_pending = true;
       pipeline->m_pendingDesc = owned;
       pending = pipeline;
@@ -4851,6 +4864,7 @@ namespace dxup::d3d12 {
     auto pipeline = std::make_shared<D3D12BackendGraphicsPipeline>(
       std::move(pso), m_graphicsRootSignature.Get(), desc.topology, resourceLimits, activeStageMask);
     pipeline->setNullVertexSlot(nullVertexSlot);
+    pipeline->setTargetWrites(desc);
 
     // GetCachedBlob and file writes can stall the render thread. Keep the PSO
     // alive and let the low-priority cache worker serialize it instead.

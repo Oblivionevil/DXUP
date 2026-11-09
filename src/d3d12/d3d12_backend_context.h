@@ -521,6 +521,55 @@ namespace dxup::d3d12 {
     void prepareShaderAccess(bool compute);
     void restoreBoundImageStates(bool compute);
     void ensureImageViewState(D3D12BackendImageView* view, D3D12_RESOURCE_STATES needed);
+
+    // Clears that repeat what their target holds are left out, as
+    // Direct3D 11's drivers do (Heroes of the Storm clears its depth buffer,
+    // a 4K HDR target and its shadow maps several times a frame with nothing
+    // drawn in between). Images keep what their last clear left
+    // (D3D12BackendImage::ClearRecord); whatever writes an image drops it:
+    // transitions into a write state (copies, resolves, unordered access,
+    // internal passes) and draws into bound targets (noteTargetWrites).
+    // Binding targets and the clears themselves write nothing yet.
+    // dxup_no_clear_skip.txt turns it off.
+    // Not images other devices write (shared), whose memory changes without
+    // a write (tiled, swap chain buffers drawn into directly) or which other
+    // queues may write in the common state.
+    bool clearSkipAllowed(D3D12BackendImage* image) const {
+      return m_clearSkip && !image->isStaging() && !image->isRetargetable() && !image->getSharedSync()
+        && !image->allowsSimultaneousAccess() && !image->isLazyUncommitted()
+        && !(image->getDesc().miscFlags & kResourceMiscTiled);
+    }
+    // (The copy context, whose thread may differ, keeps away from records.)
+    void noteImageWrite(D3D12BackendImage* image) {
+      if (m_clearSkip && !m_bindingTargets)
+        image->clearRecord().planes = 0;
+    }
+    // A draw: the bound targets it writes lose their clear records.
+    void noteTargetWrites();
+    // The targets bound now, for noteTargetWrites.
+    void noteBoundTargets(uint32_t count, IBackendImageView* const* rtvs, IBackendImageView* dsv);
+    // After a clear: the bits of the targets bound now that hold a record.
+    void noteClearedBoundTargets(D3D12BackendImage* image);
+    static constexpr uint32_t kClearedDepthBit = 1u << 8, kClearedStencilBit = 1u << 9;
+    // Transitions in its scope bind or clear targets.
+    struct TargetBindingScope {
+      explicit TargetBindingScope(bool& flag) : m_flag(flag) { m_flag = true; }
+      ~TargetBindingScope() { m_flag = false; }
+      TargetBindingScope(const TargetBindingScope&) = delete;
+      TargetBindingScope& operator=(const TargetBindingScope&) = delete;
+      bool& m_flag;
+    };
+    bool m_clearSkip = false;
+    bool m_bindingTargets = false;        // transitions that bind or clear targets
+    uint64_t m_clearEpoch = 1;            // a new one forgets every record (a dropped batch)
+    std::array<D3D12BackendImage*, kMaxRenderTargets> m_boundColorImages = {};
+    D3D12BackendImage* m_boundDepthImage = nullptr;
+    bool m_boundDepthWritable = false;
+    bool m_boundStencilWritable = false;
+    uint32_t m_clearedTargetsBound = 0;   // render target slots, kClearedDepthBit, kClearedStencilBit
+    uint8_t m_pipelineColorWrites = 0xFF;
+    bool m_pipelineDepthWrites = true;
+    bool m_pipelineStencilWrites = true;
     void markBoundImageStatesDirty() {
       m_graphicsImageStatesDirty = true;
       m_computeImageStatesDirty = true;
