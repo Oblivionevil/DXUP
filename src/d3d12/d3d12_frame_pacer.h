@@ -538,9 +538,11 @@ namespace dxup::d3d12 {
         const double grid = double(due) * m_msPerTick;
         const double longer = tick.tickCpuMs - tick.normalMedianMs;
         // The tick frame: the first whose start on the grid, earlier by how
-        // much longer it takes, lies after the tick.
+        // much longer it takes, lies after the tick, with a margin: the
+        // game's tick may come a little later than the earliest moment the
+        // spikes allow (its phase wanders by half a millisecond).
         int frames = 0;
-        while (frames < kTickHorizon && grid + frames * step - longer < tick.hi)
+        while (frames < kTickHorizon && grid + frames * step - longer < tick.hi + kTickLateMarginMs)
           frames++;
         if (frames < kTickHorizon) {
           double start = grid + frames * step - longer;
@@ -592,10 +594,11 @@ namespace dxup::d3d12 {
     }
 
   private:
-    // Frames ahead a tick is planned for, and how long before the tick the
-    // frames before it begin.
+    // Frames ahead a tick is planned for, how long before the tick the
+    // frames before it begin and how long after it the tick frame at least.
     static constexpr int    kTickHorizon = 8;
     static constexpr double kTickMarginMs = 0.25;
+    static constexpr double kTickLateMarginMs = 0.6;
 
     double   m_msPerTick = 0.0;
     int64_t  m_step = 0;
