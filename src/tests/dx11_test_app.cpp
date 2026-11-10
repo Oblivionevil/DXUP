@@ -504,7 +504,6 @@ void main(uint2 id : SV_DispatchThreadID) {
         {"low_latency_gpu_pacing", &Dx11TestApp::testLowLatencyGpuPacing},
         {"frame_timing_clock", &Dx11TestApp::testFrameTimingClock},
         {"frame_limiter", &Dx11TestApp::testFrameLimiter},
-        {"frame_limiter_ticks", &Dx11TestApp::testFrameLimiterTicks},
         {"native_fallback", &Dx11TestApp::testNativeFallback},
         {"fullscreen_swap_chain", &Dx11TestApp::testFullscreenSwapChain},
         {"window_ghosting", &Dx11TestApp::testWindowGhosting},
@@ -10356,89 +10355,6 @@ float4 main(float4 position : SV_Position, float4 t0 : TEXCOORD0, float4 t : TEX
           error = formatString("%.2f ms from a frame's start to its Present (latency), %.2f ms (smooth)", latency.toPresent, smooth.toPresent);
         else if (smooth.p99 > latency.p99 - step * 0.1)
           error = formatString("Presents p99 %.2f ms apart (smooth), %.2f ms (latency)", smooth.p99, latency.p99);
-        else
-          passed = true;
-      }
-      DeleteFileA(marker.c_str());
-      return passed;
-    }
-
-    // dxgi.frameLimiter = latency with a fixed-step game loop: a tick every
-    // 7.625 steps makes the first frame that begins after it take 1.1 steps
-    // instead of 0.5. The limiter learns when the ticks come and begins the
-    // frames before one early, so that the tick frame presents on time: the
-    // Presents stay even while a frame's start stays close to its Present.
-    // With dxup_no_tick_plan.txt every tick frame comes late.
-    bool testFrameLimiterTicks(std::string& error) {
-      if (!runsOnDxup()) {
-        error = "SKIP: needs DXUP";
-        return false;
-      }
-      char path[MAX_PATH] = {};
-      GetModuleFileNameA(nullptr, path, MAX_PATH);
-      std::string dir = path;
-      dir.resize(dir.find_last_of('\\') + 1);
-      const std::string marker = dir + "dxup_latency_stats.txt";
-      const std::string noPlan = dir + "dxup_no_tick_plan.txt";
-      if (FILE* file = _fsopen(marker.c_str(), "w", _SH_DENYNO))
-        std::fclose(file);
-      HDC screen = GetDC(nullptr);
-      const int refresh = GetDeviceCaps(screen, VREFRESH);
-      ReleaseDC(nullptr, screen);
-      const double rate = refresh >= 130 ? 125.0 : (std::max)(refresh, 30) * 0.5;
-      const double step = 1000.0 / rate;
-      struct Numbers {
-        double toPresent = 0.0, every = 0.0, p99 = 0.0, period = 0.0;
-        unsigned long long early = 0;
-      };
-      auto run = [&](bool plan, Numbers& numbers) {
-        if (!plan) {
-          if (FILE* file = _fsopen(noPlan.c_str(), "w", _SH_DENYNO))
-            std::fclose(file);
-        }
-        const std::string config = formatString("dxgi.maxFrameRate = %.1f\ndxgi.frameLimiter = latency\n", rate);
-        const std::string argument = formatString("--frame-limiter-child %.3f ticks", step);
-        const bool ran = runChildWithConfig(config.c_str(), argument.c_str(), error);
-        DeleteFileA(noPlan.c_str());
-        if (!ran)
-          return false;
-        if (FILE* log = _fsopen((dir + "logdxup.log").c_str(), "rb", _SH_DENYNO)) {
-          std::string text(1 << 20, '\0');
-          text.resize(std::fread(text.data(), 1, text.size(), log));
-          std::fclose(log);
-          const char* const kLine = "to Present and GPU done ";
-          const size_t at = text.rfind(kLine);
-          const size_t every = at == std::string::npos ? at : text.find("Present every ", at);
-          const size_t ticks = every == std::string::npos ? every : text.find("ticks every ", every);
-          if (ticks != std::string::npos
-           && std::sscanf(text.c_str() + at + std::strlen(kLine), "%lf", &numbers.toPresent) == 1
-           && std::sscanf(text.c_str() + every, "Present every %lf ms (p99 %lf", &numbers.every, &numbers.p99) == 2
-           && std::sscanf(text.c_str() + ticks, "ticks every %lf ms, %llu", &numbers.period, &numbers.early) == 2)
-            return true;
-        }
-        error = "no statistics in the child's log";
-        return false;
-      };
-      bool passed = false;
-      // Timing: other work on the machine can spoil one try.
-      for (int attempt = 0; attempt < 2 && !passed; attempt++) {
-        error.clear();
-        Numbers planned, unplanned;
-        if (!run(true, planned) || !run(false, unplanned))
-          break;
-        std::printf("  frame limiter ticks %.1f fps: planned %.2f ms to Present, every %.2f ms (p99 %.2f), ticks every %.2f ms, "
-          "%llu frames early; unplanned %.2f ms, every %.2f ms (p99 %.2f)\n", rate, planned.toPresent, planned.every, planned.p99,
-          planned.period, planned.early, unplanned.toPresent, unplanned.every, unplanned.p99);
-        if (std::abs(planned.every - step) > step * 0.06 || std::abs(unplanned.every - step) > step * 0.06)
-          error = formatString("Presents every %.2f ms (planned), %.2f ms (unplanned), %.2f ms asked for", planned.every, unplanned.every, step);
-        else if (unplanned.p99 < step * 1.3)
-          error = formatString("tick frames on time without planning (p99 %.2f ms)", unplanned.p99);
-        else if (std::abs(planned.period - step * 7.625) > step * 0.05 || !planned.early)
-          error = formatString("ticks every %.2f ms (%.2f ms), %llu frames early", planned.period, step * 7.625, planned.early);
-        else if (planned.p99 > step * 1.2)
-          error = formatString("Presents p99 %.2f ms apart with planning, %.2f ms without", planned.p99, unplanned.p99);
-        else if (planned.toPresent > unplanned.toPresent + step * 0.5)
-          error = formatString("%.2f ms from a frame's start to its Present with planning, %.2f ms without", planned.toPresent, unplanned.toPresent);
         else
           passed = true;
       }
@@ -26425,11 +26341,8 @@ float4 main(float4 p : SV_Position) : SV_Target {
   }
 
   // See testFrameLimiter. Spins for a tenth of a step a frame, for 1.4 steps
-  // every 16th; long enough for DXUP's statistics, every 1000 frames. ticks
-  // (testFrameLimiterTicks): half a step a frame, 1.1 steps for the first
-  // frame that begins after a tick of a loop simulating every 7.625 steps,
-  // for two windows of statistics.
-  int runFrameLimiterChild(double stepMs, bool ticks) {
+  // every 16th; long enough for DXUP's statistics, every 1000 frames.
+  int runFrameLimiterChild(double stepMs) {
     WNDCLASSA windowClass = {};
     windowClass.lpfnWndProc = DefWindowProcA;
     windowClass.hInstance = GetModuleHandleA(nullptr);
@@ -26466,23 +26379,10 @@ float4 main(float4 p : SV_Position) : SV_Target {
       }
       LARGE_INTEGER frequency;
       QueryPerformanceFrequency(&frequency);
-      const double msPerTick = 1000.0 / double(frequency.QuadPart);
-      double nextTick = 0.0;
-      for (uint32_t frame = 0; frame < (ticks ? 2100u : 1100u) && !result; frame++) {
+      for (uint32_t frame = 0; frame < 1100 && !result; frame++) {
         LARGE_INTEGER start, now;
         QueryPerformanceCounter(&start);
-        double workMs = stepMs * (frame % 16 == 15 ? 1.4 : 0.1);
-        if (ticks) {
-          const double startMs = double(start.QuadPart) * msPerTick;
-          bool tick = false;
-          if (nextTick == 0.0)
-            nextTick = startMs + stepMs * 7.625;
-          while (startMs >= nextTick) {
-            tick = true;
-            nextTick += stepMs * 7.625;
-          }
-          workMs = stepMs * (tick ? 1.1 : 0.5);
-        }
+        const double workMs = stepMs * (frame % 16 == 15 ? 1.4 : 0.1);
         do {
           YieldProcessor();
           QueryPerformanceCounter(&now);
@@ -27014,7 +26914,7 @@ int main(int argc, char** argv) {
   if (argc > 1 && std::strcmp(argv[1], "--submit-thread-child") == 0)
     return runSubmitThreadChild();
   if (argc > 2 && std::strcmp(argv[1], "--frame-limiter-child") == 0)
-    return runFrameLimiterChild(std::atof(argv[2]), argc > 3 && std::strcmp(argv[3], "ticks") == 0);
+    return runFrameLimiterChild(std::atof(argv[2]));
   if (argc > 2 && std::strcmp(argv[1], "--low-latency-child") == 0)
     return runLowLatencyChild(argv[2]);
   if (argc > 1 && std::strcmp(argv[1], "--native-fallback-child") == 0)

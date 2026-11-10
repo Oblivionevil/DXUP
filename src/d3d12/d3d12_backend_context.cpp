@@ -8066,12 +8066,8 @@ namespace dxup::d3d12 {
     // presents, the presents up to maxLatency before the latest are done.
     QueryPerformanceFrequency(&frequency);
     const double msPerTick = 1000.0 / double(frequency.QuadPart);
-    if (m_pacingReturn) {
+    if (m_pacingReturn)
       m_latencyPacer.noteCpuFrame(double(entry.QuadPart - m_pacingReturn) * msPerTick);
-      if (m_frameLimiter.enabled() && m_previousPacingReturn)
-        m_ticks.noteFrame(double(m_previousPacingReturn) * msPerTick, double(m_pacingReturn) * msPerTick,
-          double(entry.QuadPart - m_pacingReturn) * msPerTick);
-    }
     for (const uint64_t done = m_presentCount > maxLatency ? m_presentCount - maxLatency : 0; m_pacedFrame < done;
          m_pacedFrame++) {
       double busyMs = 0.0, lateMs = 0.0;
@@ -8084,24 +8080,14 @@ namespace dxup::d3d12 {
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
     const double sleepMs = (std::max)(UserOverrides::get().lowLatency && m_pacedGpuEnd
-      ? m_latencyPacer.sleepMs(double(now.QuadPart - m_pacedGpuEnd) * msPerTick) : 0.0, m_frameLimiter.waitMs(now.QuadPart, tickPlanning() ? &m_ticks : nullptr));
-    m_presentTarget = m_frameLimiter.presentTarget();
+      ? m_latencyPacer.sleepMs(double(now.QuadPart - m_pacedGpuEnd) * msPerTick) : 0.0, m_frameLimiter.waitMs(now.QuadPart));
     if (sleepMs > 0.0) {
       paceSleep(m_pacingTimer, sleepMs, [](HANDLE timer, DWORD timeout) { WaitForSingleObject(timer, timeout); });
       QueryPerformanceCounter(&now);
     }
-    m_previousPacingReturn = m_pacingReturn;
     m_pacingReturn = now.QuadPart;
 #else
     (void)maxLatency;
-#endif
-  }
-
-  int64_t D3D12BackendContext::framePresentTarget() const {
-#ifdef _WIN32
-    return m_presentTarget;
-#else
-    return 0;
 #endif
   }
 

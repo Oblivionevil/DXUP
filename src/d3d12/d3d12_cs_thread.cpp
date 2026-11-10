@@ -1567,14 +1567,8 @@ namespace dxup {
     LARGE_INTEGER frequency, now;
     QueryPerformanceFrequency(&frequency);
     const double msPerTick = 1000.0 / double(frequency.QuadPart);
-    if (m_pacingReturn) {
+    if (m_pacingReturn)
       m_latencyPacer.noteCpuFrame(double(entry - m_pacingReturn) * msPerTick);
-      // The frame just presented began at m_pacingReturn, the one before it
-      // a frame earlier.
-      if (m_frameLimiter.enabled() && m_presents >= 2)
-        m_ticks.noteFrame(double(m_frameStarts[(m_presents - 2) % kPresentHistory]) * msPerTick,
-          double(m_pacingReturn) * msPerTick, double(entry - m_pacingReturn) * msPerTick);
-    }
     // The frames whose GPU work is done (or not counted: frameGpuTiming
     // tells), all of which the worker has finished.
     const uint64_t done = (std::min)(m_presents > maxLatency ? m_presents - maxLatency : 0,
@@ -1604,8 +1598,7 @@ namespace dxup {
     }
     QueryPerformanceCounter(&now);
     const double sleepMs = (std::max)(m_lowLatency && m_pacedGpuEnd
-      ? m_latencyPacer.sleepMs(double(now.QuadPart - m_pacedGpuEnd) * msPerTick) : 0.0, m_frameLimiter.waitMs(now.QuadPart, d3d12::tickPlanning() ? &m_ticks : nullptr));
-    m_presentTargets[m_presents % kPresentHistory] = m_frameLimiter.presentTarget();
+      ? m_latencyPacer.sleepMs(double(now.QuadPart - m_pacedGpuEnd) * msPerTick) : 0.0, m_frameLimiter.waitMs(now.QuadPart));
     if (sleepMs > 0.0) {
       HitchScope hitch("app lowLatency sleep");
       d3d12::paceSleep(m_pacingTimer, sleepMs, [](HANDLE timer, DWORD timeout) { waitTakingSentMessages(timer, timeout); });
@@ -1631,10 +1624,9 @@ namespace dxup {
       // The marker asks for them; else with the info log.
       static const bool asked = dxupSiblingExists("dxup_latency_stats.txt");
       logMessage(asked ? LogLevel::Warn : LogLevel::Info, "frame latency: frame start to GPU done %.2f ms (p95 %.2f), to Present and GPU done %.2f ms (p95 %.2f), Present every %.2f ms (p99 %.2f) over %zu frames; "
-        "low latency %s: held back %.3f ms a frame, margin %.2f ms, %llu frames late so far; ticks every %.3f ms, %llu frames began early",
+        "low latency %s: held back %.3f ms a frame, margin %.2f ms, %llu frames late so far",
         median, p95, presentMedian, presentP95, intervalMedian, intervalP99, m_frameLatencies.size(), m_lowLatency ? "on" : "off", m_pacingSleptMs / m_pacingFrames,
-        m_latencyPacer.marginMs(), static_cast<unsigned long long>(m_latencyPacer.lateFrames()), m_ticks.periodMs(),
-        static_cast<unsigned long long>(m_frameLimiter.earlyFrames()));
+        m_latencyPacer.marginMs(), static_cast<unsigned long long>(m_latencyPacer.lateFrames()));
       m_frameLatencies.clear();
       m_presentLatencies.clear();
       m_presentIntervals.clear();

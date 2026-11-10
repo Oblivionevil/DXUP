@@ -1651,11 +1651,8 @@ namespace dxup {
     // dxgi.frameLimiter = smooth: the frame goes out at its step, whenever
     // the application got done with it.
     d3d12::FrameLimiter m_presentLimiter{ d3d12::smoothFrameRate(), d3d12::kPresentLimiterShortestStep };
-    // target: the time the latency limiter wants the frame presented at
-    // (framePresentTarget, 0 if none).
-    void limitPresent(int64_t target) {
+    void limitPresent() {
       m_presentLimiter.hold([](HANDLE timer, DWORD timeout) { WaitForSingleObject(timer, timeout); });
-      m_presentLimiter.holdUntil(target);
     }
 
     // The real Present, of whole frames: DXUP copies (and scales) the whole
@@ -1855,14 +1852,13 @@ namespace dxup {
         // The worker may wait for the display (the application does not):
         // DO_NOT_WAIT there would drop the frame queued as presented.
         const UINT workerFlags = flags & ~UINT(DXGI_PRESENT_DO_NOT_WAIT);
-        const int64_t target = ctx->framePresentTarget();
-        ctx->executeOnBackend([this, syncInterval, flags = workerFlags, present1, dxupTearing, target](IBackendContext* backend) {
+        ctx->executeOnBackend([this, syncInterval, flags = workerFlags, present1, dxupTearing](IBackendContext* backend) {
           preparePresent(backend);
           // With the submit thread (d3d12.submitThread) the frame's lists
           // reach the queue first. Present stays here: on the submit thread
           // NVIDIA's Present spun and held the next frame's lists back.
           backend->waitForQueue();
-          limitPresent(target);
+          limitPresent();
           const int64_t start = hitchTraceEnabled() ? hitchTimestamp() : 0;
           const HRESULT hr = presentReal(syncInterval, flags, present1, dxupTearing);
           if (start)
@@ -1882,7 +1878,7 @@ namespace dxup {
       }
 
       if (!(flags & DXGI_PRESENT_TEST))
-        limitPresent(ctx ? ctx->framePresentTarget() : 0);
+        limitPresent();
       HRESULT hr = presentReal(syncInterval, flags, present1, dxupTearing);
       if (SUCCEEDED(hr) && !(flags & DXGI_PRESENT_TEST)) {
         if (ctx && m_direct)
