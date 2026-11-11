@@ -505,6 +505,7 @@ void main(uint2 id : SV_DispatchThreadID) {
         {"frame_timing_clock", &Dx11TestApp::testFrameTimingClock},
         {"frame_limiter", &Dx11TestApp::testFrameLimiter},
         {"native_fallback", &Dx11TestApp::testNativeFallback},
+        {"foreign_adapter", &Dx11TestApp::testForeignAdapter},
         {"fullscreen_swap_chain", &Dx11TestApp::testFullscreenSwapChain},
         {"window_ghosting", &Dx11TestApp::testWindowGhosting},
         {"idle_memory_trim", &Dx11TestApp::testIdleMemoryTrim},
@@ -10168,6 +10169,16 @@ float4 main(float4 position : SV_Position, float4 t0 : TEXCOORD0, float4 t : TEX
       const bool passed = runChildProcess("--native-fallback-child", error);
       SetEnvironmentVariableA("DXUP_FAIL_D3D12", nullptr);
       return passed;
+    }
+
+    // An application that loads Windows' dxgi.dll and d3d10.dll by their full
+    // paths, as Crysis's Direct3D 10 renderer does: its device comes from an
+    // adapter of Windows' factory (Windows' d3d10.dll creates it through the
+    // d3d11.dll next to the program, DXUP's), its swap chain from that factory,
+    // which cannot take DXUP's device. DXUP hands out Windows' device then:
+    // the swap chain works and presents (see runForeignAdapterChild).
+    bool testForeignAdapter(std::string& error) {
+      return runChildProcess("--foreign-adapter-child", error);
     }
 
     // d3d11.relaxedUavBarriers: dispatches of one shader into disjoint parts
@@ -26058,6 +26069,69 @@ float4 main() : SV_Target { return color; }
   }
 
   // See testNativeFallback. Returns 0 or the failed check.
+  // See testForeignAdapter.
+  int runForeignAdapterChild() {
+    wchar_t folder[MAX_PATH] = {};
+    if (!GetSystemDirectoryW(folder, MAX_PATH))
+      return 2;
+    const std::wstring system = folder;
+    HMODULE dxgi = LoadLibraryW((system + L"\\dxgi.dll").c_str());
+    HMODULE d3d10 = LoadLibraryW((system + L"\\d3d10.dll").c_str());
+    using CreateFactory = HRESULT (WINAPI*)(REFIID, void**);
+    using CreateDevice = HRESULT (WINAPI*)(IDXGIAdapter*, D3D10_DRIVER_TYPE, HMODULE, UINT, UINT, ID3D10Device**);
+    auto createFactory = dxgi ? reinterpret_cast<CreateFactory>(GetProcAddress(dxgi, "CreateDXGIFactory")) : nullptr;
+    auto createDevice = d3d10 ? reinterpret_cast<CreateDevice>(GetProcAddress(d3d10, "D3D10CreateDevice")) : nullptr;
+    if (!createFactory || !createDevice)
+      return 3;
+    ComPtr<IDXGIFactory> factory;
+    ComPtr<IDXGIAdapter> adapter;
+    ComPtr<ID3D10Device> device;
+    if (FAILED(createFactory(__uuidof(IDXGIFactory), reinterpret_cast<void**>(factory.GetAddressOf())))
+     || FAILED(factory->EnumAdapters(0, adapter.GetAddressOf())))
+      return 4;
+    if (FAILED(createDevice(adapter.Get(), D3D10_DRIVER_TYPE_HARDWARE, nullptr, 0, D3D10_SDK_VERSION, device.GetAddressOf())))
+      return 5;
+    // Not DXUP's device: Windows' factory would crash on it.
+    static const GUID kDxupDevice = { 0x5c2e0c4b, 0x6f61, 0x4a57, { 0x9d, 0x8e, 0x2b, 0x5b, 0x3f, 0x1d, 0x7a, 0x10 } };
+    ComPtr<IUnknown> dxup;
+    if (SUCCEEDED(device->QueryInterface(kDxupDevice, reinterpret_cast<void**>(dxup.GetAddressOf()))))
+      return 6;
+    HWND window = CreateWindowExA(0, "STATIC", "dxup foreign adapter", WS_POPUP, 0, 0, 64, 64,
+      nullptr, nullptr, GetModuleHandleA(nullptr), nullptr);
+    if (!window)
+      return 7;
+    DXGI_SWAP_CHAIN_DESC desc = {};
+    desc.BufferDesc.Width = 64;
+    desc.BufferDesc.Height = 64;
+    desc.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    desc.SampleDesc.Count = 1;
+    desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    desc.BufferCount = 1;
+    desc.OutputWindow = window;
+    desc.Windowed = TRUE;
+    desc.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
+    ComPtr<IDXGISwapChain> swapChain;
+    ComPtr<ID3D10Texture2D> backBuffer;
+    ComPtr<ID3D10RenderTargetView> rtv;
+    int result = 0;
+    if (FAILED(factory->CreateSwapChain(device.Get(), &desc, swapChain.GetAddressOf())))
+      result = 8;
+    else if (FAILED(swapChain->GetBuffer(0, __uuidof(ID3D10Texture2D), reinterpret_cast<void**>(backBuffer.GetAddressOf())))
+          || FAILED(device->CreateRenderTargetView(backBuffer.Get(), nullptr, rtv.GetAddressOf())))
+      result = 9;
+    else {
+      const float color[4] = { 0.1f, 0.2f, 0.3f, 1.0f };
+      device->ClearRenderTargetView(rtv.Get(), color);
+      if (FAILED(swapChain->Present(0, 0)))
+        result = 10;
+    }
+    rtv.Reset();
+    backBuffer.Reset();
+    swapChain.Reset();
+    DestroyWindow(window);
+    return result;
+  }
+
   int runNativeFallbackChild() {
     ComPtr<ID3D11Device> device;
     ComPtr<ID3D11DeviceContext> context;
@@ -26919,6 +26993,8 @@ int main(int argc, char** argv) {
     return runLowLatencyChild(argv[2]);
   if (argc > 1 && std::strcmp(argv[1], "--native-fallback-child") == 0)
     return runNativeFallbackChild();
+  if (argc > 1 && std::strcmp(argv[1], "--foreign-adapter-child") == 0)
+    return runForeignAdapterChild();
   if (argc > 1 && std::strcmp(argv[1], "--lazy-render-targets-child") == 0)
     return runLazyRenderTargetsChild();
   if (argc > 1 && std::strcmp(argv[1], "--idle-memory-trim-child") == 0)

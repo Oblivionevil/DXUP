@@ -115,6 +115,10 @@ zip and in [`src/util/util_config.h`](src/util/util_config.h).
   aware (the original is kept and comes back when DXUP is removed). That
   is not possible for games with Steam's DRM wrapper (Overlord II): they
   do not start with a changed EXE.
+- **Games that load Windows' own `dxgi.dll` by its path** (Crysis in
+  Direct3D 10) bypass DXUP's DXGI: DXUP gives them Windows' Direct3D 11,
+  and they run as without DXUP. Crysis's Direct3D 9 renderer (`-dx9`) does
+  not run on DXUP yet.
 - **Online games with anti-cheat:** replacing a game's DLLs can look like
   tampering to anti-cheat software. Use DXUP with such games at your own
   risk.

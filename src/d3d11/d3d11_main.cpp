@@ -366,7 +366,7 @@ HRESULT WINAPI D3D11On12CreateDevice(
 // Without a Direct3D 12 device (a GPU without a Direct3D 12 driver, a
 // virtual machine) the game gets Windows' own Direct3D 11 device: it runs
 // as it would without DXUP. An adapter from DXUP's DXGI is handed over as
-// the real one.
+// the real one. why: the reason, for the log.
 static HRESULT createNativeDevice(
     IDXGIAdapter*            pAdapter,
     D3D_DRIVER_TYPE          DriverType,
@@ -377,7 +377,8 @@ static HRESULT createNativeDevice(
     UINT                     SDKVersion,
     ID3D11Device**           ppDevice,
     D3D_FEATURE_LEVEL*       pFeatureLevel,
-    ID3D11DeviceContext**    ppImmediateContext) {
+    ID3D11DeviceContext**    ppImmediateContext,
+    const char*              why = "no Direct3D 12 device") {
   HMODULE sysD3D11 = loadSystemD3D11Module();
   auto systemCreate = sysD3D11
     ? reinterpret_cast<PFN_D3D11_CREATE_DEVICE>(GetProcAddress(sysD3D11, "D3D11CreateDevice")) : nullptr;
@@ -389,9 +390,32 @@ static HRESULT createNativeDevice(
     adapter = real.Get();
   const HRESULT hr = systemCreate(adapter, DriverType, Software, Flags, pFeatureLevels, FeatureLevels,
     SDKVersion, ppDevice, pFeatureLevel, ppImmediateContext);
-  logMessage(LogLevel::Warn, "D3D11CreateDevice: no Direct3D 12 device, Windows' Direct3D 11 instead (hr=0x%08x)",
-    static_cast<unsigned>(hr));
+  logMessage(LogLevel::Warn, "D3D11CreateDevice: %s, Windows' Direct3D 11 instead (hr=0x%08x)",
+    why, static_cast<unsigned>(hr));
   return hr;
+}
+
+// Whether the adapter is an object of Windows' own dxgi.dll (its methods lie
+// in that module), not one of DXUP's DXGI or of another DXGI wrapper.
+static bool isWindowsDxgiAdapter(IDXGIAdapter* adapter) {
+  HMODULE owner = nullptr;
+  const void* methods = *reinterpret_cast<void* const*>(adapter);
+  char path[MAX_PATH] = {};
+  if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        static_cast<const char*>(methods), &owner)
+   || !GetModuleFileNameA(owner, path, MAX_PATH))
+    return false;
+  // In a 32-bit process Windows' DLLs may carry either folder's name.
+  char folder[MAX_PATH] = {};
+  for (int i = 0; i < 2; i++) {
+    const UINT length = i ? GetSystemWow64DirectoryA(folder, MAX_PATH) : GetSystemDirectoryA(folder, MAX_PATH);
+    if (!length || length >= MAX_PATH - 10)
+      continue;
+    strncat_s(folder, "\\dxgi.dll", _TRUNCATE);
+    if (_stricmp(path, folder) == 0)
+      return true;
+  }
+  return false;
 }
 
 // The LUID of WARP, from the system's DXGI (not DXUP's dxgi.dll).
@@ -448,6 +472,16 @@ HRESULT __stdcall D3D11CreateDevice(
   // As in D3D11: an explicit adapter goes with D3D_DRIVER_TYPE_UNKNOWN only.
   if ((pAdapter != nullptr) != (DriverType == D3D_DRIVER_TYPE_UNKNOWN))
     return E_INVALIDARG;
+
+  // An adapter of Windows' own DXGI: the application loaded Windows'
+  // dxgi.dll itself (Crysis's Direct3D 10 renderer does, by its full path)
+  // and makes its swap chain with Windows' factory, which cannot take
+  // DXUP's device (it crashed there). It gets Windows' Direct3D 11 device and
+  // runs as it would without DXUP.
+  if (pAdapter && isWindowsDxgiAdapter(pAdapter))
+    return createNativeDevice(pAdapter, DriverType, Software, Flags, pFeatureLevels, FeatureLevels,
+      SDKVersion, ppDevice, pFeatureLevel, ppImmediateContext,
+      "the adapter comes from Windows' DXGI, not DXUP's (the application loads Windows' dxgi.dll itself)");
 
   LUID adapterLuid = {};
   const LUID* requestedAdapter = nullptr;

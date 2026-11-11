@@ -587,4 +587,18 @@ namespace dxup::d3d9 {
     return D3D_OK;
   }
 
+  // As Windows' Direct3D 9: the adapter's memory as DXGI gives it to the
+  // program (dedicated and shared; a 32-bit program sees at most 4 GB), in
+  // whole megabytes and at most 4095 MB. Windows reports those 4095 MB for any
+  // GPU of today; Crysis's Direct3D 9 renderer, given less (2047 MB), asked for a
+  // block of 3 GB and quit.
+  UINT Interface::availableTextureMem(UINT adapter) const {
+    constexpr uint64_t kMost = 0xfff00000u;
+    if (adapter >= m_adapters.size())
+      return UINT(kMost);
+    const DXGI_ADAPTER_DESC1& desc = m_adapters[adapter].desc;
+    const uint64_t total = uint64_t(desc.DedicatedVideoMemory) + desc.DedicatedSystemMemory + desc.SharedSystemMemory;
+    return UINT((std::min)(total, kMost) & ~uint64_t(0xfffff));
+  }
+
 }

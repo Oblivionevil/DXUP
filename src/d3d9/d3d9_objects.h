@@ -981,6 +981,8 @@ namespace dxup::d3d9 {
     HRESULT STDMETHODCALLTYPE GetAdapterLUID(UINT adapter, LUID* luid) override;
 
     static D3DCAPS9 makeCaps(UINT adapter);
+    // IDirect3DDevice9::GetAvailableTextureMem of a device on the adapter.
+    UINT availableTextureMem(UINT adapter) const;
     // Display modes of an adapter (monitor), sorted, without duplicates.
     const std::vector<D3DDISPLAYMODEEX>& modes(UINT adapter);
 

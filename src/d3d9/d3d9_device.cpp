@@ -659,8 +659,7 @@ namespace dxup::d3d9 {
   }
 
   UINT Device::GetAvailableTextureMem() {
-    // Old games keep this in a signed 32-bit integer.
-    return 0x7ff00000u;
+    return m_parent->availableTextureMem(m_adapter);
   }
 
   HRESULT Device::GetDirect3D(IDirect3D9** d3d) {
